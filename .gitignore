@@ -67,8 +67,7 @@ hf_token.local
 # Never commit.
 config.seed.json
 
-# Design iteration output (logo previews; regenerate with
-# lia/generate_logo.py --variants)
+# Design-iteration leftovers (the retired drawn-logo experiment's previews)
 _lia_logo/
 _*.py
 _*.html

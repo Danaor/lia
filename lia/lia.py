@@ -1519,26 +1519,11 @@ def _fmt_user_text(cfg, text, limit=None):
     meeting titles, correction hits) for the log. Privacy default: only the
     size is logged; the full text appears only when the user opts in with
     log_transcripts:true (a debugging aid - the log lives unencrypted on
-    disk for weeks). Module-level call sites with no config in scope pass
-    cfg=None - the last loaded config (set by load_config) decides then."""
+    disk for weeks). cfg=None means no opt-in in scope: sizes only."""
     text = text or ""
-    if cfg is None:
-        cfg = _LAST_LOADED_CONFIG
     if cfg and cfg.get("log_transcripts"):
         return text if limit is None else text[:limit]
     return "[%d chars]" % len(text)
-
-
-# The most recently loaded config, for _fmt_user_text(None, ...) call sites.
-_LAST_LOADED_CONFIG = None
-
-
-def _remember_config(cfg):
-    """Record the config for module-level _fmt_user_text(None, ...) callers,
-    then return it (used at every load_config return point)."""
-    global _LAST_LOADED_CONFIG
-    _LAST_LOADED_CONFIG = cfg
-    return cfg
 
 
 def _unprotect_config_secrets(cfg):
@@ -1566,7 +1551,7 @@ def load_config():
             log.warning("Config file corrupt or unreadable (%s) — using defaults", e)
             cfg = DEFAULT_CONFIG.copy()
             cfg["meeting_model"] = _default_meeting_model()
-            return _remember_config(cfg)
+            return cfg
         # Whether the user already has a meeting model saved — decides if the
         # GPU-smart default below applies (fresh installs only).
         had_meeting_model = "meeting_model" in cfg
@@ -1600,7 +1585,7 @@ def load_config():
                          cfg.get("hotkey_with_enter"))
                 cfg["hotkey_with_enter"] = ""
             cfg["_enter_hotkey_disabled"] = True
-        return _remember_config(_unprotect_config_secrets(cfg))
+        return _unprotect_config_secrets(cfg)
     # No config file at all (first run ever) — start from defaults + GPU-smart
     # meeting model. A PORTABLE build may ship config.seed.json next to the app
     # (gitignored, like hf_token.local) with opinionated defaults (e.g. cloud
@@ -1643,7 +1628,7 @@ def load_config():
                 "local_pyannote_hebrew": "local_pyannote_parakeet",
             }.get(cfg["meeting_model"], cfg["meeting_model"])
     # A seed config may carry pre-protected secrets; decrypt like a real load.
-    return _remember_config(_unprotect_config_secrets(cfg))
+    return _unprotect_config_secrets(cfg)
 
 
 def is_user_admin():
@@ -6259,12 +6244,16 @@ class GroqLLMCleaner:
         ),
     }
 
-    def __init__(self, api_key, model="llama-3.3-70b-versatile", chat_url=None):
+    def __init__(self, api_key, model="llama-3.3-70b-versatile", chat_url=None,
+                 log_cfg=None):
         self.api_key = api_key
         self.model = model
         # Endpoint override — lets a (summary) cleaner target a LOCAL OpenAI-
         # compatible server (Ollama) instead of the class's cloud CHAT_URL.
         self.chat_url = chat_url or self.CHAT_URL
+        # The app config, for LOG privacy only (_fmt_user_text opt-in in the
+        # summary backstops). None (children, tests) means sizes-only logs.
+        self._log_cfg = log_cfg
         # Persistent HTTP connection — saves ~100-300ms TLS handshake per
         # cleanup call. Same pattern as GroqTranscriber._session.
         self._session = None
@@ -6646,7 +6635,7 @@ class GroqLLMCleaner:
                     # Deterministic title backstop - BEFORE the section-splitting
                     # passes, so they see the contract shape. Malformed-first-header
                     # class only; no-op otherwise.
-                    out = _fix_title_header(out, lang)
+                    out = _fix_title_header(out, lang, cfg=self._log_cfg)
                 # LOCAL tasks pass: a NARROW second call that only extracts
                 # commitments, merged into '## משימות'. Closes the measured
                 # long-meeting task recall gap. Meeting
@@ -6675,7 +6664,8 @@ class GroqLLMCleaner:
                                 parts.append(self._ollama_summary_once(
                                     url, tasks_prompt, wc, nc_w, False,
                                     read_to, num_predict=4000) or "")
-                            tasks_md = _merge_task_windows(parts, fuzzy=mr_fuzzy_dedup)
+                            tasks_md = _merge_task_windows(parts, fuzzy=mr_fuzzy_dedup,
+                                                           cfg=self._log_cfg)
                             log.info("Summary tasks pass: windowed x%d "
                                      "(map-reduce parity).", len(wins))
                         else:
@@ -6775,7 +6765,7 @@ class GroqLLMCleaner:
                     # the ported backstop chain: tone + paren-owner normalization,
                     # then a final near-duplicate sweep over '## משימות' (pure code).
                     out = _soften_tone(_normalize_paren_owners(out, lang), lang)
-                    out = _dedupe_tasks_section(out)
+                    out = _dedupe_tasks_section(out, cfg=self._log_cfg)
                 out = _localize_summary_markers(out)
                 log.info("Summary (%s): %d chars in %.1fs", self.model, len(out),
                          time.time() - t0)
@@ -6830,10 +6820,10 @@ class GroqLLMCleaner:
                 # Cloud PARITY, code side: the free deterministic backstop chain
                 # the local path always gets - pure code, zero extra cloud cost.
                 # The paid LLM passes stay off here by design.
-                out = _fix_title_header(out, lang)
+                out = _fix_title_header(out, lang, cfg=self._log_cfg)
                 out = _soften_tone(_normalize_paren_owners(
                     _strip_speaker_label_owners(out), lang), lang)
-                out = _dedupe_tasks_section(out)
+                out = _dedupe_tasks_section(out, cfg=self._log_cfg)
             out = _localize_summary_markers(out)
             log.info("Summary (%s): %d chars in %.1fs", self.model, len(out),
                      time.time() - t0)
@@ -7139,8 +7129,9 @@ class OpenAILLMCleaner(GroqLLMCleaner):
     """
     CHAT_URL = "https://api.openai.com/v1/chat/completions"
 
-    def __init__(self, api_key, model="gpt-5.1", chat_url=None):
-        super().__init__(api_key=api_key, model=model, chat_url=chat_url)
+    def __init__(self, api_key, model="gpt-5.1", chat_url=None, log_cfg=None):
+        super().__init__(api_key=api_key, model=model, chat_url=chat_url,
+                         log_cfg=log_cfg)
 
 
 # Google Gemini via AI Studio's OpenAI-COMPATIBLE endpoint — lets the existing
@@ -7157,11 +7148,14 @@ def _is_gemini_url(url):
     not the OpenAI key or the Ollama placeholder). Matches the parsed HOSTNAME,
     not a substring - a URL merely containing the host in its path/userinfo
     must never be handed the Gemini key."""
-    if not url:
+    u = (url or "").strip()
+    if not u:
         return False
+    if "://" not in u:
+        u = "https://" + u   # a scheme-less config value still names the host
     try:
         from urllib.parse import urlsplit
-        host = (urlsplit(url).hostname or "").lower()
+        host = (urlsplit(u).hostname or "").rstrip(".").lower()
     except ValueError:
         return False
     return host == "generativelanguage.googleapis.com"
@@ -9841,7 +9835,7 @@ def _norm_task_text(text):
     return _re_tasks.sub(r"\s+", " ", (text or "").strip()).casefold()
 
 
-def _merge_task_windows(parts, fuzzy=False):
+def _merge_task_windows(parts, fuzzy=False, cfg=None):
     """One checklist from per-window tasks-pass outputs: window order kept, exact
     duplicates (normalized task TEXT, checkbox/owner stripped) dropped - the same
     task spoken near a window boundary must not appear twice. With `fuzzy`
@@ -9868,8 +9862,8 @@ def _merge_task_windows(parts, fuzzy=False):
                         new_rich == old_rich and dedup.prefer(match[1], text) == 1)
                     log.info("mr dedup: near-duplicate task %s: %s ~ %s",
                              "replaced by richer" if take_new else "dropped",
-                             _fmt_user_text(None, match[1].strip(), limit=80),
-                             _fmt_user_text(None, text.strip(), limit=80))
+                             _fmt_user_text(cfg, match[1].strip(), limit=80),
+                             _fmt_user_text(cfg, text.strip(), limit=80))
                     if take_new:
                         match[0], match[1] = line, text
                     seen.add(key)
@@ -9879,7 +9873,7 @@ def _merge_task_windows(parts, fuzzy=False):
     return "\n".join(k[0] for k in kept)
 
 
-def _dedupe_tasks_section(out):
+def _dedupe_tasks_section(out, cfg=None):
     """A FINAL near-duplicate sweep over '## משימות' (same closed rule as the
     window merges, richer-variant preference, applied in place: non-task lines
     and all whitespace stay byte-identical, a dropped duplicate's richer twin
@@ -9907,8 +9901,8 @@ def _dedupe_tasks_section(out):
             new_rich == old_rich and dedup.prefer(match[1], text) == 1)
         log.info("final dedup: near-duplicate task %s: %s ~ %s",
                  "replaced by richer" if take_new else "dropped",
-                 _fmt_user_text(None, match[1].strip(), limit=80),
-                 _fmt_user_text(None, text.strip(), limit=80))
+                 _fmt_user_text(cfg, match[1].strip(), limit=80),
+                 _fmt_user_text(cfg, text.strip(), limit=80))
         if take_new:
             lines[match[0]] = line + ("\n" if lines[match[0]].endswith("\n") else "")
             match[1] = text
@@ -9928,7 +9922,7 @@ _TITLE_HEADER_EN = "## Discussion Title"
 _KNOWN_SECTION_TITLES = lang_pack.KNOWN_SECTION_TITLES
 
 
-def _fix_title_header(out, lang="he"):
+def _fix_title_header(out, lang="he", cfg=None):
     if not out or _TITLE_HEADER in out or _TITLE_HEADER_EN in out:
         return out
     m = _re_tasks.match(r"\s*## (.+)\r?\n", out)
@@ -9942,7 +9936,7 @@ def _fix_title_header(out, lang="he"):
         return out
     hdr = _TITLE_HEADER_EN if lang == "en" else _TITLE_HEADER
     log.info("Summary title backstop: first header %s demoted under '%s'.",
-             _fmt_user_text(None, first, limit=80), hdr)
+             _fmt_user_text(cfg, first, limit=80), hdr)
     return hdr + "\n" + first + "\n" + out[m.end():]
 
 
@@ -10972,20 +10966,31 @@ def _promote_tray_icon(timeout_sec=15.0):
     icon first registers, so poll briefly. On Windows 10 the key does not
     exist and this is a silent no-op.
 
-    Returns True when a matching entry exists and is promoted (either by
-    us now or already before) - the signal to stop trying on later runs.
+    Returns True when a matching entry exists and its promotion verifiably
+    landed (or was already set) - the signal to stop trying on later runs.
     """
     import winreg
     exe = os.path.normcase(os.path.abspath(sys.executable))
+    # Identity gate: only OUR launcher (the renamed-pythonw Lia.exe) or the
+    # frozen build has an ExecutablePath unique to Lia. Under a shared
+    # interpreter (`python lia.py` dev runs; run.bat's very first launch,
+    # before _ensure_lia_launcher creates Lia.exe) the path would match
+    # OTHER Python tray apps - promoting them and never us. Skip; once the
+    # launcher exists, the next run retries under the unique path.
+    if (os.path.basename(exe) != "lia.exe"
+            and not getattr(sys, "frozen", False)):
+        return False
     deadline = time.time() + timeout_sec
+    delay = 0.5
     while True:
-        found = False
         try:
             root = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                                   r"Control Panel\NotifyIconSettings")
         except OSError:
             return False  # pre-22H2 Windows: no overflow registry, nothing to do
+        promoted = False
         with root:
+            # Enumerate READ-only; only the matched entry is reopened writable.
             i = 0
             while True:
                 try:
@@ -10994,28 +10999,39 @@ def _promote_tray_icon(timeout_sec=15.0):
                     break
                 i += 1
                 try:
-                    with winreg.OpenKey(root, sub, 0,
-                                        winreg.KEY_READ | winreg.KEY_SET_VALUE) as k:
+                    with winreg.OpenKey(root, sub, 0, winreg.KEY_READ) as k:
                         path, _ = winreg.QueryValueEx(k, "ExecutablePath")
                         if os.path.normcase(str(path)) != exe:
                             continue
-                        found = True
                         try:
-                            promoted = winreg.QueryValueEx(k, "IsPromoted")[0]
+                            already = winreg.QueryValueEx(k, "IsPromoted")[0]
                         except OSError:
-                            promoted = 0
-                        if not promoted:
-                            winreg.SetValueEx(k, "IsPromoted", 0,
-                                              winreg.REG_DWORD, 1)
-                            log.info("Tray icon promoted out of the Windows 11 "
-                                     "overflow (NotifyIconSettings\\%s)", sub)
+                            already = 0
                 except OSError:
                     continue
-        if found:
+                if already:
+                    promoted = True
+                    continue
+                # Success only when the write verifiably landed - a denied
+                # write must NOT persist the one-time flag (no retry ever).
+                try:
+                    with winreg.OpenKey(root, sub, 0, winreg.KEY_SET_VALUE) as wk:
+                        winreg.SetValueEx(wk, "IsPromoted", 0,
+                                          winreg.REG_DWORD, 1)
+                    with winreg.OpenKey(root, sub, 0, winreg.KEY_READ) as rk:
+                        if winreg.QueryValueEx(rk, "IsPromoted")[0] == 1:
+                            promoted = True
+                            log.info("Tray icon promoted out of the Windows 11 "
+                                     "overflow (NotifyIconSettings\\%s)", sub)
+                except OSError as e:
+                    log.warning("Tray icon promote write failed on %s: %s "
+                                "- will retry next launch", sub, e)
+        if promoted:
             return True
         if time.time() >= deadline:
-            return False  # entry never appeared; retry on the next launch
-        time.sleep(2.0)
+            return False  # entry never appeared / write denied; retry next launch
+        time.sleep(delay)
+        delay = min(2.0, delay * 2)
 
 
 def _set_startup_shortcut(enabled):
@@ -15250,10 +15266,9 @@ class LiaApp:
         flag, so a user who later hides the icon or never wants another
         balloon is left alone."""
         try:
-            if not self.config.get("_tray_icon_promoted"):
-                if _promote_tray_icon():
-                    self.config["_tray_icon_promoted"] = True
-                    save_config(self.config)
+            dirty = False
+            # Balloon FIRST: it must not wait behind the promote poll (up to
+            # 15s on a slow Explorer - exactly when the user needs the signal).
             if not self.config.get("_first_run_welcome_shown"):
                 hotkey = self.config.get("hotkey", "ctrl+space")
                 try:
@@ -15263,6 +15278,15 @@ class LiaApp:
                 except Exception:
                     pass  # notify unsupported on this backend - promotion still helps
                 self.config["_first_run_welcome_shown"] = True
+                dirty = True
+            if not self.config.get("_tray_icon_promoted"):
+                if _promote_tray_icon():
+                    self.config["_tray_icon_promoted"] = True
+                    dirty = True
+            # One save for both flags (each save re-encrypts every DPAPI
+            # secret). If it raises (fail-closed DPAPI), the in-memory flags
+            # still suppress repeats for THIS session; next launch retries.
+            if dirty:
                 save_config(self.config)
         except Exception as e:
             log.warning("Tray onboarding failed: %s", e)
@@ -17614,7 +17638,7 @@ class LiaApp:
                 or getattr(c, "chat_url", None) != chat_url):
             self._summary_cleaner = OpenAILLMCleaner(
                 api_key=key, model=model,
-                chat_url=(base_url or None))
+                chat_url=(base_url or None), log_cfg=self.config)
         return self._summary_cleaner
 
     def _get_compose_cleaner(self):
@@ -19655,6 +19679,24 @@ class LiaApp:
         except Exception:
             pass
         try:
+            # Re-assert the DECLARED intent FIRST, unconditionally: the rename
+            # can leave a mechanism that EXISTS but points at a dead path, so
+            # an is-enabled guard would wrongly skip the repair. set_auto_start
+            # is idempotent and rewrites the mechanism at the CURRENT path.
+            # Runs before the elevated-only task cleanup so a non-elevated
+            # launch still repairs auto-start (the Run-key path needs no
+            # admin). One-time by the flag below, so a mechanism the user
+            # removed by hand OUTSIDE the app is resurrected at most once.
+            resync_ok = True
+            if self.config.get("auto_start"):
+                try:
+                    set_auto_start(True)
+                    resync_ok = is_auto_start_enabled()
+                except Exception as e:
+                    resync_ok = False
+                    log.warning("Auto-start re-sync error: %s", e)
+                if resync_ok:
+                    log.info("Auto-start re-asserted for the 'Lia' rename")
             tasks_dir = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
                                      "System32", "Tasks")
             legacy = [n for n in _LEGACY_TASK_NAMES
@@ -19680,18 +19722,11 @@ class LiaApp:
                     return  # don't set the flag; retry when elevated
                 log.info("Removed orphaned legacy auto-start task(s): %s",
                          ", ".join(legacy))
-            # Re-sync to the DECLARED intent: recreate under the new 'Lia'
-            # name only if the user's config actually wants auto-start and no
-            # mechanism currently exists. Deliberately OUTSIDE the legacy-task
-            # branch: a partial earlier run may have removed the orphan without
-            # completing the recreation, and this launch is the retry.
-            try:
-                if self.config.get("auto_start") and not is_auto_start_enabled():
-                    set_auto_start(True)
-                    log.info("Auto-start re-created for the 'Lia' rename")
-            except Exception as e:
-                log.warning("Auto-start re-sync failed (Settings -> General -> "
-                            "'Start with Windows' re-toggles it): %s", e)
+            if not resync_ok:
+                log.warning("Auto-start re-sync incomplete (Settings -> General "
+                            "-> 'Start with Windows' re-toggles it) - "
+                            "retrying next launch")
+                return  # don't set the flag; the re-sync IS the retry
             self.config["_legacy_autostart_migrated_lia"] = True
             save_config(self.config)
         except Exception as e:

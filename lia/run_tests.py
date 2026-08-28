@@ -3064,32 +3064,72 @@ _test("tray: lean layout (status + capture + meeting + History + Settings + Quit
 def t_tray_onboarding():
     """First-run tray onboarding (2026-08-28): Windows 11 hides new tray
     icons in the ^ overflow, so a first-time user concludes the app did not
-    start. Guards: (1) _promote_tray_icon exists, targets NotifyIconSettings/
-    IsPromoted, matches by ExecutablePath, and is a no-op when the key is
-    absent (Win10); (2) the onboarding method runs from the tray-ready
-    callback, is gated by the two one-time config flags, and shows the
-    welcome balloon regardless of silent_mode (no silent_mode read); (3) the
-    promote flag is saved only on success so later launches retry."""
+    start. BEHAVIORAL, with promote/save stubbed: the balloon fires exactly
+    once and BEFORE the promote poll (it must not wait behind up to 15s of
+    Explorer lag), the promote flag persists only on verified success (a
+    failed promote must retry next launch), both flags share ONE config
+    save, a second run is a complete no-op, and a save_config raise
+    (fail-closed DPAPI) never escapes. Plus: the real _promote_tray_icon
+    carries the shared-interpreter identity gate (a python.exe-hosted run
+    must never promote OTHER apps' NotifyIconSettings entries), and the
+    hook is wired from the tray-ready callback."""
     import inspect
+    import types
     import lia as wt
+    calls = []
+
+    class Icon:
+        def notify(self, msg, title):
+            calls.append(("notify", msg, title))
+
+    orig_promote, orig_save = wt._promote_tray_icon, wt.save_config
+    try:
+        # Failed promote: balloon still shows (first!), welcome flag set,
+        # promote flag NOT persisted, one save for the dirty welcome flag.
+        wt._promote_tray_icon = (
+            lambda *a, **k: (calls.append(("promote",)), False)[1])
+        wt.save_config = lambda cfg: calls.append(("save",))
+        fake = types.SimpleNamespace(config={})
+        wt.LiaApp._tray_first_run_onboarding(fake, Icon())
+        assert [c[0] for c in calls] == ["notify", "promote", "save"], calls
+        assert fake.config.get("_first_run_welcome_shown") is True
+        assert "_tray_icon_promoted" not in fake.config, \
+            "a failed promote must not persist the flag (no retry ever)"
+        assert "ctrl+space" in calls[0][1]
+
+        # Successful promote: both flags, exactly ONE save, hotkey honored.
+        calls.clear()
+        wt._promote_tray_icon = lambda *a, **k: True
+        fake2 = types.SimpleNamespace(config={"hotkey": "f9"})
+        wt.LiaApp._tray_first_run_onboarding(fake2, Icon())
+        assert fake2.config.get("_tray_icon_promoted") is True
+        assert fake2.config.get("_first_run_welcome_shown") is True
+        assert [c[0] for c in calls].count("save") == 1, calls
+        assert "f9" in calls[0][1]
+
+        # Both flags set: complete no-op (no balloon spam, no save).
+        calls.clear()
+        wt.LiaApp._tray_first_run_onboarding(types.SimpleNamespace(config={
+            "_tray_icon_promoted": True, "_first_run_welcome_shown": True}),
+            Icon())
+        assert calls == [], calls
+
+        # A fail-closed save_config must be swallowed, not crash the thread.
+        def _boom(cfg):
+            raise RuntimeError("dpapi down")
+        wt.save_config = _boom
+        wt.LiaApp._tray_first_run_onboarding(
+            types.SimpleNamespace(config={}), Icon())
+    finally:
+        wt._promote_tray_icon, wt.save_config = orig_promote, orig_save
+
     promo_src = inspect.getsource(wt._promote_tray_icon)
-    for needle in ("NotifyIconSettings", "IsPromoted", "ExecutablePath",
-                   "winreg.REG_DWORD"):
+    for needle in ("NotifyIconSettings", "IsPromoted", "ExecutablePath"):
         assert needle in promo_src, "_promote_tray_icon missing " + needle
-    assert "return False" in promo_src, "no Win10 no-op path"
-    onb_src = inspect.getsource(wt.LiaApp._tray_first_run_onboarding)
-    assert "_tray_icon_promoted" in onb_src and "_first_run_welcome_shown" in onb_src
-    assert "_promote_tray_icon()" in onb_src and "icon.notify(" in onb_src
-    assert 'get("silent_mode")' not in onb_src, "onboarding must ignore silent_mode"
-    # promote flag saved only inside the success branch
-    lines = onb_src.splitlines()
-    promo_set = next(i for i, l in enumerate(lines)
-                     if 'self.config["_tray_icon_promoted"] = True' in l)
-    guard = next(i for i, l in enumerate(lines) if "if _promote_tray_icon()" in l)
-    assert guard < promo_set, "promote flag must be gated on success"
-    # wired from the tray-ready callback
-    run_src = inspect.getsource(wt.LiaApp.run)
-    assert "_tray_first_run_onboarding" in run_src, "onboarding not wired in run()"
+    assert 'basename(exe) != "lia.exe"' in promo_src, \
+        "shared-interpreter identity gate missing"
+    assert "_tray_first_run_onboarding" in inspect.getsource(wt.LiaApp.run), \
+        "onboarding not wired in run()"
 
 
 _test("tray: first-run onboarding (overflow promote + welcome balloon)",
