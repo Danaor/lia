@@ -7,6 +7,7 @@
 **Local Inference Assistant** - push-to-talk dictation and meeting intelligence for Windows.
 Local-first, Hebrew and English, zero friction.
 
+[![Release](https://img.shields.io/github/v/release/Danaor/lia?color=7d3fc9)](https://github.com/Danaor/lia/releases/latest)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Windows](https://img.shields.io/badge/platform-Windows-0078D6.svg)](https://www.microsoft.com/windows)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
