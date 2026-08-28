@@ -1,0 +1,33 @@
+faster-whisper>=1.1.0
+pyaudio>=0.2.14
+PyAudioWPatch>=0.2.12.7
+keyboard>=0.13.5
+pyperclip>=1.8.2
+pystray>=0.19.5
+Pillow>=10.0.0
+numpy>=1.24.0
+requests>=2.31.0
+# pywebview: the HTML/CSS windows (Settings, Ask-your-meetings, Action items,
+# Chat, Email search, Compose/Summary editor). edgechromium (WebView2) backend.
+pywebview>=6.2
+# pywin32: Outlook COM (win32com.client / pythoncom) for the email/summary
+# windows, and the de-elevation / window helpers.
+pywin32>=306
+# python-bidi: NO LONGER used for Tk display (this Tk renders bidi natively —
+# get_display would double-reverse). Kept only because _to_visual_rtl remains
+# for back-compat; safe to drop once that helper is removed.
+python-bidi>=0.4.2
+# onnx-asr: the LOCAL English backend (NVIDIA Parakeet TDT 0.6B v2, int8 ONNX,
+# CC-BY-4.0). Tiny footprint (numpy + onnxruntime, no torch); the model
+# (~670MB) auto-downloads on first use. CPU is several-x realtime.
+onnx-asr[cpu,hub]>=0.12
+# Optional: Intel GPU/NPU acceleration (uncomment to install)
+# openvino-genai
+# huggingface-hub
+
+# Optional: NVIDIA GPU (CUDA) acceleration for local faster-whisper.
+# With an NVIDIA card + recent driver, install these and the app auto-uses the
+# GPU (config "whisper_device": "auto"). They ship the CUDA 12 cuBLAS + cuDNN 9
+# runtime DLLs CTranslate2 needs; the app adds them to the DLL search path at
+# startup. ~1.2 GB. Not needed on CPU-only machines.
+# pip install nvidia-cublas-cu12 "nvidia-cudnn-cu12>=9,<10"
