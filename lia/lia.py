@@ -1519,11 +1519,26 @@ def _fmt_user_text(cfg, text, limit=None):
     meeting titles, correction hits) for the log. Privacy default: only the
     size is logged; the full text appears only when the user opts in with
     log_transcripts:true (a debugging aid - the log lives unencrypted on
-    disk for weeks)."""
+    disk for weeks). Module-level call sites with no config in scope pass
+    cfg=None - the last loaded config (set by load_config) decides then."""
     text = text or ""
+    if cfg is None:
+        cfg = _LAST_LOADED_CONFIG
     if cfg and cfg.get("log_transcripts"):
         return text if limit is None else text[:limit]
     return "[%d chars]" % len(text)
+
+
+# The most recently loaded config, for _fmt_user_text(None, ...) call sites.
+_LAST_LOADED_CONFIG = None
+
+
+def _remember_config(cfg):
+    """Record the config for module-level _fmt_user_text(None, ...) callers,
+    then return it (used at every load_config return point)."""
+    global _LAST_LOADED_CONFIG
+    _LAST_LOADED_CONFIG = cfg
+    return cfg
 
 
 def _unprotect_config_secrets(cfg):
@@ -1551,7 +1566,7 @@ def load_config():
             log.warning("Config file corrupt or unreadable (%s) — using defaults", e)
             cfg = DEFAULT_CONFIG.copy()
             cfg["meeting_model"] = _default_meeting_model()
-            return cfg
+            return _remember_config(cfg)
         # Whether the user already has a meeting model saved — decides if the
         # GPU-smart default below applies (fresh installs only).
         had_meeting_model = "meeting_model" in cfg
@@ -1585,7 +1600,7 @@ def load_config():
                          cfg.get("hotkey_with_enter"))
                 cfg["hotkey_with_enter"] = ""
             cfg["_enter_hotkey_disabled"] = True
-        return _unprotect_config_secrets(cfg)
+        return _remember_config(_unprotect_config_secrets(cfg))
     # No config file at all (first run ever) — start from defaults + GPU-smart
     # meeting model. A PORTABLE build may ship config.seed.json next to the app
     # (gitignored, like hf_token.local) with opinionated defaults (e.g. cloud
@@ -1628,7 +1643,7 @@ def load_config():
                 "local_pyannote_hebrew": "local_pyannote_parakeet",
             }.get(cfg["meeting_model"], cfg["meeting_model"])
     # A seed config may carry pre-protected secrets; decrypt like a real load.
-    return _unprotect_config_secrets(cfg)
+    return _remember_config(_unprotect_config_secrets(cfg))
 
 
 def is_user_admin():
@@ -7139,8 +7154,17 @@ GEMINI_CHAT_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/
 
 def _is_gemini_url(url):
     """True if `url` is Gemini's OpenAI-compat endpoint (→ auth with gemini_api_key,
-    not the OpenAI key or the Ollama placeholder)."""
-    return bool(url) and "generativelanguage.googleapis.com" in url
+    not the OpenAI key or the Ollama placeholder). Matches the parsed HOSTNAME,
+    not a substring - a URL merely containing the host in its path/userinfo
+    must never be handed the Gemini key."""
+    if not url:
+        return False
+    try:
+        from urllib.parse import urlsplit
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return host == "generativelanguage.googleapis.com"
 
 
 # Summary prompts — used by LiaApp._run_summary for BOTH meeting
@@ -9842,9 +9866,10 @@ def _merge_task_windows(parts, fuzzy=False):
                     new_rich, old_rich = _real_owner(line), _real_owner(match[0])
                     take_new = (new_rich and not old_rich) or (
                         new_rich == old_rich and dedup.prefer(match[1], text) == 1)
-                    log.info("mr dedup: near-duplicate task %s: %r ~ %r",
+                    log.info("mr dedup: near-duplicate task %s: %s ~ %s",
                              "replaced by richer" if take_new else "dropped",
-                             match[1].strip(), text.strip())
+                             _fmt_user_text(None, match[1].strip(), limit=80),
+                             _fmt_user_text(None, text.strip(), limit=80))
                     if take_new:
                         match[0], match[1] = line, text
                     seen.add(key)
@@ -9880,9 +9905,10 @@ def _dedupe_tasks_section(out):
         new_rich, old_rich = _real_owner(line), _real_owner(old_line)
         take_new = (new_rich and not old_rich) or (
             new_rich == old_rich and dedup.prefer(match[1], text) == 1)
-        log.info("final dedup: near-duplicate task %s: %r ~ %r",
+        log.info("final dedup: near-duplicate task %s: %s ~ %s",
                  "replaced by richer" if take_new else "dropped",
-                 match[1].strip(), text.strip())
+                 _fmt_user_text(None, match[1].strip(), limit=80),
+                 _fmt_user_text(None, text.strip(), limit=80))
         if take_new:
             lines[match[0]] = line + ("\n" if lines[match[0]].endswith("\n") else "")
             match[1] = text
@@ -9915,7 +9941,8 @@ def _fix_title_header(out, lang="he"):
         # title-prefixed variants are already a title header, just non-canonical.
         return out
     hdr = _TITLE_HEADER_EN if lang == "en" else _TITLE_HEADER
-    log.info("Summary title backstop: first header %r demoted under '%s'.", first, hdr)
+    log.info("Summary title backstop: first header %s demoted under '%s'.",
+             _fmt_user_text(None, first, limit=80), hdr)
     return hdr + "\n" + first + "\n" + out[m.end():]
 
 
