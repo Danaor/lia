@@ -23179,6 +23179,11 @@ class LiaApp:
                        and bool(c.get("translate_mode", False)) == translate
                        and (backend != "openai"
                             or c.get("openai_model", "gpt-4o-transcribe") == om))
+            # gpt-4o-transcribe hidden from the picker (2026-08-29, Naor's
+            # call - gpt-transcribe covers the OpenAI story). Code stays;
+            # a user already on it keeps seeing their row.
+            if om == "gpt-4o-transcribe" and not checked:
+                continue
             pk_missing = model_id.startswith("parakeet") and not has_parakeet
             # Cloud rows without their key show DIMMED (2026-08-29) - the
             # option is visible and transparent about what it needs, instead
@@ -23213,7 +23218,7 @@ class LiaApp:
             # call - the list got too long and they see little use). The
             # backend code stays; a user whose config already selects one
             # keeps seeing THEIR row so the UI never shows nothing-checked.
-            if ("assemblyai" in key
+            if (("assemblyai" in key or key == "openai_gpt4o")
                     and c.get("meeting_model", "local_hebrew_turbo") != key):
                 continue
             miss = missing(reqs)
@@ -23229,7 +23234,7 @@ class LiaApp:
                       "checked": (c.get("file_transcribe_model", "") or "") == "",
                       "enabled": True, "note": "", "where": ""}]
         for label, key, reqs in self._MEETING_MODELS:
-            if ("assemblyai" in key
+            if (("assemblyai" in key or key == "openai_gpt4o")
                     and c.get("file_transcribe_model", "") != key):
                 continue  # hidden like the meeting picker (see above)
             miss = missing(reqs)
