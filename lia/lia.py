@@ -18589,9 +18589,9 @@ class LiaApp:
         ("AssemblyAI only", "assemblyai_diarize_only", ["assemblyai_api_key"]),
         ("Hebrew Turbo Local only", "local_hebrew_turbo", []),
         ("English Parakeet Local only", "local_parakeet_english", []),
-        ("🏠 Hebrew Turbo Remote (home GPU)", "remote_hebrew_turbo", ["remote_server_url"]),
         ("GPT-transcribe only", "openai_gpt_transcribe", ["openai_api_key"]),
         ("GPT-4o only", "openai_gpt4o", ["openai_api_key"]),
+        ("Hebrew Turbo Remote", "remote_hebrew_turbo", ["remote_server_url"]),
     ]
 
     # Meeting Summary Module — the LLM that writes summaries. (label, model,
@@ -19498,12 +19498,12 @@ class LiaApp:
     _MENU_MODELS_ORDERED = [
         ("OpenAI gpt-transcribe ⭐ (best)", "ivrit-ai/whisper-large-v3-turbo-ct2", "openai", False, "gpt-transcribe"),
         ("OpenAI gpt-4o-transcribe", "ivrit-ai/whisper-large-v3-turbo-ct2", "openai", False, "gpt-4o-transcribe"),
-        ("🏠 Hebrew Turbo Remote ⭐ (home GPU · free)", "ivrit-ai/whisper-large-v3-turbo-ct2", "remote", False, ""),
         ("Groq Turbo", "large-v3-turbo", "groq", False, ""),
         ("Hebrew Turbo Local ⭐ (best local Hebrew)", "ivrit-ai/whisper-large-v3-turbo-ct2", "local", False, ""),
         ("English Parakeet Local ⭐ (best English)", "parakeet-tdt-0.6b-v2", "local", False, ""),
         ("English Distil Local", "distil-large-v3", "local", False, ""),
         ("General Turbo Local", "large-v3-turbo", "local", False, ""),
+        ("Hebrew Turbo Remote", "ivrit-ai/whisper-large-v3-turbo-ct2", "remote", False, ""),
     ]
 
     def _set_model_backend_translate(self, model, backend, translate, openai_model=""):

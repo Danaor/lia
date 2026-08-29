@@ -206,9 +206,9 @@ def _demo_state():
         "outputs": [{"idx": 3, "name": "Speakers (Realtek)"},
                     {"idx": 4, "name": "Focusrite USB"}],
         "tables": {
-            "dictation": [{"idx": 0, "label": "OpenAI gpt-transcribe (best)", "checked": True},
-                          {"idx": 2, "label": "Hebrew Turbo Remote (home GPU)", "checked": False},
-                          {"idx": 4, "label": "Hebrew Turbo Local", "checked": False}],
+            "dictation": [{"idx": 0, "label": "OpenAI gpt-transcribe (best)", "checked": True, "where": "cloud"},
+                          {"idx": 3, "label": "Hebrew Turbo Local (best local Hebrew)", "checked": False, "where": "local"},
+                          {"idx": 7, "label": "Hebrew Turbo Remote", "checked": False, "where": "remote"}],
             "meeting": [{"key": "local_hebrew_turbo", "label": "Hebrew Turbo Local only", "checked": True, "enabled": True, "note": ""},
                         {"key": "assemblyai_diarize_only", "label": "AssemblyAI only", "checked": False, "enabled": False, "note": "needs assemblyai_api_key"}],
             "file": [{"key": "", "label": "Same as meeting model", "checked": True, "enabled": True, "note": ""}],
@@ -351,17 +351,26 @@ APP_JS = r"""
       (disabled?' disabled':'')+'><span class="track"></span><span>'+esc(label)+'</span></label>';
   }
   var WB_TEXT = {local:'🖥️ LOCAL', cloud:'CLOUD',
-                 remote:'🏠 REMOTE LOCAL GPU'};
+                 remote:'REMOTE LOCAL GPU'};
+  var WB_SUB = {remote:'Use a GPU on another PC in your local network'};
   function radio(name, method, arg, argtype, label, checked, enabled, note, where){
     var dis = enabled===false;
+    var wsub = where ? (WB_SUB[where]||'') : '';
+    var badge = '';
+    if(where){
+      var pill = '<span class="wb '+esc(where)+'">'+(WB_TEXT[where]||esc(where))+'</span>';
+      if(wsub){
+        badge = '<span class="wb-group">'+pill+'<span class="wb-sub">'+esc(wsub)+'</span></span>';
+      } else {
+        badge = pill;
+      }
+    }
     return '<label class="radio'+(checked?' on':'')+(dis?' disabled':'')+'">'+
       '<input type="radio" name="'+esc(name)+'" data-radio="'+esc(method)+'" '+
       'data-arg="'+esc(arg)+'" data-argtype="'+(argtype||'str')+'"'+
       (checked?' checked':'')+(dis?' disabled':'')+'>'+
       '<span class="box"></span><span class="txt">'+esc(label)+
-      (note?'<small>'+esc(note)+'</small>':'')+'</span>'+
-      (where?'<span class="wb '+esc(where)+'">'+(WB_TEXT[where]||esc(where))+
-             '</span>':'')+'</label>';
+      (note?'<small>'+esc(note)+'</small>':'')+'</span>'+badge+'</label>';
   }
   function btn(label, method, args, kind, slow){
     return '<button class="btn '+(kind||'')+'" data-call="'+esc(method)+'" '+

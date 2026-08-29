@@ -267,8 +267,13 @@ input:disabled,select:disabled,textarea:disabled{opacity:.55; cursor:default;}
           border:1px solid var(--ok);}
 .wb.cloud{background:transparent; color:var(--faint);
           border:1px solid var(--line-2);}
-.wb.remote{background:var(--info-soft); color:var(--info);
-           border:1px solid var(--info);}
+.wb.remote{background:transparent; color:var(--faint);
+           border:1px solid var(--line-2);}
+.wb-group{margin-inline-start:auto; display:flex; flex-direction:column;
+          align-items:flex-end; gap:1px;}
+.wb-group .wb{margin-inline-start:0;}
+.wb-sub{font-size:9px; color:var(--faint); white-space:nowrap;
+        letter-spacing:normal; font-weight:400; padding-inline-end:2px;}
 .wb.beta{background:var(--warn-soft); color:var(--warn);
          border:1px solid var(--warn);}
 .radio input{position:absolute; opacity:0; width:0; height:0;}
