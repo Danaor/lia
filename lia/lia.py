@@ -360,11 +360,12 @@ DEFAULT_CONFIG = {
     # summarising is a reasoning/synthesis task with NO latency pressure (it
     # runs once, in a background thread, at the end), and the user often reads
     # ONLY the summary instead of the transcript — so it's worth the strongest
-    # model available. gpt-5.6-sol is the default (user's choice): LIVE-verified
-    # 2026-07-11 through the real summarize() path (Hebrew PM format, ~6s). Falls
-    # in the `gpt-5.` family → `max_completion_tokens` shaping in .summarize().
-    # (Selectable alts in _SUMMARY_MODELS: gpt-5.6-terra, gpt-5.5, local Ollama.)
-    "summary_model": "gpt-5.6-sol",
+    # "off" = AI summaries disabled - meetings save a transcript only. The
+    # honest keyless default (2026-08-29): a fresh install has no key, so
+    # promising a summary would just degrade anyway. Saving an OpenAI key
+    # auto-upgrades this to gpt-5.6-sol (see _apply_openai_key); the user
+    # can always pick a model (cloud/Gemini-free/local Ollama) in Settings.
+    "summary_model": "off",
     # Meeting Summary Module: which LLM writes meeting summaries (+ the standalone
     # Summarize tool). "" = OpenAI cloud (uses openai_api_key); a localhost URL =
     # a LOCAL Ollama OpenAI-compatible endpoint (the model must be `ollama pull`ed).
@@ -17709,6 +17710,8 @@ class LiaApp:
         (summary_base_url set) OR an OpenAI cloud key. Used to decide whether a
         meeting can be summarized or should degrade to transcript-only — keeps a
         keyless install from promising a summary it can't produce."""
+        if (self.config.get("summary_model") or "") == "off":
+            return False  # AI summaries explicitly disabled - transcript only
         base = (self.config.get("summary_base_url", "") or "").strip()
         if base:
             # Gemini needs its own key; a local Ollama endpoint needs nothing.
@@ -17723,6 +17726,8 @@ class LiaApp:
         OpenAI cloud (needs openai_api_key); a localhost URL = a LOCAL Ollama
         OpenAI-compatible endpoint. Returns None if cloud is chosen but no key."""
         model = self.config.get("summary_model", "gpt-5.5")
+        if (model or "") == "off":
+            return None  # AI summaries disabled
         base_url = (self.config.get("summary_base_url", "") or "").strip()
         if base_url:
             if _is_gemini_url(base_url):
@@ -18664,14 +18669,16 @@ class LiaApp:
     # Each entry: (label_for_menu, key_for_config, requires_one_of_keys)
     # `requires_one_of_keys` is a list of config-key names that must be
     # non-empty for the row to be selectable; empty = always available.
+    # LOCAL first (2026-08-29, Naor's ordering): plain local, then local
+    # diarized (speaker names), then cloud, remote last.
     _MEETING_MODELS = [
+        ("Hebrew Turbo Local only", "local_hebrew_turbo", []),
+        ("English Parakeet Local only", "local_parakeet_english", []),
         ("🖥  Local diarize (pyannote + Hebrew Turbo)", "local_pyannote_hebrew", []),
         ("🖥  Local diarize (pyannote + English Parakeet)", "local_pyannote_parakeet", []),
         ("AssemblyAI + Hebrew Turbo Local", "assemblyai_local_hebrew", ["assemblyai_api_key"]),
         ("AssemblyAI + GPT-4o", "assemblyai_universal_2", ["assemblyai_api_key"]),
         ("AssemblyAI only", "assemblyai_diarize_only", ["assemblyai_api_key"]),
-        ("Hebrew Turbo Local only", "local_hebrew_turbo", []),
-        ("English Parakeet Local only", "local_parakeet_english", []),
         ("GPT-transcribe only", "openai_gpt_transcribe", ["openai_api_key"]),
         ("GPT-4o only", "openai_gpt4o", ["openai_api_key"]),
         ("Hebrew Turbo Remote", "remote_hebrew_turbo", ["remote_server_url"]),
@@ -18703,7 +18710,7 @@ class LiaApp:
         # 2026-06-05, newer than the plain 31b tag). Trained with 4-bit
         # simulated, so Q4_0 lands far closer to BF16 quality than an ordinary
         # post-training quant — at a SMALLER footprint (18.9 vs 19.9 GB).
-        ("🖥  Gemma 4 31B QAT (local · best quality)", "gemma4:31b-it-qat", _OLLAMA_CHAT_URL),
+        ("🖥  Gemma 4 31B QAT (local · best quality · needs a 24 GB GPU)", "gemma4:31b-it-qat", _OLLAMA_CHAT_URL),
     ]
 
     # Human-friendly name of the tool that actually produces the transcript
@@ -19233,6 +19240,15 @@ class LiaApp:
         save_config(self.config)
         self._summary_cleaner = None  # rebuilt on next summary with the new model
         log.info("Summary model → %s (%s)", model, base_url or "OpenAI cloud")
+        if model == "off":
+            self._notify_summary("AI summaries are OFF - meetings save a "
+                                 "transcript only")
+            try:
+                if self.tray_icon:
+                    self.tray_icon.update_menu()
+            except Exception:
+                pass
+            return
         if _is_gemini_url(base_url):  # free Gemini — prompt for the key if missing
             if not (self.config.get("gemini_api_key", "") or "").strip():
                 self._notify_summary("Enter a FREE Gemini key (Google AI Studio) to use it")
@@ -19578,14 +19594,16 @@ class LiaApp:
     # be the Hebrew-tuned model, not the generic multilingual one — so the
     # OpenAI row falls back to ivrit-ai (also lets the diarized 'Hebrew Local'
     # enhance reuse the already-loaded model instead of loading a second one).
+    # LOCAL first (2026-08-29, Naor's ordering): the local models are the
+    # product's identity and the app default; cloud follows, remote last.
     _MENU_MODELS_ORDERED = [
-        ("OpenAI gpt-transcribe ⭐ (best)", "ivrit-ai/whisper-large-v3-turbo-ct2", "openai", False, "gpt-transcribe"),
-        ("OpenAI gpt-4o-transcribe", "ivrit-ai/whisper-large-v3-turbo-ct2", "openai", False, "gpt-4o-transcribe"),
-        ("Groq Turbo", "large-v3-turbo", "groq", False, ""),
         ("Hebrew Turbo Local ⭐ (best local Hebrew)", "ivrit-ai/whisper-large-v3-turbo-ct2", "local", False, ""),
         ("English Parakeet Local ⭐ (best English)", "parakeet-tdt-0.6b-v2", "local", False, ""),
         ("English Distil Local", "distil-large-v3", "local", False, ""),
-        ("General Turbo Local", "large-v3-turbo", "local", False, ""),
+        ("General Turbo Local (multilingual · 99 languages)", "large-v3-turbo", "local", False, ""),
+        ("OpenAI gpt-transcribe ⭐ (best)", "ivrit-ai/whisper-large-v3-turbo-ct2", "openai", False, "gpt-transcribe"),
+        ("OpenAI gpt-4o-transcribe", "ivrit-ai/whisper-large-v3-turbo-ct2", "openai", False, "gpt-4o-transcribe"),
+        ("Groq Turbo", "large-v3-turbo", "groq", False, ""),
         ("Hebrew Turbo Remote", "ivrit-ai/whisper-large-v3-turbo-ct2", "remote", False, ""),
     ]
 
@@ -22427,6 +22445,15 @@ class LiaApp:
         self._openai_transcriber = o
         self.transcriber = o
         self.config["transcription_backend"] = "openai"
+        # Summary auto-upgrade (2026-08-29): a fresh install defaults to
+        # summary "off" (no key = no summary to promise). The moment a
+        # working OpenAI key lands, flip to the best cloud summary model.
+        if (self.config.get("summary_model") or "") == "off":
+            self.config["summary_model"] = "gpt-5.6-sol"
+            self.config["summary_base_url"] = ""
+            self._summary_cleaner = None
+            log.info("Summary model auto-upgraded off -> gpt-5.6-sol "
+                     "(OpenAI key added)")
         save_config(self.config)
         self._llm_cleaner = self._make_cleanup_cleaner()
         log.info("OpenAI API key saved & activated; cleanup provider=%s",
@@ -22901,6 +22928,9 @@ class LiaApp:
         return (True, label.strip())
 
     def _settings_set_summary_model(self, model_id):
+        if model_id == "off":
+            self._set_summary_model("off", "")
+            return (True, "AI summaries off - transcript only.")
         for label, m, url in self._SUMMARY_MODELS:
             if m == model_id:
                 self._set_summary_model(m, url)
@@ -23139,25 +23169,29 @@ class LiaApp:
             return "API key set" if have else "Requires API key"
 
         has_oa = bool((c.get("openai_api_key") or "").strip())
+        has_groq = bool((c.get("groq_api_key") or "").strip())
         has_parakeet = self._parakeet_available()
         dictation = []
         for i, (label, model_id, backend, translate, om) in enumerate(
                 self._MENU_MODELS_ORDERED):
-            if backend == "openai" and not has_oa:
-                continue
             checked = (c.get("model_size") == model_id
                        and c.get("transcription_backend", "local") == backend
                        and bool(c.get("translate_mode", False)) == translate
                        and (backend != "openai"
                             or c.get("openai_model", "gpt-4o-transcribe") == om))
             pk_missing = model_id.startswith("parakeet") and not has_parakeet
+            # Cloud rows without their key show DIMMED (2026-08-29) - the
+            # option is visible and transparent about what it needs, instead
+            # of silently absent (the old openai behavior).
+            key_missing = ((backend == "openai" and not has_oa)
+                           or (backend == "groq" and not has_groq))
             wn = ""
             if backend == "groq":
                 wn = key_note("groq_api_key")
             elif backend == "openai":
                 wn = key_note("openai_api_key")
             dictation.append({"idx": i, "label": unbadge(label), "checked": checked,
-                              "enabled": not pk_missing,
+                              "enabled": not pk_missing and not key_missing,
                               "where": where_of(backend), "wnote": wn,
                               "note": "pip install onnx-asr" if pk_missing else ""})
         def _key_reqs(reqs):
@@ -23188,12 +23222,20 @@ class LiaApp:
                                        ("needs " + ", ".join(miss)) if miss else "")})
         pulled = self._ollama_pulled() if ollama else "skip"
         cur_sm = c.get("summary_model", "")
-        summary = []
+        # "Off" leads the list (2026-08-29): the honest keyless default -
+        # meetings save a transcript only, no AI summary promised.
+        summary = [{"model": "off", "label": "Off - transcript only "
+                    "(no AI summary)",
+                    "checked": (cur_sm or "") == "off", "enabled": True,
+                    "where": "", "wnote": "", "note": ""}]
         for label, model, url in self._SUMMARY_MODELS:
             note = ""
             enabled = True
             if url == GEMINI_CHAT_URL and not (c.get("gemini_api_key") or "").strip():
                 note = "set Gemini key"
+                enabled = False  # dimmed until the key lands (2026-08-29)
+            elif url == "" and not has_oa:
+                enabled = False  # OpenAI cloud rows dim without the key
             elif url == self._OLLAMA_CHAT_URL and pulled != "skip":
                 if pulled is None:
                     note = "start Ollama"
