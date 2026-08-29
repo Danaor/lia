@@ -19500,7 +19500,7 @@ class LiaApp:
         ("OpenAI gpt-4o-transcribe", "ivrit-ai/whisper-large-v3-turbo-ct2", "openai", False, "gpt-4o-transcribe"),
         ("🏠 Hebrew Turbo Remote ⭐ (home GPU · free)", "ivrit-ai/whisper-large-v3-turbo-ct2", "remote", False, ""),
         ("Groq Turbo", "large-v3-turbo", "groq", False, ""),
-        ("Hebrew Turbo Local", "ivrit-ai/whisper-large-v3-turbo-ct2", "local", False, ""),
+        ("Hebrew Turbo Local ⭐ (best local Hebrew)", "ivrit-ai/whisper-large-v3-turbo-ct2", "local", False, ""),
         ("English Parakeet Local ⭐ (best English)", "parakeet-tdt-0.6b-v2", "local", False, ""),
         ("English Distil Local", "distil-large-v3", "local", False, ""),
         ("General Turbo Local", "large-v3-turbo", "local", False, ""),
