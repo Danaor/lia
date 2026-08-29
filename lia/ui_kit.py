@@ -622,6 +622,44 @@ def save_ui_pref(key, value):
         pass
 
 
+def clamp_to_workarea(width, height, x=None, y=None, margin=16):
+    """Clamp a window's size/position to the PRIMARY monitor's work area
+    (the screen minus the taskbar), so windows never open touching or
+    sliding behind the taskbar (2026-08-29 field complaint: the Settings
+    window's bottom edge hid behind it).
+
+    Returns {width, height, x, y}. With no x/y given the window is centered
+    in the work area; a given position is clamped fully inside it. On any
+    failure (non-Windows, API error) returns the inputs unchanged."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        rect = wintypes.RECT()
+        SPI_GETWORKAREA = 0x0030
+        if not ctypes.windll.user32.SystemParametersInfoW(
+                SPI_GETWORKAREA, 0, ctypes.byref(rect), 0):
+            raise OSError("SPI_GETWORKAREA failed")
+        wa_w = rect.right - rect.left
+        wa_h = rect.bottom - rect.top
+        width = max(360, min(int(width), wa_w - 2 * margin))
+        height = max(320, min(int(height), wa_h - 2 * margin))
+        if x is None or y is None:
+            x = rect.left + (wa_w - width) // 2
+            y = rect.top + (wa_h - height) // 2
+        else:
+            x = max(rect.left + margin,
+                    min(int(x), rect.right - width - margin))
+            y = max(rect.top + margin,
+                    min(int(y), rect.bottom - height - margin))
+        return {"width": width, "height": height, "x": x, "y": y}
+    except Exception:
+        out = {"width": width, "height": height}
+        if x is not None and y is not None:
+            out["x"] = x
+            out["y"] = y
+        return out
+
+
 def window_geometry(name, default=None):
     """Saved {x,y,width,height} for a window, or `default`. Values are sanity-
     clamped so a stale/off-screen or absurd size never traps a window."""

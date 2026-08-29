@@ -150,12 +150,12 @@ def build_window(webview, payload):
     # "settings2" (2026-08-29): a fresh geometry key so every user gets the
     # new larger centered default ONCE (the old "settings" entry may carry a
     # cramped/off-screen geometry); resizes are remembered from then on.
+    # clamp_to_workarea keeps the window fully INSIDE the screen-minus-
+    # taskbar area - it must never open touching or behind the taskbar.
     geo = uk.window_geometry("settings2", {"width": 1100, "height": 780})
-    kw = {"width": geo.get("width", 1100), "height": geo.get("height", 780),
-          "min_size": (820, 600)}
-    if "x" in geo:
-        kw["x"] = geo["x"]
-        kw["y"] = geo["y"]
+    kw = uk.clamp_to_workarea(geo.get("width", 1100), geo.get("height", 780),
+                              geo.get("x"), geo.get("y"))
+    kw["min_size"] = (820, 600)
     if prewarm:
         # Pre-warmed: boot the WebView2 engine + render now, but stay hidden
         # until the parent sends a reveal (t:"focus"/"show"). WebView2 still
