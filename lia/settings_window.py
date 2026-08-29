@@ -215,7 +215,7 @@ def _demo_state():
                           {"idx": 6, "label": "Groq Turbo", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · free tier"},
                           {"idx": 7, "label": "Hebrew Turbo Remote", "checked": False, "where": "remote"}],
             "meeting": [{"key": "local_hebrew_turbo", "label": "Hebrew Turbo Local only", "checked": True, "enabled": True, "note": ""},
-                        {"key": "assemblyai_diarize_only", "label": "AssemblyAI only", "checked": False, "enabled": False, "note": "needs assemblyai_api_key"}],
+                        {"key": "openai_gpt_transcribe", "label": "GPT-transcribe only", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · ~$0.4 per meeting hour", "note": "needs openai_api_key"}],
             "file": [{"key": "", "label": "Same as meeting model", "checked": True, "enabled": True, "note": ""}],
             "summary": [{"model": "off", "label": "Off - transcript only (no AI summary)", "checked": True, "enabled": True, "note": ""},
                         {"model": "gpt-5.6-sol", "label": "ChatGPT 5.6-SOL (cloud)", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · ~$0.5 per 1h meeting", "note": ""},

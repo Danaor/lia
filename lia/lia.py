@@ -23209,6 +23209,13 @@ class LiaApp:
             return wn
         meeting = []
         for label, key, reqs in self._MEETING_MODELS:
+            # AssemblyAI rows hidden from the pickers (2026-08-29, Naor's
+            # call - the list got too long and they see little use). The
+            # backend code stays; a user whose config already selects one
+            # keeps seeing THEIR row so the UI never shows nothing-checked.
+            if ("assemblyai" in key
+                    and c.get("meeting_model", "local_hebrew_turbo") != key):
+                continue
             miss = missing(reqs)
             pk_missing = "parakeet" in key and not has_parakeet
             wn = _meeting_wnote(key, reqs)
@@ -23222,6 +23229,9 @@ class LiaApp:
                       "checked": (c.get("file_transcribe_model", "") or "") == "",
                       "enabled": True, "note": "", "where": ""}]
         for label, key, reqs in self._MEETING_MODELS:
+            if ("assemblyai" in key
+                    and c.get("file_transcribe_model", "") != key):
+                continue  # hidden like the meeting picker (see above)
             miss = missing(reqs)
             pk_missing = "parakeet" in key and not has_parakeet
             wn = _meeting_wnote(key, reqs)
