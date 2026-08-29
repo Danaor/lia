@@ -3345,7 +3345,7 @@ def t_email_semantic_live():
         vv = ei.embed_texts(ch)
         ei.store_chunks(vconn, r["id"], ch, vv)
     ei._VEC_CACHE["n"] = -1
-    res = ei.semantic_search(conn, vconn, "פרויקט עם בן גוריון", limit=2)
+    res = ei.semantic_search(conn, vconn, "פרויקט הגירה לענן", limit=2)
     assert len(res) >= 1, "semantic search returned nothing"
 
 
@@ -4639,7 +4639,11 @@ def t_summary_prompt_sync():
     import hashlib
     import lia as w
     sha = lambda s: hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
-    assert sha(w._SUMMARY_PROMPT_MEETING) == "d862f6d412b6658e", (
+    # NOTE (2026-08-28): the meeting prompt DELIBERATELY diverges from the
+    # upstream project here - a person/org disambiguation example named a real
+    # bank, genericized for the public repo (יהב -> אורי). A future re-sync
+    # from upstream must re-apply that swap, not reintroduce the real name.
+    assert sha(w._SUMMARY_PROMPT_MEETING) == "6c9b0fae63281d7b", (
         "meeting prompt TEMPLATE drifted: " + sha(w._SUMMARY_PROMPT_MEETING))
     assert sha(w._LOCAL_TASKS_PASS_PROMPT) == "9e3c0df8e27193e8", (
         "tasks-pass prompt TEMPLATE drifted: " + sha(w._LOCAL_TASKS_PASS_PROMPT))

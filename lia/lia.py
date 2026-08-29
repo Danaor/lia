@@ -7292,8 +7292,8 @@ CORE RULES
    If the SAME person owns several tasks, attribute each.
    PERSON, NOT ENTITY: אחראי must be a named INDIVIDUAL — never an organization, client, bank, team,
    vendor, product, or system. The catch is that the SAME word can name a person in one sentence and
-   an organization in another — decide from CONTEXT, not from the word alone. "יהב יטפל בזה" /
-   "סגירת הקטלוג זה של יהב" names a PERSON (attribute: יהב); "מול בנק יהב" / "העברנו לבנק" is the
+   an organization in another - decide from CONTEXT, not from the word alone. "אורי יטפל בזה" /
+   "סגירת הקטלוג זה של אורי" names a PERSON (attribute: אורי); "מול בנק אורי" / "העברנו לבנק" is the
    CLIENT (not an owner). If you cannot tell whether a name refers to the individual doing the work
    or to an org/client/product it shares a name with, do NOT use it as אחראי — put that party inside
    the task wording instead.
