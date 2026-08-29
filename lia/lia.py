@@ -10908,6 +10908,53 @@ def _ensure_lia_launcher():
         return None
 
 
+def _ensure_portable_shortcut():
+    """Portable layout only: create/refresh 'Lia.lnk' (with the orb icon)
+    next to Lia.bat in the extracted folder. Shortcuts store ABSOLUTE
+    paths, so one baked at build time is broken and icon-less on every
+    user's machine (2026-08-29 field report) - it must be minted HERE,
+    where the real paths are known. Re-minted automatically if the folder
+    was moved. Runs on a background thread; COM needs its own init there."""
+    try:
+        exe = os.path.abspath(sys.executable)
+        rt_dir = os.path.dirname(exe)
+        if os.path.basename(exe).lower() != "lia.exe":
+            return  # dev run / frozen build - not the portable layout
+        if os.path.basename(rt_dir).lower() != "runtime":
+            return
+        root = os.path.dirname(rt_dir)
+        if not os.path.exists(os.path.join(root, "Lia.bat")):
+            return
+        lnk = os.path.join(root, "Lia.lnk")
+        script = os.path.join(root, "app", "lia.py")
+        icon = os.path.join(root, "app", "lia.ico")
+        import pythoncom
+        import win32com.client
+        pythoncom.CoInitialize()
+        try:
+            shell = win32com.client.Dispatch("WScript.Shell")
+            if os.path.exists(lnk):
+                try:
+                    cur = shell.CreateShortcut(lnk)
+                    if os.path.normcase(str(cur.TargetPath)) == os.path.normcase(exe):
+                        return  # already correct for this machine + folder
+                except Exception:
+                    pass  # unreadable - rewrite below
+            sc = shell.CreateShortcut(lnk)
+            sc.TargetPath = exe
+            sc.Arguments = '"%s"' % script
+            sc.WorkingDirectory = os.path.join(root, "app")
+            if os.path.exists(icon):
+                sc.IconLocation = icon + ",0"
+            sc.Description = "Lia - Local Inference Assistant"
+            sc.Save()
+            log.info("Portable shortcut minted: %s", lnk)
+        finally:
+            pythoncom.CoUninitialize()
+    except Exception as e:
+        log.debug("Portable shortcut skipped: %s", e)
+
+
 def _get_startup_target():
     """Return (target_path, arguments, working_dir, icon_path) for the startup shortcut.
 
@@ -15060,6 +15107,12 @@ class LiaApp:
         """Main entry point."""
         import pystray
         from PIL import Image
+
+        # Portable layout: create/refresh the root Lia.lnk with paths valid
+        # for THIS machine (a build-time .lnk carries the build machine's
+        # absolute paths and is broken everywhere else). Background - never
+        # blocks startup.
+        threading.Thread(target=_ensure_portable_shortcut, daemon=True).start()
 
         # Create tray icon in LOADING state — the model takes ~2-5s to load
         # on warm starts (and up to 30s on cold boot). Starting with the green

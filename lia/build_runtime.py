@@ -117,7 +117,10 @@ def phase_2_configure_pth():
             pth = os.path.join(RUNTIME_DIR, f)
             break
     with open(pth, "w") as f:
-        f.write("python313.zip\n.\nLib\nLib\\site-packages\nimport site\n")
+        # ../app lets sibling-module imports (lang_pack, ui_kit, etc.) work
+        # regardless of the working directory. The embeddable ._pth overrides
+        # Python's default script-directory injection into sys.path.
+        f.write("python313.zip\n.\nLib\nLib\\site-packages\n..\\app\nimport site\n")
     print(f"  Wrote {pth}")
 
 
@@ -164,8 +167,11 @@ def phase_4_install_deps():
     """Bootstrap pip and install requirements.lock."""
     print("\n=== Phase 4: install dependencies ===")
     os.makedirs(os.path.join(RUNTIME_DIR, "Lib", "site-packages"), exist_ok=True)
-    # get-pip.py
-    get_pip = os.path.join(BUILD_DIR, "get-pip.py")
+    # get-pip.py lives in the build CACHE dir (build/), never in the
+    # shipped tree (it showed up in the portable zip root - 2026-08-29).
+    cache_dir = os.path.join(HERE, "build")
+    os.makedirs(cache_dir, exist_ok=True)
+    get_pip = os.path.join(cache_dir, "get-pip.py")
     if not os.path.exists(get_pip):
         _download(GET_PIP_URL, get_pip)
     _python(get_pip, "--no-warn-script-location")
@@ -179,8 +185,28 @@ def phase_4_install_deps():
     print(f"  {n} packages installed")
 
 
+def _create_shortcut(lnk_path, target, icon, desc=""):
+    """Create a Windows .lnk shortcut using PowerShell COM."""
+    import subprocess
+    # PowerShell one-liner that creates a .lnk via WScript.Shell COM
+    ps = (
+        f'$ws = New-Object -ComObject WScript.Shell; '
+        f'$s = $ws.CreateShortcut("{lnk_path}"); '
+        f'$s.TargetPath = "{target}"; '
+        f'$s.WorkingDirectory = "{os.path.dirname(target)}"; '
+        f'$s.IconLocation = "{icon}, 0"; '
+        f'$s.Description = "{desc}"; '
+        f'$s.WindowStyle = 7; '  # minimized (hides the cmd flash)
+        f'$s.Save()'
+    )
+    subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                   check=True, capture_output=True)
+
+
 def phase_5_create_launcher():
-    """Create Lia.exe as a copy of pythonw.exe (unsigned copy keeps PSF sig)."""
+    """Create Lia.exe as a copy of pythonw.exe, stamped with the Lia icon
+    and version resource so it looks like Lia in Explorer, Task Manager,
+    and the tray icon list."""
     print("\n=== Phase 5: create launcher ===")
     pythonw = os.path.join(RUNTIME_DIR, "pythonw.exe")
     launcher = os.path.join(RUNTIME_DIR, "Lia.exe")
@@ -188,6 +214,128 @@ def phase_5_create_launcher():
         raise RuntimeError("pythonw.exe not found in runtime")
     shutil.copy2(pythonw, launcher)
     print(f"  Created {launcher} ({os.path.getsize(launcher)} bytes)")
+    # Stamp version resource (FileDescription = "Lia" in Task Manager)
+    try:
+        from PyInstaller.utils.win32.versioninfo import (
+            VSVersionInfo, FixedFileInfo, StringFileInfo, StringTable,
+            StringStruct, VarFileInfo, VarStruct,
+            write_version_info_to_executable)
+        v = tuple(int(x) for x in PYTHON_VERSION.split(".")[0:2]) + (1, 0)
+        vi = VSVersionInfo(
+            ffi=FixedFileInfo(filevers=v, prodvers=v, mask=0x3f,
+                              flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0),
+            kids=[
+                StringFileInfo([StringTable('040904B0', [
+                    StringStruct('CompanyName', 'Naor Daniel'),
+                    StringStruct('FileDescription',
+                                 'Lia - Local Inference Assistant'),
+                    StringStruct('FileVersion', '1.0.1'),
+                    StringStruct('InternalName', 'Lia'),
+                    StringStruct('OriginalFilename', 'Lia.exe'),
+                    StringStruct('ProductName', 'Lia'),
+                    StringStruct('ProductVersion', '1.0.1'),
+                ])]),
+                VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
+            ],
+        )
+        write_version_info_to_executable(launcher, vi)
+        print("  Stamped version resource")
+    except Exception as e:
+        print(f"  Version stamp skipped ({e})")
+    # Replace the icon with lia.ico
+    ico_path = os.path.join(HERE, "lia.ico")
+    if os.path.exists(ico_path):
+        try:
+            _replace_exe_icon(launcher, ico_path)
+            print("  Embedded lia.ico into launcher")
+        except Exception as e:
+            print(f"  Icon embed failed ({e}) - launcher uses default Python icon")
+
+
+def _replace_exe_icon(exe_path, ico_path):
+    """Replace the main icon in an exe with the contents of an .ico file.
+    Uses the Win32 UpdateResource API via ctypes."""
+    import ctypes
+    from ctypes import wintypes
+
+    # Read .ico file: header (6 bytes) + entries (16 bytes each) + image data
+    with open(ico_path, "rb") as f:
+        ico_data = f.read()
+
+    # Parse ICO header
+    reserved, ico_type, num_images = (
+        int.from_bytes(ico_data[0:2], 'little'),
+        int.from_bytes(ico_data[2:4], 'little'),
+        int.from_bytes(ico_data[4:6], 'little'),
+    )
+    if ico_type != 1:
+        raise ValueError(f"Not an ICO file (type={ico_type})")
+
+    # Parse directory entries
+    entries = []
+    for i in range(num_images):
+        off = 6 + i * 16
+        entry = ico_data[off:off + 16]
+        width = entry[0] or 256
+        height = entry[1] or 256
+        color_count = entry[2]
+        planes = int.from_bytes(entry[4:6], 'little')
+        bit_count = int.from_bytes(entry[6:8], 'little')
+        data_size = int.from_bytes(entry[8:12], 'little')
+        data_offset = int.from_bytes(entry[12:16], 'little')
+        entries.append((width, height, color_count, planes, bit_count,
+                        data_size, data_offset))
+
+    # Win32 API with proper prototypes
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel32.BeginUpdateResourceW.argtypes = [ctypes.c_wchar_p, ctypes.c_bool]
+    kernel32.BeginUpdateResourceW.restype = ctypes.c_void_p
+    kernel32.UpdateResourceW.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_ushort, ctypes.c_void_p, ctypes.c_uint]
+    kernel32.UpdateResourceW.restype = ctypes.c_bool
+    kernel32.EndUpdateResourceW.argtypes = [ctypes.c_void_p, ctypes.c_bool]
+    kernel32.EndUpdateResourceW.restype = ctypes.c_bool
+
+    RT_ICON = 3
+    RT_GROUP_ICON = 14
+
+    handle = kernel32.BeginUpdateResourceW(exe_path, False)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    # Write each icon image as RT_ICON resource (IDs 1, 2, 3, ...)
+    for i, (w, h, cc, planes, bpp, size, offset) in enumerate(entries):
+        img = ico_data[offset:offset + size]
+        ok = kernel32.UpdateResourceW(
+            handle, RT_ICON, i + 1, 0x0409, img, len(img))
+        if not ok:
+            kernel32.EndUpdateResourceW(handle, True)
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    # Build GRPICONDIR structure for RT_GROUP_ICON
+    grp = bytearray()
+    grp += (0).to_bytes(2, 'little')  # reserved
+    grp += (1).to_bytes(2, 'little')  # type = ICO
+    grp += num_images.to_bytes(2, 'little')
+    for i, (w, h, cc, planes, bpp, size, offset) in enumerate(entries):
+        grp += bytes([w & 0xFF])       # width (0 = 256)
+        grp += bytes([h & 0xFF])       # height
+        grp += bytes([cc])             # color count
+        grp += bytes([0])              # reserved
+        grp += planes.to_bytes(2, 'little')
+        grp += bpp.to_bytes(2, 'little')
+        grp += size.to_bytes(4, 'little')
+        grp += (i + 1).to_bytes(2, 'little')  # nID = resource ID
+
+    ok = kernel32.UpdateResourceW(
+        handle, RT_GROUP_ICON, 1, 0x0409, bytes(grp), len(grp))
+    if not ok:
+        kernel32.EndUpdateResourceW(handle, True)
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    if not kernel32.EndUpdateResourceW(handle, False):
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 def phase_6_copy_sources():
@@ -228,6 +376,15 @@ def phase_6_copy_sources():
         src = os.path.join(repo_root, f)
         if os.path.exists(src):
             shutil.copy2(src, BUILD_DIR)
+    # Create a root launcher so users can double-click to start
+    bat_path = os.path.join(BUILD_DIR, "Lia.bat")
+    with open(bat_path, "w") as f:
+        f.write('@echo off\ncd /d "%~dp0app"\nstart "" "%~dp0runtime\\Lia.exe" "%~dp0app\\lia.py"\n')
+    print("  Created Lia.bat (root launcher)")
+    # NO build-time .lnk: shortcuts store ABSOLUTE paths, so one created
+    # here is broken (and icon-less) on every user's machine (2026-08-29
+    # field report). The app itself creates/refreshes Lia.lnk on first run
+    # with paths correct for THAT machine - see _ensure_portable_shortcut.
 
 
 def phase_7_prune():
