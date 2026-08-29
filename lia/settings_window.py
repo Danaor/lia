@@ -351,7 +351,7 @@ APP_JS = r"""
       (disabled?' disabled':'')+'><span class="track"></span><span>'+esc(label)+'</span></label>';
   }
   var WB_TEXT = {local:'🖥️ LOCAL', cloud:'CLOUD',
-                 remote:'🏠 HOME GPU'};
+                 remote:'🏠 REMOTE LOCAL GPU'};
   function radio(name, method, arg, argtype, label, checked, enabled, note, where){
     var dis = enabled===false;
     return '<label class="radio'+(checked?' on':'')+(dis?' disabled':'')+'">'+
