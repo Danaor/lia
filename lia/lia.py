@@ -22828,6 +22828,20 @@ class LiaApp:
         except Exception as e:
             return (False, "Save failed: %s" % e)
 
+    def _reset_vocabulary_default(self):
+        """Settings > Vocabulary: replace the manual terms with the shipped
+        default set. For users whose config carries a stale default from an
+        older install (the legacy Recap/WhisperType migration keeps the old
+        config verbatim, so they never see the newer curated set)."""
+        try:
+            default = DEFAULT_CONFIG.get("custom_vocabulary", "")
+            self._save_vocabulary(default)
+            n = len([t for t in default.split(",") if t.strip()])
+            log.info("Vocabulary reset to the shipped default (%d terms)", n)
+            return (True, "Reset to the default %d terms." % n)
+        except Exception as e:
+            return (False, "Reset failed: %s" % e)
+
     def _snippets_get(self):
         return self.config.get("snippets", []) or []
 
@@ -23007,6 +23021,7 @@ class LiaApp:
         add("open_live_transcript", self._open_live_transcript)
         # Vocabulary
         add("save_vocabulary", self._save_vocabulary_result)
+        add("reset_vocab_default", self._reset_vocabulary_default)
         add("vocab_pending_list", self._vocab_pending_list)
         add("vocab_resolve", self._vocab_resolve)
         add("vocab_learned_list", self._vocab_learned_list)

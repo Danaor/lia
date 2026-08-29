@@ -611,6 +611,7 @@ APP_JS = r"""
         '<div class="hint">Comma- or newline-separated terms the transcriber should prefer.</div>'+
         '<textarea id="vocabText" class="rtl-auto" dir="auto" style="min-height:120px">'+esc(draftOr("vocabText", cfg("custom_vocabulary","")))+'</textarea>'+
         '<div class="btnrow"><button class="btn primary" data-save-vocab="1">Save terms</button>'+
+        '<button class="btn ghost" data-reset-vocab="1">Reset to default terms</button>'+
         sw("Auto-learn new terms from meetings", !!cfg("vocab_autolearn",true), "toggle_vocab_autolearn")+'</div>'+
       '</div>'+
       '<div class="page"><div class="section-title">Suggestions <span class="badge soft">'+(S.vocab_pending||0)+'</span></div>'+
@@ -795,6 +796,9 @@ APP_JS = r"""
     var sv = e.target.closest('[data-save-vocab]');
     if(sv){ var vt=(document.getElementById("vocabText")||{}).value||"";
       call("save_vocabulary",[vt]).then(function(r){ if(r.ok) delete DRAFT["vocabText"]; }); return; }
+    var rv = e.target.closest('[data-reset-vocab]');
+    if(rv){ if(!confirm("Replace the terms above with the shipped default set?")) return;
+      call("reset_vocab_default",[]).then(function(r){ if(r.ok) delete DRAFT["vocabText"]; }); return; }
     var va = e.target.closest('[data-vocab-apply]');
     if(va){ applyPending(); return; }
     var vr = e.target.closest('[data-vocab-remove]');
