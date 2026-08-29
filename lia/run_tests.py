@@ -2543,6 +2543,52 @@ _test("bilingual: route decision policy (he-bias + en mirror + hysteresis)",
       t_bilingual_route_decisions)
 
 
+def t_bilingual_short_clip_clamp():
+    """SHORT-CLIP CLAMP (2026-08-29 field failure): a press-to-talk clip
+    that language-detects as a 'confident' third language (de/ru/...) must
+    be clamped to the primary language - noisy laptop mics fool the
+    detector far more often than anyone dictates German. Long audio (the
+    split path) keeps third-language routing."""
+    import numpy as np
+    import lia as wt
+
+    class _Child:
+        def __init__(self):
+            self.model = object()   # "loaded"
+            self.custom_vocabulary = ""
+            self.calls = []
+        def transcribe(self, audio_np, language=None, beam_size=3,
+                       task="transcribe"):
+            self.calls.append(language)
+            return "ok"
+
+    he, gen = _Child(), _Child()
+    r = wt.BilingualRouterTranscriber(he_transcriber=he,
+                                      general_transcriber=gen)
+    # Force the router's detection to claim confident German
+    r._route = lambda audio: "de"
+    audio = np.zeros(4 * 16000, dtype=np.float32)   # 4s: short path
+    out = r.transcribe(audio)                        # language=None -> router decides
+    assert out == "ok"
+    # The clamp must send the clip to the HEBREW child with language="he",
+    # never to the general child as German.
+    assert he.calls == ["he"], "he child calls: %r" % (he.calls,)
+    assert gen.calls == [], "general child must not get the clip: %r" % (gen.calls,)
+    assert r._last_route == "he", "clamp must also reset _last_route"
+    # primary="en" mirror: the clamp lands on English
+    he2, gen2 = _Child(), _Child()
+    r2 = wt.BilingualRouterTranscriber(he_transcriber=he2,
+                                       general_transcriber=gen2, primary="en")
+    r2._route = lambda audio: "ru"
+    r2.transcribe(audio)
+    assert gen2.calls == ["en"] or he2.calls == [], \
+        "primary=en clamp: gen2=%r he2=%r" % (gen2.calls, he2.calls)
+
+
+_test("bilingual: short-clip third-language clamp (the German-dictation fix)",
+      t_bilingual_short_clip_clamp)
+
+
 def t_bilingual_router_wiring():
     """Router class surface + meeting-builder wiring + config default."""
     import inspect

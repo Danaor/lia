@@ -4180,6 +4180,18 @@ class BilingualRouterTranscriber(BaseTranscriber):
         if len(audio_np) >= int(self.SPLIT_MIN_SEC * 16000):
             return self._transcribe_split(audio_np, beam_size, task)
         route = self._route(audio_np)
+        # SHORT-CLIP CLAMP (2026-08-29 field failure): on a noisy laptop mic,
+        # Hebrew press-to-talk audio hit a "confident" third-language
+        # detection (de >= OTHER_LANG_MIN) and came out as German text. For
+        # short clips a third-language dictation is far rarer than a noisy-mic
+        # misdetection, so routing is clamped to he/en here; the long/split
+        # path (meeting chunks) keeps genuine third-language support, where
+        # detection has much more audio to stand on.
+        if route not in ("he", "en"):
+            log.info("Bilingual route: short clip clamps %r -> %s",
+                     route, self.primary)
+            route = self.primary
+            self._last_route = route
         child, lang = self._child_for(route)
         return child.transcribe(audio_np, language=lang, beam_size=beam_size,
                                 task=task)
