@@ -147,9 +147,12 @@ def build_window(webview, payload):
     theme = "dark" if (init_state.get("config", {}).get("ui_theme") == "dark") else None
     html = uk.page("Lia Settings", BODY, extra_css=EXTRA_CSS, extra_js=APP_JS,
                    head_extra=head, theme=theme)
-    geo = uk.window_geometry("settings", {"width": 960, "height": 680})
-    kw = {"width": geo.get("width", 960), "height": geo.get("height", 680),
-          "min_size": (760, 540)}
+    # "settings2" (2026-08-29): a fresh geometry key so every user gets the
+    # new larger centered default ONCE (the old "settings" entry may carry a
+    # cramped/off-screen geometry); resizes are remembered from then on.
+    geo = uk.window_geometry("settings2", {"width": 1100, "height": 780})
+    kw = {"width": geo.get("width", 1100), "height": geo.get("height", 780),
+          "min_size": (820, 600)}
     if "x" in geo:
         kw["x"] = geo["x"]
         kw["y"] = geo["y"]
@@ -163,7 +166,7 @@ def build_window(webview, payload):
         _WINDOW.events.closing += _on_closing
     except Exception:
         pass
-    uk.attach_geometry_memory(_WINDOW, "settings")
+    uk.attach_geometry_memory(_WINDOW, "settings2")
     threading.Thread(target=_stdin_reader, daemon=True).start()
     return _WINDOW
 
@@ -324,7 +327,7 @@ EXTRA_CSS = """
 APP_JS = r"""
 (function(){
   var S = window.__LIA_INIT__ || {};
-  var PAGE = window.__LIA_PAGE__ || "general";
+  var PAGE = window.__LIA_PAGE__ || "models";
   var FOCUS = window.__LIA_FOCUS__ || "";
   var DRAFT = {};            // text fields that must survive re-render, by id
   var pending = {};          // call id -> {resolve}
@@ -396,27 +399,31 @@ APP_JS = r"""
       Object.keys(hk).map(function(k){
         return '<div class="row"><span class="grow">'+esc(k)+'</span><span class="kbd">'+esc(hk[k])+'</span></div>';
       }).join('')+'</div>';
+    // Each concern gets its OWN card (2026-08-29): one long undivided page
+    // made 'Recording mode' / 'Paste' / the toggles read as one blur.
     return '<div class="content-head"><h1>General</h1></div>'+
-      '<div class="page">'+
-        field("Press-to-talk hotkey",
-          '<div class="row-inline"><input type="text" id="hotkeyInput" style="max-width:220px" value="'+
-            esc(draftOr("hotkeyInput", hk.main||"ctrl+space"))+'">'+
-          '<button class="btn" id="btnCapture">Capture&#8230;</button>'+
-          '<button class="btn primary" data-save-hotkey="1">Save</button>'+
-          '<button class="btn ghost" data-reset-hotkey="1">Reset</button></div>',
-          "Click Capture, then press the combination. Needs a modifier (Ctrl/Alt/Shift).")+
-        '<div class="divider"></div>'+
-        field("Recording mode",
-          radio("rm","set_recording_mode","hold","str","Hold to record", cfg("recording_mode","hold")==="hold")+
-          radio("rm","set_recording_mode","toggle","str","Toggle (press start / press stop)", cfg("recording_mode")==="toggle"))+
-        field("Paste",
-          radio("pm","set_paste_mode","auto_paste","str","Auto-paste (Ctrl+V)", cfg("paste_mode")==="auto_paste")+
-          radio("pm","set_paste_mode","clipboard_only","str","Clipboard only", cfg("paste_mode")==="clipboard_only"))+
-        field("Primary language",
-          radio("plang","set_primary_language","he","str","Hebrew (עברית)", cfg("primary_language","he")==="he")+
-          radio("plang","set_primary_language","en","str","English", cfg("primary_language","he")==="en"),
-          "The language you mainly dictate and hold meetings in. Sets the summary language and which models the app prefers.")+
-        '<div class="divider"></div>'+
+      '<div class="page"><div class="section-title">Press-to-talk hotkey</div>'+
+        '<div class="row-inline"><input type="text" id="hotkeyInput" style="max-width:220px" value="'+
+          esc(draftOr("hotkeyInput", hk.main||"ctrl+space"))+'">'+
+        '<button class="btn" id="btnCapture">Capture&#8230;</button>'+
+        '<button class="btn primary" data-save-hotkey="1">Save</button>'+
+        '<button class="btn ghost" data-reset-hotkey="1">Reset</button></div>'+
+        '<div class="hint">Click Capture, then press the combination. Needs a modifier (Ctrl/Alt/Shift).</div>'+
+      '</div>'+
+      '<div class="page"><div class="section-title">Recording mode</div>'+
+        radio("rm","set_recording_mode","hold","str","Hold to record", cfg("recording_mode","hold")==="hold")+
+        radio("rm","set_recording_mode","toggle","str","Toggle (press start / press stop)", cfg("recording_mode")==="toggle")+
+      '</div>'+
+      '<div class="page"><div class="section-title">Paste</div>'+
+        radio("pm","set_paste_mode","auto_paste","str","Auto-paste (Ctrl+V)", cfg("paste_mode")==="auto_paste")+
+        radio("pm","set_paste_mode","clipboard_only","str","Clipboard only", cfg("paste_mode")==="clipboard_only")+
+      '</div>'+
+      '<div class="page"><div class="section-title">Primary language</div>'+
+        radio("plang","set_primary_language","he","str","Hebrew (עברית)", cfg("primary_language","he")==="he")+
+        radio("plang","set_primary_language","en","str","English", cfg("primary_language","he")==="en")+
+        '<div class="hint">The language you mainly dictate and hold meetings in. Sets the summary language and which models the app prefers.</div>'+
+      '</div>'+
+      '<div class="page"><div class="section-title">Behavior</div>'+
         sw("Restore clipboard after paste", !!cfg("clipboard_auto_restore", true), "toggle_clipboard_auto_restore")+'<br>'+
         sw("Press Enter after paste", !!cfg("press_enter_after_paste", false), "toggle_press_enter_after_paste")+'<br>'+
         sw("Invisible mode (no overlay / waveform)", !!cfg("silent_mode", false), "toggle_silent_mode")+'<br>'+

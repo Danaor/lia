@@ -83,8 +83,8 @@ CSS_TOKENS = """
   /* toast: a dark pill in BOTH themes (deliberately NOT overridden in the dark
      block) so the white text + coloured level dots always stay readable. */
   --toast-bg:#1B2430; --toast-fg:#FFFFFF;
-  /* scrollbar */
-  --sb-thumb:#d6d9e0; --sb-thumb-h:#c2c6d0;
+  /* scrollbar - dark enough to actually SEE against the light bg */
+  --sb-thumb:#aab1bf; --sb-thumb-h:#8b93a5;
 }
 :root[data-theme="dark"]{
   --bg:#0f131a; --card:#161b24; --card-2:#1b212c;
@@ -404,8 +404,8 @@ input:disabled,select:disabled,textarea:disabled{opacity:.55; cursor:default;}
 .rtl-auto,[dir=auto]{unicode-bidi:plaintext;}
 
 /* --- scrollbar ---------------------------------------------------------- */
-::-webkit-scrollbar{width:11px; height:11px;}
-::-webkit-scrollbar-thumb{background:var(--sb-thumb); border-radius:8px; border:3px solid var(--bg);}
+::-webkit-scrollbar{width:13px; height:13px;}
+::-webkit-scrollbar-thumb{background:var(--sb-thumb); border-radius:8px; border:3px solid var(--bg); min-height:48px;}
 ::-webkit-scrollbar-thumb:hover{background:var(--sb-thumb-h);}
 ::-webkit-scrollbar-track{background:transparent;}
 """

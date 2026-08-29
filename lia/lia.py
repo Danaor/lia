@@ -23306,7 +23306,9 @@ class LiaApp:
         A pre-warmed window (spawned hidden by _prewarm_settings_window) is
         already booted, so this just reveals + refreshes it => the click feels
         instant. If none is alive, spawn a fresh VISIBLE one (the old path)."""
-        page = page or "general"
+        # Models is the landing page (2026-08-29, Naor's call): the model
+        # choice is the decision new users actually come to make.
+        page = page or "models"
         proc = getattr(self, "_settings_proc", None)
         if proc is not None and proc.poll() is None:
             self._reveal_settings(proc, page, focus)
@@ -23323,7 +23325,7 @@ class LiaApp:
         proc = getattr(self, "_settings_proc", None)
         if proc is not None and proc.poll() is None:
             return
-        self._spawn_settings_proc(page="general", focus=None, prewarm=True)
+        self._spawn_settings_proc(page="models", focus=None, prewarm=True)
 
     def _spawn_settings_proc(self, *, page, focus, prewarm):
         """Spawn the Settings child process. prewarm=True => the child creates
