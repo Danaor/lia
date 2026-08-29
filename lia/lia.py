@@ -22863,6 +22863,76 @@ class LiaApp:
         except Exception as e:
             return (False, str(e)[:120])
 
+    def _settings_report_problem(self):
+        """Settings > Advanced: build a sanitized diagnostic bundle (log +
+        cleaned config + system info) as a zip, reveal it in Explorer, and
+        open the GitHub new-issue page. NOTHING is sent automatically - the
+        user attaches the zip themselves, so they see exactly what leaves
+        the machine. Secrets are masked to set/empty; personal content
+        (vocabulary, snippets, notetaker names) is redacted to sizes."""
+        import json as _json
+        import platform
+        import subprocess
+        import webbrowser
+        import zipfile
+        try:
+            out_dir = os.path.join(CONFIG_DIR, "diagnostics")
+            os.makedirs(out_dir, exist_ok=True)
+            stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+            zpath = os.path.join(out_dir, "lia_diagnostics_%s.zip" % stamp)
+            SECRETS = {"openai_api_key", "groq_api_key", "gemini_api_key",
+                       "assemblyai_api_key", "hf_token", "remote_server_token"}
+            PERSONAL = {"custom_vocabulary", "snippets", "notetaker_names"}
+            cfg = {}
+            for k, v in self.config.items():
+                if k in SECRETS:
+                    cfg[k] = "set" if str(v or "").strip() else ""
+                elif k in PERSONAL:
+                    cfg[k] = "<redacted: %d chars>" % len(str(v or ""))
+                else:
+                    cfg[k] = v
+            sysinfo = "\n".join([
+                "Lia diagnostic bundle - %s" % stamp,
+                "OS: %s" % platform.platform(),
+                "Python: %s" % sys.version.split()[0],
+                "Executable: %s" % sys.executable,
+                "Frozen: %s" % getattr(sys, "frozen", False),
+                "Config dir: %s" % CONFIG_DIR,
+                "Model: %s / backend %s" % (
+                    self.config.get("model_size"),
+                    self.config.get("transcription_backend")),
+                "Model loaded: %s" % self.model_loaded,
+            ])
+            readme = (
+                "This bundle was created by Lia's 'Report a problem' button.\n"
+                "Contents:\n"
+                "  lia.log                - the app log (privacy-safe by "
+                "default: sizes, not your text)\n"
+                "  config.sanitized.json  - settings with API keys masked "
+                "and personal lists redacted\n"
+                "  sysinfo.txt            - OS/Python/model basics\n\n"
+                "Review the files, then attach this zip to a GitHub issue:\n"
+                "  https://github.com/Danaor/lia/issues/new\n")
+            with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
+                log_path = os.path.join(CONFIG_DIR, "lia.log")
+                if os.path.exists(log_path):
+                    zf.write(log_path, "lia.log")
+                zf.writestr("config.sanitized.json",
+                            _json.dumps(cfg, ensure_ascii=False, indent=2,
+                                        default=str))
+                zf.writestr("sysinfo.txt", sysinfo)
+                zf.writestr("README.txt", readme)
+            try:
+                subprocess.Popen(["explorer", "/select,", zpath])
+            except Exception:
+                os.startfile(out_dir)
+            webbrowser.open("https://github.com/Danaor/lia/issues/new")
+            log.info("Diagnostic bundle created: %s", zpath)
+            return (True, "Bundle ready - attach the zip to the GitHub issue.")
+        except Exception as e:
+            log.warning("Report problem failed: %s", e)
+            return (False, str(e)[:120])
+
     def _settings_open_config_dir(self):
         try:
             os.startfile(CONFIG_DIR)
@@ -22946,6 +23016,7 @@ class LiaApp:
         add("restart_app", lambda: self._restart_app("settings"))
         add("open_log", self._settings_open_log)
         add("open_config_dir", self._settings_open_config_dir)
+        add("report_problem", self._settings_report_problem, True)
         add("quit_app", self._quit)
         add("delete_all_data", self._settings_delete_all_data, True)
         return A

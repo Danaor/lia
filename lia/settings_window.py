@@ -655,8 +655,11 @@ APP_JS = r"""
         btn("Restart Lia","restart_app",[],"")+
         btn("Open log","open_log",[],"ghost")+
         btn("Open config folder","open_config_dir",[],"ghost")+
+        btn("Report a problem…","report_problem",[],"ghost",true)+
         '<button class="btn danger" data-quit="1">Quit Lia</button>'+
-      '</div></div>'+
+      '</div>'+
+      '<div class="hint">Report a problem builds a diagnostic zip (log + sanitized settings - API keys and personal lists removed), shows it in Explorer, and opens the GitHub issue page. Nothing is sent automatically - you attach the file yourself.</div>'+
+      '</div>'+
       '<div class="page"><div class="section-title">About</div>'+
         '<div class="kv"><span class="k">Config</span><span class="rtl-auto" dir="auto">'+esc(p.config||"")+'</span></div>'+
         '<div class="kv"><span class="k">Log</span><span class="rtl-auto" dir="auto">'+esc(p.log||"")+'</span></div>'+
