@@ -15430,21 +15430,6 @@ class LiaApp:
         cache[state] = img
         return img
 
-    def _status_label(self):
-        """Live text for the tray-menu Status line (re-evaluated each time the
-        menu opens). Replaces the old hardcoded 'Loading...' that never updated
-        — so it stayed 'Loading...' forever even though the model was ready."""
-        if not getattr(self, "model_loaded", False):
-            return "Loading model…"
-        try:
-            if self._is_meeting_active():
-                return "Meeting recording…"
-        except Exception:
-            pass
-        if getattr(self, "is_recording", False):
-            return "Recording…"
-        return "Ready"
-
     def _make_local_transcriber(self, model_size):
         """Build the local transcriber for `model_size` — or, for the Hebrew
         (ivrit.ai) models with dictation_bilingual_auto on, the bilingual
@@ -15517,7 +15502,10 @@ class LiaApp:
                 self.model_loaded = True
                 self.status_text = "Ready"
                 log.info("%s ready. Loading local fallback in background...", cloud_primary_label)
-                self._refresh_tray(update_menu=False)
+                # update_menu=True: pystray renders menu-item text at BUILD
+                # time, so without a rebuild the status line stays "Loading
+                # model…" forever even though the orb is already green.
+                self._refresh_tray(update_menu=True)
                 self.overlay.show_done()
 
                 def _load_local_bg():
@@ -15550,7 +15538,9 @@ class LiaApp:
             self.model_loaded = True
             self.status_text = "Ready"
             log.info("Model loaded. Ready to transcribe!")
-            self._refresh_tray(update_menu=False)
+            # update_menu=True: re-render the built menu so the status line
+            # flips from "Loading model…" to Ready (see the cloud branch note).
+            self._refresh_tray(update_menu=True)
             self.overlay.show_done()
         except Exception as e:
             self.status_text = f"Error: {e}"
