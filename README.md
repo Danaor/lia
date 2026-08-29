@@ -131,6 +131,8 @@ You don't need an expensive GPU to get fast transcription and quality summaries.
 
 Cloud transcription and summaries are not processed locally - your audio and text are sent to the provider's servers. For most use cases this is perfectly fine, and it's the easiest way to get the full Lia experience without any GPU hardware.
 
+You can also skip the summary API entirely and paste the transcript into ChatGPT, Gemini, or any chat assistant to get a summary yourself. Lia's built-in summary pipeline does more than a single prompt - it runs a multi-stage process with specialized prompts designed to preserve factual accuracy, extract every action item with owners, and handle bilingual content correctly ([see the prompts in the source](lia/lia.py)) - but a manual paste-and-ask is always an option.
+
 ### Recommended GPUs
 
 For those who want everything local, or faster local processing:
