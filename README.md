@@ -18,6 +18,13 @@ Local-first, Hebrew and English, zero friction.
 
 Hold a hotkey, speak, release - your words appear wherever your cursor is. Record a meeting and get a live transcript, speaker names, and a faithful AI summary with a real task list. Ask questions about everything your meetings ever said - fully on your own machine.
 
+<div align="center">
+<table><tr>
+<td><img src="docs/settings_general.png" alt="Settings - General" width="460"></td>
+<td><img src="docs/settings_models.png" alt="Settings - Models" width="460"></td>
+</tr></table>
+</div>
+
 > **About the name.** L.I.A stands for **Local Inference Assistant**. It is also my daughter's name, which is the better reason.
 
 ## Why Lia?
