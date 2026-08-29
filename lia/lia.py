@@ -15066,9 +15066,22 @@ class LiaApp:
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
-                lambda item: ("⏹  Stop Meeting" if self._is_meeting_active()
-                               else "📝  Start Meeting"),
+                "📝  Start Meeting",
                 lambda: self._toggle_meeting(summarize=True),
+                visible=lambda item: not self._is_meeting_active(),
+            ),
+            # While a meeting runs, the summarize decision moves to STOP time
+            # (2026-08-29, Naor's ask): you know at the END whether the
+            # meeting deserved a summary.
+            pystray.MenuItem(
+                "⏹  End Meeting & Summarize",
+                lambda: self._stop_meeting(summarize=True),
+                visible=lambda item: self._is_meeting_active(),
+            ),
+            pystray.MenuItem(
+                "⏹  End Meeting (no summary)",
+                lambda: self._stop_meeting(summarize=False),
+                visible=lambda item: self._is_meeting_active(),
             ),
             pystray.MenuItem(
                 "📄  Live Transcript",
@@ -20644,16 +20657,22 @@ class LiaApp:
             duration_ms=20000,
         )
 
-    def _stop_meeting(self):
+    def _stop_meeting(self, summarize=None):
         """Stop the in-progress meeting, save the transcript file, and surface
         the result. Regular mode opens the transcript; "& Summarize" mode pops
         up the gpt-5.5 summary (the file is saved silently in the background).
-        Diarized meetings finalise ASYNC in _run_diarize_job."""
+        Diarized meetings finalise ASYNC in _run_diarize_job.
+
+        `summarize` (2026-08-29): an explicit end-time override from the tray
+        ("End Meeting & Summarize" / "End Meeting (no summary)"). None keeps
+        the session's start-time choice (auto-detect / watchdog / pill stops)."""
         with self._meeting_lock:
             session = self._active_meeting
             if session is None:
                 return
             self._active_meeting = None
+        if summarize is not None:
+            session.summarize = bool(summarize)
 
         # Reset the auto-detect state machine so the next call/meeting starts
         # clean — covers a manual stop of an 'adopted' meeting (otherwise the
