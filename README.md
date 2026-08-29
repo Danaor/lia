@@ -72,6 +72,18 @@ Most dictation tools are subscriptions (SuperWhisper, Wispr Flow), cloud-locked 
 
 ## Quick start
 
+### Option 1: Download and run (easiest)
+
+1. Download **Lia-Portable.zip** from the [latest release](https://github.com/Danaor/lia/releases/latest)
+2. Extract the zip anywhere
+3. Double-click `Lia.exe`
+
+No Python or command line needed. Windows SmartScreen may warn you on first run because the exe is unsigned - click "More info" then "Run anyway".
+
+### Option 2: Install from source
+
+Requires [Python 3.11+](https://www.python.org/downloads/) (check "Add to PATH" during install). Open PowerShell and paste:
+
 ```bash
 git clone https://github.com/Danaor/lia.git
 cd lia/lia
@@ -79,11 +91,17 @@ pip install -r requirements.lock
 python lia.py
 ```
 
+Or without git - download the [source zip](https://github.com/Danaor/lia/archive/refs/heads/main.zip), extract it, open a terminal in the `lia/lia` folder, and run the last two lines.
+
 (`requirements.lock` is the pinned, hash-verified dependency set; use
 `requirements.txt` instead if you prefer resolving the latest compatible
 versions yourself.)
 
-On first run the app picks your primary language from Windows, downloads the matching model (Hebrew Turbo ~1.6 GB / Parakeet ~670 MB), and sits in the system tray. Left-click the tray icon for Settings. Lia pins its icon next to the clock on the first run; if Windows still tucks it behind the `^` overflow arrow, drag the orb out once and it stays. Lia runs non-elevated by default; if you also want to dictate into admin windows, launch through `run.bat` - note that this runs the whole app with highest privileges for the session.
+### First run
+
+On first run the app picks your primary language from Windows, downloads the matching model (Hebrew Turbo ~1.6 GB / Parakeet ~670 MB), and sits in the system tray. Left-click the tray icon for Settings. Lia pins its icon next to the clock on the first run; if Windows still tucks it behind the `^` overflow arrow, drag the orb out once and it stays.
+
+Lia runs non-elevated by default; if you also want to dictate into admin windows, launch through `run.bat` - note that this runs the whole app with highest privileges for the session.
 
 Optional cloud speed: get a free [Groq key](https://console.groq.com/keys), paste it into Settings -> Keys & Server, and pick Groq in Settings -> Models.
 
