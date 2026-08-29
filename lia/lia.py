@@ -10776,9 +10776,14 @@ def _ensure_lia_launcher():
     bundle / non-Windows / no pythonw to copy).
     """
     if getattr(sys, 'frozen', False):
-        return None  # PyInstaller bundle — already named Lia.exe
+        return None  # PyInstaller bundle - already named Lia.exe
     if os.name != 'nt':
         return None
+    # Full-runtime install (runtime\Lia.exe app\lia.py): the process is
+    # already Lia.exe - no copy needed. Return the current executable so
+    # callers use the runtime dir launcher, not a copy in the app dir.
+    if os.path.basename(sys.executable).lower() == "lia.exe":
+        return sys.executable
 
     script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
     target = os.path.join(script_dir, "Lia.exe")

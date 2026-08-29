@@ -17,7 +17,7 @@
 ; ============================================================
 
 #define AppName       "Lia"
-#define AppVersion    "1.0.0"
+#define AppVersion    "1.0.1"
 #define AppPublisher  "Naor Daniel"
 #define AppURL        "https://github.com/Danaor/lia"
 #define AppExeName    "Lia.exe"
@@ -90,20 +90,27 @@ Name: "elevatedautostart"; Description: "{cm:AutoStartElevated}"; GroupDescripti
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
-    ValueType: string; ValueName: "{#AppName}"; ValueData: """{app}\{#AppExeName}"""; \
+    ValueType: string; ValueName: "{#AppName}"; ValueData: """{app}\runtime\{#AppExeName}"" ""{app}\app\lia.py"""; \
     Flags: uninsdeletevalue; Tasks: autostart and not elevatedautostart
 
 [Files]
-; The PyInstaller-built standalone exe is the only required payload.
-Source: "dist\{#AppExeName}";    DestDir: "{app}"; Flags: ignoreversion
-Source: "lia.ico";             DestDir: "{app}"; Flags: ignoreversion
-Source: "..\README.md";           DestDir: "{app}"; Flags: ignoreversion isreadme
-Source: "..\LICENSE";             DestDir: "{app}"; Flags: ignoreversion
+; Full-runtime distribution: private CPython + app sources (replaces the
+; frozen PyInstaller exe from v1.0.x). Everything works out of the box:
+; Settings, all pywebview windows, subprocess mic recorder, file dialogs.
+Source: "build_runtime\runtime\*";  DestDir: "{app}\runtime"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "build_runtime\app\*";      DestDir: "{app}\app";     Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "lia.ico";                  DestDir: "{app}";         Flags: ignoreversion
+Source: "..\README.md";             DestDir: "{app}";         Flags: ignoreversion isreadme
+Source: "..\LICENSE";               DestDir: "{app}";         Flags: ignoreversion
+
+[InstallDelete]
+; Remove the legacy frozen exe from v1.0.x (same AppId = in-place upgrade).
+Type: files; Name: "{app}\{#AppExeName}"
 
 [Icons]
-Name: "{group}\{#AppName}";                     Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\lia.ico"; Comment: "{#AppName} — speech to text"
+Name: "{group}\{#AppName}";                     Filename: "{app}\runtime\{#AppExeName}"; Parameters: """{app}\app\lia.py"""; WorkingDir: "{app}\app"; IconFilename: "{app}\lia.ico"; Comment: "{#AppName} - speech to text"
 Name: "{group}\{cm:UninstallProgram,{#AppName}}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#AppName}";                Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\lia.ico"; Tasks: desktopicon; Comment: "{#AppName} — speech to text"
+Name: "{autodesktop}\{#AppName}";                Filename: "{app}\runtime\{#AppExeName}"; Parameters: """{app}\app\lia.py"""; WorkingDir: "{app}\app"; IconFilename: "{app}\lia.ico"; Tasks: desktopicon; Comment: "{#AppName} - speech to text"
 
 [Run]
 ; ELEVATED auto-start only (opt-in, elevated installs): a Scheduled Task with
@@ -111,13 +118,15 @@ Name: "{autodesktop}\{#AppName}";                Filename: "{app}\{#AppExeName}"
 ; can dictate into elevated windows.
 ; Note: /tr requires triple-quoted exe path because of nested cmd parsing.
 Filename: "{cmd}"; \
-    Parameters: "/C schtasks /create /tn ""{#TaskName}"" /tr ""\""{app}\{#AppExeName}\"""" /sc ONLOGON /rl HIGHEST /delay 0000:05 /f"; \
+    Parameters: "/C schtasks /create /tn ""{#TaskName}"" /tr """"""{app}\runtime\{#AppExeName}"" ""{app}\app\lia.py"""""" /sc ONLOGON /rl HIGHEST /delay 0000:05 /f"; \
     Flags: runhidden; \
     StatusMsg: "Registering elevated auto-start task..."; \
     Tasks: elevatedautostart
 
-; Launch after install. The exe is asInvoker now - no UAC on launch.
-Filename: "{app}\{#AppExeName}"; \
+; Launch after install.
+Filename: "{app}\runtime\{#AppExeName}"; \
+    Parameters: """{app}\app\lia.py"""; \
+    WorkingDir: "{app}\app"; \
     Description: "{cm:LaunchProgram,{#AppName}}"; \
     Flags: nowait postinstall skipifsilent
 
