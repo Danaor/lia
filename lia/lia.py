@@ -23185,22 +23185,33 @@ class LiaApp:
             # of silently absent (the old openai behavior).
             key_missing = ((backend == "openai" and not has_oa)
                            or (backend == "groq" and not has_groq))
+            # Ballpark pricing (2026-08-29, Naor's ask): a rough per-hour
+            # figure so users grasp the cost order of magnitude before
+            # picking a cloud model. Deliberately approximate.
             wn = ""
             if backend == "groq":
-                wn = key_note("groq_api_key")
+                wn = key_note("groq_api_key") + " · free tier"
             elif backend == "openai":
-                wn = key_note("openai_api_key")
+                wn = key_note("openai_api_key") + " · ~$0.4 per audio hour"
             dictation.append({"idx": i, "label": unbadge(label), "checked": checked,
                               "enabled": not pk_missing and not key_missing,
                               "where": where_of(backend), "wnote": wn,
                               "note": "pip install onnx-asr" if pk_missing else ""})
         def _key_reqs(reqs):
             return [r for r in reqs if r.endswith("_api_key") or r == "hf_token"]
+
+        def _meeting_wnote(key, reqs):
+            if where_of(key) != "cloud":
+                return ""
+            wn = key_note(*_key_reqs(reqs))
+            if wn:
+                wn += " · ~$0.4 per meeting hour"
+            return wn
         meeting = []
         for label, key, reqs in self._MEETING_MODELS:
             miss = missing(reqs)
             pk_missing = "parakeet" in key and not has_parakeet
-            wn = key_note(*_key_reqs(reqs)) if where_of(key) == "cloud" else ""
+            wn = _meeting_wnote(key, reqs)
             meeting.append({"key": key, "label": unbadge(label),
                             "checked": c.get("meeting_model", "local_hebrew_turbo") == key,
                             "enabled": not miss and not pk_missing,
@@ -23213,7 +23224,7 @@ class LiaApp:
         for label, key, reqs in self._MEETING_MODELS:
             miss = missing(reqs)
             pk_missing = "parakeet" in key and not has_parakeet
-            wn = key_note(*_key_reqs(reqs)) if where_of(key) == "cloud" else ""
+            wn = _meeting_wnote(key, reqs)
             file_rows.append({"key": key, "label": unbadge(label),
                               "checked": c.get("file_transcribe_model", "") == key,
                               "enabled": not miss and not pk_missing,
@@ -23246,8 +23257,11 @@ class LiaApp:
             s_where = "local" if url == self._OLLAMA_CHAT_URL else "cloud"
             s_wn = ""
             if s_where == "cloud":
-                s_wn = key_note("gemini_api_key" if url == GEMINI_CHAT_URL
-                                else "openai_api_key")
+                if url == GEMINI_CHAT_URL:
+                    s_wn = key_note("gemini_api_key") + " · free"
+                else:
+                    s_wn = (key_note("openai_api_key")
+                            + " · ~$0.5 per 1h meeting")
             summary.append({"model": model, "label": unbadge(label),
                             "checked": cur_sm == model, "enabled": enabled,
                             "where": s_where, "wnote": s_wn,
