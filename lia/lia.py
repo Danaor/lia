@@ -20774,6 +20774,51 @@ class LiaApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _rename_speakers_in_old_meeting(self):
+        """Settings > Meetings: pick an old diarized transcript and open the
+        speaker-rename dialog. Text rename works on any saved transcript; voice
+        preview works when the Opus archive is still on disk; voiceprint
+        learning is unavailable (no in-memory embeddings - the guard in
+        _rename_speakers_dialog handles this gracefully)."""
+        def worker():
+            import tkinter as tk
+            from tkinter import filedialog
+            try:
+                os.makedirs(MEETINGS_DIR, exist_ok=True)
+            except Exception:
+                pass
+            path = None
+            try:
+                root = tk.Tk()
+                _apply_dpi_scaling_to_tk(root)
+                root.withdraw()
+                root.attributes('-topmost', True)
+                try:
+                    path = filedialog.askopenfilename(
+                        title="Select a diarized meeting to rename speakers",
+                        initialdir=MEETINGS_DIR,
+                        filetypes=[
+                            ("Diarized transcripts", "*_meeting_diarized.txt"),
+                            ("Text files", "*.txt"),
+                            ("All files", "*.*"),
+                        ],
+                        parent=root,
+                    )
+                except Exception:
+                    path = None
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+            except Exception as e:
+                log.warning("Rename-speakers picker failed: %s", e)
+                return
+            if not path:
+                return
+            self._rename_speakers_dialog(path)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _open_email_search(self):
         """Open the local Outlook email-search window (long-lived, non-blocking)
         and kick a background index refresh. This process NEVER touches Outlook
@@ -22827,6 +22872,7 @@ class LiaApp:
         add("open_action_items", self._open_action_items)
         add("open_meetings_folder", self._open_meetings_folder)
         add("edit_meeting_summary", self._edit_meeting_summary)
+        add("rename_speakers_old", self._rename_speakers_in_old_meeting)
         add("transcribe_file", self._transcribe_file)
         add("summarize_text_dialog", self._summarize_text_dialog)
         add("open_live_transcript", self._open_live_transcript)

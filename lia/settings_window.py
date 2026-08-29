@@ -598,6 +598,7 @@ APP_JS = r"""
         actrow('&#128203;','Action items…','open_action_items',hk.actions)+
         actrow('&#128193;','Open meeting folder','open_meetings_folder','')+
         actrow('&#9998;','Edit a meeting summary…','edit_meeting_summary','')+
+        actrow('&#128101;','Rename speakers in a meeting…','rename_speakers_old','')+
         actrow('&#127908;','Transcribe a file…','transcribe_file','')+
         actrow('&#128221;','Summarize text / file…','summarize_text_dialog','')+
         live+
