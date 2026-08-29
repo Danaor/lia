@@ -218,7 +218,7 @@ def _demo_state():
                         {"key": "openai_gpt_transcribe", "label": "GPT-transcribe only", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · ~$0.4 per meeting hour", "note": "needs openai_api_key"}],
             "file": [{"key": "", "label": "Same as meeting model", "checked": True, "enabled": True, "note": ""}],
             "summary": [{"model": "off", "label": "Off - transcript only (no AI summary)", "checked": True, "enabled": True, "note": ""},
-                        {"model": "gpt-5.6-sol", "label": "ChatGPT 5.6-SOL (cloud)", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · ~$0.5 per 1h meeting", "note": ""},
+                        {"model": "gpt-5.6-sol", "label": "ChatGPT 5.6-SOL (cloud)", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · ~$0.10 per meeting summary", "note": ""},
                         {"model": "gemini-3.7-flash", "label": "Gemini 3.7 Flash (free)", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · free", "note": "set Gemini key"},
                         {"model": "gemma4:31b-it-qat", "label": "Gemma 4 31B QAT (local · best quality · needs a 24 GB GPU)", "checked": False, "enabled": False, "where": "local", "note": "start Ollama"}],
             "cleanup_styles": [{"style": "off", "label": "Off - raw transcription", "checked": False},

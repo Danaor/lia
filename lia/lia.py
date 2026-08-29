@@ -1448,8 +1448,11 @@ _LOCAL_HW_NOTES = {
     "parakeet-tdt-0.6b-v2": "fast on a plain CPU · no GPU needed",
     "distil-large-v3": "works on CPU · GPU faster",
     "large-v3-turbo": "GPU (4 GB+) recommended · slower on CPU",
-    # Meeting keys
-    "local_hebrew_turbo": "GPU (4 GB+) recommended · keeps up on CPU",
+    # Meeting keys. Chunked mode transcribes DURING the meeting (45s
+    # chunks), so CPU cost shows as a short wrap-up at stop, not a long
+    # post-processing wait like the diarized modes.
+    "local_hebrew_turbo":
+        "GPU (4 GB+) recommended · CPU: ready ~5 min after a 1h meeting",
     "local_parakeet_english": "fast on a plain CPU · no GPU needed",
     "local_pyannote_hebrew":
         "GPU (6 GB+) strongly recommended · CPU: ~90 min per meeting hour",
@@ -23354,8 +23357,12 @@ class LiaApp:
                 if url == GEMINI_CHAT_URL:
                     s_wn = key_note("gemini_api_key") + " · free"
                 else:
-                    s_wn = (key_note("openai_api_key")
-                            + " · ~$0.5 per 1h meeting")
+                    # MEASURED per-summary cost (2026-08-03, incl. hidden
+                    # reasoning tokens): SOL ~$0.106, Terra ~$0.024.
+                    price = {"gpt-5.6-sol": " · ~$0.10 per meeting summary",
+                             "gpt-5.6-terra": " · ~$0.02 per meeting summary"
+                             }.get(model, "")
+                    s_wn = key_note("openai_api_key") + price
             summary.append({"model": model, "label": unbadge(label),
                             "checked": cur_sm == model, "enabled": enabled,
                             "where": s_where, "wnote": s_wn,
