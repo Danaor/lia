@@ -102,11 +102,35 @@ Have one GPU box and several machines? Lia can also send audio to a WhisperLive 
 
 - **OS**: Windows 10/11 (WASAPI for system audio)
 - **Python**: 3.11+ (developed on 3.13)
-- **RAM**: 8 GB recommended
-- **GPU**: not required - everything runs on CPU; an NVIDIA GPU accelerates local Whisper and local summaries when present
+- **RAM**: 8 GB minimum, 16 GB recommended
+- **GPU**: **strongly recommended** - see the performance table below. Everything works without one, but meeting processing is significantly slower. NVIDIA only (CUDA); AMD and Intel GPUs are not supported.
 - **Internet**: only for the first model download and optional cloud modes
 
 Settings live in `%APPDATA%\Lia\config.json`; every option is in the Settings window (tray left-click).
+
+### Performance: CPU vs GPU
+
+Everything in Lia runs on CPU, but an NVIDIA GPU makes local transcription dramatically faster. Short dictation clips are usable either way; meetings are where the GPU really matters.
+
+| Task | CPU only | With NVIDIA GPU |
+|---|---|---|
+| **Dictation** (10s clip, Hebrew) | 5-15s wait | under 1s |
+| **Dictation** (10s clip, English Parakeet) | ~2s (fast on CPU) | ~1s |
+| **Meeting** (1h, chunked - no speaker names) | Keeps up during recording | Keeps up, no backlog |
+| **Meeting** (1h, diarized - with speaker names) | 60-90 min post-processing | 5-10 min |
+| **Local summary** (Ollama, gemma4 31B) | Very slow (needs 32 GB+ RAM) | 2-5 min (needs 20+ GB VRAM) |
+
+> **Bottom line:** for dictation-only use, CPU is fine - you wait a few seconds after releasing the hotkey. For meetings with speaker identification, a GPU turns a 90-minute wait into a 10-minute one.
+
+### Recommended GPUs
+
+| Tier | Examples | VRAM | What it unlocks |
+|---|---|---|---|
+| Entry | GTX 1650, RTX 3050 | 4-6 GB | Fast dictation |
+| **Recommended** | **RTX 3060, RTX 4060** | **8-12 GB** | Fast dictation + diarized meetings |
+| Power user | RTX 3090, RTX 4090 | 24 GB | All of the above + local AI summaries (Ollama) |
+
+Already have a GPU on another machine? Lia's [remote mode](docs/SELF_HOSTED_SERVER.md) lets a laptop without a GPU use your home PC's GPU over the network.
 
 ## Privacy
 
