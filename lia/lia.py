@@ -9,6 +9,17 @@ Usage:
 
 import sys
 import os
+
+# pythonw (the Lia.exe launcher) runs with NO console: sys.stdout/stderr are
+# None, and anything that writes to them crashes with "'NoneType' object has
+# no attribute 'write'" - the 2026-08-29 field failure was HuggingFace's
+# tqdm progress bar during the first model download killing the model load.
+# Give the process safe sinks BEFORE any import that might print.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
 import json
 import threading
 import time
