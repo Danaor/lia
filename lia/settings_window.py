@@ -209,8 +209,8 @@ def _demo_state():
         "outputs": [{"idx": 3, "name": "Speakers (Realtek)"},
                     {"idx": 4, "name": "Focusrite USB"}],
         "tables": {
-            "dictation": [{"idx": 0, "label": "Hebrew Turbo Local ⭐ (best local Hebrew)", "checked": True, "where": "local"},
-                          {"idx": 1, "label": "English Parakeet Local ⭐ (best English)", "checked": False, "where": "local"},
+            "dictation": [{"idx": 0, "label": "Hebrew Turbo Local ⭐ (best local Hebrew)", "checked": True, "where": "local", "wnote": "GPU (4 GB+) recommended · slower on CPU"},
+                          {"idx": 1, "label": "English Parakeet Local ⭐ (best English)", "checked": False, "where": "local", "wnote": "fast on a plain CPU · no GPU needed"},
                           {"idx": 4, "label": "OpenAI gpt-transcribe ⭐ (best)", "checked": False, "where": "cloud", "wnote": "API key set · ~$0.4 per audio hour"},
                           {"idx": 6, "label": "Groq Turbo", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · free tier"},
                           {"idx": 7, "label": "Hebrew Turbo Remote", "checked": False, "where": "remote"}],

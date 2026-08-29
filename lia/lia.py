@@ -1437,6 +1437,26 @@ MODEL_LANGUAGE = {
     "large-v3": "auto",
 }
 
+# Hardware hints rendered under the LOCAL badge on the Models page
+# (2026-08-29): honest expectations per model. Parakeet is the CPU story
+# (int8 ONNX, several-x realtime on a plain CPU); the Whisper models want
+# an NVIDIA GPU (~4 GB VRAM at int8_float16) and get noticeably slower
+# without one. Keyed by model id (dictation) and meeting key.
+_LOCAL_HW_NOTES = {
+    "ivrit-ai/whisper-large-v3-turbo-ct2":
+        "GPU (4 GB+) recommended · slower on CPU",
+    "parakeet-tdt-0.6b-v2": "fast on a plain CPU · no GPU needed",
+    "distil-large-v3": "works on CPU · GPU faster",
+    "large-v3-turbo": "GPU (4 GB+) recommended · slower on CPU",
+    # Meeting keys
+    "local_hebrew_turbo": "GPU (4 GB+) recommended · keeps up on CPU",
+    "local_parakeet_english": "fast on a plain CPU · no GPU needed",
+    "local_pyannote_hebrew":
+        "GPU (6 GB+) strongly recommended · CPU: ~90 min per meeting hour",
+    "local_pyannote_parakeet":
+        "GPU (6 GB+) strongly recommended · CPU: ~90 min per meeting hour",
+}
+
 # Supply-chain pinning (2026-08-28 audit): every HuggingFace model download is
 # pinned to a reviewed commit, so a compromised/retagged upstream repo cannot
 # silently change what users run. SHAs captured 2026-08-28; bump deliberately
@@ -23198,6 +23218,10 @@ class LiaApp:
                 wn = key_note("groq_api_key") + " · free tier"
             elif backend == "openai":
                 wn = key_note("openai_api_key") + " · ~$0.4 per audio hour"
+            elif backend == "local":
+                # Hardware hint (2026-08-29, Naor's ask): what each local
+                # model needs so nobody is surprised by CPU wait times.
+                wn = _LOCAL_HW_NOTES.get(model_id, "")
             dictation.append({"idx": i, "label": unbadge(label), "checked": checked,
                               "enabled": not pk_missing and not key_missing,
                               "where": where_of(backend), "wnote": wn,
@@ -23206,6 +23230,8 @@ class LiaApp:
             return [r for r in reqs if r.endswith("_api_key") or r == "hf_token"]
 
         def _meeting_wnote(key, reqs):
+            if where_of(key) == "local":
+                return _LOCAL_HW_NOTES.get(key, "")
             if where_of(key) != "cloud":
                 return ""
             wn = key_note(*_key_reqs(reqs))
