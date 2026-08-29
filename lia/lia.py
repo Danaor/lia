@@ -4339,13 +4339,44 @@ class ParakeetTranscriber(BaseTranscriber):
                 kwargs = {"providers": ["CUDAExecutionProvider",
                                         "CPUExecutionProvider"]}
             try:
-                self.model = onnx_asr.load_model(name, **kwargs)
-            except Exception as gpu_e:
-                if self.device != "cuda":
+                try:
+                    self.model = onnx_asr.load_model(name, **kwargs)
+                except Exception as gpu_e:
+                    if self.device != "cuda":
+                        raise
+                    log.warning("Parakeet CUDA load failed (%s) — falling "
+                                "back to int8 CPU", gpu_e)
+                    self.model = onnx_asr.load_model(name, quantization="int8")
+            except Exception as e:
+                # SELF-HEAL (2026-08-29 field failure): an interrupted first
+                # download leaves a truncated .onnx in the HF cache, and
+                # every later load fails with INVALID_PROTOBUF ("Protobuf
+                # parsing failed") - permanently, until someone clears the
+                # cache by hand. Detect the corrupt-cache signatures, wipe
+                # just this model's cache dir, and retry the download once.
+                msg = str(e)
+                corrupt = any(s in msg for s in (
+                    "INVALID_PROTOBUF", "Protobuf parsing failed",
+                    "NO_SUCHFILE", "invalid external data", "ModelProto"))
+                if not corrupt:
                     raise
-                log.warning("Parakeet CUDA load failed (%s) — falling back "
-                            "to int8 CPU", gpu_e)
+                log.warning("Parakeet cache looks corrupt (%s) - wiping and "
+                            "re-downloading once", msg[:200])
+                try:
+                    import shutil as _sh
+                    from huggingface_hub.constants import HF_HUB_CACHE
+                    cache_dir = os.path.join(
+                        HF_HUB_CACHE,
+                        "models--istupakov--parakeet-tdt-0.6b-v2-onnx")
+                    if os.path.isdir(cache_dir):
+                        _sh.rmtree(cache_dir, ignore_errors=True)
+                        log.info("Wiped Parakeet cache: %s", cache_dir)
+                except Exception as wipe_e:
+                    log.warning("Parakeet cache wipe failed: %s", wipe_e)
+                if callback:
+                    callback("Re-downloading Parakeet (English)...")
                 self.model = onnx_asr.load_model(name, quantization="int8")
+                log.info("Parakeet recovered after cache wipe (%s)", name)
             log.info("Parakeet model loaded in %.1fs (%s, %s)",
                      time.time() - t0, name, self.device)
             if callback:

@@ -2589,6 +2589,69 @@ _test("bilingual: short-clip third-language clamp (the German-dictation fix)",
       t_bilingual_short_clip_clamp)
 
 
+def t_parakeet_cache_self_heal():
+    """Parakeet SELF-HEAL (2026-08-29 field failure): a truncated first
+    download leaves the HF cache corrupt and every load fails with
+    INVALID_PROTOBUF until the cache is cleared by hand. load_model must
+    detect the signature, wipe, and retry ONCE; unrelated errors still
+    raise immediately."""
+    import sys
+    import types
+    import lia as wt
+
+    old = sys.modules.get("onnx_asr")
+
+    # Corrupt-cache error on the first call -> retry succeeds
+    calls = []
+    fake = types.ModuleType("onnx_asr")
+    def _load(name, **kw):
+        calls.append(name)
+        if len(calls) == 1:
+            raise RuntimeError(
+                "[ONNXRuntimeError] : 7 : INVALID_PROTOBUF : Load model "
+                "from encoder.onnx failed: Protobuf parsing failed.")
+        return object()
+    fake.load_model = _load
+    sys.modules["onnx_asr"] = fake
+    try:
+        p = wt.ParakeetTranscriber()
+        p.load_model()
+        assert p.model is not None, "self-heal retry did not load"
+        assert len(calls) == 2, "expected exactly 1 retry, got %d calls" % len(calls)
+        assert not p._loading
+    finally:
+        sys.modules.pop("onnx_asr", None)
+        if old is not None:
+            sys.modules["onnx_asr"] = old
+
+    # A non-corrupt error (network) must raise with NO retry
+    calls2 = []
+    fake2 = types.ModuleType("onnx_asr")
+    def _load2(name, **kw):
+        calls2.append(name)
+        raise RuntimeError("connection refused")
+    fake2.load_model = _load2
+    sys.modules["onnx_asr"] = fake2
+    try:
+        p2 = wt.ParakeetTranscriber()
+        raised = False
+        try:
+            p2.load_model()
+        except RuntimeError:
+            raised = True
+        assert raised, "non-corrupt error must raise"
+        assert len(calls2) == 1, "non-corrupt error must not retry"
+        assert p2.model is None and not p2._loading
+    finally:
+        sys.modules.pop("onnx_asr", None)
+        if old is not None:
+            sys.modules["onnx_asr"] = old
+
+
+_test("parakeet: corrupt-cache self-heal (wipe + one retry)",
+      t_parakeet_cache_self_heal)
+
+
 def t_bilingual_router_wiring():
     """Router class surface + meeting-builder wiring + config default."""
     import inspect
