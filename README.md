@@ -122,11 +122,22 @@ Everything in Lia runs on CPU, but an NVIDIA GPU makes local transcription drama
 
 > **Bottom line:** for dictation-only use, CPU is fine - you wait a few seconds after releasing the hotkey. For meetings with speaker identification, a GPU turns a 90-minute wait into a 10-minute one.
 
+### Don't have a GPU? Use cloud APIs
+
+You don't need an expensive GPU to get fast transcription and quality summaries. Lia supports cloud backends that work great for most users:
+
+- **Dictation**: [Groq](https://console.groq.com/keys) offers free Whisper transcription (~0.5s per clip). OpenAI's gpt-transcribe is the most accurate (paid).
+- **Summaries**: [Gemini](https://aistudio.google.com/apikey) has a generous free tier. OpenAI GPT-5.6 produces the best results (paid).
+
+Cloud transcription and summaries are not processed locally - your audio and text are sent to the provider's servers. For most use cases this is perfectly fine, and it's the easiest way to get the full Lia experience without any GPU hardware.
+
 ### Recommended GPUs
+
+For those who want everything local, or faster local processing:
 
 | Tier | Examples | VRAM | What it unlocks |
 |---|---|---|---|
-| Entry | GTX 1650, RTX 3050 | 4-6 GB | Fast dictation |
+| Entry | GTX 1650, RTX 3050 | 4-6 GB | Fast local dictation |
 | **Recommended** | **RTX 3060, RTX 4060** | **8-12 GB** | Fast dictation + diarized meetings |
 | Power user | RTX 3090, RTX 4090 | 24 GB | All of the above + local AI summaries (Ollama) |
 
