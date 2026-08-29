@@ -22892,6 +22892,20 @@ class LiaApp:
 
         def missing(reqs):
             return [k for k in reqs if not (c.get(k) or "").strip()]
+
+        # Where each model RUNS - drives the LOCAL/CLOUD/HOME GPU badge on the
+        # Models page (the privacy story at a glance). The legacy emoji prefix
+        # in a few labels is stripped here: the badge replaces it.
+        def where_of(backend_or_key):
+            s = backend_or_key
+            if s == "local" or s.startswith("local_"):
+                return "local"
+            if s == "remote" or s.startswith("remote_"):
+                return "remote"
+            return "cloud"
+
+        def unbadge(label):
+            return label.strip().lstrip("🖥☁🏠️ ").strip()
         has_oa = bool((c.get("openai_api_key") or "").strip())
         has_parakeet = self._parakeet_available()
         dictation = []
@@ -22905,27 +22919,30 @@ class LiaApp:
                        and (backend != "openai"
                             or c.get("openai_model", "gpt-4o-transcribe") == om))
             pk_missing = model_id.startswith("parakeet") and not has_parakeet
-            dictation.append({"idx": i, "label": label.strip(), "checked": checked,
+            dictation.append({"idx": i, "label": unbadge(label), "checked": checked,
                               "enabled": not pk_missing,
+                              "where": where_of(backend),
                               "note": "pip install onnx-asr" if pk_missing else ""})
         meeting = []
         for label, key, reqs in self._MEETING_MODELS:
             miss = missing(reqs)
             pk_missing = "parakeet" in key and not has_parakeet
-            meeting.append({"key": key, "label": label.strip(),
+            meeting.append({"key": key, "label": unbadge(label),
                             "checked": c.get("meeting_model", "local_hebrew_turbo") == key,
                             "enabled": not miss and not pk_missing,
+                            "where": where_of(key),
                             "note": ("pip install onnx-asr" if pk_missing else
                                      ("needs " + ", ".join(miss)) if miss else "")})
         file_rows = [{"key": "", "label": "Same as meeting model",
                       "checked": (c.get("file_transcribe_model", "") or "") == "",
-                      "enabled": True, "note": ""}]
+                      "enabled": True, "note": "", "where": ""}]
         for label, key, reqs in self._MEETING_MODELS:
             miss = missing(reqs)
             pk_missing = "parakeet" in key and not has_parakeet
-            file_rows.append({"key": key, "label": label.strip(),
+            file_rows.append({"key": key, "label": unbadge(label),
                               "checked": c.get("file_transcribe_model", "") == key,
                               "enabled": not miss and not pk_missing,
+                              "where": where_of(key),
                               "note": ("pip install onnx-asr" if pk_missing else
                                        ("needs " + ", ".join(miss)) if miss else "")})
         pulled = self._ollama_pulled() if ollama else "skip"
@@ -22943,8 +22960,11 @@ class LiaApp:
                 elif model not in pulled:
                     note = "ollama pull " + model
                     enabled = False
-            summary.append({"model": model, "label": label.strip(),
-                            "checked": cur_sm == model, "enabled": enabled, "note": note})
+            summary.append({"model": model, "label": unbadge(label),
+                            "checked": cur_sm == model, "enabled": enabled,
+                            "where": ("local" if url == self._OLLAMA_CHAT_URL
+                                      else "cloud"),
+                            "note": note})
         cleanup_styles = [{"style": s, "label": l,
                            "checked": c.get("cleanup_style", "off") == s}
                           for l, s in self.CLEANUP_MENU_STYLES]

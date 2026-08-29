@@ -314,6 +314,9 @@ EXTRA_CSS = """
 .rowbtn:hover{background:var(--accent-soft); border-color:var(--accent);}
 .rowbtn .ic{font-size:16px;}
 .rowbtn .hk{margin-inline-start:auto; color:var(--muted); font-size:var(--fs-hint);}
+/* A badge (e.g. BETA) takes over the right-push; the hotkey trails it. */
+.rowbtn .wb{margin-inline-start:auto;}
+.rowbtn .wb ~ .hk{margin-inline-start:0;}
 .disabledrow{opacity:.5;}
 """
 
@@ -347,14 +350,18 @@ APP_JS = r"""
       '<input type="checkbox" data-toggle="'+esc(method)+'"'+(checked?' checked':'')+
       (disabled?' disabled':'')+'><span class="track"></span><span>'+esc(label)+'</span></label>';
   }
-  function radio(name, method, arg, argtype, label, checked, enabled, note){
+  var WB_TEXT = {local:'🖥️ LOCAL', cloud:'CLOUD',
+                 remote:'🏠 HOME GPU'};
+  function radio(name, method, arg, argtype, label, checked, enabled, note, where){
     var dis = enabled===false;
     return '<label class="radio'+(checked?' on':'')+(dis?' disabled':'')+'">'+
       '<input type="radio" name="'+esc(name)+'" data-radio="'+esc(method)+'" '+
       'data-arg="'+esc(arg)+'" data-argtype="'+(argtype||'str')+'"'+
       (checked?' checked':'')+(dis?' disabled':'')+'>'+
       '<span class="box"></span><span class="txt">'+esc(label)+
-      (note?'<small>'+esc(note)+'</small>':'')+'</span></label>';
+      (note?'<small>'+esc(note)+'</small>':'')+'</span>'+
+      (where?'<span class="wb '+esc(where)+'">'+(WB_TEXT[where]||esc(where))+
+             '</span>':'')+'</label>';
   }
   function btn(label, method, args, kind, slow){
     return '<button class="btn '+(kind||'')+'" data-call="'+esc(method)+'" '+
@@ -443,7 +450,7 @@ APP_JS = r"""
     function group(title, rows, method, argKey, argtype, slow){
       var html = '<div class="page"><div class="section-title">'+esc(title)+'</div>';
       (rows||[]).forEach(function(r){
-        html += radio(method, method, String(r[argKey]), argtype, r.label, r.checked, r.enabled!==false, r.note||"");
+        html += radio(method, method, String(r[argKey]), argtype, r.label, r.checked, r.enabled!==false, r.note||"", r.where||"");
       });
       html += '</div>';
       return html;
@@ -559,9 +566,10 @@ APP_JS = r"""
 
   PAGES.meetings = function(){
     var hk = S.hotkeys||{};
-    function actrow(icon, label, method, hkstr){
+    function actrow(icon, label, method, hkstr, beta){
       return '<div class="rowbtn" data-call="'+method+'" data-args="[]">'+
         '<span class="ic">'+icon+'</span><span class="grow">'+esc(label)+'</span>'+
+        (beta?'<span class="wb beta">BETA</span>':'')+
         (hkstr?'<span class="hk">'+esc(hkstr)+'</span>':'')+'</div>';
     }
     var live = S.live_transcript_available
@@ -572,8 +580,8 @@ APP_JS = r"""
         sw("Auto-detect Zoom / Teams / Meet calls", !!cfg("auto_detect_meetings",false), "toggle_auto_detect_meetings")+
       '</div>'+
       '<div class="page"><div class="section-title">Tools</div>'+
-        actrow('&#128269;','Ask your meetings…','open_meetings_ask',hk.ask)+
-        actrow('&#127908;','Voice ask (speak a question, press again to answer)','voice_ask_now',hk.voice_ask)+
+        actrow('&#128269;','Ask your meetings…','open_meetings_ask',hk.ask,true)+
+        actrow('&#127908;','Voice ask (speak a question, press again to answer)','voice_ask_now',hk.voice_ask,true)+
         field("Voice ask answer goes to",
           radio("vao","set_voice_ask_output","card","str","Answer card (always visible)", cfg("voice_ask_output","card")==="card")+
           radio("vao","set_voice_ask_output","paste","str","Paste at cursor", cfg("voice_ask_output")==="paste")+

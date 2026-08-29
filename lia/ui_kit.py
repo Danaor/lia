@@ -257,6 +257,20 @@ input:disabled,select:disabled,textarea:disabled{opacity:.55; cursor:default;}
   transition:background var(--tr),border-color var(--tr),color var(--tr);
 }
 .radio:last-child{margin-bottom:0;}
+/* Where-badges: LOCAL / CLOUD / HOME GPU chips on option rows (Models page).
+   Right-aligned so scanning the column instantly separates what runs on this
+   machine from what leaves it - the privacy story at a glance. */
+.wb{margin-inline-start:auto; flex:0 0 auto; font-size:10px; font-weight:700;
+    letter-spacing:.08em; padding:2px 9px; border-radius:999px;
+    white-space:nowrap;}
+.wb.local{background:var(--ok-soft); color:var(--ok);
+          border:1px solid var(--ok);}
+.wb.cloud{background:transparent; color:var(--faint);
+          border:1px solid var(--line-2);}
+.wb.remote{background:var(--info-soft); color:var(--info);
+           border:1px solid var(--info);}
+.wb.beta{background:var(--warn-soft); color:var(--warn);
+         border:1px solid var(--warn);}
 .radio input{position:absolute; opacity:0; width:0; height:0;}
 .radio .box{
   flex:0 0 20px; width:20px; height:20px; border-radius:50%;
