@@ -23097,6 +23097,17 @@ class LiaApp:
 
         def unbadge(label):
             return label.strip().lstrip("🖥☁🏠️ ").strip()
+
+        # Cloud rows carry a small note under the badge: whether the key
+        # this row needs is already set. Purely informational - the row's
+        # enabled state / "needs X" note still governs selectability.
+        def key_note(*keys):
+            keys = [k for k in keys if k]
+            if not keys:
+                return ""
+            have = all((c.get(k) or "").strip() for k in keys)
+            return "API key set" if have else "Requires API key"
+
         has_oa = bool((c.get("openai_api_key") or "").strip())
         has_parakeet = self._parakeet_available()
         dictation = []
@@ -23110,18 +23121,26 @@ class LiaApp:
                        and (backend != "openai"
                             or c.get("openai_model", "gpt-4o-transcribe") == om))
             pk_missing = model_id.startswith("parakeet") and not has_parakeet
+            wn = ""
+            if backend == "groq":
+                wn = key_note("groq_api_key")
+            elif backend == "openai":
+                wn = key_note("openai_api_key")
             dictation.append({"idx": i, "label": unbadge(label), "checked": checked,
                               "enabled": not pk_missing,
-                              "where": where_of(backend),
+                              "where": where_of(backend), "wnote": wn,
                               "note": "pip install onnx-asr" if pk_missing else ""})
+        def _key_reqs(reqs):
+            return [r for r in reqs if r.endswith("_api_key") or r == "hf_token"]
         meeting = []
         for label, key, reqs in self._MEETING_MODELS:
             miss = missing(reqs)
             pk_missing = "parakeet" in key and not has_parakeet
+            wn = key_note(*_key_reqs(reqs)) if where_of(key) == "cloud" else ""
             meeting.append({"key": key, "label": unbadge(label),
                             "checked": c.get("meeting_model", "local_hebrew_turbo") == key,
                             "enabled": not miss and not pk_missing,
-                            "where": where_of(key),
+                            "where": where_of(key), "wnote": wn,
                             "note": ("pip install onnx-asr" if pk_missing else
                                      ("needs " + ", ".join(miss)) if miss else "")})
         file_rows = [{"key": "", "label": "Same as meeting model",
@@ -23130,10 +23149,11 @@ class LiaApp:
         for label, key, reqs in self._MEETING_MODELS:
             miss = missing(reqs)
             pk_missing = "parakeet" in key and not has_parakeet
+            wn = key_note(*_key_reqs(reqs)) if where_of(key) == "cloud" else ""
             file_rows.append({"key": key, "label": unbadge(label),
                               "checked": c.get("file_transcribe_model", "") == key,
                               "enabled": not miss and not pk_missing,
-                              "where": where_of(key),
+                              "where": where_of(key), "wnote": wn,
                               "note": ("pip install onnx-asr" if pk_missing else
                                        ("needs " + ", ".join(miss)) if miss else "")})
         pulled = self._ollama_pulled() if ollama else "skip"
@@ -23151,10 +23171,14 @@ class LiaApp:
                 elif model not in pulled:
                     note = "ollama pull " + model
                     enabled = False
+            s_where = "local" if url == self._OLLAMA_CHAT_URL else "cloud"
+            s_wn = ""
+            if s_where == "cloud":
+                s_wn = key_note("gemini_api_key" if url == GEMINI_CHAT_URL
+                                else "openai_api_key")
             summary.append({"model": model, "label": unbadge(label),
                             "checked": cur_sm == model, "enabled": enabled,
-                            "where": ("local" if url == self._OLLAMA_CHAT_URL
-                                      else "cloud"),
+                            "where": s_where, "wnote": s_wn,
                             "note": note})
         cleanup_styles = [{"style": s, "label": l,
                            "checked": c.get("cleanup_style", "off") == s}

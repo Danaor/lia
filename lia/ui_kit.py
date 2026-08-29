@@ -265,7 +265,7 @@ input:disabled,select:disabled,textarea:disabled{opacity:.55; cursor:default;}
     white-space:nowrap;}
 .wb.local{background:var(--ok-soft); color:var(--ok);
           border:1px solid var(--ok);}
-.wb.cloud{background:transparent; color:var(--faint);
+.wb.cloud{background:var(--bg); color:var(--muted);
           border:1px solid var(--line-2);}
 .wb.remote{background:transparent; color:var(--faint);
            border:1px solid var(--line-2);}

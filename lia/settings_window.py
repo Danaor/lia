@@ -206,7 +206,8 @@ def _demo_state():
         "outputs": [{"idx": 3, "name": "Speakers (Realtek)"},
                     {"idx": 4, "name": "Focusrite USB"}],
         "tables": {
-            "dictation": [{"idx": 0, "label": "OpenAI gpt-transcribe (best)", "checked": True, "where": "cloud"},
+            "dictation": [{"idx": 0, "label": "OpenAI gpt-transcribe (best)", "checked": True, "where": "cloud", "wnote": "API key set"},
+                          {"idx": 2, "label": "Groq Turbo", "checked": False, "where": "cloud", "wnote": "Requires API key"},
                           {"idx": 3, "label": "Hebrew Turbo Local (best local Hebrew)", "checked": False, "where": "local"},
                           {"idx": 7, "label": "Hebrew Turbo Remote", "checked": False, "where": "remote"}],
             "meeting": [{"key": "local_hebrew_turbo", "label": "Hebrew Turbo Local only", "checked": True, "enabled": True, "note": ""},
@@ -353,9 +354,9 @@ APP_JS = r"""
   var WB_TEXT = {local:'🖥️ LOCAL', cloud:'CLOUD',
                  remote:'REMOTE LOCAL GPU'};
   var WB_SUB = {remote:'Use a GPU on another PC in your local network'};
-  function radio(name, method, arg, argtype, label, checked, enabled, note, where){
+  function radio(name, method, arg, argtype, label, checked, enabled, note, where, wnote){
     var dis = enabled===false;
-    var wsub = where ? (WB_SUB[where]||'') : '';
+    var wsub = wnote || (where ? (WB_SUB[where]||'') : '');
     var badge = '';
     if(where){
       var pill = '<span class="wb '+esc(where)+'">'+(WB_TEXT[where]||esc(where))+'</span>';
@@ -459,7 +460,7 @@ APP_JS = r"""
     function group(title, rows, method, argKey, argtype, slow){
       var html = '<div class="page"><div class="section-title">'+esc(title)+'</div>';
       (rows||[]).forEach(function(r){
-        html += radio(method, method, String(r[argKey]), argtype, r.label, r.checked, r.enabled!==false, r.note||"", r.where||"");
+        html += radio(method, method, String(r[argKey]), argtype, r.label, r.checked, r.enabled!==false, r.note||"", r.where||"", r.wnote||"");
       });
       html += '</div>';
       return html;
