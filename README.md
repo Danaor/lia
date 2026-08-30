@@ -68,6 +68,7 @@ Most dictation tools are subscriptions (SuperWhisper, Wispr Flow), cloud-locked 
 
 | | |
 |---|---|
+| **Live captions** | Real-time on-screen transcript of your mic as you speak, powered by Google's free `gemini-3.5-transcribe-live` streaming model (needs a Google AI Studio key). Tray -> Live Captions. Mic-only for now (the far side of a call is a follow-up). BETA. |
 | **Email search** | A fully local index of your Outlook mail (SQLite FTS5 + embeddings) with keyword search, semantic search, and "ask your email" over a local model. Windows + Outlook desktop only, and rougher than the rest of the app - treat it as an experiment that happens to be useful. |
 
 ## Quick start
@@ -109,9 +110,9 @@ Optional cloud speed: get a free [Groq key](https://console.groq.com/keys), past
 
 | Purpose | Local (free, offline) | Cloud (optional) |
 |---|---|---|
-| Hebrew dictation | ivrit.ai Whisper large-v3-turbo | Groq Whisper, OpenAI gpt-transcribe |
-| English dictation | **NVIDIA Parakeet TDT 0.6B** (best English WER, realtime on CPU) | Groq Whisper, OpenAI gpt-transcribe |
-| Meetings | chunked or diarized (pyannote) variants of the above | AssemblyAI, OpenAI |
+| Hebrew dictation | ivrit.ai Whisper large-v3-turbo | Groq Whisper, OpenAI gpt-transcribe, Gemini Live (free · ~1.3s) |
+| English dictation | **NVIDIA Parakeet TDT 0.6B** (best English WER, realtime on CPU) | Groq Whisper, OpenAI gpt-transcribe, Gemini Live (free) |
+| Meetings | chunked or diarized (pyannote) variants of the above | Gemini Transcribe (free tier, incl. speaker diarization - BETA), AssemblyAI, OpenAI |
 | Summaries | Gemma via [Ollama](https://ollama.com) | OpenAI, Gemini (free tier) |
 
 Have one GPU box and several machines? Lia can also send audio to a WhisperLive server you host yourself - see [docs/SELF_HOSTED_SERVER.md](docs/SELF_HOSTED_SERVER.md).
@@ -145,9 +146,10 @@ Everything in Lia runs on CPU, but an NVIDIA GPU makes local transcription drama
 You don't need an expensive GPU to get fast transcription and quality summaries. Lia supports cloud backends that work great for most users:
 
 - **Dictation**: [Groq](https://console.groq.com/keys) offers free Whisper transcription (~0.5s per clip). OpenAI's gpt-transcribe is the most accurate (paid).
+- **Meetings**: [Gemini Transcribe](https://aistudio.google.com/apikey) is free (Google AI Studio key), transcribes Hebrew as well as the local model, and can label speakers with no GPU - a free alternative to local pyannote diarization or paid AssemblyAI. Pick it in Settings -> Models. Its diarized mode is BETA.
 - **Summaries**: [Gemini](https://aistudio.google.com/apikey) has a generous free tier. OpenAI GPT-5.6 produces the best results (paid).
 
-Cloud transcription and summaries are not processed locally - your audio and text are sent to the provider's servers. For most use cases this is perfectly fine, and it's the easiest way to get the full Lia experience without any GPU hardware.
+Cloud transcription and summaries are not processed locally - your audio and text are sent to the provider's servers, and a provider's free tier may use your data to improve its models. For most use cases this is perfectly fine, and it's the easiest way to get the full Lia experience without any GPU hardware.
 
 You can also skip the summary API entirely and paste the transcript into ChatGPT, Gemini, or any chat assistant to get a summary yourself. Lia's built-in summary pipeline does more than a single prompt - it runs a multi-stage process with specialized prompts designed to preserve factual accuracy, extract every action item with owners, and handle bilingual content correctly ([see the prompts in the source](lia/lia.py)) - but a manual paste-and-ask is always an option.
 

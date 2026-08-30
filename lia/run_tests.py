@@ -648,6 +648,418 @@ def t_groq_transcriber_bias_prompt():
 _test("GroqTranscriber bias prompt composes vocab + he_en", t_groq_transcriber_bias_prompt)
 
 
+class _FakeGemResp:
+    def __init__(self, status, body):
+        self.status_code = status
+        self._body = body
+        self.headers = {}
+        import json as _json
+        self.content = _json.dumps(body).encode()
+
+    def json(self):
+        return self._body
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError("HTTP %d" % self.status_code)
+
+
+class _FakeGemSession:
+    """Captures the last POST body so tests can assert the request shape without
+    hitting the network. GET returns a benign model resource (verify_key)."""
+    def __init__(self, post_body):
+        self._post_body = post_body
+        self.last = None
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        self.last = {"url": url, "headers": headers, "json": json}
+        return _FakeGemResp(200, self._post_body)
+
+    def get(self, url, headers=None, timeout=None):
+        return _FakeGemResp(200, {"name": "models/gemini-3.5-transcribe"})
+
+
+def t_gemini_transcriber_request_shape():
+    """GeminiTranscriber posts the LIVE-verified Interactions shape: audio inline,
+    language_codes whitelist, custom_vocabulary list, mode.type=verbatim, and an
+    RLM prefix on Hebrew output. A forced language pins a single code."""
+    import lia as w
+    import numpy as _np
+    resp = {"steps": [{"type": "model_output",
+                       "content": [{"type": "text", "text": "שלום עולם"}]}]}
+    t = w.GeminiTranscriber(api_key="fake", language_codes=["he-IL", "en-US"])
+    t._session = _FakeGemSession(resp)
+    t.custom_vocabulary = "git, push, React"
+    t.load_model()
+    audio = (_np.random.randn(16000).astype(_np.float32) * 0.1)
+    out = t.transcribe(audio, language=None)
+    body = t._session.last["json"]
+    assert body["model"] == "gemini-3.5-transcribe", body["model"]
+    assert body["input"][0]["type"] == "audio"
+    assert body["input"][0]["mime_type"] == "audio/wav"
+    tc = body["generation_config"]["transcription_config"]
+    assert tc["language_codes"] == ["he-IL", "en-US"], tc["language_codes"]
+    assert tc["custom_vocabulary"] == ["git", "push", "React"], tc["custom_vocabulary"]
+    assert tc["mode"]["type"] == "verbatim"
+    assert "diarization_mode" not in tc["mode"]
+    assert t._session.last["headers"]["x-goog-api-key"] == "fake"
+    assert out.startswith("‏") and "שלום עולם" in out, repr(out)
+    # forced language -> a single pinned code
+    t2 = w.GeminiTranscriber(api_key="fake")
+    t2._session = _FakeGemSession(resp)
+    t2.load_model()
+    t2.transcribe(audio, language="en")
+    tc2 = t2._session.last["json"]["generation_config"]["transcription_config"]
+    assert tc2["language_codes"] == ["en-US"], tc2["language_codes"]
+
+
+_test("GeminiTranscriber request shape (Interactions API, language_codes, vocab)",
+      t_gemini_transcriber_request_shape)
+
+
+def t_gemini_diarize_parsing():
+    """Diarized request carries diarization_mode + word timestamps; the documented
+    word-annotation response aggregates into speaker utterances with ms timings.
+    Multi-segment audio renumbers labels per segment; prose-only degrades to a
+    single utterance (graceful fallback)."""
+    import lia as w
+    import numpy as _np
+    diar = {"steps": [{"type": "model_output", "content": [{
+        "type": "text", "text": "hello there general",
+        "annotations": [
+            {"type": "word_info", "text": "hello", "speaker": "spk_1",
+             "start_offset": "0.10s", "end_offset": "0.40s"},
+            {"type": "word_info", "text": "there", "speaker": "spk_1",
+             "start_offset": "0.45s", "end_offset": "0.80s"},
+            {"type": "word_info", "text": "general", "speaker": "spk_2",
+             "start_offset": "1.00s", "end_offset": "1.50s"}]}]}]}
+    t = w.GeminiTranscriber(api_key="fake")
+    t._session = _FakeGemSession(diar)
+    t.load_model()
+    audio = (_np.random.randn(16000).astype(_np.float32) * 0.1)
+    utts = t.transcribe_diarized(audio, language=None)
+    tc = t._session.last["json"]["generation_config"]["transcription_config"]
+    assert tc["mode"]["diarization_mode"] == "speaker"
+    assert tc["mode"]["timestamp_granularities"] == ["word"]
+    assert len(utts) == 2, utts
+    assert utts[0]["speaker"] == "spk_1" and utts[0]["text"] == "hello there"
+    assert utts[0]["start"] == 100.0 and utts[0]["end"] == 800.0, utts[0]
+    assert utts[1]["speaker"] == "spk_2" and utts[1]["start"] == 1000.0
+    # multi-segment: force 2 segments and check per-segment speaker prefixes
+    t2 = w.GeminiTranscriber(api_key="fake")
+    t2._session = _FakeGemSession(diar)
+    t2.load_model()
+    t2.INLINE_MAX_S = 1.0
+    t2.SPLIT_TARGET_S = 0.5
+    long_audio = (_np.random.randn(16000 * 3).astype(_np.float32) * 0.1)
+    utts2 = t2.transcribe_diarized(long_audio, language=None)
+    assert any("-" in u["speaker"] and u["speaker"].startswith("S") for u in utts2), utts2
+    # prose-only fallback
+    prose = {"steps": [{"type": "model_output",
+                        "content": [{"type": "text", "text": "just text"}]}]}
+    t3 = w.GeminiTranscriber(api_key="fake")
+    t3._session = _FakeGemSession(prose)
+    t3.load_model()
+    utts3 = t3.transcribe_diarized(audio, language=None)
+    assert len(utts3) == 1 and utts3[0]["text"] == "just text", utts3
+
+
+_test("GeminiTranscriber diarization request + utterance parsing (+ fallbacks)",
+      t_gemini_diarize_parsing)
+
+
+def t_gemini_meeting_registered():
+    """Gemini meeting models wired: both keys gated behind gemini_api_key, the
+    builder returns is_diarized correctly, the diarize dispatch pins the 'gemini'
+    backend, and the wnote shows free-tier (not the hardcoded ~$0.4/hr)."""
+    import inspect
+    import lia as w
+    App = w.LiaApp
+    meet = {k: req for _l, k, req in App._MEETING_MODELS}
+    assert meet.get("gemini_transcribe") == ["gemini_api_key"], list(meet)
+    assert meet.get("gemini_diarize") == ["gemini_api_key"], list(meet)
+    assert "gemini_transcribe" in App._MEETING_TRANSCRIBE_NAMES
+    assert "gemini_diarize" in App._MEETING_TRANSCRIBE_NAMES
+    # builder returns is_diarized = (key == gemini_diarize)
+    bsrc = inspect.getsource(App._build_meeting_transcriber)
+    assert 'key == "gemini_diarize"' in bsrc, "builder is_diarized mapping missing"
+    assert "_ensure_gemini_transcriber" in bsrc
+    # diarize backend dispatch maps gemini_diarize -> "gemini" (a LiaApp method)
+    src = inspect.getsource(App)
+    assert 'diarize_backend = "gemini"' in src, "gemini diarize_backend dispatch missing"
+    # _run_diarize_job (module-level MeetingSession) has a gemini branch
+    dsrc = inspect.getsource(w.MeetingSession._run_diarize_job)
+    assert "is_gemini" in dsrc and "transcribe_diarized" in dsrc, "diarize job gemini branch missing"
+
+
+_test("Gemini meeting models registered + diarize backend wired",
+      t_gemini_meeting_registered)
+
+
+def t_gemini_key_clear_reverts():
+    """Clearing the Gemini key reverts a gemini meeting/file model to local and
+    drops cached transcribers, so the picker never keeps a dead selection."""
+    import lia as w
+    App = w.LiaApp
+    app = App.__new__(App)
+    app.config = {"gemini_api_key": "AQ.fake", "meeting_model": "gemini_diarize",
+                  "file_transcribe_model": "gemini_transcribe"}
+    app._summary_cleaner = None
+    app._gemini_transcriber = object()
+    app._meeting_xcribers = {"gemini_diarize": ("x", None, True),
+                             "gemini_transcribe": ("y", None, False)}
+    app._make_cleanup_cleaner = lambda: None
+    _saved = {}
+    import lia as _w
+    _orig_save = _w.save_config
+    _w.save_config = lambda c: _saved.update(c)
+    try:
+        ok, msg = app._clear_credential("gemini")
+    finally:
+        _w.save_config = _orig_save
+    assert ok
+    assert app.config["gemini_api_key"] == ""
+    assert app.config["meeting_model"] == "local_hebrew_turbo", app.config["meeting_model"]
+    assert app.config["file_transcribe_model"] == "", app.config["file_transcribe_model"]
+    assert app._gemini_transcriber is None
+    assert "gemini_diarize" not in app._meeting_xcribers
+    assert "gemini_transcribe" not in app._meeting_xcribers
+
+
+_test("Gemini key-clear reverts meeting/file model + drops cache",
+      t_gemini_key_clear_reverts)
+
+
+def t_gemini_transcribe_live():
+    """LIVE: the configured Gemini key authenticates against the transcribe model
+    (verify_key). Skipped under LIA_SKIP_LIVE or when no key is set."""
+    _skip_live("Gemini verify_key call")
+    import lia as w
+    cfg = w.load_config()
+    key = (cfg.get("gemini_api_key") or "").strip()
+    if not key:
+        raise SkipTest("No Gemini API key configured")
+    t = w.GeminiTranscriber(api_key=key)
+    ok, msg = t.verify_key(timeout=15)
+    assert ok, "verify_key failed: %s" % msg
+
+
+_test("LIVE: Gemini key verifies against gemini-3.5-transcribe",
+      t_gemini_transcribe_live)
+
+
+class _FakeWS:
+    """Minimal websocket-client stand-in: records sends, yields scripted recvs."""
+    def __init__(self, script):
+        self.script = list(script)   # list of JSON strings to hand back on recv()
+        self.sent = []
+    def send(self, s):
+        self.sent.append(s)
+    def recv(self):
+        if not self.script:
+            raise OSError("closed")
+        return self.script.pop(0)
+    def settimeout(self, t):
+        pass
+    def close(self):
+        pass
+
+
+def t_gemini_live_stream_protocol():
+    """GeminiLiveStream builds the verified Live-API messages and parses the
+    server transcript shapes (interim vs final)."""
+    import json as _json
+    import lia as w
+    s = w.GeminiLiveStream(api_key="fake", language_codes=["he-IL", "en-US"])
+    s._ws = _FakeWS([])
+    # audio + end message shapes
+    s.feed(b"\x01\x02\x03\x04")
+    s.end_audio()
+    a = _json.loads(s._ws.sent[0])
+    assert a["realtimeInput"]["audio"]["mimeType"] == "audio/pcm;rate=16000"
+    assert a["realtimeInput"]["audio"]["data"], "missing base64 audio"
+    b = _json.loads(s._ws.sent[1])
+    assert b["realtimeInput"]["audioStreamEnd"] is True
+    # _extract: interim, final, none
+    assert w.GeminiLiveStream._extract(
+        {"serverContent": {"interimInputTranscription": {"text": "hi"}}}) == ("hi", False)
+    assert w.GeminiLiveStream._extract(
+        {"serverContent": {"inputTranscription": {"text": "final"}}}) == ("final", True)
+    assert w.GeminiLiveStream._extract({"serverContent": {}}) == (None, None)
+    # collect_final over a scripted turn: interims then final then generationComplete
+    seen = []
+    s2 = w.GeminiLiveStream(api_key="fake")
+    s2._ws = _FakeWS([
+        _json.dumps({"serverContent": {"interimInputTranscription": {"text": "אני"}}}),
+        _json.dumps({"serverContent": {"interimInputTranscription": {"text": "אני גם"}}}),
+        _json.dumps({"serverContent": {"inputTranscription": {"text": "אני גם עובד"}}}),
+        _json.dumps({"serverContent": {"generationComplete": True}}),
+    ])
+    final = s2.collect_final(on_interim=seen.append)
+    assert final == "אני גם עובד", final
+    assert seen == ["אני", "אני גם"], seen
+
+
+_test("GeminiLiveStream protocol messages + transcript parsing",
+      t_gemini_live_stream_protocol)
+
+
+def t_gemini_live_transcriber_wiring():
+    """GeminiLiveTranscriber bursts recorded audio through a stream and returns
+    RTL-marked text; a forced language pins a single BCP-47 code."""
+    import lia as w
+    import numpy as _np
+    captured = {}
+
+    class _FakeStream:
+        def __init__(self, api_key, language_codes=None, connect_timeout=10):
+            captured["codes"] = language_codes
+        def transcribe_pcm(self, pcm, on_interim=None, chunk_ms=100, realtime=False):
+            captured["pcm_len"] = len(pcm)
+            return "שלום עולם"
+
+    orig = w.GeminiLiveStream
+    w.GeminiLiveStream = _FakeStream
+    try:
+        t = w.GeminiLiveTranscriber(api_key="fake", language_codes=["he-IL", "en-US"])
+        t.load_model()
+        audio = (_np.random.randn(16000).astype(_np.float32) * 0.1)
+        out = t.transcribe(audio, language=None)
+        assert out.startswith("‏") and "שלום עולם" in out, repr(out)
+        assert captured["codes"] == ["he-IL", "en-US"], captured["codes"]
+        assert captured["pcm_len"] > 0
+        t.transcribe(audio, language="en")
+        assert captured["codes"] == ["en-US"], captured["codes"]
+    finally:
+        w.GeminiLiveStream = orig
+
+
+_test("GeminiLiveTranscriber bursts audio + RTL + language pin",
+      t_gemini_live_transcriber_wiring)
+
+
+def t_gemini_live_dictation_registered():
+    """gemini_live is a dictation backend: a Menu row, an API-key guard, startup
+    selection, _set_backend + key-clear all handle it."""
+    import inspect
+    import lia as w
+    App = w.LiaApp
+    rows = {r[2] for r in App._MENU_MODELS_ORDERED}
+    assert "gemini_live" in rows, rows
+    src = inspect.getsource(App)
+    assert 'backend == "gemini_live" and self._gemini_live_transcriber is not None' in src
+    assert 'elif backend == "gemini_live":' in inspect.getsource(App._set_backend)
+    assert "_ensure_gemini_live_transcriber" in src
+    # key-clear reverts a gemini_live dictation backend to local
+    app = App.__new__(App)
+    app.config = {"gemini_api_key": "AQ.x", "transcription_backend": "gemini_live",
+                  "meeting_model": "local_hebrew_turbo", "file_transcribe_model": ""}
+    app._summary_cleaner = None
+    app._gemini_transcriber = object()
+    app._gemini_live_transcriber = object()
+    app._local_transcriber = "LOCAL"
+    app._meeting_xcribers = {}
+    app._make_cleanup_cleaner = lambda: None
+    _orig = w.save_config
+    w.save_config = lambda c: None
+    try:
+        ok, msg = app._clear_credential("gemini")
+    finally:
+        w.save_config = _orig
+    assert ok
+    assert app.config["transcription_backend"] == "local", app.config["transcription_backend"]
+    assert app.transcriber == "LOCAL"
+    assert app._gemini_live_transcriber is None
+
+
+_test("gemini_live dictation backend registered + key-clear reverts",
+      t_gemini_live_dictation_registered)
+
+
+def t_live_captions_session():
+    """LiveCaptionsSession orchestration: streams mic audio, accumulates finals
+    across rotations, pushes interims to the caption window, cleans up on stop.
+    Mocks the WS stream + recorder + overlay (no real audio/network)."""
+    import lia as w
+    import numpy as _np
+
+    class _FakeRec:
+        def __init__(self): self.stopped = False; self._n = 0
+        def drain(self):
+            self._n += 1
+            return (_np.zeros(1600, dtype=_np.float32) if self._n == 1
+                    else _np.array([], dtype=_np.float32))
+        def stop(self): self.stopped = True
+
+    class _FakeOverlay:
+        def __init__(self): self.updates = []; self.shown = False; self.hidden = False
+        def captions_show(self): self.shown = True
+        def captions_update(self, t): self.updates.append(t)
+        def captions_hide(self): self.hidden = True
+
+    class _FakeApp:
+        def __init__(self):
+            self.config = {"gemini_api_key": "AQ.x", "input_device_index": None,
+                           "primary_language": "he"}
+            self.overlay = _FakeOverlay()
+            self._captions_session = "SENTINEL"
+
+    sess = w.LiveCaptionsSession(_FakeApp())
+    sess._recorder = _FakeRec()
+    sess._active = True
+
+    class _FakeStream:
+        def __init__(self, key, language_codes=None, connect_timeout=10):
+            assert language_codes == ["he-IL", "en-US"], language_codes
+        def start(self): pass
+        def feed(self, pcm): pass
+        def end_audio(self): pass
+        def collect_final(self, on_interim=None, idle_timeout=6):
+            on_interim("שלום")
+            sess._stop.set()          # user stops after this rotation
+            return "שלום עולם"
+        def close(self): pass
+
+    orig = w.GeminiLiveStream
+    w.GeminiLiveStream = _FakeStream
+    try:
+        sess._run()
+    finally:
+        w.GeminiLiveStream = orig
+    assert sess._finals == ["שלום עולם"], sess._finals
+    assert sess.app.overlay.updates, "no caption updates pushed"
+    assert sess.app.overlay.updates[-1] == "שלום עולם"
+    assert sess.app.overlay.hidden and sess._recorder is None
+    assert sess.app._captions_session is None
+
+
+_test("LiveCaptionsSession streams + accumulates + cleans up",
+      t_live_captions_session)
+
+
+def t_live_captions_registered():
+    """Live captions is tray-wired + key-gated + blocks during a meeting."""
+    import inspect
+    import lia as w
+    App = w.LiaApp
+    assert hasattr(App, "_toggle_live_captions")
+    src = inspect.getsource(App._toggle_live_captions)
+    assert "_is_meeting_active" in src and "LiveCaptionsSession" in src
+    assert all(hasattr(w.OverlayNotification, m)
+               for m in ("captions_show", "captions_update", "captions_hide"))
+    assert "Toplevel" in inspect.getsource(w.OverlayNotification._create_captions_window)
+    # key-gated visibility
+    app = App.__new__(App)
+    app.config = {"gemini_api_key": ""}
+    assert app._live_captions_available() is False
+    app.config = {"gemini_api_key": "AQ.x"}
+    assert app._live_captions_available() is True
+
+
+_test("live captions tray-wired + key-gated + meeting guard",
+      t_live_captions_registered)
+
+
 def t_audio_recorder_construct():
     import lia as w
     r = w.AudioRecorder(input_device_index=None)

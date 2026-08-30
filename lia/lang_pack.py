@@ -58,6 +58,15 @@ def primary_language(config):
     return lang if lang in ("he", "en") else "he"
 
 
+def gemini_language_codes(config):
+    """BCP-47 whitelist for Gemini Transcribe's `language_codes`, ordered by the
+    user's primary language. BOTH he+en are always present - the whitelist is a
+    guard against a mis-detected third language, not a mono pin, since meetings
+    and dictation here are routinely mixed Hebrew + English."""
+    return (["he-IL", "en-US"] if primary_language(config) == "he"
+            else ["en-US", "he-IL"])
+
+
 # ---------------------------------------------------------------------------
 # Notetaker-name rendering
 # ---------------------------------------------------------------------------

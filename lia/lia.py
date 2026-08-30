@@ -245,7 +245,7 @@ DEFAULT_CONFIG = {
     "translate_mode": False,  # True = translate to English (Whisper task="translate")
     "model_before_translate": None,  # saved model to restore when translate mode is disabled
     "auto_start": False,  # True = start with Windows
-    "transcription_backend": "local",  # "local" / "groq" / "openai" / "remote"
+    "transcription_backend": "local",  # "local" / "groq" / "openai" / "remote" / "gemini_live"
     # Serve mode: a self-hosted WhisperLive + ivrit.ai server on a home GPU box,
     # reached over a Tailscale tailnet. "remote" backend + these two keys route
     # dictation (and the "Hebrew Turbo Remote" meeting model) to that box — free,
@@ -792,6 +792,32 @@ def guess_audio_mime(file_path):
     """
     ext = os.path.splitext(file_path)[1].lower()
     return _AUDIO_MIME_BY_EXT.get(ext, "application/octet-stream")
+
+
+def _read_wav_mono_16k(path):
+    """Read a PCM16 WAV into an int16 mono numpy array (stdlib only, no
+    soundfile/ffmpeg). Meeting WAVs are already 16 kHz mono, so this needs no
+    resampling; a non-16 kHz file is returned as-is with a warning (the caller's
+    encoder assumes 16 kHz). Returns None on any read error / non-PCM16 file."""
+    try:
+        with wave.open(path, "rb") as wf:
+            nch = wf.getnchannels()
+            sw = wf.getsampwidth()
+            fr = wf.getframerate()
+            raw = wf.readframes(wf.getnframes())
+        if sw != 2:
+            log.warning("_read_wav_mono_16k: %s is %d-byte samples, not PCM16", path, sw)
+            return None
+        audio = np.frombuffer(raw, dtype=np.int16)
+        if nch > 1:
+            audio = audio.reshape(-1, nch).mean(axis=1).astype(np.int16)
+        if fr != 16000:
+            log.warning("_read_wav_mono_16k: %s is %d Hz, not 16 kHz - timings "
+                        "may be scaled by the fixed-rate encoder", path, fr)
+        return audio
+    except Exception as e:
+        log.error("_read_wav_mono_16k failed for %s: %s", path, e)
+        return None
 
 
 def audio_peak_rms(audio_np, sample_rate=16000, window_ms=300):
@@ -4974,6 +5000,644 @@ class GroqTranscriber(BaseTranscriber):
 
 
 # ============================================================
+# Gemini cloud transcription (dedicated STT model)
+# ============================================================
+class GeminiTranscriber(BaseTranscriber):
+    """Cloud transcription via Google's dedicated `gemini-3.5-transcribe` model.
+
+    Uses the **Interactions API** (`/v1beta/interactions`) - the ONLY endpoint
+    that accepts `transcription_config`; the classic `:generateContent` path
+    rejects it and returns an empty part (live-verified 2026-08-30). Free tier,
+    Hebrew `he-IL`, a `language_codes` whitelist (a STRONG bias against a third
+    language, though NOT absolute on near-silent audio - the trailing-silence
+    trim + hallucination strip still guard the edges), custom-vocabulary biasing
+    up to ~1,000 terms, and optional speaker diarization + word timestamps
+    (used by the diarized meeting path).
+
+    Live-verified on the author's key (2026-08-30): Hebrew quality on par with /
+    slightly better than Groq whisper-large-v3-turbo; p50 ~3.6s per clip (too
+    slow for press-to-talk dictation - this backend is meetings / file only);
+    free-tier limit 25 requests/minute.
+    """
+    INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
+    MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+    DEFAULT_MODEL = "gemini-3.5-transcribe"
+    # One request carries at most ~20 MB inline (base64 inflates raw audio by
+    # 4/3). 16 kHz mono int16 is 32 kB/s, so 6.5 min => ~12.5 MB raw => ~16.6 MB
+    # base64 - comfortably under 20 MB AND under the 30-min diarization cap, so
+    # segmenting at this size needs NO Files API in v1.
+    INLINE_MAX_S = 390.0
+    SPLIT_TARGET_S = 330.0
+
+    def __init__(self, model_size="gemini-3.5-transcribe", api_key="",
+                 language_codes=None):
+        super().__init__(model_size=model_size, cpu_threads=0)
+        self.api_key = api_key
+        self.custom_vocabulary = ""     # user terms -> transcription_config.custom_vocabulary
+        # BOTH languages are always present: Naor dictates + meets in mixed
+        # he+en, so the whitelist is the third-language GUARD, not a mono pin.
+        # Ordered by primary language (first = preferred).
+        self.language_codes = (list(language_codes) if language_codes
+                               else ["he-IL", "en-US"])
+        self._session = None            # per-thread requests.Session (set below)
+
+    def _ensure_session(self):
+        """Per-thread requests.Session (connection reuse, no cookie races)."""
+        return _thread_local_session(self)
+
+    def _headers(self):
+        return {"x-goog-api-key": self.api_key, "Content-Type": "application/json"}
+
+    def load_model(self, callback=None):
+        """No local model - just require the API key to be set."""
+        if not self.api_key:
+            if callback:
+                callback("Missing Gemini API key")
+            raise RuntimeError("Gemini API key not set - configure via Settings")
+        self.model = "gemini_ready"
+        if callback:
+            callback("Gemini Transcribe ready (cloud)")
+
+    def verify_key(self, timeout=10):
+        """Cheap GET on the model resource to confirm the key. A 429 still proves
+        the key is valid (the request authenticated, only the quota tripped)."""
+        if not self.api_key:
+            return False, "No API key"
+        try:
+            import requests
+        except ImportError as e:
+            return False, f"'requests' not installed: {e}"
+        try:
+            log.info("Gemini verify_key: GET model (timeout=%s)", timeout)
+            s = self._ensure_session()
+            r = s.get(f"{self.MODELS_URL}/{self.DEFAULT_MODEL}",
+                      headers={"x-goog-api-key": self.api_key},
+                      timeout=(5, timeout))
+            log.info("Gemini verify_key: HTTP %d", r.status_code)
+            if r.status_code == 200:
+                return True, "Key valid"
+            if r.status_code == 429:
+                return True, "Key valid (rate limited)"
+            if r.status_code in (401, 403):
+                return False, "Invalid API key"
+            return False, f"HTTP {r.status_code}: {r.text[:80]}"
+        except requests.exceptions.Timeout:
+            return False, "Network timeout - check internet"
+        except requests.exceptions.ConnectionError as e:
+            return False, f"Cannot reach Google: {type(e).__name__}"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    def _audio_to_wav_bytes(self, audio_np):
+        """numpy audio -> 16 kHz mono int16 WAV bytes (matches GroqTranscriber)."""
+        if audio_np.dtype == np.float32:
+            samples = (audio_np * 32767).clip(-32768, 32767).astype(np.int16)
+        else:
+            samples = audio_np.astype(np.int16)
+        buf = io.BytesIO()
+        with wave.open(buf, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(samples.tobytes())
+        return buf.getvalue()
+
+    @staticmethod
+    def _bcp47(lang):
+        """Map Lia's short language codes to the BCP-47 tags the API expects."""
+        return {"he": "he-IL", "en": "en-US"}.get(lang, lang)
+
+    def _vocab_terms(self):
+        """Split the composed vocabulary string into a term list (cap 1,000;
+        best results <=100 per Google, but we pass what the user set)."""
+        import re as _re
+        vocab = (self.custom_vocabulary or "").strip()
+        if not vocab:
+            return []
+        terms = [t.strip() for t in _re.split(r'[,\n]', vocab) if t.strip()]
+        return terms[:1000]
+
+    def _build_transcription_config(self, language=None, diarize=False,
+                                    word_ts=False):
+        """Assemble generation_config.transcription_config for one request."""
+        if language and language != "auto":
+            codes = [self._bcp47(language)]
+        else:
+            codes = list(self.language_codes)
+        tc = {"language_codes": codes}
+        terms = self._vocab_terms()
+        if terms:
+            tc["custom_vocabulary"] = terms
+        mode = {"type": "verbatim"}      # `type` is REQUIRED by the API
+        if diarize:
+            mode["diarization_mode"] = "speaker"
+        if word_ts:
+            mode["timestamp_granularities"] = ["word"]
+        tc["mode"] = mode
+        return tc
+
+    def _post_interaction(self, wav_bytes, tc, timeout):
+        """POST one audio segment to the Interactions API; return the JSON body.
+        Errors map like the other cloud transcribers so _transcribe_with_fallback
+        catches them and falls back to a local model."""
+        import base64 as _b64
+        s = self._ensure_session()
+        body = {
+            "model": self.model_size,
+            "input": [{"type": "audio",
+                       "data": _b64.b64encode(wav_bytes).decode("ascii"),
+                       "mime_type": "audio/wav"}],
+            "generation_config": {"transcription_config": tc},
+        }
+        r = s.post(self.INTERACTIONS_URL, headers=self._headers(),
+                   json=body, timeout=timeout)
+        if r.status_code in (401, 403):
+            raise RuntimeError("Invalid Gemini API key")
+        if r.status_code == 429:
+            raise RuntimeError("Gemini rate limit exceeded")
+        r.raise_for_status()
+        return r.json()
+
+    @staticmethod
+    def _extract_text(resp_json):
+        """Plain transcript = the concatenation of every text content item."""
+        out = []
+        for step in resp_json.get("steps", []):
+            for c in step.get("content", []):
+                if c.get("type") == "text" and c.get("text"):
+                    out.append(c["text"])
+        return " ".join(out).strip()
+
+    @staticmethod
+    def _parse_offset(v):
+        """'0.450s' / '1.2s' / number -> float seconds (0.0 on anything odd)."""
+        if v is None:
+            return 0.0
+        try:
+            if isinstance(v, (int, float)):
+                return float(v)
+            return float(str(v).rstrip("s"))
+        except (ValueError, TypeError):
+            return 0.0
+
+    def _split_for_inline(self, audio_np, sr=16000, overlap_s=0.0):
+        """Split long audio into <= INLINE_MAX_S pieces, cutting at the quietest
+        point inside [SPLIT_TARGET_S, INLINE_MAX_S] so words aren't clipped.
+        overlap_s=0 for diarization (an overlap would duplicate utterances)."""
+        n = len(audio_np)
+        max_n = int(self.INLINE_MAX_S * sr)
+        if n <= max_n:
+            return [audio_np]
+        fr = int(0.03 * sr)
+        nf = n // fr
+        if nf == 0:
+            return [audio_np]
+        frames = np.asarray(audio_np[:nf * fr], dtype=np.float32).reshape(nf, fr)
+        rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
+        thr = max(0.006, float(np.median(rms)) * 0.5)
+        silent = rms < thr
+        tgt_n = int(self.SPLIT_TARGET_S * sr)
+        chunks, start = [], 0
+        while start < n:
+            if n - start <= max_n:
+                chunks.append(audio_np[start:])
+                break
+            f0 = (start + tgt_n) // fr
+            f1 = min(nf, (start + max_n) // fr)
+            best_run, best_mid = 0, None
+            i = f0
+            while i < f1:
+                if silent[i]:
+                    j = i
+                    while j < f1 and silent[j]:
+                        j += 1
+                    if (j - i) > best_run:
+                        best_run, best_mid = j - i, ((i + j) // 2) * fr
+                    i = j
+                else:
+                    i += 1
+            if best_mid is not None:
+                chunks.append(audio_np[start:best_mid])
+                start = best_mid if overlap_s <= 0 else max(0, best_mid - int(overlap_s * sr))
+            else:
+                end = start + max_n
+                chunks.append(audio_np[start:end])
+                start = end - int(overlap_s * sr) if overlap_s > 0 else end
+        return chunks
+
+    @staticmethod
+    def _rtl_mark(text):
+        """Prepend an RLM to Hebrew/Arabic text so terminals render it correctly."""
+        is_rtl = any('֐' <= c <= '׿' or '؀' <= c <= 'ۿ'
+                     or 'יִ' <= c <= '﷿' or 'ﹰ' <= c <= '﻿'
+                     for c in text)
+        return ('‏' + text) if is_rtl else text
+
+    def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe"):
+        """Batch transcript of a numpy clip. `task="translate"` is unsupported by
+        the transcribe model, so it degrades to a plain transcript (the meeting /
+        file paths never request translation on this backend)."""
+        if self.model is None:
+            raise RuntimeError("Gemini transcriber not initialized")
+        if len(audio_np) == 0:
+            return ""
+        orig_len = len(audio_np)
+        audio_np = trim_trailing_silence(audio_np, sample_rate=16000)
+        if len(audio_np) < orig_len:
+            log.info("Gemini: trimmed %d samples of trailing silence",
+                     orig_len - len(audio_np))
+        tc = self._build_transcription_config(language=language)
+        pieces = self._split_for_inline(audio_np)
+        texts = []
+        for piece in pieces:
+            duration = len(piece) / 16000.0
+            http_timeout = (10, max(60, int(duration * 4) + 20))
+            wav = self._audio_to_wav_bytes(piece)
+            j = self._post_interaction(wav, tc, http_timeout)
+            t = self._extract_text(j)
+            if t:
+                texts.append(t)
+        text = " ".join(texts).strip()
+        if not text:
+            return ""
+        text = strip_hallucinated_tail(text)
+        if not text:
+            return ""
+        return self._rtl_mark(text)
+
+    def transcribe_file(self, file_path, language=None, task="transcribe"):
+        """Transcribe an audio file. Small files are sent inline as-is (any format
+        Gemini accepts); large WAVs are decoded + split at silence. Non-WAV files
+        over the inline cap ask the user to use a local model."""
+        if self.model is None:
+            raise RuntimeError("Gemini transcriber not initialized")
+        try:
+            size = os.path.getsize(file_path)
+        except OSError:
+            size = -1
+        tc = self._build_transcription_config(language=language)
+        # Under the inline cap: send the file bytes directly (no decode needed).
+        if 0 <= size <= 18 * 1024 * 1024:
+            import base64 as _b64
+            mime = guess_audio_mime(file_path)
+            with open(file_path, "rb") as f:
+                data = _b64.b64encode(f.read()).decode("ascii")
+            body = {"model": self.model_size,
+                    "input": [{"type": "audio", "data": data, "mime_type": mime}],
+                    "generation_config": {"transcription_config": tc}}
+            s = self._ensure_session()
+            r = s.post(self.INTERACTIONS_URL, headers=self._headers(),
+                       json=body, timeout=(10, 240))
+            if r.status_code in (401, 403):
+                raise RuntimeError("Invalid Gemini API key")
+            if r.status_code == 429:
+                raise RuntimeError("Gemini rate limit exceeded")
+            r.raise_for_status()
+            text = self._extract_text(r.json())
+            return self._rtl_mark(strip_hallucinated_tail(text)) if text else ""
+        # Over the ~20 MB inline cap. Gemini decodes any format server-side, so
+        # we do not resample here; a split would need a local decoder (no
+        # soundfile dependency) and, for the transcribe model, a Files-API upload
+        # - both are follow-ups. Point the user at a local model for big files.
+        mb = size / (1024 * 1024) if size >= 0 else -1
+        raise RuntimeError(
+            f"File is {mb:.1f} MB - Gemini Transcribe accepts up to ~20 MB per "
+            f"request. Compress the file, or switch to a Local model "
+            f"(faster-whisper handles any size).")
+
+    def transcribe_diarized(self, audio_np, language=None, on_progress=None):
+        """Whole-file speaker diarization. Splits long audio into inline-sized
+        segments, diarizes each with word timestamps, and returns a flat list of
+        utterances in the shape `_run_diarize_job` consumes:
+            {"speaker": <label>, "start": <ms>, "end": <ms>, "text": <str>}
+        Speaker labels are renumbered PER SEGMENT (e.g. 'S2-Speaker 1') because
+        the model does not guarantee label identity across separate requests -
+        the LLM speaker-naming pass + the rename dialog reconcile them downstream.
+        """
+        if self.model is None:
+            raise RuntimeError("Gemini transcriber not initialized")
+        pieces = self._split_for_inline(audio_np, overlap_s=0.0)
+        utterances = []
+        seg_start_s = 0.0
+        for idx, piece in enumerate(pieces):
+            seg_dur = len(piece) / 16000.0
+            if on_progress:
+                try:
+                    on_progress(idx + 1, len(pieces))
+                except Exception:
+                    pass
+            tc = self._build_transcription_config(
+                language=language, diarize=True, word_ts=True)
+            wav = self._audio_to_wav_bytes(piece)
+            http_timeout = (10, max(120, int(seg_dur * 6) + 30))
+            j = self._post_interaction(wav, tc, http_timeout)
+            seg_prefix = f"S{idx + 1}-" if len(pieces) > 1 else ""
+            utterances.extend(
+                self._utterances_from_response(j, seg_start_s, seg_prefix))
+            seg_start_s += seg_dur
+        return utterances
+
+    def _utterances_from_response(self, resp_json, offset_s, speaker_prefix):
+        """Aggregate word-level annotations into speaker utterances. Words are
+        grouped while the speaker label is unchanged. `offset_s` shifts segment-
+        local times onto the meeting timeline; times are returned in ms."""
+        utts = []
+        cur = None
+        any_annotations = False
+        for step in resp_json.get("steps", []):
+            for c in step.get("content", []):
+                anns = c.get("annotations") or []
+                for a in anns:
+                    if a.get("type") not in (None, "word_info"):
+                        continue
+                    word = a.get("text") or a.get("word") or ""
+                    if not word:
+                        continue
+                    any_annotations = True
+                    spk = a.get("speaker") or "Speaker 1"
+                    label = f"{speaker_prefix}{spk}"
+                    st = (offset_s + self._parse_offset(a.get("start_offset"))) * 1000.0
+                    en = (offset_s + self._parse_offset(a.get("end_offset"))) * 1000.0
+                    if cur is not None and cur["speaker"] == label:
+                        cur["end"] = en
+                        cur["text"] = (cur["text"] + " " + word).strip()
+                    else:
+                        if cur is not None:
+                            utts.append(cur)
+                        cur = {"speaker": label, "start": st, "end": en,
+                               "text": word}
+        if cur is not None:
+            utts.append(cur)
+        # No word annotations (diarization returned prose only): keep the plain
+        # text as a single unlabelled utterance so the meeting still gets text.
+        if not any_annotations:
+            text = self._extract_text(resp_json)
+            if text:
+                utts.append({"speaker": f"{speaker_prefix}Speaker 1",
+                             "start": offset_s * 1000.0,
+                             "end": offset_s * 1000.0,
+                             "text": text})
+        return utts
+
+
+class GeminiLiveStream:
+    """One bidi-WebSocket session to `gemini-3.5-transcribe-live` (the Live API).
+
+    Streams raw PCM16/16 kHz/mono audio and receives interim + final transcripts
+    incrementally. Live-verified 2026-08-30 on the author's key: setup ~0.22s,
+    burst release-to-final 0.28s (3s clip) / 0.38s (10s) - fast enough for
+    press-to-talk, unlike the 3.6s batch `gemini-3.5-transcribe`. Uses a SEPARATE
+    free-tier quota from the batch model. 10-min session cap (fine for dictation
+    clips + meeting chunks; live captions rotate the session).
+
+    Protocol (verified):
+      setup   -> {"setup":{"model":"models/gemini-3.5-transcribe-live",
+                  "generationConfig":{"responseModalities":["TEXT"]},
+                  "inputAudioTranscription":{"languageCodes":[...]}}}
+      audio   -> {"realtimeInput":{"audio":{"data":<b64 pcm>,"mimeType":"audio/pcm;rate=16000"}}}
+      end     -> {"realtimeInput":{"audioStreamEnd":true}}
+      server  -> {"serverContent":{"interimInputTranscription":{"text":...}}}  (partial)
+                 {"serverContent":{"inputTranscription":{"text":...}}}         (final)
+                 {"serverContent":{"generationComplete":true}}                 (done)
+    """
+    WS_URL = ("wss://generativelanguage.googleapis.com/ws/"
+              "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent")
+    MODEL = "models/gemini-3.5-transcribe-live"
+
+    def __init__(self, api_key, language_codes=None, connect_timeout=10):
+        self.api_key = api_key
+        self.language_codes = (list(language_codes) if language_codes
+                               else ["he-IL", "en-US"])
+        self.connect_timeout = connect_timeout
+        self._ws = None
+        self._last_interim = None
+
+    @staticmethod
+    def _loads(raw):
+        try:
+            return json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+        except Exception:
+            return None
+
+    def start(self):
+        """Open the socket + send setup + block until setupComplete. Raises
+        RuntimeError on setup/auth/quota failure so callers can fall back."""
+        import websocket
+        url = self.WS_URL + "?key=" + self.api_key
+        self._ws = websocket.create_connection(
+            url, timeout=self.connect_timeout,
+            header=["Content-Type: application/json"])
+        setup = {"setup": {"model": self.MODEL,
+                           "generationConfig": {"responseModalities": ["TEXT"]},
+                           "inputAudioTranscription": {
+                               "languageCodes": self.language_codes}}}
+        self._ws.send(json.dumps(setup))
+        self._ws.settimeout(self.connect_timeout)
+        while True:
+            try:
+                raw = self._ws.recv()
+            except Exception as e:
+                raise RuntimeError("Gemini Live: no setup response (%s)" % e)
+            j = self._loads(raw)
+            if j is None:
+                continue
+            if "setupComplete" in j:
+                return
+            low = json.dumps(j).lower()
+            if "error" in low:
+                raise RuntimeError("Gemini Live setup error: %s" % json.dumps(j)[:200])
+
+    def feed(self, pcm_bytes):
+        """Send one raw-PCM16 audio chunk."""
+        import base64 as _b64
+        self._ws.send(json.dumps({"realtimeInput": {"audio": {
+            "data": _b64.b64encode(pcm_bytes).decode("ascii"),
+            "mimeType": "audio/pcm;rate=16000"}}}))
+
+    def end_audio(self):
+        """Signal end of the audio stream (the model finalizes the transcript)."""
+        self._ws.send(json.dumps({"realtimeInput": {"audioStreamEnd": True}}))
+
+    @staticmethod
+    def _extract(j):
+        """(text, is_final) from a server message, or (None, None)."""
+        sc = j.get("serverContent") if isinstance(j, dict) else None
+        if not isinstance(sc, dict):
+            return (None, None)
+        v = sc.get("inputTranscription")
+        if isinstance(v, dict) and v.get("text") is not None:
+            return (v["text"], True)
+        v = sc.get("interimInputTranscription")
+        if isinstance(v, dict) and v.get("text") is not None:
+            return (v["text"], False)
+        return (None, None)
+
+    def collect_final(self, on_interim=None, idle_timeout=5):
+        """Read until generationComplete/turnComplete; return the final transcript
+        (falling back to the last interim if no explicit final arrived). Fires
+        on_interim(text) for each partial - used by the live-captions path.
+        generationComplete normally lands ~1s after audioStreamEnd (verified), so
+        idle_timeout is only a backstop for a dropped end marker - kept modest to
+        bound the worst case rather than hang."""
+        final = None
+        self._ws.settimeout(idle_timeout)
+        while True:
+            try:
+                raw = self._ws.recv()
+            except Exception:
+                break
+            j = self._loads(raw)
+            if j is None:
+                continue
+            txt, is_final = self._extract(j)
+            if txt is not None:
+                if is_final:
+                    final = txt
+                else:
+                    self._last_interim = txt
+                    if on_interim:
+                        try:
+                            on_interim(txt)
+                        except Exception:
+                            pass
+            s = json.dumps(j)
+            if "generationComplete" in s or "turnComplete" in s:
+                break
+        return final if final is not None else self._last_interim
+
+    def close(self):
+        try:
+            if self._ws:
+                self._ws.close()
+        except Exception:
+            pass
+        self._ws = None
+
+    def transcribe_pcm(self, pcm_bytes, on_interim=None, chunk_ms=100,
+                       realtime=False):
+        """One-shot: start -> stream pcm (burst by default) -> finalize -> close.
+        Returns the transcript string (or None)."""
+        self.start()
+        try:
+            step = int(0.001 * chunk_ms * 16000) * 2
+            for off in range(0, len(pcm_bytes), max(step, 2)):
+                self.feed(pcm_bytes[off:off + step])
+                if realtime:
+                    time.sleep(chunk_ms / 1000.0)
+            self.end_audio()
+            return self.collect_final(on_interim=on_interim)
+        finally:
+            self.close()
+
+
+class GeminiLiveTranscriber(BaseTranscriber):
+    """Press-to-talk dictation + meeting-chunk transcription via the Live API
+    (`gemini-3.5-transcribe-live`, streaming). ~0.3-0.5s per clip (setup + burst,
+    measured), free tier, excellent Hebrew - fast enough for dictation where the
+    3.6s batch model was not. Same `gemini_api_key`. Each call opens a fresh
+    short-lived session (the 10-min cap never bites press-to-talk clips or 45s
+    meeting chunks). Custom vocabulary is accepted but currently INERT (the Live
+    API exposes no phrase-biasing field yet) - a documented follow-up."""
+
+    def __init__(self, model_size="gemini-3.5-transcribe-live", api_key="",
+                 language_codes=None):
+        super().__init__(model_size=model_size, cpu_threads=0)
+        self.api_key = api_key
+        self.custom_vocabulary = ""   # accepted for interface parity; inert here
+        self.language_codes = (list(language_codes) if language_codes
+                               else ["he-IL", "en-US"])
+
+    def load_model(self, callback=None):
+        if not self.api_key:
+            if callback:
+                callback("Missing Gemini API key")
+            raise RuntimeError("Gemini API key not set - configure via Settings")
+        self.model = "gemini_live_ready"
+        if callback:
+            callback("Gemini Live ready (cloud streaming)")
+
+    def verify_key(self, timeout=10):
+        """Cheap GET on the live model resource (metadata, not quota-limited)."""
+        if not self.api_key:
+            return False, "No API key"
+        try:
+            import requests
+        except ImportError as e:
+            return False, f"'requests' not installed: {e}"
+        try:
+            r = requests.get(
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                "gemini-3.5-transcribe-live",
+                headers={"x-goog-api-key": self.api_key}, timeout=(5, timeout))
+            if r.status_code == 200:
+                return True, "Key valid"
+            if r.status_code == 429:
+                return True, "Key valid (rate limited)"
+            if r.status_code in (401, 403):
+                return False, "Invalid API key"
+            return False, f"HTTP {r.status_code}: {r.text[:80]}"
+        except requests.exceptions.Timeout:
+            return False, "Network timeout - check internet"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    @staticmethod
+    def _audio_to_pcm16(audio_np):
+        """numpy -> raw little-endian PCM16 bytes (16 kHz mono, no WAV header)."""
+        if audio_np.dtype == np.float32:
+            samples = (audio_np * 32767).clip(-32768, 32767).astype(np.int16)
+        else:
+            samples = audio_np.astype(np.int16)
+        return samples.tobytes()
+
+    def _codes_for(self, language):
+        if language and language != "auto":
+            return [GeminiTranscriber._bcp47(language)]
+        return list(self.language_codes)
+
+    def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe"):
+        if self.model is None:
+            raise RuntimeError("Gemini Live transcriber not initialized")
+        if len(audio_np) == 0:
+            return ""
+        orig_len = len(audio_np)
+        audio_np = trim_trailing_silence(audio_np, sample_rate=16000)
+        if len(audio_np) < orig_len:
+            log.info("Gemini Live: trimmed %d samples of trailing silence",
+                     orig_len - len(audio_np))
+        pcm = self._audio_to_pcm16(audio_np)
+        stream = GeminiLiveStream(self.api_key,
+                                  language_codes=self._codes_for(language))
+        try:
+            text = stream.transcribe_pcm(pcm) or ""
+        except Exception as e:
+            msg = str(e).lower()
+            if "429" in msg or "quota" in msg or "exhausted" in msg:
+                raise RuntimeError("Gemini rate limit exceeded")
+            if "401" in msg or "403" in msg or "unauthenticated" in msg \
+                    or "permission" in msg:
+                raise RuntimeError("Invalid Gemini API key")
+            raise
+        text = strip_hallucinated_tail((text or "").strip())
+        if not text:
+            return ""
+        return GeminiTranscriber._rtl_mark(text)
+
+    def transcribe_file(self, file_path, language=None, task="transcribe"):
+        """Stream a 16 kHz mono PCM WAV. Other formats/rates should use the batch
+        Gemini row or a local model (the Live API wants raw PCM and we do not
+        bundle a decoder)."""
+        if self.model is None:
+            raise RuntimeError("Gemini Live transcriber not initialized")
+        audio = _read_wav_mono_16k(file_path)
+        if audio is None:
+            raise RuntimeError(
+                "Gemini Live needs a 16 kHz mono PCM WAV. Use the batch Gemini "
+                "row or a Local model for this file.")
+        return self.transcribe(audio, language=language)
+
+
+# ============================================================
 # OpenAI cloud transcription
 # ============================================================
 class OpenAITranscriber(BaseTranscriber):
@@ -8981,11 +9645,24 @@ class MeetingSession:
           - "local_pyannote" : pyannote.audio (100% local, GPU) → speaker turns,
             then the ivrit.ai Hebrew model transcribes each turn (mandatory,
             since pyannote gives no text). No cloud, no per-minute cost.
+          - "gemini"         : gemini-3.5-transcribe (cloud, free tier) returns
+            speaker-labelled words directly (no separate diarizer, no enhance).
+            Whole file split into inline-sized segments; labels renumber per
+            segment (the downstream naming pass reconciles them).
         Runs after stop(); the user gets a notification when done."""
         backend = getattr(self, "_diarize_backend", "assemblyai")
         is_local = (backend == "local_pyannote")
+        is_gemini = (backend == "gemini")
         transcriber = getattr(self.app, "_assemblyai_transcriber", None)
-        if not is_local and (transcriber is None or not getattr(transcriber, "api_key", "")):
+        gem = self.app._ensure_gemini_transcriber() if is_gemini else None
+        if is_gemini and gem is None:
+            log.error("Diarized meeting: no Gemini key configured")
+            try:
+                self.app.overlay.show_error("Gemini key not set")
+            except Exception:
+                pass
+            return
+        if not is_local and not is_gemini and (transcriber is None or not getattr(transcriber, "api_key", "")):
             log.error("Diarized meeting: no AssemblyAI key configured")
             try:
                 self.app.overlay.show_error("AssemblyAI key not set")
@@ -9015,6 +9692,10 @@ class MeetingSession:
         if is_local:
             first_stage = ("diarize", "Diarizing speakers")
             stages = [first_stage]
+        elif is_gemini:
+            # One cloud model does speakers + text inline (no upload/enhance).
+            first_stage = ("transcribe", "Transcribing + speakers")
+            stages = [first_stage]
         else:
             first_stage = ("upload", "Uploading")
             stages = [first_stage, ("transcribe", "Transcribing")]
@@ -9041,6 +9722,18 @@ class MeetingSession:
                     self._wav_path,
                     on_status=lambda s: ov.meeting_status_detail("diarize", s, gen=gen))
                 result = {"utterances": utts, "speaker_embeddings": spk_embs}
+            elif is_gemini:
+                ov.meeting_status_step("transcribe", gen=gen)
+                audio_np = _read_wav_mono_16k(self._wav_path)
+                if audio_np is None or len(audio_np) == 0:
+                    raise RuntimeError("Could not read the meeting WAV for Gemini")
+                utts = gem.transcribe_diarized(
+                    audio_np, language=None,
+                    on_progress=lambda d, t: ov.meeting_status_detail(
+                        "transcribe", f"segment {d}/{t}", gen=gen))
+                # Gemini gives no speaker embeddings (like AssemblyAI), so
+                # voiceprint learning/matching is inert on this backend.
+                result = {"utterances": utts, "speaker_embeddings": {}}
             else:
                 ov.meeting_status_step("upload", gen=gen)
                 upload_url = transcriber.upload_file(self._wav_path)
@@ -11442,6 +12135,10 @@ class OverlayNotification:
         self._wave_anim_running = False  # guard: is the self-driving tick live
         self._hide_after_id = None   # pending auto-hide Tk timer id
         self.silent = False          # when True, show_* methods no-op
+        # Live-captions window (Gemini Live). Persistent Toplevel, updated in
+        # real time from the captions session worker via the Tk queue.
+        self._captions_top = None
+        self._captions_label = None
         self._tk_queue = queue.Queue()
         # Tk-thread self-healing. The mainloop can die on a Tcl fault after long
         # uptime + display sleep/wake + DPI churn; under pythonw (stderr=None) that
@@ -12743,6 +13440,75 @@ class OverlayNotification:
         top.after(duration_ms,
                   lambda: _close_and(on_timeout if on_timeout is not None
                                      else on_dismiss))
+
+    # ---- Live captions (Gemini Live) -------------------------------------
+    def captions_show(self):
+        """Show (or reuse) the live-captions window. Tk-thread-safe. Always shown
+        even in silent_mode - the caption text IS the deliverable."""
+        self._tk_queue.put(self._create_captions_window)
+
+    def _create_captions_window(self):
+        if not self._root:
+            return
+        import tkinter as tk
+        if self._captions_top is not None:
+            try:
+                self._captions_top.deiconify()
+                self._captions_top.lift()
+                return
+            except Exception:
+                self._captions_top = None
+        BG, FG = '#11111b', '#cdd6f4'
+        top = tk.Toplevel(self._root)
+        top.title("Live Captions")
+        top.configure(bg=BG)
+        top.attributes('-topmost', True)
+        top.geometry("860x190")
+        lbl = tk.Label(top, text="Listening…", bg=BG, fg=FG,
+                       font=('Segoe UI Variable Text', 16), wraplength=820,
+                       justify='right', anchor='sw')
+        lbl.pack(fill='both', expand=True, padx=16, pady=12)
+
+        def _on_close():
+            cb = getattr(self, 'on_captions_close', None)
+            if cb:
+                try:
+                    cb()
+                except Exception:
+                    pass
+            self.captions_hide()
+        top.protocol("WM_DELETE_WINDOW", _on_close)
+        self._captions_top, self._captions_label = top, lbl
+
+    def captions_update(self, text):
+        """Replace the caption text (worker thread -> Tk queue). Shows the tail so
+        a long transcript never overflows the window."""
+        def _do():
+            try:
+                if self._captions_label is None:
+                    self._create_captions_window()
+                if self._captions_label is None:
+                    return
+                t = (text or "").strip()
+                tail = t[-320:] if len(t) > 320 else t
+                is_rtl = _is_mostly_hebrew(tail) if tail else True
+                self._captions_label.configure(
+                    text=tail or "Listening…",
+                    justify='right' if is_rtl else 'left',
+                    anchor='se' if is_rtl else 'sw')
+            except Exception as e:
+                log.debug("captions_update failed: %s", e)
+        self._tk_queue.put(_do)
+
+    def captions_hide(self):
+        def _do():
+            try:
+                if self._captions_top is not None:
+                    self._captions_top.destroy()
+            except Exception:
+                pass
+            self._captions_top = self._captions_label = None
+        self._tk_queue.put(_do)
 
     def show_summary(self, title, text, on_open_file=None, on_save=None):
         """Pop up a window showing a summary (meeting OR the standalone
@@ -14708,6 +15474,138 @@ def play_beep(freq=800, duration_ms=150, device_index=None):
             pass
 
 
+class LiveCaptionsSession:
+    """Real-time captions via `gemini-3.5-transcribe-live` (BETA).
+
+    Captures the mic with the IN-PROCESS AudioRecorder (the default subprocess
+    recorder keeps no readable buffer - its audio lives in a child process),
+    streams it continuously to the Live API, and pushes interim transcripts to
+    the overlay caption window as they arrive (~every 0.5s, ~1s behind live -
+    measured). The WS session is rotated before the 10-min Live-API cap; the
+    running transcript carries across rotations. v1 is MIC-ONLY - capturing the
+    far side of a call (system audio) needs real-time loopback mixing, a
+    documented follow-up. Uses the same gemini_api_key.
+    """
+    SESSION_MAX_S = 540.0     # rotate ~90s before the 10-min Live-API cap
+    DRAIN_INTERVAL = 0.1      # how often to push mic audio to the socket
+
+    def __init__(self, app):
+        self.app = app
+        self._recorder = None
+        self._worker = None
+        self._stop = threading.Event()
+        self._finals = []      # finalized transcript text across rotations
+        self._active = False
+
+    def start(self):
+        key = (self.app.config.get("gemini_api_key") or "").strip()
+        if not key:
+            self.app.overlay.show_error("Set Gemini API key first")
+            return False
+        self._recorder = AudioRecorder(
+            input_device_index=self.app.config.get("input_device_index"))
+        try:
+            self._recorder.start()
+        except Exception as e:
+            log.error("Live captions: mic start failed: %s", e)
+            self.app.overlay.show_error("Mic unavailable for captions")
+            self._recorder = None
+            return False
+        self._active = True
+        self._stop.clear()
+        self._finals = []
+        self.app.overlay.on_captions_close = self.stop
+        self.app.overlay.captions_show()
+        self._worker = threading.Thread(target=self._run, daemon=True)
+        self._worker.start()
+        log.info("Live captions started (mic, gemini-3.5-transcribe-live)")
+        return True
+
+    def _drain_pcm(self):
+        """Raw PCM16 bytes captured since the last drain (mono 16 kHz)."""
+        if self._recorder is None:
+            return b""
+        audio = self._recorder.drain()
+        if len(audio) == 0:
+            return b""
+        return GeminiLiveTranscriber._audio_to_pcm16(audio)
+
+    def _run(self):
+        codes = lang_pack.gemini_language_codes(self.app.config)
+        key = self.app.config["gemini_api_key"]
+        while not self._stop.is_set():
+            stream = GeminiLiveStream(key, language_codes=codes)
+            try:
+                stream.start()
+            except Exception as e:
+                log.error("Live captions: session start failed: %s", e)
+                self.app.overlay.captions_update(
+                    "(captions unavailable: %s)" % str(e)[:70])
+                break
+            t0 = time.time()
+
+            def _feed(_stream=stream, _t0=t0):
+                while (not self._stop.is_set()
+                       and (time.time() - _t0) < self.SESSION_MAX_S):
+                    pcm = self._drain_pcm()
+                    if pcm:
+                        try:
+                            _stream.feed(pcm)
+                        except Exception:
+                            break
+                    time.sleep(self.DRAIN_INTERVAL)
+                try:
+                    _stream.end_audio()
+                except Exception:
+                    pass
+
+            ft = threading.Thread(target=_feed, daemon=True)
+            ft.start()
+            base = " ".join(self._finals).strip()
+
+            def _on_interim(txt, _base=base):
+                self.app.overlay.captions_update(
+                    (_base + " " + txt).strip() if _base else txt)
+
+            try:
+                # A generous idle timeout: normal speech pauses must NOT end the
+                # session (generationComplete after audioStreamEnd is the real
+                # terminator); this only backstops a dropped end marker.
+                final = stream.collect_final(on_interim=_on_interim, idle_timeout=60)
+            except Exception as e:
+                log.warning("Live captions: read loop error: %s", e)
+                final = None
+            ft.join(timeout=2)
+            stream.close()
+            if final:
+                self._finals.append(final)
+                self.app.overlay.captions_update(" ".join(self._finals).strip())
+        self._cleanup()
+
+    def stop(self):
+        """Signal the worker to finish the current session and tear down. Safe to
+        call from any thread (including the Tk window-close handler)."""
+        if not self._active:
+            return
+        self._active = False
+        self._stop.set()
+
+    def _cleanup(self):
+        try:
+            if self._recorder:
+                self._recorder.stop()
+        except Exception:
+            pass
+        self._recorder = None
+        try:
+            self.app.overlay.on_captions_close = None
+        except Exception:
+            pass
+        self.app.overlay.captions_hide()
+        self.app._captions_session = None
+        log.info("Live captions stopped")
+
+
 # ============================================================
 # System Tray Application
 # ============================================================
@@ -14961,6 +15859,26 @@ class LiaApp:
                 api_key=self.config["assemblyai_api_key"],
             )
 
+        # Gemini Transcribe client (dedicated BATCH STT model, free tier). Built
+        # lazily by _ensure_gemini_transcriber; shared by the gemini_transcribe
+        # (chunked) + gemini_diarize (whole-file, BETA) meeting models. Too slow
+        # for dictation (~3.6s/clip) - the streaming variant below handles that.
+        self._gemini_transcriber = None
+        # Gemini LIVE client (gemini-3.5-transcribe-live, streaming). Dictation
+        # backend "gemini_live" (~1.3s/clip, non-default) + the live-captions
+        # meeting mode. Built eagerly only when it is the active backend, else
+        # lazily by _ensure_gemini_live_transcriber.
+        self._gemini_live_transcriber = None
+        if (self.config.get("transcription_backend") == "gemini_live"
+                and (self.config.get("gemini_api_key") or "").strip()):
+            self._gemini_live_transcriber = GeminiLiveTranscriber(
+                api_key=self.config["gemini_api_key"],
+                language_codes=lang_pack.gemini_language_codes(self.config))
+            self._gemini_live_transcriber.custom_vocabulary = \
+                self._composed_vocabulary()
+        # Live-captions session (gemini-3.5-transcribe-live). None when idle.
+        self._captions_session = None
+
         # Meeting + file transcribe backend cache. Independent of the
         # press-to-talk Model menu — the user picks one of these via
         # Transcribe → Model and it controls all "long form" transcription
@@ -14994,9 +15912,11 @@ class LiaApp:
             self.transcriber = self._groq_transcriber
         elif backend == "remote" and self._remote_transcriber is not None:
             self.transcriber = self._remote_transcriber
+        elif backend == "gemini_live" and self._gemini_live_transcriber is not None:
+            self.transcriber = self._gemini_live_transcriber
         else:
             self.transcriber = self._local_transcriber
-            if backend in ("groq", "openai", "remote"):
+            if backend in ("groq", "openai", "remote", "gemini_live"):
                 log.warning("%s backend selected but not configured — falling back to local", backend)
                 self.config["transcription_backend"] = "local"
                 save_config(self.config)
@@ -15180,6 +16100,15 @@ class LiaApp:
                 "🗑  Cancel Meeting (discard)",
                 lambda: self._cancel_meeting(),
                 visible=lambda item: self._is_meeting_active(),
+            ),
+            # Live captions (gemini-3.5-transcribe-live) - real-time mic
+            # transcript. Dynamic Start/Stop label; visible only with a key.
+            pystray.MenuItem(
+                lambda item: ("⏹  Stop Live Captions"
+                              if self._live_captions_active()
+                              else "🔤  Live Captions (BETA)"),
+                lambda: self._toggle_live_captions(),
+                visible=lambda item: self._live_captions_available(),
             ),
             # History lives here (under the Start Meeting group) per user layout.
             pystray.MenuItem("History", lambda: self._show_history()),
@@ -18752,6 +19681,8 @@ class LiaApp:
         ("English Parakeet Local only", "local_parakeet_english", []),
         ("🖥  Local diarize (pyannote + Hebrew Turbo)", "local_pyannote_hebrew", []),
         ("🖥  Local diarize (pyannote + English Parakeet)", "local_pyannote_parakeet", []),
+        ("Gemini Transcribe (free · Google)", "gemini_transcribe", ["gemini_api_key"]),
+        ("Gemini diarize speakers (free · Google · BETA)", "gemini_diarize", ["gemini_api_key"]),
         ("AssemblyAI + Hebrew Turbo Local", "assemblyai_local_hebrew", ["assemblyai_api_key"]),
         ("AssemblyAI + GPT-4o", "assemblyai_universal_2", ["assemblyai_api_key"]),
         ("AssemblyAI only", "assemblyai_diarize_only", ["assemblyai_api_key"]),
@@ -18803,6 +19734,8 @@ class LiaApp:
         "local_parakeet_english": "English Parakeet (local)",
         "local_pyannote_hebrew": "Hebrew Turbo (local) · pyannote speakers",
         "local_pyannote_parakeet": "English Parakeet (local) · pyannote speakers",
+        "gemini_transcribe": "Gemini Transcribe (free · Google)",
+        "gemini_diarize": "Gemini Transcribe · speakers (free · Google)",
         "assemblyai_universal_2": "AssemblyAI → gpt-4o-transcribe",
         "assemblyai_local_hebrew": "AssemblyAI → Hebrew Turbo (local)",
         "assemblyai_diarize_only": "AssemblyAI",
@@ -19067,12 +20000,61 @@ class LiaApp:
                 self._composed_vocabulary()
         return self._remote_transcriber
 
+    def _ensure_gemini_transcriber(self):
+        """Build (once) + return the Gemini Transcribe client for the configured
+        gemini_api_key, or None if no key is set. Shared by the gemini_transcribe
+        (chunked) and gemini_diarize (whole-file) meeting models."""
+        key = (self.config.get("gemini_api_key") or "").strip()
+        if not key:
+            return None
+        if self._gemini_transcriber is None:
+            self._gemini_transcriber = GeminiTranscriber(
+                api_key=key,
+                language_codes=lang_pack.gemini_language_codes(self.config),
+            )
+            self._gemini_transcriber.custom_vocabulary = \
+                self._composed_vocabulary()
+        return self._gemini_transcriber
+
+    def _ensure_gemini_live_transcriber(self):
+        """Build (once) + return the Gemini LIVE (streaming) transcriber for the
+        configured gemini_api_key, or None if no key is set. Shared by the
+        gemini_live dictation backend and the live-captions meeting mode."""
+        key = (self.config.get("gemini_api_key") or "").strip()
+        if not key:
+            return None
+        if self._gemini_live_transcriber is None:
+            self._gemini_live_transcriber = GeminiLiveTranscriber(
+                api_key=key,
+                language_codes=lang_pack.gemini_language_codes(self.config))
+            self._gemini_live_transcriber.custom_vocabulary = \
+                self._composed_vocabulary()
+        return self._gemini_live_transcriber
+
     def _build_meeting_transcriber(self, key):
         """Create + load the transcriber for a given meeting_model key.
         Loading happens here so the first meeting/file action takes the hit;
         cache is populated by _resolve_meeting_model on success.
         """
         cb = lambda m: log.info("Meeting transcriber: %s", m)
+
+        if key in ("gemini_transcribe", "gemini_diarize"):
+            # gemini_transcribe = chunked (live transcript, non-diarized, like
+            # groq_turbo). gemini_diarize = whole-file speaker diarization via
+            # _run_diarize_job's "gemini" backend (is_diarized=True). Both share
+            # one client; language None => the he+en whitelist auto-detects
+            # (a meeting is routinely mixed - pinning "he" drops English).
+            t = self._ensure_gemini_transcriber()
+            if t is None:
+                log.warning("Meeting model %s requires gemini_api_key", key)
+                return (None, None, False)
+            try:
+                if t.model is None:
+                    t.load_model(callback=cb)
+            except Exception as e:
+                log.error("Meeting model %s load failed: %s", key, e)
+                return (None, None, False)
+            return (t, None, key == "gemini_diarize")
 
         if key == "remote_hebrew_turbo":
             # Chunked meeting transcribed on the home GPU (WhisperLive + ivrit.ai).
@@ -19680,6 +20662,7 @@ class LiaApp:
         ("OpenAI gpt-transcribe ⭐ (best)", "ivrit-ai/whisper-large-v3-turbo-ct2", "openai", False, "gpt-transcribe"),
         ("OpenAI gpt-4o-transcribe", "ivrit-ai/whisper-large-v3-turbo-ct2", "openai", False, "gpt-4o-transcribe"),
         ("Groq Turbo", "large-v3-turbo", "groq", False, ""),
+        ("Gemini Live (free · Google)", "ivrit-ai/whisper-large-v3-turbo-ct2", "gemini_live", False, ""),
         ("Hebrew Turbo Remote", "ivrit-ai/whisper-large-v3-turbo-ct2", "remote", False, ""),
     ]
 
@@ -19709,6 +20692,11 @@ class LiaApp:
             log.warning("Remote selected but no server URL — opening dialog")
             self.overlay.show_error("Set the Home Server URL first")
             self._set_remote_server()
+            return
+        if backend == "gemini_live" and not (self.config.get("gemini_api_key") or "").strip():
+            log.warning("Gemini Live selected but no API key — opening dialog")
+            self.overlay.show_error("Set Gemini API key first")
+            self._set_gemini_api_key()
             return
         # Update translate mode
         if current_translate != translate:
@@ -20467,10 +21455,15 @@ class LiaApp:
             # English variant (2026-08): same pyannote turns, Parakeet per turn.
             "local_pyannote_parakeet": "local_parakeet_english",
         }.get(model_key)
-        diarize_backend = ("local_pyannote"
-                           if model_key in ("local_pyannote_hebrew",
-                                            "local_pyannote_parakeet")
-                           else "assemblyai")
+        # Which engine finds the speaker turns. gemini_diarize returns text +
+        # word timestamps directly (no separate enhance pass, so it is not in
+        # diarize_enhance_model above); pyannote gives turns only; else AssemblyAI.
+        if model_key == "gemini_diarize":
+            diarize_backend = "gemini"
+        elif model_key in ("local_pyannote_hebrew", "local_pyannote_parakeet"):
+            diarize_backend = "local_pyannote"
+        else:
+            diarize_backend = "assemblyai"
         # Friendly transcription-engine name for the status card (computed AFTER
         # the keyless fallback so it reflects the model actually used).
         transcribe_label = self._meeting_transcribe_display(model_key)
@@ -20658,6 +21651,38 @@ class LiaApp:
                 self.overlay.show_error("Could not open live transcript")
         else:
             self.overlay.show_error("No transcript yet — first chunk lands in ~45s")
+
+    def _live_captions_active(self):
+        return getattr(self, "_captions_session", None) is not None
+
+    def _live_captions_available(self):
+        """Menu-visibility: needs a Gemini key (the Live model rides it)."""
+        return bool((self.config.get("gemini_api_key") or "").strip())
+
+    def _toggle_live_captions(self):
+        """Tray → 'Live Captions'. Start/stop real-time mic captions via
+        gemini-3.5-transcribe-live (BETA). Blocks while a meeting is recording -
+        both would open the same mic device."""
+        if self._captions_session is not None:
+            try:
+                self._captions_session.stop()
+            except Exception as e:
+                log.warning("Stop live captions failed: %s", e)
+            return
+        if self._is_meeting_active():
+            self.overlay.show_error("Stop the meeting first (shared mic)")
+            return
+        if self.is_recording:
+            self.overlay.show_error("Finish current recording first")
+            return
+        session = LiveCaptionsSession(self)
+        if session.start():
+            self._captions_session = session
+        try:
+            if self.tray_icon:
+                self.tray_icon.update_menu()
+        except Exception:
+            pass
 
     def _recap_meeting(self):
         """Tray → '📋 Recap & Continue'. Mid-meeting checkpoint: transcript +
@@ -22445,6 +23470,26 @@ class LiaApp:
                     return
             self.transcriber = t
             log.info("Transcription backend: Remote (home GPU)")
+        elif backend == "gemini_live":
+            key = (self.config.get("gemini_api_key") or "").strip()
+            if not key:
+                log.warning("Gemini Live selected but no API key — opening dialog")
+                self.overlay.show_error("Set Gemini API key first")
+                self._set_gemini_api_key()
+                return
+            t = self._ensure_gemini_live_transcriber()
+            if t is None:
+                self.overlay.show_error("Gemini Live unavailable")
+                return
+            if t.model is None:
+                try:
+                    t.load_model(callback=lambda msg: log.info(msg))
+                except Exception as e:
+                    log.error("Failed to init Gemini Live: %s", e)
+                    self.overlay.show_error(f"Gemini Live init failed: {str(e)[:80]}")
+                    return
+            self.transcriber = t
+            log.info("Transcription backend: Gemini Live (streaming)")
         else:
             self.transcriber = self._local_transcriber
             log.info("Transcription backend: Local")
@@ -22579,6 +23624,13 @@ class LiaApp:
         save_config(self.config)
         self._summary_cleaner = None
         self._llm_cleaner = self._make_cleanup_cleaner()
+        # Gemini also powers the meeting-transcription models + the gemini_live
+        # dictation backend now: drop any cached client + meeting entries so a
+        # new/fixed key takes effect immediately.
+        self._gemini_transcriber = None
+        self._gemini_live_transcriber = None
+        self._meeting_xcribers.pop("gemini_transcribe", None)
+        self._meeting_xcribers.pop("gemini_diarize", None)
         log.info("Gemini API key %s", "saved" if key else "cleared")
         return (True, "Saved." if key else "Cleared.")
 
@@ -22646,8 +23698,28 @@ class LiaApp:
             self.config["gemini_api_key"] = ""
             self._summary_cleaner = None
             self._llm_cleaner = self._make_cleanup_cleaner()
+            # Gemini powers meeting transcription + the gemini_live dictation
+            # backend too: drop cached clients and revert any meeting/file model
+            # or dictation backend that needs the (now gone) key so nothing shows
+            # a dead selection.
+            self._gemini_transcriber = None
+            self._gemini_live_transcriber = None
+            self._meeting_xcribers.pop("gemini_transcribe", None)
+            self._meeting_xcribers.pop("gemini_diarize", None)
+            reverted = False
+            if self.config.get("meeting_model") in ("gemini_transcribe", "gemini_diarize"):
+                self.config["meeting_model"] = "local_hebrew_turbo"
+                reverted = True
+            if self.config.get("file_transcribe_model") in ("gemini_transcribe", "gemini_diarize"):
+                self.config["file_transcribe_model"] = ""
+                reverted = True
+            if self.config.get("transcription_backend") == "gemini_live":
+                self.config["transcription_backend"] = "local"
+                self.transcriber = self._local_transcriber
+                reverted = True
             save_config(self.config)
-            return (True, "Key cleared.")
+            return (True, "Key cleared." + (" Reverted to Local."
+                                            if reverted else ""))
         if service == "hf":
             self.config["hf_token"] = ""
             save_config(self.config)
@@ -23246,6 +24318,7 @@ class LiaApp:
 
         has_oa = bool((c.get("openai_api_key") or "").strip())
         has_groq = bool((c.get("groq_api_key") or "").strip())
+        has_gm = bool((c.get("gemini_api_key") or "").strip())
         has_parakeet = self._parakeet_available()
         dictation = []
         for i, (label, model_id, backend, translate, om) in enumerate(
@@ -23265,7 +24338,8 @@ class LiaApp:
             # option is visible and transparent about what it needs, instead
             # of silently absent (the old openai behavior).
             key_missing = ((backend == "openai" and not has_oa)
-                           or (backend == "groq" and not has_groq))
+                           or (backend == "groq" and not has_groq)
+                           or (backend == "gemini_live" and not has_gm))
             # Ballpark pricing (2026-08-29, Naor's ask): a rough per-hour
             # figure so users grasp the cost order of magnitude before
             # picking a cloud model. Deliberately approximate.
@@ -23274,6 +24348,12 @@ class LiaApp:
                 wn = key_note("groq_api_key") + " · free tier"
             elif backend == "openai":
                 wn = key_note("openai_api_key") + " · ~$0.4 per audio hour"
+            elif backend == "gemini_live":
+                # Honest, measured hint (Naor's rule): free but slower + less
+                # private than Groq, so it is a clearly non-default option.
+                wn = (key_note("gemini_api_key")
+                      + " · free tier · ~1.3s/clip (slower than Groq) · "
+                        "Google may use free-tier audio to train its models")
             elif backend == "local":
                 # Hardware hint (2026-08-29, Naor's ask): what each local
                 # model needs so nobody is surprised by CPU wait times.
@@ -23291,7 +24371,14 @@ class LiaApp:
             if where_of(key) != "cloud":
                 return ""
             wn = key_note(*_key_reqs(reqs))
-            if wn:
+            if not wn:
+                return wn
+            # Per-key price: Gemini Transcribe is FREE-tier; every other cloud
+            # row is paid (~$0.4/audio hour). The free tier may use audio to
+            # improve Google's models - an honest privacy note, not marketing.
+            if key.startswith("gemini_"):
+                wn += " · free tier · Google may use free-tier audio to train its models"
+            else:
                 wn += " · ~$0.4 per meeting hour"
             return wn
         meeting = []
