@@ -68,7 +68,6 @@ Most dictation tools are subscriptions (SuperWhisper, Wispr Flow), cloud-locked 
 
 | | |
 |---|---|
-| **Live captions** | Real-time on-screen transcript of your mic as you speak, powered by Google's free `gemini-3.5-transcribe-live` streaming model (needs a Google AI Studio key). Tray -> Live Captions. Mic-only for now (the far side of a call is a follow-up). BETA. |
 | **Email search** | A fully local index of your Outlook mail (SQLite FTS5 + embeddings) with keyword search, semantic search, and "ask your email" over a local model. Windows + Outlook desktop only, and rougher than the rest of the app - treat it as an experiment that happens to be useful. |
 
 ## Quick start

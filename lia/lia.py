@@ -5387,8 +5387,8 @@ class GeminiLiveStream:
     incrementally. Live-verified 2026-08-30 on the author's key: setup ~0.22s,
     burst release-to-final 0.28s (3s clip) / 0.38s (10s) - fast enough for
     press-to-talk, unlike the 3.6s batch `gemini-3.5-transcribe`. Uses a SEPARATE
-    free-tier quota from the batch model. 10-min session cap (fine for dictation
-    clips + meeting chunks; live captions rotate the session).
+    free-tier quota from the batch model. 10-min session cap (never an issue for
+    press-to-talk clips, which open a fresh short-lived session each time).
 
     Protocol (verified):
       setup   -> {"setup":{"model":"models/gemini-3.5-transcribe-live",
@@ -5475,7 +5475,7 @@ class GeminiLiveStream:
     def collect_final(self, on_interim=None, idle_timeout=5):
         """Read until generationComplete/turnComplete; return the final transcript
         (falling back to the last interim if no explicit final arrived). Fires
-        on_interim(text) for each partial - used by the live-captions path.
+        on_interim(text) for each partial (available for a future streaming UI).
         generationComplete normally lands ~1s after audioStreamEnd (verified), so
         idle_timeout is only a backstop for a dropped end marker - kept modest to
         bound the worst case rather than hang."""
@@ -12135,10 +12135,6 @@ class OverlayNotification:
         self._wave_anim_running = False  # guard: is the self-driving tick live
         self._hide_after_id = None   # pending auto-hide Tk timer id
         self.silent = False          # when True, show_* methods no-op
-        # Live-captions window (Gemini Live). Persistent Toplevel, updated in
-        # real time from the captions session worker via the Tk queue.
-        self._captions_top = None
-        self._captions_label = None
         self._tk_queue = queue.Queue()
         # Tk-thread self-healing. The mainloop can die on a Tcl fault after long
         # uptime + display sleep/wake + DPI churn; under pythonw (stderr=None) that
@@ -13440,75 +13436,6 @@ class OverlayNotification:
         top.after(duration_ms,
                   lambda: _close_and(on_timeout if on_timeout is not None
                                      else on_dismiss))
-
-    # ---- Live captions (Gemini Live) -------------------------------------
-    def captions_show(self):
-        """Show (or reuse) the live-captions window. Tk-thread-safe. Always shown
-        even in silent_mode - the caption text IS the deliverable."""
-        self._tk_queue.put(self._create_captions_window)
-
-    def _create_captions_window(self):
-        if not self._root:
-            return
-        import tkinter as tk
-        if self._captions_top is not None:
-            try:
-                self._captions_top.deiconify()
-                self._captions_top.lift()
-                return
-            except Exception:
-                self._captions_top = None
-        BG, FG = '#11111b', '#cdd6f4'
-        top = tk.Toplevel(self._root)
-        top.title("Live Captions")
-        top.configure(bg=BG)
-        top.attributes('-topmost', True)
-        top.geometry("860x190")
-        lbl = tk.Label(top, text="Listening…", bg=BG, fg=FG,
-                       font=('Segoe UI Variable Text', 16), wraplength=820,
-                       justify='right', anchor='sw')
-        lbl.pack(fill='both', expand=True, padx=16, pady=12)
-
-        def _on_close():
-            cb = getattr(self, 'on_captions_close', None)
-            if cb:
-                try:
-                    cb()
-                except Exception:
-                    pass
-            self.captions_hide()
-        top.protocol("WM_DELETE_WINDOW", _on_close)
-        self._captions_top, self._captions_label = top, lbl
-
-    def captions_update(self, text):
-        """Replace the caption text (worker thread -> Tk queue). Shows the tail so
-        a long transcript never overflows the window."""
-        def _do():
-            try:
-                if self._captions_label is None:
-                    self._create_captions_window()
-                if self._captions_label is None:
-                    return
-                t = (text or "").strip()
-                tail = t[-320:] if len(t) > 320 else t
-                is_rtl = _is_mostly_hebrew(tail) if tail else True
-                self._captions_label.configure(
-                    text=tail or "Listening…",
-                    justify='right' if is_rtl else 'left',
-                    anchor='se' if is_rtl else 'sw')
-            except Exception as e:
-                log.debug("captions_update failed: %s", e)
-        self._tk_queue.put(_do)
-
-    def captions_hide(self):
-        def _do():
-            try:
-                if self._captions_top is not None:
-                    self._captions_top.destroy()
-            except Exception:
-                pass
-            self._captions_top = self._captions_label = None
-        self._tk_queue.put(_do)
 
     def show_summary(self, title, text, on_open_file=None, on_save=None):
         """Pop up a window showing a summary (meeting OR the standalone
@@ -15474,138 +15401,6 @@ def play_beep(freq=800, duration_ms=150, device_index=None):
             pass
 
 
-class LiveCaptionsSession:
-    """Real-time captions via `gemini-3.5-transcribe-live` (BETA).
-
-    Captures the mic with the IN-PROCESS AudioRecorder (the default subprocess
-    recorder keeps no readable buffer - its audio lives in a child process),
-    streams it continuously to the Live API, and pushes interim transcripts to
-    the overlay caption window as they arrive (~every 0.5s, ~1s behind live -
-    measured). The WS session is rotated before the 10-min Live-API cap; the
-    running transcript carries across rotations. v1 is MIC-ONLY - capturing the
-    far side of a call (system audio) needs real-time loopback mixing, a
-    documented follow-up. Uses the same gemini_api_key.
-    """
-    SESSION_MAX_S = 540.0     # rotate ~90s before the 10-min Live-API cap
-    DRAIN_INTERVAL = 0.1      # how often to push mic audio to the socket
-
-    def __init__(self, app):
-        self.app = app
-        self._recorder = None
-        self._worker = None
-        self._stop = threading.Event()
-        self._finals = []      # finalized transcript text across rotations
-        self._active = False
-
-    def start(self):
-        key = (self.app.config.get("gemini_api_key") or "").strip()
-        if not key:
-            self.app.overlay.show_error("Set Gemini API key first")
-            return False
-        self._recorder = AudioRecorder(
-            input_device_index=self.app.config.get("input_device_index"))
-        try:
-            self._recorder.start()
-        except Exception as e:
-            log.error("Live captions: mic start failed: %s", e)
-            self.app.overlay.show_error("Mic unavailable for captions")
-            self._recorder = None
-            return False
-        self._active = True
-        self._stop.clear()
-        self._finals = []
-        self.app.overlay.on_captions_close = self.stop
-        self.app.overlay.captions_show()
-        self._worker = threading.Thread(target=self._run, daemon=True)
-        self._worker.start()
-        log.info("Live captions started (mic, gemini-3.5-transcribe-live)")
-        return True
-
-    def _drain_pcm(self):
-        """Raw PCM16 bytes captured since the last drain (mono 16 kHz)."""
-        if self._recorder is None:
-            return b""
-        audio = self._recorder.drain()
-        if len(audio) == 0:
-            return b""
-        return GeminiLiveTranscriber._audio_to_pcm16(audio)
-
-    def _run(self):
-        codes = lang_pack.gemini_language_codes(self.app.config)
-        key = self.app.config["gemini_api_key"]
-        while not self._stop.is_set():
-            stream = GeminiLiveStream(key, language_codes=codes)
-            try:
-                stream.start()
-            except Exception as e:
-                log.error("Live captions: session start failed: %s", e)
-                self.app.overlay.captions_update(
-                    "(captions unavailable: %s)" % str(e)[:70])
-                break
-            t0 = time.time()
-
-            def _feed(_stream=stream, _t0=t0):
-                while (not self._stop.is_set()
-                       and (time.time() - _t0) < self.SESSION_MAX_S):
-                    pcm = self._drain_pcm()
-                    if pcm:
-                        try:
-                            _stream.feed(pcm)
-                        except Exception:
-                            break
-                    time.sleep(self.DRAIN_INTERVAL)
-                try:
-                    _stream.end_audio()
-                except Exception:
-                    pass
-
-            ft = threading.Thread(target=_feed, daemon=True)
-            ft.start()
-            base = " ".join(self._finals).strip()
-
-            def _on_interim(txt, _base=base):
-                self.app.overlay.captions_update(
-                    (_base + " " + txt).strip() if _base else txt)
-
-            try:
-                # A generous idle timeout: normal speech pauses must NOT end the
-                # session (generationComplete after audioStreamEnd is the real
-                # terminator); this only backstops a dropped end marker.
-                final = stream.collect_final(on_interim=_on_interim, idle_timeout=60)
-            except Exception as e:
-                log.warning("Live captions: read loop error: %s", e)
-                final = None
-            ft.join(timeout=2)
-            stream.close()
-            if final:
-                self._finals.append(final)
-                self.app.overlay.captions_update(" ".join(self._finals).strip())
-        self._cleanup()
-
-    def stop(self):
-        """Signal the worker to finish the current session and tear down. Safe to
-        call from any thread (including the Tk window-close handler)."""
-        if not self._active:
-            return
-        self._active = False
-        self._stop.set()
-
-    def _cleanup(self):
-        try:
-            if self._recorder:
-                self._recorder.stop()
-        except Exception:
-            pass
-        self._recorder = None
-        try:
-            self.app.overlay.on_captions_close = None
-        except Exception:
-            pass
-        self.app.overlay.captions_hide()
-        self.app._captions_session = None
-        log.info("Live captions stopped")
-
-
 # ============================================================
 # System Tray Application
 # ============================================================
@@ -15865,9 +15660,9 @@ class LiaApp:
         # for dictation (~3.6s/clip) - the streaming variant below handles that.
         self._gemini_transcriber = None
         # Gemini LIVE client (gemini-3.5-transcribe-live, streaming). Dictation
-        # backend "gemini_live" (~1.3s/clip, non-default) + the live-captions
-        # meeting mode. Built eagerly only when it is the active backend, else
-        # lazily by _ensure_gemini_live_transcriber.
+        # backend "gemini_live" (~1.3s/clip, non-default). Built eagerly only
+        # when it is the active backend, else lazily by
+        # _ensure_gemini_live_transcriber.
         self._gemini_live_transcriber = None
         if (self.config.get("transcription_backend") == "gemini_live"
                 and (self.config.get("gemini_api_key") or "").strip()):
@@ -15876,8 +15671,6 @@ class LiaApp:
                 language_codes=lang_pack.gemini_language_codes(self.config))
             self._gemini_live_transcriber.custom_vocabulary = \
                 self._composed_vocabulary()
-        # Live-captions session (gemini-3.5-transcribe-live). None when idle.
-        self._captions_session = None
 
         # Meeting + file transcribe backend cache. Independent of the
         # press-to-talk Model menu — the user picks one of these via
@@ -16100,15 +15893,6 @@ class LiaApp:
                 "🗑  Cancel Meeting (discard)",
                 lambda: self._cancel_meeting(),
                 visible=lambda item: self._is_meeting_active(),
-            ),
-            # Live captions (gemini-3.5-transcribe-live) - real-time mic
-            # transcript. Dynamic Start/Stop label; visible only with a key.
-            pystray.MenuItem(
-                lambda item: ("⏹  Stop Live Captions"
-                              if self._live_captions_active()
-                              else "🔤  Live Captions (BETA)"),
-                lambda: self._toggle_live_captions(),
-                visible=lambda item: self._live_captions_available(),
             ),
             # History lives here (under the Start Meeting group) per user layout.
             pystray.MenuItem("History", lambda: self._show_history()),
@@ -20018,8 +19802,8 @@ class LiaApp:
 
     def _ensure_gemini_live_transcriber(self):
         """Build (once) + return the Gemini LIVE (streaming) transcriber for the
-        configured gemini_api_key, or None if no key is set. Shared by the
-        gemini_live dictation backend and the live-captions meeting mode."""
+        configured gemini_api_key, or None if no key is set. Used by the
+        gemini_live dictation backend."""
         key = (self.config.get("gemini_api_key") or "").strip()
         if not key:
             return None
@@ -21651,38 +21435,6 @@ class LiaApp:
                 self.overlay.show_error("Could not open live transcript")
         else:
             self.overlay.show_error("No transcript yet — first chunk lands in ~45s")
-
-    def _live_captions_active(self):
-        return getattr(self, "_captions_session", None) is not None
-
-    def _live_captions_available(self):
-        """Menu-visibility: needs a Gemini key (the Live model rides it)."""
-        return bool((self.config.get("gemini_api_key") or "").strip())
-
-    def _toggle_live_captions(self):
-        """Tray → 'Live Captions'. Start/stop real-time mic captions via
-        gemini-3.5-transcribe-live (BETA). Blocks while a meeting is recording -
-        both would open the same mic device."""
-        if self._captions_session is not None:
-            try:
-                self._captions_session.stop()
-            except Exception as e:
-                log.warning("Stop live captions failed: %s", e)
-            return
-        if self._is_meeting_active():
-            self.overlay.show_error("Stop the meeting first (shared mic)")
-            return
-        if self.is_recording:
-            self.overlay.show_error("Finish current recording first")
-            return
-        session = LiveCaptionsSession(self)
-        if session.start():
-            self._captions_session = session
-        try:
-            if self.tray_icon:
-                self.tray_icon.update_menu()
-        except Exception:
-            pass
 
     def _recap_meeting(self):
         """Tray → '📋 Recap & Continue'. Mid-meeting checkpoint: transcript +
