@@ -11522,18 +11522,18 @@ def _stamp_lia_launcher(exe_path):
         return False
     try:
         vi = VSVersionInfo(
-            ffi=FixedFileInfo(filevers=(1, 0, 0, 0), prodvers=(1, 0, 0, 0),
+            ffi=FixedFileInfo(filevers=(1, 1, 0, 0), prodvers=(1, 1, 0, 0),
                               mask=0x3f, flags=0x0, OS=0x40004,
                               fileType=0x1, subtype=0x0),
             kids=[
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.0.0.0'),
+                    StringStruct('FileVersion', '1.1.0.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.0.0.0'),
+                    StringStruct('ProductVersion', '1.1.0.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],

@@ -17,7 +17,7 @@
 ; ============================================================
 
 #define AppName       "Lia"
-#define AppVersion    "1.0.1"
+#define AppVersion    "1.1.0"
 #define AppPublisher  "Naor Daniel"
 #define AppURL        "https://github.com/Danaor/lia"
 #define AppExeName    "Lia.exe"
