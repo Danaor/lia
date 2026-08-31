@@ -19368,13 +19368,13 @@ class LiaApp:
         ("English Parakeet Local only", "local_parakeet_english", []),
         ("🖥  Local diarize (pyannote + Hebrew Turbo)", "local_pyannote_hebrew", []),
         ("🖥  Local diarize (pyannote + English Parakeet)", "local_pyannote_parakeet", []),
-        ("Gemini Transcribe (free · Google)", "gemini_transcribe", ["gemini_api_key"]),
-        ("Gemini diarize speakers (free · Google · BETA)", "gemini_diarize", ["gemini_api_key"]),
+        ("Gemini 3.5 transcribe", "gemini_transcribe", ["gemini_api_key"]),
+        ("Gemini 3.5 transcribe · speakers (BETA)", "gemini_diarize", ["gemini_api_key"]),
         ("AssemblyAI + Hebrew Turbo Local", "assemblyai_local_hebrew", ["assemblyai_api_key"]),
-        ("AssemblyAI + GPT-4o", "assemblyai_universal_2", ["assemblyai_api_key"]),
-        ("AssemblyAI only", "assemblyai_diarize_only", ["assemblyai_api_key"]),
-        ("GPT-transcribe only", "openai_gpt_transcribe", ["openai_api_key"]),
-        ("GPT-4o only", "openai_gpt4o", ["openai_api_key"]),
+        ("AssemblyAI + OpenAI GPT-4o", "assemblyai_universal_2", ["assemblyai_api_key"]),
+        ("AssemblyAI", "assemblyai_diarize_only", ["assemblyai_api_key"]),
+        ("OpenAI GPT transcribe", "openai_gpt_transcribe", ["openai_api_key"]),
+        ("OpenAI GPT-4o transcribe", "openai_gpt4o", ["openai_api_key"]),
         ("Hebrew Turbo Remote", "remote_hebrew_turbo", ["remote_server_url"]),
     ]
 
@@ -19389,14 +19389,14 @@ class LiaApp:
         # correct max_completion_tokens request shaping. ChatGPT 5.5 removed
         # from the picker 2026-08-03 (superseded by the 5.6 tier). `gpt-5.6-luna`
         # also exists on the account (cheapest — 28x under SOL per summary).
-        ("☁  ChatGPT 5.6-SOL (cloud)", "gpt-5.6-sol", ""),
-        ("☁  ChatGPT 5.6-Terra (cloud)", "gpt-5.6-terra", ""),
+        ("☁  OpenAI ChatGPT 5.6 Sol", "gpt-5.6-sol", ""),
+        ("☁  OpenAI ChatGPT 5.6 Terra", "gpt-5.6-terra", ""),
         # Gemini 3.7 Flash via Google AI Studio's OpenAI-compat endpoint — the
         # strongest FREE-tier model (no credit card; own gemini_api_key), the
         # smarter workhorse that superseded 3.6 (also free, verified 2026-08-15).
         # A zero-cost summary option. NOTE: the free tier may use content to
         # improve Google's models — avoid it for sensitive meetings.
-        ("☁  Gemini 3.7 Flash (free · Google)", "gemini-3.7-flash", GEMINI_CHAT_URL),
+        ("☁  Gemini 3.7 Flash", "gemini-3.7-flash", GEMINI_CHAT_URL),
         # Gemma 4 31B dense (Google). A blind judge panel on real Hebrew meetings
         # rated it the best LOCAL model — tied with gpt-5.5 overall, and the
         # most faithful of the local candidates.
@@ -19411,19 +19411,19 @@ class LiaApp:
     # text for each meeting_model key — shown on the meeting status card
     # ("Transcribing with …") so the user always knows which engine is running.
     _MEETING_TRANSCRIBE_NAMES = {
-        "openai_gpt_transcribe": "gpt-transcribe",
-        "openai_gpt4o": "gpt-4o-transcribe",
-        "openai_gpt4o_mini": "gpt-4o-mini-transcribe",
-        "groq_turbo": "Groq Turbo",
+        "openai_gpt_transcribe": "OpenAI GPT transcribe",
+        "openai_gpt4o": "OpenAI GPT-4o transcribe",
+        "openai_gpt4o_mini": "OpenAI GPT-4o-mini transcribe",
+        "groq_turbo": "Groq Whisper Large v3 Turbo",
         "local_hebrew_turbo": "Hebrew Turbo (local)",
         "remote_hebrew_turbo": "Hebrew Turbo (home GPU)",
         "local_english_distil": "English Distil (local)",
         "local_parakeet_english": "English Parakeet (local)",
         "local_pyannote_hebrew": "Hebrew Turbo (local) · pyannote speakers",
         "local_pyannote_parakeet": "English Parakeet (local) · pyannote speakers",
-        "gemini_transcribe": "Gemini Transcribe (free · Google)",
-        "gemini_diarize": "Gemini Transcribe · speakers (free · Google)",
-        "assemblyai_universal_2": "AssemblyAI → gpt-4o-transcribe",
+        "gemini_transcribe": "Gemini 3.5 transcribe",
+        "gemini_diarize": "Gemini 3.5 transcribe · speakers",
+        "assemblyai_universal_2": "AssemblyAI → OpenAI GPT-4o transcribe",
         "assemblyai_local_hebrew": "AssemblyAI → Hebrew Turbo (local)",
         "assemblyai_diarize_only": "AssemblyAI",
     }
@@ -20331,10 +20331,10 @@ class LiaApp:
         ("English Parakeet Local ⭐ (best English)", "parakeet-tdt-0.6b-v2", "local", False, ""),
         ("English Distil Local", "distil-large-v3", "local", False, ""),
         ("General Turbo Local (multilingual · 99 languages)", "large-v3-turbo", "local", False, ""),
-        ("OpenAI gpt-transcribe ⭐ (best)", "ivrit-ai/whisper-large-v3-turbo-ct2", "openai", False, "gpt-transcribe"),
-        ("OpenAI gpt-4o-transcribe", "ivrit-ai/whisper-large-v3-turbo-ct2", "openai", False, "gpt-4o-transcribe"),
-        ("Groq Turbo", "large-v3-turbo", "groq", False, ""),
-        ("Gemini (free · Google)", "ivrit-ai/whisper-large-v3-turbo-ct2", "gemini", False, ""),
+        ("OpenAI GPT transcribe", "ivrit-ai/whisper-large-v3-turbo-ct2", "openai", False, "gpt-transcribe"),
+        ("OpenAI GPT-4o transcribe", "ivrit-ai/whisper-large-v3-turbo-ct2", "openai", False, "gpt-4o-transcribe"),
+        ("Groq Whisper Large v3 Turbo", "large-v3-turbo", "groq", False, ""),
+        ("Gemini 3.5 transcribe", "ivrit-ai/whisper-large-v3-turbo-ct2", "gemini", False, ""),
         ("Hebrew Turbo Remote", "ivrit-ai/whisper-large-v3-turbo-ct2", "remote", False, ""),
     ]
 
@@ -20872,9 +20872,9 @@ class LiaApp:
     # earlier. gpt-5.x shaping (max_completion_tokens, no temperature) is in
     # OpenAILLMCleaner.clean().
     CLEANUP_OPENAI_MODELS = [
-        ("GPT-5.6 Luna — light, fast ⭐", "gpt-5.6-luna"),
-        ("GPT-5.6 Sol — strongest", "gpt-5.6-sol"),
-        ("GPT-5.6 Terra — strongest (alt)", "gpt-5.6-terra"),
+        ("OpenAI ChatGPT 5.6 Luna - light, fast ⭐", "gpt-5.6-luna"),
+        ("OpenAI ChatGPT 5.6 Sol - strongest", "gpt-5.6-sol"),
+        ("OpenAI ChatGPT 5.6 Terra - strongest (alt)", "gpt-5.6-terra"),
     ]
 
     # Gemini cleanup models (FREE tier, own gemini_api_key, via the OpenAI-compat
@@ -23990,14 +23990,14 @@ class LiaApp:
             # picking a cloud model. Deliberately approximate.
             wn = ""
             if backend == "groq":
-                wn = key_note("groq_api_key") + " · free tier"
+                wn = key_note("groq_api_key") + " · free tier available"
             elif backend == "openai":
                 wn = key_note("openai_api_key") + " · ~$0.4 per audio hour"
             elif backend == "gemini":
                 # Honest, measured hint (Naor's rule): free but slower + less
                 # private than Groq, so it is a clearly non-default option.
                 wn = (key_note("gemini_api_key")
-                      + " · free tier · ~3.6s/clip (slower than Groq) · "
+                      + " · free tier available · ~3.6s/clip (slower than Groq) · "
                         "Google may use free-tier audio to train its models")
             elif backend == "local":
                 # Hardware hint (2026-08-29, Naor's ask): what each local
@@ -24022,7 +24022,7 @@ class LiaApp:
             # row is paid (~$0.4/audio hour). The free tier may use audio to
             # improve Google's models - an honest privacy note, not marketing.
             if key.startswith("gemini_"):
-                wn += " · free tier · Google may use free-tier audio to train its models"
+                wn += " · free tier available · Google may use free-tier audio to train its models"
             else:
                 wn += " · ~$0.4 per meeting hour"
             return wn
@@ -24087,7 +24087,7 @@ class LiaApp:
             s_wn = ""
             if s_where == "cloud":
                 if url == GEMINI_CHAT_URL:
-                    s_wn = key_note("gemini_api_key") + " · free"
+                    s_wn = key_note("gemini_api_key") + " · free tier available"
                 else:
                     # MEASURED per-summary cost (2026-08-03, incl. hidden
                     # reasoning tokens): SOL ~$0.106, Terra ~$0.024.

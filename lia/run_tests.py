@@ -3626,7 +3626,7 @@ def t_cleanup_provider_and_models():
     app._ollama_cache = None
     picker = [r["label"] for r in App._settings_tables(app, ollama=False)["cleanup_models"]]
     assert any("Groq" in l for l in picker), picker
-    assert any("GPT-5.6 Sol" in l for l in picker), picker
+    assert any("ChatGPT 5.6 Sol" in l for l in picker), picker
     assert not any("GPT-4o" in l for l in picker), picker
 
     # _make_cleanup_cleaner routes to the right client class.
