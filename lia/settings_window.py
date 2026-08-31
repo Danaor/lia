@@ -479,7 +479,11 @@ APP_JS = r"""
         '<div class="btnrow">'+btn("Refresh devices","refresh",[],"ghost",true)+'</div>'+
       '</div>'+
       '<div class="page"><div class="section-title">Microphone</div>'+mics.join('')+'</div>'+
-      loops;
+      loops+
+      '<div class="page"><div class="section-title">Local Whisper device ('+esc(S.whisper_device_label||"Auto")+')</div>'+
+        '<div class="radio-row">'+((S.tables||{}).device||[]).map(function(r){
+          return radio("dev","set_whisper_device",r.key,"str",r.label,r.checked,true,"");
+        }).join('')+'</div></div>';
   };
 
   PAGES.models = function(){
@@ -513,11 +517,7 @@ APP_JS = r"""
         '</div>'+
         '<div class="hint">The language meeting and text summaries are written in, regardless of the language spoken.</div>'+
       '</div>'+
-      group("Transcribe-file model", t.file, "set_file_model", "key", "str")+
-      '<div class="page"><div class="section-title">Local Whisper device ('+esc(S.whisper_device_label||"Auto")+')</div>'+
-        (t.device||[]).map(function(r){
-          return radio("dev","set_whisper_device",r.key,"str",r.label,r.checked,true,"");
-        }).join('')+'</div>';
+      group("Transcribe-file model", t.file, "set_file_model", "key", "str");
   };
 
   PAGES.cleanup = function(){
