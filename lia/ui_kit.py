@@ -251,9 +251,9 @@ input:disabled,select:disabled,textarea:disabled{opacity:.55; cursor:default;}
    accent border, bold ink, and a filled accent dot - so the current pick is
    unmistakable and the group never blurs into its header. */
 .radio{
-  display:flex; align-items:center; gap:12px; cursor:pointer; user-select:none;
-  padding:11px 14px; margin-bottom:8px; color:var(--ink-2);
-  border:1.5px solid var(--line); border-radius:var(--r-s); background:var(--card);
+  display:flex; align-items:center; gap:10px; cursor:pointer; user-select:none;
+  padding:7px 12px; margin-bottom:5px; color:var(--ink-2); line-height:1.25;
+  border:1px solid var(--line); border-radius:var(--r-s); background:var(--card);
   transition:background var(--tr),border-color var(--tr),color var(--tr);
 }
 .radio:last-child{margin-bottom:0;}
@@ -269,11 +269,13 @@ input:disabled,select:disabled,textarea:disabled{opacity:.55; cursor:default;}
           border:1px solid var(--line-2);}
 .wb.remote{background:transparent; color:var(--faint);
            border:1px solid var(--line-2);}
-.wb-group{margin-inline-start:auto; display:flex; flex-direction:column;
-          align-items:flex-end; gap:1px;}
+/* badge + hint on ONE line (badge pinned far right for column scanning, hint to
+   its left) so an option row stays a single line and the list reads tight. */
+.wb-group{margin-inline-start:auto; display:flex; flex-direction:row-reverse;
+          align-items:center; gap:10px; min-width:0;}
 .wb-group .wb{margin-inline-start:0;}
-.wb-sub{font-size:9px; color:var(--faint); white-space:nowrap;
-        letter-spacing:normal; font-weight:400; padding-inline-end:2px;}
+.wb-sub{font-size:11px; color:var(--muted); white-space:nowrap; text-align:end;
+        letter-spacing:normal; font-weight:400; overflow:hidden; text-overflow:ellipsis;}
 .wb.beta{background:var(--warn-soft); color:var(--warn);
          border:1px solid var(--warn);}
 .radio input{position:absolute; opacity:0; width:0; height:0;}

@@ -23997,8 +23997,8 @@ class LiaApp:
                 # Honest, measured hint (Naor's rule): free but slower + less
                 # private than Groq, so it is a clearly non-default option.
                 wn = (key_note("gemini_api_key")
-                      + " · free tier available · ~3.6s/clip (slower than Groq) · "
-                        "Google may use free-tier audio to train its models")
+                      + " · free tier available · ~3.6s, slower than Groq · "
+                        "trains on your audio")
             elif backend == "local":
                 # Hardware hint (2026-08-29, Naor's ask): what each local
                 # model needs so nobody is surprised by CPU wait times.
@@ -24022,7 +24022,7 @@ class LiaApp:
             # row is paid (~$0.4/audio hour). The free tier may use audio to
             # improve Google's models - an honest privacy note, not marketing.
             if key.startswith("gemini_"):
-                wn += " · free tier available · Google may use free-tier audio to train its models"
+                wn += " · free tier available · trains on your audio"
             else:
                 wn += " · ~$0.4 per meeting hour"
             return wn
