@@ -483,14 +483,17 @@ APP_JS = r"""
       loops = '<div class="page"><div class="section-title">System audio</div>'+L.join('')+'</div>';
     }
     return '<div class="content-head"><h1>Audio</h1></div>'+
-      '<div class="page">'+
+      '<div class="page"><div class="section-title">Recording sources</div>'+
         sw("Record my microphone", micOn, "toggle_record_mic")+'<br>'+
         sw("Record system audio", sysOn, "toggle_record_system", !S.loopback_available)+
+        '<div class="hint">Whether each source is captured at all. Which devices are used is set below (Dictation / Meeting microphone).</div>'+
         '<div class="btnrow">'+btn("Refresh devices","refresh",[],"ghost",true)+'</div>'+
       '</div>'+
-      '<div class="page"><div class="section-title">Dictation microphone</div>'+mics.join('')+'</div>'+
+      '<div class="page"><div class="section-title">Dictation microphone</div>'+mics.join('')+
+        '<div class="hint">The mic used for press-to-talk dictation.</div>'+
+      '</div>'+
       '<div class="page"><div class="section-title">Meeting microphone</div>'+mmics.join('')+
-        '<div class="hint">Which mic records YOUR side of a meeting. Pick your call headset here to get its close-up quality in meeting transcripts, while the mic above stays free for dictating mid-meeting. If this device is unplugged, meetings fall back to the dictation mic.</div>'+
+        '<div class="hint">The mic that records YOUR side of a meeting (needs "Record my microphone" on above). Pick your call headset here for its close-up quality in meeting transcripts, while the Dictation microphone stays free for dictating mid-meeting. If this device is unplugged, meetings fall back to the dictation mic.</div>'+
       '</div>'+
       loops;
   };
