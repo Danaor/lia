@@ -109,8 +109,8 @@ Optional cloud speed: get a free [Groq key](https://console.groq.com/keys), past
 
 | Purpose | Local (free, offline) | Cloud (optional) |
 |---|---|---|
-| Hebrew dictation | ivrit.ai Whisper large-v3-turbo | Groq Whisper, OpenAI gpt-transcribe, Gemini Live (free · ~1.3s) |
-| English dictation | **NVIDIA Parakeet TDT 0.6B** (best English WER, realtime on CPU) | Groq Whisper, OpenAI gpt-transcribe, Gemini Live (free) |
+| Hebrew dictation | ivrit.ai Whisper large-v3-turbo | Groq Whisper, OpenAI gpt-transcribe, Gemini (free) |
+| English dictation | **NVIDIA Parakeet TDT 0.6B** (best English WER, realtime on CPU) | Groq Whisper, OpenAI gpt-transcribe, Gemini (free) |
 | Meetings | chunked or diarized (pyannote) variants of the above | Gemini Transcribe (free tier, incl. speaker diarization - BETA), AssemblyAI, OpenAI |
 | Summaries | Gemma via [Ollama](https://ollama.com) | OpenAI, Gemini (free tier) |
 

@@ -904,61 +904,27 @@ _test("GeminiLiveStream protocol messages + transcript parsing",
       t_gemini_live_stream_protocol)
 
 
-def t_gemini_live_transcriber_wiring():
-    """GeminiLiveTranscriber bursts recorded audio through a stream and returns
-    RTL-marked text; a forced language pins a single BCP-47 code."""
-    import lia as w
-    import numpy as _np
-    captured = {}
-
-    class _FakeStream:
-        def __init__(self, api_key, language_codes=None, connect_timeout=10):
-            captured["codes"] = language_codes
-        def transcribe_pcm(self, pcm, on_interim=None, chunk_ms=100,
-                           pace_ms=0, idle_timeout=8):
-            captured["pcm_len"] = len(pcm)
-            captured["pace_ms"] = pace_ms
-            return "שלום עולם"
-
-    orig = w.GeminiLiveStream
-    w.GeminiLiveStream = _FakeStream
-    try:
-        t = w.GeminiLiveTranscriber(api_key="fake", language_codes=["he-IL", "en-US"])
-        t.load_model()
-        audio = (_np.random.randn(16000).astype(_np.float32) * 0.1)
-        out = t.transcribe(audio, language=None)
-        assert out.startswith("‏") and "שלום עולם" in out, repr(out)
-        assert captured["codes"] == ["he-IL", "en-US"], captured["codes"]
-        assert captured["pcm_len"] > 0
-        t.transcribe(audio, language="en")
-        assert captured["codes"] == ["en-US"], captured["codes"]
-    finally:
-        w.GeminiLiveStream = orig
-
-
-_test("GeminiLiveTranscriber bursts audio + RTL + language pin",
-      t_gemini_live_transcriber_wiring)
-
-
-def t_gemini_live_dictation_registered():
-    """gemini_live is a dictation backend: a Menu row, an API-key guard, startup
-    selection, _set_backend + key-clear all handle it."""
+def t_gemini_dictation_registered():
+    """The dictation Gemini backend is the BATCH 'gemini' (gemini-3.5-transcribe):
+    a Menu row, startup selection, _set_backend + key-clear all handle it. The
+    old streaming GeminiLiveTranscriber / gemini_live backend is gone (moved to
+    backlog); GeminiLiveStream is kept as the foundation for that future work."""
     import inspect
     import lia as w
     App = w.LiaApp
     rows = {r[2] for r in App._MENU_MODELS_ORDERED}
-    assert "gemini_live" in rows, rows
+    assert "gemini" in rows and "gemini_live" not in rows, rows
+    assert not hasattr(w, "GeminiLiveTranscriber"), "GeminiLiveTranscriber should be removed"
+    assert hasattr(w, "GeminiLiveStream"), "GeminiLiveStream kept for the backlog"
     src = inspect.getsource(App)
-    assert 'backend == "gemini_live" and self._gemini_live_transcriber is not None' in src
-    assert 'elif backend == "gemini_live":' in inspect.getsource(App._set_backend)
-    assert "_ensure_gemini_live_transcriber" in src
-    # key-clear reverts a gemini_live dictation backend to local
+    assert 'backend == "gemini" and self._gemini_transcriber is not None' in src
+    assert 'elif backend == "gemini":' in inspect.getsource(App._set_backend)
+    # key-clear reverts a gemini dictation backend to local + drops the client
     app = App.__new__(App)
-    app.config = {"gemini_api_key": "AQ.x", "transcription_backend": "gemini_live",
+    app.config = {"gemini_api_key": "AQ.x", "transcription_backend": "gemini",
                   "meeting_model": "local_hebrew_turbo", "file_transcribe_model": ""}
     app._summary_cleaner = None
     app._gemini_transcriber = object()
-    app._gemini_live_transcriber = object()
     app._local_transcriber = "LOCAL"
     app._meeting_xcribers = {}
     app._make_cleanup_cleaner = lambda: None
@@ -971,11 +937,11 @@ def t_gemini_live_dictation_registered():
     assert ok
     assert app.config["transcription_backend"] == "local", app.config["transcription_backend"]
     assert app.transcriber == "LOCAL"
-    assert app._gemini_live_transcriber is None
+    assert app._gemini_transcriber is None
 
 
-_test("gemini_live dictation backend registered + key-clear reverts",
-      t_gemini_live_dictation_registered)
+_test("gemini dictation backend (batch) registered + key-clear reverts",
+      t_gemini_dictation_registered)
 
 
 def t_audio_recorder_construct():
