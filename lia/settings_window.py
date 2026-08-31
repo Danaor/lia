@@ -450,7 +450,11 @@ APP_JS = r"""
         sw("Start with Windows", !!S.auto_start, "toggle_auto_start")+
       '</div>'+
       '<div class="page"><div class="section-title">Beep output</div>'+beepRows.join('')+'</div>'+
-      '<div class="page"><div class="section-title">Keyboard shortcuts</div>'+shortcuts+'</div>';
+      '<div class="page"><div class="section-title">Keyboard shortcuts</div>'+shortcuts+'</div>'+
+      '<div class="page"><div class="section-title">Local Whisper device ('+esc(S.whisper_device_label||"Auto")+')</div>'+
+        '<div class="radio-row">'+((S.tables||{}).device||[]).map(function(r){
+          return radio("dev","set_whisper_device",r.key,"str",r.label,r.checked,true,"");
+        }).join('')+'</div></div>';
   };
 
   PAGES.audio = function(){
@@ -484,15 +488,11 @@ APP_JS = r"""
         sw("Record system audio", sysOn, "toggle_record_system", !S.loopback_available)+
         '<div class="btnrow">'+btn("Refresh devices","refresh",[],"ghost",true)+'</div>'+
       '</div>'+
-      '<div class="page"><div class="section-title">Microphone</div>'+mics.join('')+'</div>'+
+      '<div class="page"><div class="section-title">Dictation microphone</div>'+mics.join('')+'</div>'+
       '<div class="page"><div class="section-title">Meeting microphone</div>'+mmics.join('')+
         '<div class="hint">Which mic records YOUR side of a meeting. Pick your call headset here to get its close-up quality in meeting transcripts, while the mic above stays free for dictating mid-meeting. If this device is unplugged, meetings fall back to the dictation mic.</div>'+
       '</div>'+
-      loops+
-      '<div class="page"><div class="section-title">Local Whisper device ('+esc(S.whisper_device_label||"Auto")+')</div>'+
-        '<div class="radio-row">'+((S.tables||{}).device||[]).map(function(r){
-          return radio("dev","set_whisper_device",r.key,"str",r.label,r.checked,true,"");
-        }).join('')+'</div></div>';
+      loops;
   };
 
   PAGES.models = function(){
