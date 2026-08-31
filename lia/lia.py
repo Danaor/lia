@@ -5238,7 +5238,7 @@ class GeminiTranscriber(BaseTranscriber):
         the transcribe model, so it degrades to a plain transcript (the meeting /
         file paths never request translation on this backend)."""
         if self.model is None:
-            raise RuntimeError("Gemini transcriber not initialized")
+            self.load_model()   # lazy-load (cheap, key-check only)
         if len(audio_np) == 0:
             return ""
         orig_len = len(audio_np)
@@ -5270,7 +5270,7 @@ class GeminiTranscriber(BaseTranscriber):
         Gemini accepts); large WAVs are decoded + split at silence. Non-WAV files
         over the inline cap ask the user to use a local model."""
         if self.model is None:
-            raise RuntimeError("Gemini transcriber not initialized")
+            self.load_model()   # lazy-load (cheap, key-check only)
         try:
             size = os.path.getsize(file_path)
         except OSError:
@@ -5315,7 +5315,7 @@ class GeminiTranscriber(BaseTranscriber):
         the LLM speaker-naming pass + the rename dialog reconcile them downstream.
         """
         if self.model is None:
-            raise RuntimeError("Gemini transcriber not initialized")
+            self.load_model()   # lazy-load (cheap, key-check only)
         pieces = self._split_for_inline(audio_np, overlap_s=0.0)
         utterances = []
         seg_start_s = 0.0
@@ -5597,7 +5597,10 @@ class GeminiLiveTranscriber(BaseTranscriber):
 
     def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe"):
         if self.model is None:
-            raise RuntimeError("Gemini Live transcriber not initialized")
+            # Lazy-load: some construction paths (startup with gemini_live saved
+            # as the backend) build the instance without load_model. load_model
+            # only checks the key + flips a flag, so this is cheap + idempotent.
+            self.load_model()
         if len(audio_np) == 0:
             return ""
         orig_len = len(audio_np)
@@ -5628,7 +5631,7 @@ class GeminiLiveTranscriber(BaseTranscriber):
         Gemini row or a local model (the Live API wants raw PCM and we do not
         bundle a decoder)."""
         if self.model is None:
-            raise RuntimeError("Gemini Live transcriber not initialized")
+            self.load_model()   # lazy-load (cheap, key-check only) - see transcribe()
         audio = _read_wav_mono_16k(file_path)
         if audio is None:
             raise RuntimeError(
@@ -16364,6 +16367,9 @@ class LiaApp:
             elif backend == "remote" and self._remote_transcriber is not None:
                 cloud_primary_transcriber = self._remote_transcriber
                 cloud_primary_label = "Remote (home GPU)"
+            elif backend == "gemini_live" and self._gemini_live_transcriber is not None:
+                cloud_primary_transcriber = self._gemini_live_transcriber
+                cloud_primary_label = "Gemini Live"
 
             if cloud_primary_transcriber is not None:
                 # Cloud is primary: validate it (fast HTTP call), mark ready,
