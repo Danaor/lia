@@ -176,6 +176,19 @@ a:hover{text-decoration:underline;}
 .divider{height:1px; background:var(--line); margin:var(--sp-4) 0;}
 .hint{font-size:var(--fs-hint); color:var(--muted); margin:6px 0 0;}
 
+/* --- setup-help: a compact collapsible how-to inside a card ------------- */
+.setup-help{margin-top:var(--sp-3); border-top:1px solid var(--line); padding-top:var(--sp-3);}
+.setup-help > summary{
+  cursor:pointer; font-size:var(--fs-hint); font-weight:600; color:var(--accent);
+  list-style:none; user-select:none;
+}
+.setup-help > summary::-webkit-details-marker{display:none;}
+.setup-help > summary::before{content:"▸ "; color:var(--muted);}
+.setup-help[open] > summary::before{content:"▾ ";}
+.setup-help ol{margin:var(--sp-3) 0 0; padding-left:1.4em; font-size:var(--fs-hint); color:var(--fg);}
+.setup-help ol li{margin:0 0 6px;}
+.setup-help .hint{margin-top:var(--sp-3);}
+
 /* --- field: label + control + hint ------------------------------------- */
 .field{margin-bottom:var(--sp-5);}
 /* Group header: uppercase muted small-caps so it reads as a SECTION LABEL

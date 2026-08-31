@@ -80,6 +80,8 @@ Most dictation tools are subscriptions (SuperWhisper, Wispr Flow), cloud-locked 
 
 No Python or command line needed. Windows SmartScreen may warn you on first run because the exe is unsigned - click "More info" then "Run anyway".
 
+**Locked / corporate PCs:** if `Lia.exe` is blocked with "Access denied" (WDAC or AppLocker policies block unsigned executables), run **`Lia (Work PC).bat`** instead. It launches Lia through the code-signed `pythonw.exe`, which those policies allow. Same app - it just shows as `pythonw.exe` in Task Manager.
+
 ### Option 2: Install from source
 
 Requires [Python 3.11+](https://www.python.org/downloads/) (check "Add to PATH" during install). Open PowerShell and paste:

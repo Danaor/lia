@@ -7,6 +7,11 @@ pystray>=0.19.5
 Pillow>=10.0.0
 numpy>=1.24.0
 requests>=2.31.0
+# websocket-client: the WhisperLive WebSocket client for the self-hosted
+# "remote" transcription backend (serve mode, home-GPU server), and the
+# retained GeminiLiveStream foundation. Without it the remote backend fails
+# with "websocket-client not installed".
+websocket-client>=1.7
 # pywebview: the HTML/CSS windows (Settings, Ask-your-meetings, Action items,
 # Chat, Email search, Compose/Summary editor). edgechromium (WebView2) backend.
 pywebview>=6.2

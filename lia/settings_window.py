@@ -466,6 +466,12 @@ APP_JS = r"""
     }
     var mics = [devRow("toggle_mic_device", null, "System Default", micOn && mid===null)];
     (S.mics||[]).forEach(function(d){ mics.push(devRow("toggle_mic_device", d.idx, d.name, micOn && mid===d.idx)); });
+    // Dedicated meeting mic (radio semantics; null = follow the dictation mic).
+    // Lets a headset own the meeting while a desk mic stays free for dictating
+    // mid-meeting. Falls back to the dictation mic if the device is unplugged.
+    var mmid = cfg("meeting_input_device_index", null);
+    var mmics = [devRow("set_meeting_mic_device", null, "Same as dictation mic", mmid===null)];
+    (S.mics||[]).forEach(function(d){ mmics.push(devRow("set_meeting_mic_device", d.idx, d.name, mmid===d.idx)); });
     var loops = "";
     if(S.loopback_available){
       var L = [devRow("toggle_loopback_device", null, "System Default", sysOn && lid===null)];
@@ -479,6 +485,9 @@ APP_JS = r"""
         '<div class="btnrow">'+btn("Refresh devices","refresh",[],"ghost",true)+'</div>'+
       '</div>'+
       '<div class="page"><div class="section-title">Microphone</div>'+mics.join('')+'</div>'+
+      '<div class="page"><div class="section-title">Meeting microphone</div>'+mmics.join('')+
+        '<div class="hint">Which mic records YOUR side of a meeting. Pick your call headset here to get its close-up quality in meeting transcripts, while the mic above stays free for dictating mid-meeting. If this device is unplugged, meetings fall back to the dictation mic.</div>'+
+      '</div>'+
       loops+
       '<div class="page"><div class="section-title">Local Whisper device ('+esc(S.whisper_device_label||"Auto")+')</div>'+
         '<div class="radio-row">'+((S.tables||{}).device||[]).map(function(r){
@@ -599,6 +608,23 @@ APP_JS = r"""
         '<button class="btn danger" data-call="clear_key" data-args=\'["remote"]\'>Clear</button>'+
         '<span class="grow"></span></div>'+
       '<div class="hint" id="st_remote"></div>'+
+      '<details class="setup-help">'+
+        '<summary>How to set up (Tailscale)</summary>'+
+        '<ol>'+
+          '<li>Install <b>Tailscale</b> on the server PC and on this PC from '+
+            '<span class="mono">tailscale.com/download</span>, and sign in with the '+
+            '<b>same account</b> on both. Tailscale is free for personal use and puts '+
+            'both machines on one private network - no ports to open on your router.</li>'+
+          '<li>Run your WhisperLive server on the GPU PC (see the self-hosted server '+
+            'guide). It listens on port <span class="mono">9090</span>.</li>'+
+          '<li>On the server PC, get its Tailscale address: <span class="mono">tailscale ip -4</span>.</li>'+
+          '<li>Set <b>Server URL</b> above to <span class="mono">ws://&lt;that-ip&gt;:9090</span>, '+
+            'click <b>Test</b>, then <b>Save</b>.</li>'+
+          '<li>On the <b>Models</b> page, pick a <b>Home Server</b> model.</li>'+
+        '</ol>'+
+        '<div class="hint">Work PC that blocks Tailscale? Use a Cloudflare tunnel with a '+
+          '<span class="mono">wss://your-domain</span> URL + an access token instead.</div>'+
+      '</details>'+
     '</div>';
     return '<div class="content-head"><h1>Keys &amp; Server</h1></div><div class="page keys-page">'+cards+home+'</div>';
   };

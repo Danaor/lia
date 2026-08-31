@@ -208,6 +208,10 @@ DEFAULT_CONFIG = {
     "cuda_compute_type": "int8_float16",  # fast + low-VRAM on GPU (near-FP16 quality)
     "input_device_index": None,  # None = default system microphone
     "loopback_device_index": None,  # None = default output device, or specific WASAPI loopback index
+    "meeting_input_device_index": None,  # None = same as the dictation mic; an index
+                                         # = a DEDICATED meeting mic (e.g. a headset the
+                                         # user talks into on calls, while a desk mic
+                                         # stays free for dictating mid-meeting)
     "recording_mode": "hold",  # "hold" = hold-to-record, "toggle" = press-to-start/press-to-stop
     # Press-to-talk safety cap (minutes). The recording watchdog force-stops a
     # runaway dictation at this age (stuck key / forgotten toggle). On a FORCED
@@ -8542,10 +8546,10 @@ class MeetingSession:
         self.last_summary = ""   # filled by the output writers when summarising
         self.summary_html_path = None  # clean shareable HTML of the summary
         self.source = source or app.config.get("recording_source", "both")
-        self._input_device_index = (
-            input_device_index if input_device_index is not None
-            else app.config.get("input_device_index")
-        )
+        if input_device_index is not None:
+            self._input_device_index = input_device_index
+        else:
+            self._input_device_index = self._resolve_meeting_mic(app)
         self._loopback_device_index = (
             loopback_device_index if loopback_device_index is not None
             else app.config.get("loopback_device_index")
@@ -8645,6 +8649,32 @@ class MeetingSession:
         # so a rotation already in flight when the user clicks Cancel doesn't
         # spawn a new (paid) transcription.
         self._cancelled = False
+
+    @staticmethod
+    def _resolve_meeting_mic(app):
+        """The meeting's input device: the dedicated meeting mic if one is
+        configured AND still present, else the dictation mic. The presence
+        check matters - a meeting mic is typically a headset that may be
+        unplugged; opening a stale index would record silence, so fall back
+        loudly instead."""
+        dedicated = app.config.get("meeting_input_device_index")
+        fallback = app.config.get("input_device_index")
+        if dedicated is None or dedicated == fallback:
+            return fallback
+        try:
+            present = {i for i, _n in list_input_devices()}
+        except Exception as e:
+            log.warning("Meeting mic: device enumeration failed (%s) - "
+                        "using the dictation mic", e)
+            return fallback
+        if dedicated in present:
+            log.info("Meeting mic: using dedicated device %s "
+                     "(dictation mic stays %s)", dedicated, fallback)
+            return dedicated
+        log.warning("Meeting mic: configured device %s not present - "
+                    "falling back to the dictation mic (%s)",
+                    dedicated, fallback)
+        return fallback
 
     # ---- lifecycle ----
     def start(self):
@@ -11520,14 +11550,23 @@ def _ensure_portable_shortcut():
     try:
         exe = os.path.abspath(sys.executable)
         rt_dir = os.path.dirname(exe)
-        if os.path.basename(exe).lower() != "lia.exe":
+        base = os.path.basename(exe).lower()
+        # Two portable launch shapes share this layout:
+        #   Lia.exe      -> normal PCs (branded launcher)     -> Lia.lnk
+        #   pythonw.exe  -> locked PCs via 'Lia (Work PC).bat' (WDAC blocks the
+        #                   unsigned Lia.exe; the signed pythonw.exe passes)
+        #                                                      -> 'Lia (Work PC).lnk'
+        if base not in ("lia.exe", "pythonw.exe"):
             return  # dev run / frozen build - not the portable layout
         if os.path.basename(rt_dir).lower() != "runtime":
             return
         root = os.path.dirname(rt_dir)
         if not os.path.exists(os.path.join(root, "Lia.bat")):
             return
-        lnk = os.path.join(root, "Lia.lnk")
+        # The shortcut always targets the exe we were actually launched with,
+        # so a locked-PC shortcut keeps using the signed pythonw.exe.
+        lnk = os.path.join(root, "Lia.lnk" if base == "lia.exe"
+                           else "Lia (Work PC).lnk")
         script = os.path.join(root, "app", "lia.py")
         icon = os.path.join(root, "app", "lia.ico")
         import pythoncom
@@ -20131,6 +20170,16 @@ class LiaApp:
         # while the user is in the middle of switching mics.
         self._reset_silent_state()
 
+    def _set_meeting_mic_device(self, device_idx):
+        """Settings: pick the DEDICATED meeting mic (None = same as the
+        dictation mic). Radio semantics - no toggle-off, 'Same as dictation
+        mic' is the off row. Applies from the NEXT meeting; a running
+        meeting keeps the recorder it opened."""
+        self.config["meeting_input_device_index"] = device_idx
+        save_config(self.config)
+        log.info("Meeting mic set: %s",
+                 "same as dictation" if device_idx is None else device_idx)
+
     def _toggle_loopback_device(self, device_idx):
         """Click handler for a system audio device: toggle if same, switch if different."""
         source = self.config.get("recording_source", "microphone")
@@ -23834,6 +23883,7 @@ class LiaApp:
         add("toggle_record_mic", self._toggle_record_mic)
         add("toggle_record_system", self._toggle_record_system)
         add("toggle_mic_device", self._toggle_mic_device)
+        add("set_meeting_mic_device", self._set_meeting_mic_device)
         add("toggle_loopback_device", self._toggle_loopback_device, True)
         add("refresh", self._settings_refresh_devices, True)
         # Models
@@ -23898,6 +23948,7 @@ class LiaApp:
     # Methods whose result should refresh the Ollama probe / device lists.
     _SETTINGS_OLLAMA_METHODS = {"set_summary_model", "refresh"}
     _SETTINGS_DEVICE_METHODS = {"toggle_mic_device", "toggle_loopback_device",
+                                "set_meeting_mic_device",
                                 "toggle_record_mic", "toggle_record_system",
                                 "set_beep_device", "refresh"}
     # Read-only getters (+ capture/test): they change NO config, so the child

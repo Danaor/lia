@@ -381,6 +381,19 @@ def phase_6_copy_sources():
     with open(bat_path, "w") as f:
         f.write('@echo off\ncd /d "%~dp0app"\nstart "" "%~dp0runtime\\Lia.exe" "%~dp0app\\lia.py"\n')
     print("  Created Lia.bat (root launcher)")
+    # Second launcher for LOCKED corporate PCs: WDAC / AppLocker blocks the
+    # unsigned branded Lia.exe (a copy of pythonw.exe loses its Authenticode
+    # signature the moment its icon/version resources are stamped). pythonw.exe
+    # itself stays PSF-signed, so launching through it runs under WDAC. Same
+    # app; Task Manager just shows "pythonw.exe" instead of "Lia".
+    work_bat = os.path.join(BUILD_DIR, "Lia (Work PC).bat")
+    with open(work_bat, "w") as f:
+        f.write('@echo off\n'
+                'REM Runs Lia via the PSF-SIGNED pythonw.exe for locked (WDAC/\n'
+                'REM AppLocker) corporate PCs that block the unsigned Lia.exe.\n'
+                'cd /d "%~dp0app"\n'
+                'start "" "%~dp0runtime\\pythonw.exe" "%~dp0app\\lia.py"\n')
+    print("  Created 'Lia (Work PC).bat' (signed-launcher for locked PCs)")
     # NO build-time .lnk: shortcuts store ABSOLUTE paths, so one created
     # here is broken (and icon-less) on every user's machine (2026-08-29
     # field report). The app itself creates/refreshes Lia.lnk on first run

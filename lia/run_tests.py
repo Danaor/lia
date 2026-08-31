@@ -4661,7 +4661,7 @@ def t_settings_actions_coverage():
         "toggle_silent_mode", "toggle_auto_start", "set_beep_device",
         # Audio
         "toggle_record_mic", "toggle_record_system", "toggle_mic_device",
-        "toggle_loopback_device", "refresh",
+        "set_meeting_mic_device", "toggle_loopback_device", "refresh",
         # Models
         "set_dictation_model", "set_meeting_model", "set_summary_model",
         "toggle_summary_local_tasks_pass", "set_summary_language",
@@ -4706,6 +4706,44 @@ def t_settings_actions_coverage():
 
 _test("settings: SETTINGS_ACTIONS covers every migrated tray surface (N/N)",
       t_settings_actions_coverage)
+
+
+def t_meeting_mic_resolve():
+    """The dedicated meeting mic resolves correctly: None follows the dictation
+    mic; a present index is used; an unplugged index falls back to the
+    dictation mic (never records silence from a stale handle)."""
+    import lia as w
+
+    class FakeApp:
+        def __init__(self, cfg):
+            self.config = cfg
+
+    resolve = w.MeetingSession._resolve_meeting_mic
+    orig = w.list_input_devices
+    w.list_input_devices = lambda: [(1, "JOUNIVO"), (3, "Headset Mic")]
+    try:
+        # None -> same as dictation mic
+        assert resolve(FakeApp({"input_device_index": 1})) == 1
+        assert resolve(FakeApp({"input_device_index": None})) is None
+        # dedicated present -> used (dictation mic untouched)
+        assert resolve(FakeApp({"input_device_index": 1,
+                                "meeting_input_device_index": 3})) == 3
+        # dedicated == dictation -> no enumeration needed, same result
+        assert resolve(FakeApp({"input_device_index": 1,
+                                "meeting_input_device_index": 1})) == 1
+        # dedicated UNPLUGGED -> falls back to the dictation mic
+        assert resolve(FakeApp({"input_device_index": 1,
+                                "meeting_input_device_index": 7})) == 1
+        # enumeration failure -> falls back, never raises
+        w.list_input_devices = lambda: (_ for _ in ()).throw(RuntimeError("dead"))
+        assert resolve(FakeApp({"input_device_index": 1,
+                                "meeting_input_device_index": 3})) == 1
+    finally:
+        w.list_input_devices = orig
+
+
+_test("meeting: dedicated meeting mic resolve + unplug fallback",
+      t_meeting_mic_resolve)
 
 
 def t_vocab_corrections_analytics():
