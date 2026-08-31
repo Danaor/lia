@@ -24086,6 +24086,11 @@ class LiaApp:
             # a user already on it keeps seeing their row.
             if om == "gpt-4o-transcribe" and not checked:
                 continue
+            # English Distil hidden too (2026-08-31, Naor's call - Parakeet is
+            # the better English local model). Code stays; a user already on it
+            # keeps seeing their row.
+            if model_id == "distil-large-v3" and not checked:
+                continue
             pk_missing = model_id.startswith("parakeet") and not has_parakeet
             # Cloud rows without their key show DIMMED (2026-08-29) - the
             # option is visible and transparent about what it needs, instead
