@@ -301,12 +301,28 @@ EXTRA_CSS = """
 .content{max-width:900px;}
 .kv{display:flex; gap:8px; flex-wrap:wrap; font-size:var(--fs-hint); color:var(--muted);}
 .kv .k{color:var(--ink-2); font-weight:600;}
-.credcard{border:1px solid var(--line); border-radius:var(--r-m); padding:16px; margin-bottom:14px;}
-.credcard .head{display:flex; align-items:center; gap:10px; margin-bottom:10px;}
-.credcard .bdg{width:34px;height:34px;border-radius:9px;display:flex;align-items:center;
-  justify-content:center;font-weight:800;color:var(--on-accent);flex:0 0 34px;}
-.credcard h3{margin:0;font-size:15px;} .credcard .sub{color:var(--muted);font-size:var(--fs-hint);}
-.btnrow{display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:10px;}
+/* Keys & Server page: each service is a standalone card on the page ground
+   (the wrapping .page frame is dropped via .keys-page) with subtle depth. */
+.page.keys-page{background:transparent; border:none; box-shadow:none; padding:0;}
+.credcard{background:var(--card); border:1px solid var(--line); border-radius:var(--r-l);
+  padding:18px 20px; margin-bottom:16px; box-shadow:0 1px 2px rgba(16,24,40,.05);
+  transition:box-shadow .18s ease, border-color .18s ease;}
+.credcard:hover{border-color:var(--line-2);
+  box-shadow:0 1px 2px rgba(16,24,40,.06), 0 10px 24px rgba(16,24,40,.07);}
+.credcard .head{display:flex; align-items:center; gap:12px; margin-bottom:14px;}
+.credcard .bdg{width:38px;height:38px;border-radius:11px;display:flex;align-items:center;
+  justify-content:center;font-weight:800;font-size:16px;color:var(--on-accent);flex:0 0 38px;
+  box-shadow:0 2px 6px rgba(16,24,40,.16), inset 0 1px 0 rgba(255,255,255,.28);}
+.credcard h3{margin:0;font-size:15.5px;font-weight:700;letter-spacing:-.01em;}
+.credcard .sub{color:var(--muted);font-size:var(--fs-hint);margin-top:2px;line-height:1.45;}
+/* current-key value shown as a soft pill (dashed + faint when unset) */
+.credcard .keyline{display:flex; align-items:center; gap:8px; margin:0 0 12px;
+  font-size:var(--fs-hint); color:var(--muted);}
+.credcard .keyline .masked{font-size:12px; background:var(--accent-soft);
+  border:1px solid var(--line); padding:3px 10px; border-radius:var(--r-pill); letter-spacing:.02em;}
+.credcard .keyline .masked.empty{background:transparent; border-style:dashed;}
+.credcard .row-inline{margin-top:2px;}
+.btnrow{display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:12px;}
 .btnrow .grow{flex:1 1 auto;}
 .tbl{width:100%; border-collapse:collapse;}
 .tbl td{padding:7px 6px; border-bottom:1px solid var(--line); vertical-align:middle;}
@@ -550,7 +566,7 @@ APP_JS = r"""
       return '<div class="credcard">'+
         '<div class="head"><span class="bdg" style="background:'+c.color+'">'+esc(c.badge)+'</span>'+
         '<div><h3>'+esc(c.name)+'</h3><div class="sub">'+esc(c.sub)+'</div></div></div>'+
-        '<div class="hint">Current '+esc(noun)+': '+cur+'</div>'+
+        '<div class="keyline">Current '+esc(noun)+': '+cur+'</div>'+
         '<div class="row-inline" style="margin-top:8px">'+
           '<input type="password" id="'+iid+'" class="mono" placeholder="Enter '+esc(noun)+'…" style="flex:1" value="'+esc(draftOr(iid,""))+'">'+
           '<button class="btn ghost" data-show="'+iid+'">Show</button></div>'+
@@ -580,7 +596,7 @@ APP_JS = r"""
         '<span class="grow"></span></div>'+
       '<div class="hint" id="st_remote"></div>'+
     '</div>';
-    return '<div class="content-head"><h1>Keys &amp; Server</h1></div><div class="page">'+cards+home+'</div>';
+    return '<div class="content-head"><h1>Keys &amp; Server</h1></div><div class="page keys-page">'+cards+home+'</div>';
   };
 
   PAGES.meetings = function(){
