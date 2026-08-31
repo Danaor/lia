@@ -505,10 +505,12 @@ APP_JS = r"""
         '<div class="hint">Quality passes ported from a private upstream project. The two local passes each add a narrow Ollama call; the cloud row only extends the prompt and runs free code cleanups.</div>'+
       '</div>'+
       '<div class="page"><div class="section-title">Summary language</div>'+
+        '<div class="radio-row">'+
         radio("slang","set_summary_language","primary","str","Follow primary language", cfg("summary_language","primary")==="primary")+
         radio("slang","set_summary_language","auto","str","Follow the transcript", cfg("summary_language")==="auto")+
         radio("slang","set_summary_language","he","str","Always Hebrew", cfg("summary_language")==="he")+
         radio("slang","set_summary_language","en","str","Always English", cfg("summary_language")==="en")+
+        '</div>'+
         '<div class="hint">The language meeting and text summaries are written in, regardless of the language spoken.</div>'+
       '</div>'+
       group("Transcribe-file model", t.file, "set_file_model", "key", "str")+

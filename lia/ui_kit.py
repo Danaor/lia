@@ -299,6 +299,10 @@ input:disabled,select:disabled,textarea:disabled{opacity:.55; cursor:default;}
 .radio.disabled{opacity:.5; pointer-events:none;}
 .radio .txt{flex:1 1 auto;}
 .radio .txt small{display:block; color:var(--muted); font-size:var(--fs-hint); font-weight:400;}
+/* horizontal radio group: a short enum on ONE line (equal-width cells that wrap
+   to a grid on a narrow window) instead of a tall stack of full-width rows. */
+.radio-row{display:flex; flex-wrap:wrap; gap:8px;}
+.radio-row .radio{margin-bottom:0; flex:1 1 0; min-width:150px;}
 
 /* --- switch ------------------------------------------------------------- */
 .switch{display:inline-flex; align-items:center; gap:10px; cursor:pointer; user-select:none;}
