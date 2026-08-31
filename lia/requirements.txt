@@ -12,6 +12,10 @@ requests>=2.31.0
 # retained GeminiLiveStream foundation. Without it the remote backend fails
 # with "websocket-client not installed".
 websocket-client>=1.7
+# websockets: the SERVER side - Lia's built-in "Host a transcription server"
+# (LiaTranscriptionServer, `lia.py --serve`) runs on it. Imported lazily, so
+# the tray app doesn't load it unless serve mode is on.
+websockets>=13
 # pywebview: the HTML/CSS windows (Settings, Ask-your-meetings, Action items,
 # Chat, Email search, Compose/Summary editor). edgechromium (WebView2) backend.
 pywebview>=6.2

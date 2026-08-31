@@ -3367,6 +3367,52 @@ _test("remote: Test surfaces the real failure reason (not generic 'not ready')",
       t_remote_fail_reason_surfaced)
 
 
+def t_serve_host():
+    """Serve mode HOST: port resolution + a not-listening probe, and the server
+    turns raw faster-whisper segments into the WhisperLive `segments` shape the
+    client expects (completed:true), never raising into the event loop."""
+    import numpy as np
+    import lia as w
+
+    # ServeController.port(): config value, then default.
+    sc = w.ServeController({"serve_port": 9191})
+    assert sc.port() == 9191
+    assert w.ServeController({}).port() == 9090
+    assert w.ServeController({"serve_port": "bad"}).port() == 9090
+    # A port nothing is listening on -> not running (no child, no bind).
+    assert sc._port_listening(9) is False        # port 9 (discard) - closed here
+    assert sc.owns_child() is False
+    assert sc.is_running() is False
+
+    # LiaTranscriptionServer._transcribe: raw segments -> completed segments.
+    class FakeTr:
+        model_size = "x"
+        def transcribe_segments(self, audio, language=None):
+            return [{"start": 0.0, "end": 1.2, "text": "שלום"},
+                    {"start": 1.2, "end": 2.0, "text": "עולם"}]
+    srv = w.LiaTranscriptionServer(FakeTr())
+    out = srv._transcribe(np.zeros(16000, dtype=np.float32), "he")
+    assert out == [{"start": 0.0, "end": 1.2, "text": "שלום", "completed": True},
+                   {"start": 1.2, "end": 2.0, "text": "עולם", "completed": True}]
+    # Empty audio -> no segments.
+    assert srv._transcribe(np.zeros(0, dtype=np.float32), "he") == []
+
+    # A transcriber that raises must yield [] (client falls back), never crash.
+    class BoomTr:
+        model_size = "x"
+        def transcribe_segments(self, audio, language=None):
+            raise RuntimeError("gpu gone")
+    assert w.LiaTranscriptionServer(BoomTr())._transcribe(
+        np.zeros(16000, dtype=np.float32), "he") == []
+
+    # Token gate: no token -> always authorized.
+    assert w.LiaTranscriptionServer(FakeTr(), token="")._authorized(None) is True
+
+
+_test("serve: HOST port/probe + segment shape + fail-safe",
+      t_serve_host)
+
+
 def t_model_revision_pins():
     """Supply-chain: every faster-whisper model offered in MODELS is pinned to
     a reviewed HF commit; the pin is passed at load. Parakeet (onnx-asr) has
@@ -4707,6 +4753,7 @@ def t_settings_actions_coverage():
         "set_cleanup_style", "set_cleanup_provider_model",
         # Keys & Server
         "apply_key", "clear_key", "apply_remote", "test_remote",
+        "toggle_serve", "toggle_serve_autostart", "apply_serve", "serve_status",
         # Meetings
         "toggle_auto_detect_meetings", "open_meetings_ask", "open_action_items",
         "open_meetings_folder", "edit_meeting_summary", "transcribe_file",

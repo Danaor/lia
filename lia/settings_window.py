@@ -197,6 +197,10 @@ def _demo_state():
         "loopback_available": True, "whisper_device_label": "Auto",
         "cleanup_model_label": "gpt-5.6-luna", "cleanup_provider": "openai",
         "vocab_pending": 4, "auto_start": True,
+        "serve": {"enabled": True, "autostart": False, "running": True,
+                  "port": 9090, "has_token": False,
+                  "tailscale_ip": "100.70.229.87",
+                  "ws_url": "ws://100.70.229.87:9090"},
         "hotkeys": {"main": "ctrl+space", "undo": "ctrl+alt+z", "cancel": "esc",
                     "ask": "ctrl+alt+m", "actions": "ctrl+alt+t",
                     "email": "ctrl+alt+f", "chat": "ctrl+alt+c"},
@@ -629,7 +633,38 @@ APP_JS = r"""
           '<span class="mono">wss://your-domain</span> URL + an access token instead.</div>'+
       '</details>'+
     '</div>';
-    return '<div class="content-head"><h1>Keys &amp; Server</h1></div><div class="page keys-page">'+cards+home+'</div>';
+    // This machine AS a server (serve mode host) - the flip side of Home Server.
+    var sv = S.serve || {};
+    var svPort = sv.port || 9090;
+    var statusTxt = sv.running
+      ? ('&#9679; Running on port ' + svPort)
+      : (sv.enabled ? 'Starting…' : 'Stopped');
+    var urlLine = sv.ws_url
+      ? ('Other devices point their <b>Home Server URL</b> here:<br>'+
+         '<span class="mono">' + esc(sv.ws_url) + '</span>')
+      : ('Install <a href="https://tailscale.com/download" target="_blank" rel="noopener">'+
+         'Tailscale</a> and sign in (same account) on both machines to get a '+
+         'private address, then use <span class="mono">ws://&lt;this-ip&gt;:' + svPort + '</span>.');
+    var serve = '<div class="credcard">'+
+      '<div class="head"><span class="bdg" style="background:#7c5cff">&#128225;</span>'+
+      '<div><h3>Host a transcription server</h3><div class="sub">Share this machine’s GPU - other devices transcribe against it (no Docker).</div></div></div>'+
+      sw("Run a server on this machine", !!sv.enabled, "toggle_serve")+
+      '<div class="hint" id="serve_status">'+statusTxt+'</div>'+
+      field("Port",'<input type="number" id="in_serve_port" class="mono" value="'+svPort+'" style="max-width:120px">',"default 9090")+
+      field("Access token (optional)",
+        '<input type="password" id="in_serve_tok" class="mono" placeholder="'+
+        (sv.has_token?"(saved - leave blank to keep)":"none")+'">')+
+      '<div class="btnrow"><button class="btn" data-apply-serve="1" data-slow="1">Save port / token</button><span class="grow"></span></div>'+
+      sw("Keep running after reboot (start at Windows logon)", !!sv.autostart, "toggle_serve_autostart")+
+      '<div class="hint">'+urlLine+'</div>'+
+      '<details class="setup-help"><summary>How another device connects</summary><ol>'+
+        '<li>Turn on the server here - it loads a local Hebrew model on this GPU.</li>'+
+        '<li>Install <b>Tailscale</b> on both machines and sign in with the same account.</li>'+
+        '<li>On the other device: <b>Keys &amp; Server → Home Server</b>, set the URL above, <b>Test</b>, <b>Save</b>, then pick a <b>Home Server</b> model.</li>'+
+      '</ol><div class="hint">Hebrew only (the server runs one model); English falls back to the client’s own cloud/local.</div></details>'+
+      '<div class="hint" id="st_serve"></div>'+
+    '</div>';
+    return '<div class="content-head"><h1>Keys &amp; Server</h1></div><div class="page keys-page">'+cards+home+serve+'</div>';
   };
 
   PAGES.meetings = function(){
@@ -887,6 +922,12 @@ APP_JS = r"""
       var tk2=(document.getElementById("in_remote_tok")||{}).value||"";
       busy(tr,true); call("test_remote",[u2,tk2],true).then(function(r){ unbusy(tr);
         var st=document.getElementById("st_remote"); if(st) st.textContent=r.msg||""; }); return; }
+    var asv = e.target.closest('[data-apply-serve]');
+    if(asv){ var sp=(document.getElementById("in_serve_port")||{}).value||"";
+      var stk=(document.getElementById("in_serve_tok")||{}).value||"";
+      busy(asv,true); call("apply_serve",[sp,stk],true).then(function(r){ unbusy(asv);
+        if(r.ok){ delete DRAFT["in_serve_port"]; delete DRAFT["in_serve_tok"]; }
+        var st=document.getElementById("st_serve"); if(st) st.textContent=r.msg||""; }); return; }
     var sv = e.target.closest('[data-save-vocab]');
     if(sv){ var vt=(document.getElementById("vocabText")||{}).value||"";
       call("save_vocabulary",[vt]).then(function(r){ if(r.ok) delete DRAFT["vocabText"]; }); return; }

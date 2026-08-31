@@ -21,6 +21,7 @@ if sys.stderr is None:
     sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 import json
+import asyncio
 import threading
 import time
 import wave
@@ -260,6 +261,16 @@ DEFAULT_CONFIG = {
     # Plaintext ws:// is allowed only to private/tailnet hosts; flip this to
     # knowingly allow ws:// to a PUBLIC host (token + audio unencrypted).
     "remote_allow_insecure_ws": False,
+    # Serve mode HOST (the flip side of "remote"): this machine RUNS a built-in
+    # WhisperLive-compatible server (LiaTranscriptionServer) off its local
+    # faster-whisper model, so other devices point their "remote" backend here.
+    # No Docker, no heavy deps. `lia.py --serve` runs it; the Settings toggle
+    # spawns that subprocess, and serve_autostart adds a logon Scheduled Task.
+    "serve_enabled": False,          # tray app spawns/kills the --serve child
+    "serve_autostart": False,        # also run at Windows logon (Scheduled Task)
+    "serve_port": 9090,              # the port the server listens on
+    "serve_model": "",               # "" = fall back to model_size (Hebrew turbo)
+    "serve_token": "",               # optional Bearer clients must present
     "groq_api_key": "",  # Groq API key (from https://console.groq.com/keys)
     "groq_model": "whisper-large-v3-turbo",  # Groq Whisper model
     "openai_api_key": "",  # OpenAI API key (from https://platform.openai.com/api-keys)
@@ -3926,6 +3937,35 @@ class FasterWhisperTranscriber(BaseTranscriber):
 
         return text.strip()
 
+    def transcribe_segments(self, audio_np, language=None, beam_size=3):
+        """RAW timestamped segments for the built-in serve mode (host mode).
+        Returns [{"start": s, "end": s, "text": str}, ...] with NO cleanup /
+        RTL marking / hallucination strip - the CONSUMING client applies those.
+        Shares the model + infer-lock + CPU-demote-retry with transcribe()."""
+        if self.model is None:
+            raise RuntimeError("Model not loaded")
+        if len(audio_np) == 0:
+            return []
+        lang = language if language and language != "auto" else None
+        init_prompt = None
+        if self.custom_vocabulary and self.custom_vocabulary.strip():
+            init_prompt = f"Common terms: {self.custom_vocabulary.strip()}"
+
+        def _run():
+            with self._infer_lock:
+                segments, _info = self.model.transcribe(
+                    audio_np, beam_size=beam_size, language=lang,
+                    initial_prompt=init_prompt, vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=500))
+                return [{"start": float(s.start), "end": float(s.end),
+                         "text": s.text} for s in segments]
+        try:
+            return _run()
+        except Exception as e:
+            if self._demote_to_cpu("transcribe_segments", e):
+                return _run()
+            raise
+
     def transcribe_file(self, file_path, language=None, task="transcribe"):
         """Transcribe an audio/video file fast.
 
@@ -6588,6 +6628,149 @@ class RemoteTranscriber(BaseTranscriber):
         audio = np.asarray(audio, dtype=np.float32)
         text = self.transcribe(audio, language=language, task=task)
         return text or ""
+
+
+# ============================================================
+# Serve mode HOST — a built-in WhisperLive-compatible server
+# ============================================================
+class LiaTranscriptionServer:
+    """Host a WhisperLive-compatible WebSocket server backed by Lia's OWN local
+    faster-whisper model, so another Lia install (or the same user's laptop) can
+    transcribe against this machine's GPU with NO Docker and NO heavy deps. It is
+    the exact counterpart of RemoteTranscriber / WhisperLiveStream (the client),
+    speaking the same protocol the client already expects:
+
+        client -> config JSON {uid, language, ...}
+        server -> {"uid", "message":"SERVER_READY", "backend":"faster_whisper"}
+        client -> float32 PCM (16k mono) binary frames ... then b"END_OF_AUDIO"
+        server -> {"uid", "segments":[{start,end,text,completed:true}, ...]}
+        server -> {"uid", "message":"DISCONNECT"}
+
+    Batch, not streaming: it buffers the whole clip and transcribes on
+    END_OF_AUDIO. That covers every way Lia's client uses it (dictation clips +
+    per-chunk meeting transcription); the client's finalize() collects the one
+    segments message. Concurrency across clients is safe - the transcriber's
+    _infer_lock serializes the actual GPU work. Runs on the `websockets` lib
+    (server), imported lazily so the tray app never loads it.
+    """
+    MAX_CLIP_BYTES = 16000 * 4 * 60 * 15   # 15 min of float32 - runaway guard
+
+    def __init__(self, transcriber, host="0.0.0.0", port=9090, token="",
+                 language="he"):
+        self.transcriber = transcriber
+        self.host = host
+        self.port = port
+        self.token = (token or "").strip()
+        self.language = language
+
+    def _authorized(self, ws):
+        if not self.token:
+            return True
+        try:
+            auth = ws.request.headers.get("Authorization", "")
+        except Exception:
+            auth = ""
+        return auth == ("Bearer " + self.token)
+
+    async def _handler(self, ws):
+        if not self._authorized(ws):
+            try:
+                await ws.close(code=1008, reason="unauthorized")
+            except Exception:
+                pass
+            return
+        buf = bytearray()
+        uid = None
+        lang = self.language
+        dropped = False
+        try:
+            async for msg in ws:
+                if isinstance(msg, str):
+                    try:
+                        cfg = json.loads(msg)
+                    except Exception:
+                        continue
+                    uid = cfg.get("uid")
+                    lang = cfg.get("language") or self.language
+                    await ws.send(json.dumps(
+                        {"uid": uid, "message": "SERVER_READY",
+                         "backend": "faster_whisper"}))
+                    continue
+                data = bytes(msg)
+                if data == b"END_OF_AUDIO":
+                    audio = np.frombuffer(bytes(buf), dtype=np.float32)
+                    buf = bytearray()
+                    segs = await asyncio.get_running_loop().run_in_executor(
+                        None, self._transcribe, audio, lang)
+                    await ws.send(json.dumps({"uid": uid, "segments": segs}))
+                    await ws.send(json.dumps({"uid": uid, "message": "DISCONNECT"}))
+                    continue
+                if len(buf) + len(data) > self.MAX_CLIP_BYTES:
+                    if not dropped:
+                        log.warning("serve: client clip exceeded %d bytes - "
+                                    "dropping the tail", self.MAX_CLIP_BYTES)
+                        dropped = True
+                    continue
+                buf.extend(data)
+        except Exception as e:
+            log.debug("serve: client handler ended: %s", e)
+
+    def _transcribe(self, audio, lang):
+        """Blocking transcription (run in an executor). Never raises into the
+        event loop; an error just yields no segments so the client falls back."""
+        try:
+            if audio is None or len(audio) == 0:
+                return []
+            raw = self.transcriber.transcribe_segments(audio, language=lang)
+        except Exception as e:
+            log.error("serve: transcription failed: %s", e)
+            return []
+        return [{"start": s["start"], "end": s["end"], "text": s["text"],
+                 "completed": True} for s in raw]
+
+    async def _serve(self):
+        import websockets
+        async with websockets.serve(self._handler, self.host, self.port,
+                                    max_size=None, ping_interval=20):
+            log.info("Lia serve: listening on ws://%s:%d (model=%s)",
+                     self.host, self.port, self.transcriber.model_size)
+            await asyncio.Future()   # run until the process is killed
+
+    def serve_forever(self):
+        asyncio.run(self._serve())
+
+
+def run_transcription_server(argv=None):
+    """`lia.py --serve` entry: load a local faster-whisper model and run the
+    built-in WhisperLive server, blocking forever. Its OWN process - a Settings
+    toggle spawns it, and a Scheduled Task can run it at logon (independent of
+    the tray app). Flags override config.json."""
+    import argparse
+    p = argparse.ArgumentParser(prog="lia --serve", add_help=False)
+    p.add_argument("--serve", action="store_true")
+    p.add_argument("--port", type=int, default=None)
+    p.add_argument("--model", default=None)
+    p.add_argument("--host", default="0.0.0.0")
+    args, _ = p.parse_known_args(
+        argv if argv is not None else sys.argv[1:])
+
+    cfg = load_config()
+    model = (args.model or cfg.get("serve_model")
+             or cfg.get("model_size") or "ivrit-ai/whisper-large-v3-turbo-ct2")
+    port = int(args.port or cfg.get("serve_port") or 9090)
+    token = cfg.get("serve_token", "") or ""
+    device = cfg.get("whisper_device", "auto")
+    language = cfg.get("primary_language", "he") or "he"
+
+    log.info("Lia serve: loading model %s (device=%s) ...", model, device)
+    tr = FasterWhisperTranscriber(
+        model_size=model, device=device,
+        cpu_threads=int(cfg.get("cpu_threads", 8) or 8))
+    tr.custom_vocabulary = cfg.get("custom_vocabulary", "") or ""
+    tr.load_model()
+    log.info("Lia serve: model ready on %s", tr.active_device)
+    LiaTranscriptionServer(tr, host=args.host, port=port,
+                           token=token, language=language).serve_forever()
 
 
 # ============================================================
@@ -15351,12 +15534,101 @@ def play_beep(freq=800, duration_ms=150, device_index=None):
             pass
 
 
+class ServeController:
+    """Runs the built-in transcription server (LiaTranscriptionServer) as a
+    CHILD process while the Settings toggle is on. Spawns `lia.py --serve` via
+    the signed pythonw.exe (WDAC-safe, no console). A port probe means it never
+    double-binds when the logon Scheduled Task (serve_autostart) already started
+    one - the app then just reflects that server, and stop() only kills the
+    app's OWN child, never the task's independent server."""
+
+    def __init__(self, config):
+        self.config = config
+        self._proc = None
+        self._lock = threading.Lock()
+
+    def port(self):
+        try:
+            return int(self.config.get("serve_port") or 9090)
+        except (TypeError, ValueError):
+            return 9090
+
+    @staticmethod
+    def _port_listening(port):
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.3)
+        try:
+            return s.connect_ex(("127.0.0.1", int(port))) == 0
+        except Exception:
+            return False
+        finally:
+            s.close()
+
+    def owns_child(self):
+        with self._lock:
+            return self._proc is not None and self._proc.poll() is None
+
+    def is_running(self):
+        """True if THIS app's child is alive, or something is already listening
+        on the serve port (e.g. the logon task's server)."""
+        if self.owns_child():
+            return True
+        return self._port_listening(self.port())
+
+    def start(self):
+        """Spawn the --serve child unless a server is already listening.
+        Returns (ok, message)."""
+        port = self.port()
+        if self.owns_child():
+            return True, "Server already running (this app)."
+        if self._port_listening(port):
+            return True, "Server already running on port %d (autostart?)." % port
+        py = find_python_interpreter()
+        if not py:
+            return False, "No Python interpreter available to launch the server."
+        script = os.path.abspath(sys.argv[0])
+        args = [py, script, "--serve", "--port", str(port)]
+        try:
+            import subprocess
+            proc = subprocess.Popen(
+                args, creationflags=0x08000000,   # CREATE_NO_WINDOW
+                cwd=os.path.dirname(script) or None)
+        except Exception as e:
+            log.error("Serve: launch failed: %s", e)
+            return False, "Server launch failed: %s" % e
+        with self._lock:
+            self._proc = proc
+        log.info("Serve: spawned server child pid=%s on port %d", proc.pid, port)
+        return True, "Server starting on port %d." % port
+
+    def stop(self):
+        """Terminate the app's OWN child (never the logon-task server)."""
+        with self._lock:
+            proc = self._proc
+            self._proc = None
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+            except Exception as e:
+                log.warning("Serve: stop failed: %s", e)
+            log.info("Serve: server child stopped")
+            return True, "Server stopped."
+        return True, "Server was not running (this app)."
+
+
 # ============================================================
 # System Tray Application
 # ============================================================
 class LiaApp:
     def __init__(self):
         self.config = load_config()
+        # Serve mode HOST controller (spawns `lia.py --serve` when enabled).
+        self._serve = ServeController(self.config)
         # Apply the configured notetaker identity to the prompt renderer
         # (module global consumed by the _p_* selectors + the ensemble).
         global _NOTETAKER_NAMES
@@ -15772,6 +16044,12 @@ class LiaApp:
         # absolute paths and is broken everywhere else). Background - never
         # blocks startup.
         threading.Thread(target=_ensure_portable_shortcut, daemon=True).start()
+
+        # Serve mode HOST: if enabled, spawn the built-in transcription server
+        # in the background (its own process + model). The port probe inside
+        # start() skips it when a logon Scheduled Task already runs one.
+        if self.config.get("serve_enabled"):
+            threading.Thread(target=self._serve.start, daemon=True).start()
 
         # Create tray icon in LOADING state — the model takes ~2-5s to load
         # on warm starts (and up to 30s on cold boot). Starting with the green
@@ -23474,6 +23752,112 @@ class LiaApp:
         except Exception as e:
             return (False, str(e)[:200])
 
+    # --- serve mode HOST (this machine runs the built-in server) ---
+    _SERVE_TASK_NAME = "Lia Server"
+
+    def _tailscale_ip(self):
+        """This machine's Tailscale IPv4 (for the copy-paste ws:// URL), or ""."""
+        try:
+            import subprocess
+            r = subprocess.run(["tailscale", "ip", "-4"], capture_output=True,
+                               text=True, creationflags=0x08000000, timeout=5)
+            out = (r.stdout or "").strip()
+            if r.returncode == 0 and out:
+                return out.splitlines()[0].strip()
+        except Exception:
+            pass
+        return ""
+
+    def _settings_apply_serve(self, port=None, token=None):
+        """Persist port + token from the UI. Applies to the NEXT server start;
+        if a server is running under this app, restart it to pick them up."""
+        if port is not None:
+            try:
+                p = int(port)
+                if not (1 <= p <= 65535):
+                    return (False, "Port must be 1-65535.")
+                self.config["serve_port"] = p
+            except (TypeError, ValueError):
+                return (False, "Port must be a number.")
+        if token is not None:
+            self.config["serve_token"] = (token or "").strip()
+        save_config(self.config)
+        if self._serve.owns_child():
+            self._serve.stop()
+            self._serve.start()
+        return (True, "Server settings saved.")
+
+    def _settings_toggle_serve(self):
+        on = not bool(self.config.get("serve_enabled"))
+        self.config["serve_enabled"] = on
+        save_config(self.config)
+        if on:
+            ok, msg = self._serve.start()
+            if not ok:
+                self.config["serve_enabled"] = False
+                save_config(self.config)
+            return (ok, msg)
+        ok, msg = self._serve.stop()
+        return (True, msg)
+
+    def _settings_toggle_serve_autostart(self):
+        on = not bool(self.config.get("serve_autostart"))
+        if on:
+            ok, msg = self._create_serve_task()
+            if not ok:
+                return (False, msg)
+        else:
+            self._delete_serve_task()
+        self.config["serve_autostart"] = on
+        save_config(self.config)
+        return (True, "Run at logon " + ("enabled." if on else "disabled."))
+
+    def _settings_serve_status(self):
+        serve = getattr(self, "_serve", None) or ServeController(self.config)
+        ip = self._tailscale_ip()
+        port = serve.port()
+        return {
+            "enabled": bool(self.config.get("serve_enabled")),
+            "autostart": bool(self.config.get("serve_autostart")),
+            "running": bool(serve.is_running()),
+            "port": port,
+            "has_token": bool((self.config.get("serve_token") or "").strip()),
+            "tailscale_ip": ip,
+            "ws_url": ("ws://%s:%d" % (ip, port)) if ip else "",
+        }
+
+    def _create_serve_task(self):
+        py = find_python_interpreter()
+        if not py:
+            return (False, "No interpreter available to schedule.")
+        script = os.path.abspath(sys.argv[0])
+        port = self._serve.port()
+        tr = '"%s" "%s" --serve --port %d' % (py, script, port)
+        try:
+            import subprocess
+            r = subprocess.run(
+                ["schtasks", "/Create", "/TN", self._SERVE_TASK_NAME,
+                 "/TR", tr, "/SC", "ONLOGON", "/RL", "LIMITED", "/F"],
+                capture_output=True, text=True,
+                creationflags=0x08000000, timeout=30)
+            if r.returncode != 0:
+                return (False, (r.stderr or r.stdout or "schtasks failed").strip()[:200])
+        except Exception as e:
+            return (False, "schtasks error: %s" % e)
+        log.info("Serve: logon task created (port %d)", port)
+        return (True, "Run-at-logon task created.")
+
+    def _delete_serve_task(self):
+        try:
+            import subprocess
+            subprocess.run(["schtasks", "/Delete", "/TN", self._SERVE_TASK_NAME,
+                            "/F"], capture_output=True, text=True,
+                           creationflags=0x08000000, timeout=30)
+            log.info("Serve: logon task removed")
+        except Exception as e:
+            log.warning("Serve task delete failed: %s", e)
+        return (True, "Run-at-logon task removed.")
+
     # --- hotkey capture/apply (capture runs in the parent — it owns the hook) ---
     def _capture_hotkey(self):
         import keyboard as kb
@@ -23910,6 +24294,10 @@ class LiaApp:
         add("clear_key", self._clear_credential)
         add("apply_remote", self._apply_remote_server, True)
         add("test_remote", self._test_remote_server, True)
+        add("toggle_serve", self._settings_toggle_serve, True)
+        add("toggle_serve_autostart", self._settings_toggle_serve_autostart, True)
+        add("apply_serve", self._settings_apply_serve, True)
+        add("serve_status", self._settings_serve_status)
         # Meetings
         add("toggle_auto_detect_meetings", self._toggle_auto_detect_meetings)
         add("open_meetings_ask", self._open_meetings_ask)
@@ -23961,7 +24349,8 @@ class LiaApp:
     # the page and would wipe the list the getter just loaded into the DOM.
     _SETTINGS_READONLY_METHODS = {"vocab_pending_list", "vocab_learned_list",
                                   "vocab_corrections_list", "vocab_corrections_scan",
-                                  "snippets_get", "capture_hotkey", "test_remote"}
+                                  "snippets_get", "capture_hotkey", "test_remote",
+                                  "serve_status"}
 
     def _settings_status_line(self):
         if self._is_meeting_active():
@@ -24231,6 +24620,7 @@ class LiaApp:
                       "log": os.path.join(CONFIG_DIR, "lia.log"),
                       "meetings": MEETINGS_DIR},
             "tables": self._settings_tables(ollama=ollama),
+            "serve": self._settings_serve_status(),
         }
         if devices:
             state["mics"] = [{"idx": i, "name": n} for i, n in list_input_devices()]
@@ -24691,6 +25081,12 @@ class LiaApp:
         # Mark shutdown BEFORE closing Settings so the reader's finally block
         # doesn't re-arm the pre-warm (which would spawn a child during quit).
         self._shutting_down = True
+        # Stop the built-in server child (if this app spawned one). A logon
+        # Scheduled Task's server is independent and is left running.
+        try:
+            self._serve.stop()
+        except Exception:
+            pass
         # Close the Settings child window (if open) so it doesn't outlive us.
         try:
             self._close_settings_window()
@@ -24866,6 +25262,17 @@ def _acquire_single_instance(mutex_name="Lia_SingleInstance",
 
 
 if __name__ == "__main__":
+    # ---- Serve mode HOST: run ONLY the built-in transcription server. ----
+    # A separate role from the tray app (own process, its own model), so it
+    # runs BEFORE the single-instance mutex - it may run alongside the tray
+    # app, and a Settings toggle / Scheduled Task launches it with --serve.
+    if "--serve" in sys.argv:
+        try:
+            run_transcription_server()
+        except KeyboardInterrupt:
+            pass
+        sys.exit(0)
+
     # ---- Single-instance guard (Windows named mutex) ----
     # Prevents duplicate processes that cause double-transcription + double-paste.
     # The mutex auto-releases when this process exits (Windows cleans it up),
