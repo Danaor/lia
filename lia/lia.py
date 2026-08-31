@@ -17071,7 +17071,8 @@ class LiaApp:
                         or self._is_meeting_active()
                         or self._compose_active
                         or self._compose_instr_active
-                        or self._voice_ask_active):
+                        or self._voice_ask_active
+                        or getattr(self, "_hotkey_capture_active", False)):
                     prev_main = bool(main_parts) and _chord_physically_held(main_parts)
                     prev_enter = bool(enter_parts) and _chord_physically_held(enter_parts)
                     pending.clear()

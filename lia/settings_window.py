@@ -776,12 +776,47 @@ APP_JS = r"""
       call(m, args, slow).then(function(){ unbusy(cb); });
       return;
     }
-    // hotkey capture result -> fill input
+    // Hotkey capture: read the combo IN THIS WINDOW via keydown, NOT the
+    // parent's global keyboard.read_hotkey - that fought the app's own keyboard
+    // hooks + the dead-hook watchdog and could crash/hang the app. The parent
+    // still validates (needs a modifier) when Save is clicked.
     var cap = e.target.closest('#btnCapture');
-    if(cap){ busy(cap, true); call("capture_hotkey",[],true).then(function(r){
-      unbusy(cap);
-      if(r.ok && r.data && r.data.combo){ DRAFT["hotkeyInput"]=r.data.combo;
-        var i=document.getElementById("hotkeyInput"); if(i) i.value=r.data.combo; } }); return; }
+    if(cap){
+      var input=document.getElementById("hotkeyInput");
+      var orig=cap.textContent; cap.textContent="Press keys…"; cap.classList.add("primary");
+      function keyName(ev){
+        var c=ev.code||"";
+        if(/^Key[A-Z]$/.test(c)) return c.slice(3).toLowerCase();
+        if(/^Digit[0-9]$/.test(c)) return c.slice(5);
+        if(/^Numpad[0-9]$/.test(c)) return c.slice(6);
+        if(/^F([1-9]|1[0-9]|2[0-4])$/.test(c)) return c.toLowerCase();
+        var M={Space:"space",Enter:"enter",Tab:"tab",Backspace:"backspace",
+          Delete:"delete",Escape:"esc",Home:"home",End:"end",Insert:"insert",
+          PageUp:"page up",PageDown:"page down",ArrowUp:"up",ArrowDown:"down",
+          ArrowLeft:"left",ArrowRight:"right",Minus:"-",Equal:"=",Semicolon:";",
+          Quote:"'",Comma:",",Period:".",Slash:"/",Backquote:"`",
+          BracketLeft:"[",BracketRight:"]"};
+        if(M[c]) return M[c];
+        if(/^(Control|Alt|Shift|Meta|OS)/.test(c)) return null; // pure modifier
+        if(ev.key && ev.key.length===1) return ev.key.toLowerCase();
+        return null;
+      }
+      function stop(){ document.removeEventListener("keydown",onKey,true);
+        cap.textContent=orig; cap.classList.remove("primary"); }
+      function onKey(ev){
+        ev.preventDefault(); ev.stopPropagation();
+        var bare=!ev.ctrlKey&&!ev.altKey&&!ev.shiftKey&&!ev.metaKey;
+        if(ev.key==="Escape"&&bare){ stop(); return; }   // cancel capture
+        var k=keyName(ev); if(k===null) return;           // wait for a real key
+        var mods=[]; if(ev.ctrlKey)mods.push("ctrl"); if(ev.altKey)mods.push("alt");
+        if(ev.shiftKey)mods.push("shift"); if(ev.metaKey)mods.push("windows");
+        var combo=mods.concat([k]).join("+");
+        DRAFT["hotkeyInput"]=combo; if(input) input.value=combo;
+        stop();
+      }
+      document.addEventListener("keydown",onKey,true);
+      return;
+    }
     var sh = e.target.closest('[data-save-hotkey]');
     if(sh){ var v=(document.getElementById("hotkeyInput")||{}).value||"";
       call("set_hotkey",[v]).then(function(r){ if(r.ok) delete DRAFT["hotkeyInput"]; }); return; }
