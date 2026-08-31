@@ -914,8 +914,10 @@ def t_gemini_live_transcriber_wiring():
     class _FakeStream:
         def __init__(self, api_key, language_codes=None, connect_timeout=10):
             captured["codes"] = language_codes
-        def transcribe_pcm(self, pcm, on_interim=None, chunk_ms=100, realtime=False):
+        def transcribe_pcm(self, pcm, on_interim=None, chunk_ms=100,
+                           pace_ms=0, idle_timeout=8):
             captured["pcm_len"] = len(pcm)
+            captured["pace_ms"] = pace_ms
             return "שלום עולם"
 
     orig = w.GeminiLiveStream

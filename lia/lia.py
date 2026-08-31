@@ -5514,18 +5514,21 @@ class GeminiLiveStream:
         self._ws = None
 
     def transcribe_pcm(self, pcm_bytes, on_interim=None, chunk_ms=100,
-                       realtime=False):
-        """One-shot: start -> stream pcm (burst by default) -> finalize -> close.
-        Returns the transcript string (or None)."""
+                       pace_ms=0, idle_timeout=8):
+        """One-shot: start -> stream pcm -> finalize -> close. Returns the
+        transcript (or None). pace_ms>0 spaces the chunks: this is a REAL-TIME
+        model, so dumping a long clip faster than it can ingest overflows the
+        server-side buffer and truncates/empties the result (measured 2026-08-31:
+        a 120s burst came back empty; the same clip paced came back in full)."""
         self.start()
         try:
             step = int(0.001 * chunk_ms * 16000) * 2
             for off in range(0, len(pcm_bytes), max(step, 2)):
                 self.feed(pcm_bytes[off:off + step])
-                if realtime:
-                    time.sleep(chunk_ms / 1000.0)
+                if pace_ms:
+                    time.sleep(pace_ms / 1000.0)
             self.end_audio()
-            return self.collect_final(on_interim=on_interim)
+            return self.collect_final(on_interim=on_interim, idle_timeout=idle_timeout)
         finally:
             self.close()
 
@@ -5538,6 +5541,14 @@ class GeminiLiveTranscriber(BaseTranscriber):
     short-lived session (the 10-min cap never bites press-to-talk clips or 45s
     meeting chunks). Custom vocabulary is accepted but currently INERT (the Live
     API exposes no phrase-biasing field yet) - a documented follow-up."""
+
+    # Clips up to BURST_MAX_S are dumped at once (fast: ~0.3-1s). Longer clips
+    # are paced at PACE_MS per 100ms chunk so the real-time model can ingest them
+    # without dropping audio (measured: burst is safe well past 75s but a ~120s
+    # burst came back empty; >=10ms/chunk pacing ingests reliably). 40s is a
+    # conservative burst ceiling with margin.
+    BURST_MAX_S = 40.0
+    PACE_MS = 15
 
     def __init__(self, model_size="gemini-3.5-transcribe-live", api_key="",
                  language_codes=None):
@@ -5609,10 +5620,14 @@ class GeminiLiveTranscriber(BaseTranscriber):
             log.info("Gemini Live: trimmed %d samples of trailing silence",
                      orig_len - len(audio_np))
         pcm = self._audio_to_pcm16(audio_np)
+        # Pace the send for long clips so the real-time model does not drop audio
+        # (a burst of a >~1.5min clip comes back empty/truncated).
+        duration = len(audio_np) / 16000.0
+        pace_ms = 0 if duration <= self.BURST_MAX_S else self.PACE_MS
         stream = GeminiLiveStream(self.api_key,
                                   language_codes=self._codes_for(language))
         try:
-            text = stream.transcribe_pcm(pcm) or ""
+            text = stream.transcribe_pcm(pcm, pace_ms=pace_ms) or ""
         except Exception as e:
             msg = str(e).lower()
             if "429" in msg or "quota" in msg or "exhausted" in msg:
