@@ -6047,6 +6047,9 @@ class WhisperLiveStream:
         self.on_hypothesis = None
         self.on_error = None
         self.failed = False
+        self.fail_reason = ""   # the LAST _fail message, surfaced by callers
+                                # (the Test/warm-up path shows it instead of a
+                                # generic "server not ready").
 
         self._ws = None
         self._send_lock = threading.Lock()
@@ -6068,6 +6071,7 @@ class WhisperLiveStream:
         if self.failed:
             return
         self.failed = True
+        self.fail_reason = str(msg)
         log.error("WhisperLive stream failed: %s", msg)
         cb = self.on_error
         if cb is not None:
@@ -6350,11 +6354,12 @@ class RemoteTranscriber(BaseTranscriber):
         try:
             ready = probe._ready.wait(timeout=self.WARMUP_TIMEOUT_SEC)
             if probe.failed or not ready:
+                detail = (probe.fail_reason if probe.failed
+                          else "no SERVER_READY within %.0fs"
+                                % self.WARMUP_TIMEOUT_SEC)
                 raise RuntimeError(
-                    "WhisperLive server not ready at %s%s" % (
-                        self.url,
-                        "" if probe.failed else
-                        " (no SERVER_READY within %.0fs)" % self.WARMUP_TIMEOUT_SEC))
+                    "WhisperLive server not ready at %s (%s)" % (
+                        self.url, detail or "unknown error"))
         finally:
             probe.abort()
         self.model = "remote"

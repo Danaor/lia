@@ -3326,8 +3326,45 @@ def t_remote_ws_policy():
     assert not ok and "wss://" in msg
 
 
+def t_remote_fail_reason_surfaced():
+    """A handshake failure surfaces the REAL reason in the Test/warm-up error,
+    not a generic 'server not ready' (which hid a missing websocket-client for
+    a whole debugging session, 2026-08-31)."""
+    import threading
+    import lia as w
+    # _fail records the reason on the stream object.
+    s = w.WhisperLiveStream("ws://127.0.0.1:9090")
+    assert s.fail_reason == ""
+    s._fail("websocket-client not installed: No module named 'websocket'")
+    assert s.failed and "websocket-client not installed" in s.fail_reason
+
+    # load_model bubbles that reason into its RuntimeError.
+    class FakeStream:
+        def __init__(self, *a, **k):
+            self.failed = True
+            self.fail_reason = "boom: the real cause"
+            self._ready = threading.Event()   # never set -> not ready
+        def start(self): pass
+        def abort(self): pass
+    orig = w.WhisperLiveStream
+    w.WhisperLiveStream = FakeStream
+    try:
+        t = w.RemoteTranscriber(url="ws://127.0.0.1:9090")   # private -> passes policy
+        try:
+            t.load_model()
+            assert False, "load_model should have raised"
+        except RuntimeError as e:
+            assert "boom: the real cause" in str(e), str(e)
+            assert "not ready" in str(e)
+    finally:
+        w.WhisperLiveStream = orig
+
+
 _test("remote: ws:// plaintext policy (private-only, override + warning)",
       t_remote_ws_policy)
+
+_test("remote: Test surfaces the real failure reason (not generic 'not ready')",
+      t_remote_fail_reason_surfaced)
 
 
 def t_model_revision_pins():
