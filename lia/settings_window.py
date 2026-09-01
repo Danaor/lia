@@ -290,7 +290,7 @@ def main():
 BODY = """
 <div class="shell">
   <nav class="sidebar">
-    <div class="brand"><img class="logo" src="__LOGO_SRC__" alt=""><span>Lia</span></div>
+    <div class="brand"><img class="logo" src="__LOGO_SRC__" alt=""><span class="brand-txt"><span class="brand-name">Lia</span><span class="brand-sub">Local Inference Assistant</span></span></div>
     <button class="nav-item" data-page="general"><span class="ico">&#9881;</span>General</button>
     <button class="nav-item" data-page="audio"><span class="ico">&#127911;</span>Audio</button>
     <button class="nav-item" data-page="models"><span class="ico">&#129504;</span>Models</button>

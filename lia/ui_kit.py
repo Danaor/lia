@@ -126,10 +126,14 @@ a:hover{text-decoration:underline;}
   display:flex; flex-direction:column; gap:2px;
 }
 .sidebar .brand{
-  display:flex; align-items:center; gap:var(--sp-2);
+  display:flex; align-items:center; gap:var(--sp-3);
   padding:var(--sp-2) var(--sp-3) var(--sp-4);
-  font-size:var(--fs-h1); font-weight:700; color:var(--ink);
+  color:var(--ink);
 }
+.sidebar .brand .brand-txt{display:flex; flex-direction:column; line-height:1.15; min-width:0;}
+.sidebar .brand .brand-name{font-size:var(--fs-h1); font-weight:700;}
+.sidebar .brand .brand-sub{font-size:10px; font-weight:600; letter-spacing:.02em;
+  text-transform:uppercase; color:var(--muted); margin-top:2px;}
 .sidebar .brand .logo{
   width:28px; height:28px; border-radius:8px; flex:0 0 28px;
   /* the brand orb (lia_logo.png) - transparent corners, own rim/glow, so no
