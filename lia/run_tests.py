@@ -3601,13 +3601,23 @@ def t_tray_onboarding():
         wt.save_config = lambda cfg: calls.append(("save",))
         fake = types.SimpleNamespace(config={})
         wt.LiaApp._tray_first_run_onboarding(fake, Icon())
-        assert [c[0] for c in calls] == ["notify", "promote", "save"], calls
+        # (2026-09-01) A failed promote also tells the user WHERE the icon
+        # is - once - since the overflow is exactly why "it didn't start".
+        assert [c[0] for c in calls] == ["notify", "promote", "notify", "save"], calls
         assert fake.config.get("_first_run_welcome_shown") is True
         assert "_tray_icon_promoted" not in fake.config, \
             "a failed promote must not persist the flag (no retry ever)"
+        assert fake.config.get("_tray_hint_shown") is True
+        assert "overflow" in calls[2][1] and "Lia" in calls[2][2], calls[2]
         assert "ctrl+space" in calls[0][1]
 
-        # Successful promote: both flags, exactly ONE save, hotkey honored.
+        # Second launch after that failure: promote retries, hint does NOT.
+        calls.clear()
+        wt.LiaApp._tray_first_run_onboarding(fake, Icon())
+        assert [c[0] for c in calls] == ["promote"], calls
+
+        # Successful promote: both flags, exactly ONE save, hotkey honored,
+        # no "where is it" hint.
         calls.clear()
         wt._promote_tray_icon = lambda *a, **k: True
         fake2 = types.SimpleNamespace(config={"hotkey": "f9"})
@@ -3615,6 +3625,7 @@ def t_tray_onboarding():
         assert fake2.config.get("_tray_icon_promoted") is True
         assert fake2.config.get("_first_run_welcome_shown") is True
         assert [c[0] for c in calls].count("save") == 1, calls
+        assert [c[0] for c in calls].count("notify") == 1, calls
         assert "f9" in calls[0][1]
 
         # Both flags set: complete no-op (no balloon spam, no save).
@@ -3636,8 +3647,10 @@ def t_tray_onboarding():
     promo_src = inspect.getsource(wt._promote_tray_icon)
     for needle in ("NotifyIconSettings", "IsPromoted", "ExecutablePath"):
         assert needle in promo_src, "_promote_tray_icon missing " + needle
-    assert 'basename(exe) != "lia.exe"' in promo_src, \
+    assert "_lia_owned_executable" in promo_src, \
         "shared-interpreter identity gate missing"
+    # A freshly written promotion is applied by re-registering the live icon.
+    assert "_reregister_tray_icon" in promo_src and "icon=None" in promo_src
     assert "_tray_first_run_onboarding" in inspect.getsource(wt.LiaApp.run), \
         "onboarding not wired in run()"
 
@@ -6171,6 +6184,208 @@ def t_summarize_window():
 
 _test("summarize: pywebview input window + result-file handoff + Tk fallback",
       t_summarize_window)
+
+
+# ============================================================
+# Startup at logon + tray identity (2026-09-01)
+# ============================================================
+section("Startup at logon + tray identity")
+
+
+def t_startup_relaunch_plan():
+    """The logon self-relaunch policy (pure): manual launches never retry;
+    a logon launch retries with a growing delay, carries --autostart +
+    --restarted (mutex handoff) + the attempt counter, and stops after
+    _AUTOSTART_MAX_ATTEMPTS."""
+    import lia as w
+    assert w._autostart_relaunch_plan(["lia.py"], logon=False) is None
+    plan = w._autostart_relaunch_plan(["lia.py", "--autostart"])
+    assert plan is not None
+    delay, argv = plan
+    assert delay == 15 and os.path.isabs(argv[0])
+    assert "--autostart" in argv and "--restarted" in argv
+    assert argv[-2:] == ["--attempt", "1"]
+    assert w._autostart_attempt(argv) == 1
+    # An implicit logon launch (uptime heuristic) gets the flag added so the
+    # later attempts are explicit.
+    _d2, argv2 = w._autostart_relaunch_plan(["lia.py"], logon=True)
+    assert "--autostart" in argv2 and argv2[-2:] == ["--attempt", "1"]
+    # attempt 2 -> delay 45 + attempt 3; attempt 3 -> stop
+    d3, a3 = w._autostart_relaunch_plan(["lia.py", "--autostart", "--attempt", "2"])
+    assert d3 == 45 and a3[-2:] == ["--attempt", "3"] and a3.count("--attempt") == 1
+    assert w._autostart_relaunch_plan(["lia.py", "--autostart", "--attempt", "3"]) is None
+    assert w._autostart_attempt(["lia.py", "--attempt", "x"]) == 0
+    # logon detection: explicit flag wins; otherwise the boot-uptime window
+    assert w._is_logon_launch(["lia.py", "--autostart"], uptime=99999.0) is True
+    assert w._is_logon_launch(["lia.py"], uptime=30.0) is True
+    assert w._is_logon_launch(["lia.py"], uptime=3600.0) is False
+    assert w._is_logon_launch(["lia.py"], uptime=-1.0) is False
+    assert isinstance(w._uptime_seconds(), float)
+
+
+_test("startup: logon relaunch policy (retries, flags, cap) + logon detection",
+      t_startup_relaunch_plan)
+
+
+def t_startup_trace_and_excepthook():
+    """Breadcrumbs + the crash net: _startup_trace appends stage lines and
+    never raises; the excepthook records a CRASH line without relaunching a
+    manual launch, and IS the installed sys.excepthook, installed before the
+    heavy imports - so a failure at module level before logging exists is no
+    longer invisible (the 2026-09-01 "didn't start at logon" report)."""
+    import lia as w
+    tmp = tempfile.mkdtemp()
+    orig, orig_argv, orig_err = w._STARTUP_TRACE, sys.argv, sys.stderr
+    w._STARTUP_TRACE = os.path.join(tmp, "sub", "startup_trace.log")
+    try:
+        w._startup_trace("launch", "x y")
+        w._startup_trace("main")
+        sys.argv = ["lia.py"]          # a manual launch: must not relaunch
+        sys.stderr = io.StringIO()     # swallow the default traceback print
+        try:
+            raise ValueError("boom at import")
+        except ValueError as e:
+            w._startup_excepthook(type(e), e, e.__traceback__)
+        with open(w._STARTUP_TRACE, encoding="utf-8") as f:
+            txt = f.read()
+        assert "launch x y" in txt and " main" in txt and "CRASH" in txt, txt
+        assert "boom at import" in txt and "relaunch" not in txt, txt
+        assert sys.excepthook is w._startup_excepthook
+    finally:
+        w._STARTUP_TRACE, sys.argv, sys.stderr = orig, orig_argv, orig_err
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "lia.py"),
+               encoding="utf-8").read()
+    assert src.index("sys.excepthook = _startup_excepthook") < src.index("import numpy")
+    # the tray app marks its milestones and the logon launch waits for the shell
+    assert '_startup_trace("main")' in src and '_startup_trace("tray-ready")' in src
+    assert "_shell_tray_present()" in src.split('if __name__ == "__main__":')[1]
+
+
+_test("startup: breadcrumb file + crash excepthook (before the heavy imports)",
+      t_startup_trace_and_excepthook)
+
+
+def t_startup_target_autostart_flag():
+    """Every logon mechanism launches with --autostart (the Run value, the
+    elevated task and the .lnk fallback all build from _get_startup_target),
+    and a stale Run value is recognised: same exe without the flag ->
+    rewrite; a moved (missing) target -> rewrite; another install's live
+    exe -> leave it alone; identical -> nothing."""
+    import lia as w
+    _t, args, _wd, _ico = w._get_startup_target()
+    assert args.endswith("--autostart"), args
+    cmd = w._autostart_cmdline()
+    assert cmd.startswith('"') and cmd.endswith(" --autostart"), cmd
+    exe = w._cmdline_exe(cmd)
+    assert exe and os.path.isabs(exe) and '"' not in exe, exe
+    assert w._cmdline_exe('bare.exe "x"') == "bare.exe"
+    assert w._cmdline_exe("") == ""
+    stale = w._autostart_runkey_stale
+    assert stale(cmd, cmd) is False
+    assert stale(cmd.upper(), cmd) is False               # case-insensitive
+    assert stale('"%s" "old.py"' % exe, cmd, exists=lambda p: True) is True
+    assert stale(r'"C:\gone\Lia.exe" "C:\gone\app\lia.py"', cmd,
+                 exists=lambda p: False) is True
+    assert stale(r'"C:\other\runtime\Lia.exe" "C:\other\app\lia.py" --autostart',
+                 cmd, exists=lambda p: True) is False
+    assert stale("", cmd, exists=lambda p: False) is True
+    # the installer's Run value carries the flag too
+    iss = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "installer.iss"),
+               encoding="utf-8").read()
+    assert 'lia.py"" --autostart"' in iss, "installer Run value lacks --autostart"
+    # run() performs the refresh + legacy migration off the main thread
+    import inspect
+    assert "_autostart_maintenance" in inspect.getsource(w.LiaApp.run)
+    assert "_refresh_autostart_runkey" in inspect.getsource(w.LiaApp._autostart_maintenance)
+
+
+_test("startup: --autostart on every logon mechanism + stale Run-value policy",
+      t_startup_target_autostart_flag)
+
+
+def t_launcher_identity_portable_pythonw():
+    """A locked-PC portable launch ('Lia (Work PC).bat' -> the code-signed
+    runtime\\pythonw.exe) is a Lia-owned identity: _ensure_lia_launcher keeps
+    it (no unsigned app\\Lia.exe copy that WDAC would block at logon), the
+    startup target uses it, and the tray-promote gate accepts it. A shared
+    interpreter is still rejected."""
+    import inspect
+    import lia as w
+    root = tempfile.mkdtemp()
+    rt = os.path.join(root, "runtime")
+    app = os.path.join(root, "app")
+    os.makedirs(rt)
+    os.makedirs(app)
+    pyw = os.path.join(rt, "pythonw.exe")
+    open(pyw, "wb").close()
+    open(os.path.join(app, "lia.py"), "w").close()
+    assert w._is_portable_runtime_exe(pyw) is True
+    assert w._lia_owned_executable(pyw) is True
+    assert w._is_portable_runtime_exe(os.path.join(root, "pythonw.exe")) is False
+    shared = os.path.join(tempfile.mkdtemp(), "pythonw.exe")
+    assert w._lia_owned_executable(shared) is False
+    assert w._lia_owned_executable(r"C:\x\runtime\Lia.exe") is True   # by name
+    orig_exe, orig_argv = sys.executable, sys.argv
+    try:
+        sys.executable, sys.argv = pyw, [os.path.join(app, "lia.py")]
+        assert w._ensure_lia_launcher() == pyw
+        assert not os.path.exists(os.path.join(app, "Lia.exe")), \
+            "must not mint an unsigned copy next to the signed runtime"
+        t, args, wd, _i = w._get_startup_target()
+        assert t == pyw and args.endswith("--autostart") and wd == app
+    finally:
+        sys.executable, sys.argv = orig_exe, orig_argv
+    assert "_is_portable_runtime_exe" in inspect.getsource(w._ensure_lia_launcher)
+
+
+_test("startup: signed portable pythonw is a Lia-owned launcher + tray identity",
+      t_launcher_identity_portable_pythonw)
+
+
+def t_autostart_relaunch_spawn():
+    """The relaunch itself (sleep + Popen stubbed): a logon launch that dies
+    re-spawns THIS executable with the script's absolute path, the explicit
+    flags and the attempt counter, detached + windowless, after the planned
+    delay - and leaves 'relaunch-scheduled' / 'relaunched' breadcrumbs. A
+    manual launch spawns nothing."""
+    import subprocess
+    import lia as w
+    tmp = tempfile.mkdtemp()
+    orig = (w._STARTUP_TRACE, sys.argv, time.sleep, subprocess.Popen)
+    w._STARTUP_TRACE = os.path.join(tmp, "startup_trace.log")
+    slept, spawned = [], []
+
+    class _P:
+        def __init__(self, args, **kw):
+            spawned.append((args, kw))
+    try:
+        time.sleep = lambda s: slept.append(s)
+        subprocess.Popen = _P
+        sys.argv = ["lia.py"]
+        assert w._autostart_relaunch("manual") is False and not spawned
+        sys.argv = ["lia.py", "--autostart", "--attempt", "1"]
+        assert w._autostart_relaunch("uncaught RuntimeError") is True
+        assert slept == [30], slept
+        args, kw = spawned[0]
+        assert args[0] == sys.executable and args[1] == os.path.abspath("lia.py")
+        assert args[2:] == ["--autostart", "--restarted", "--attempt", "2"], args
+        assert kw.get("close_fds") is True
+        if os.name == "nt":
+            assert kw.get("creationflags") == (0x00000008 | 0x08000000)
+        with open(w._STARTUP_TRACE, encoding="utf-8") as f:
+            txt = f.read()
+        assert "relaunch-scheduled in 30s after: uncaught RuntimeError" in txt, txt
+        assert "relaunched --autostart --restarted --attempt 2" in txt, txt
+        # the serve child's logon Run value asks for the same retry explicitly
+        import inspect
+        assert "--serve --port %d --autostart" in inspect.getsource(
+            w.LiaApp._create_serve_task)
+    finally:
+        w._STARTUP_TRACE, sys.argv, time.sleep, subprocess.Popen = orig
+
+
+_test("startup: logon relaunch spawns the next attempt (detached, flagged, delayed)",
+      t_autostart_relaunch_spawn)
 
 
 # ============================================================

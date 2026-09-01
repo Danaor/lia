@@ -90,7 +90,7 @@ Name: "elevatedautostart"; Description: "{cm:AutoStartElevated}"; GroupDescripti
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; \
-    ValueType: string; ValueName: "{#AppName}"; ValueData: """{app}\runtime\{#AppExeName}"" ""{app}\app\lia.py"""; \
+    ValueType: string; ValueName: "{#AppName}"; ValueData: """{app}\runtime\{#AppExeName}"" ""{app}\app\lia.py"" --autostart"; \
     Flags: uninsdeletevalue; Tasks: autostart and not elevatedautostart
 
 [Files]

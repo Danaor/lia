@@ -20,6 +20,156 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
+# --- Startup breadcrumbs + crash net (2026-09-01, "Lia didn't start at logon").
+# Everything below - the heavy imports, ~25k lines of module body, the log
+# handler itself - runs BEFORE the first log line, and under the pythonw
+# launcher stderr is a devnull sink. So a failure during a logon launch left
+# NO trace anywhere: the app simply wasn't there, with nothing to debug.
+# Two tiny os-only pieces close that hole: a breadcrumb file recording how far
+# each launch got, and an excepthook that writes the traceback there (and to
+# lia.log once logging is up). A logon launch (--autostart, carried by the Run
+# value / logon task) additionally re-launches itself a few times with a
+# growing delay: in the first minute after logon the shell, audio endpoints
+# and GPU driver are still settling, and a transient failure then must not
+# cost the whole session. Manual launches never retry.
+_STARTUP_TRACE = os.path.join(
+    os.environ.get("APPDATA", os.path.expanduser("~")), "Lia", "startup_trace.log")
+_AUTOSTART_MAX_ATTEMPTS = 3
+
+
+def _startup_trace(stage, detail=""):
+    """Append one breadcrumb line (stage + optional detail). Never raises."""
+    try:
+        import time as _time
+        d = os.path.dirname(_STARTUP_TRACE)
+        if not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+        try:  # keep it small: one rotation at 256KB
+            if os.path.getsize(_STARTUP_TRACE) > 256 * 1024:
+                os.replace(_STARTUP_TRACE, _STARTUP_TRACE + ".1")
+        except OSError:
+            pass
+        with open(_STARTUP_TRACE, "a", encoding="utf-8") as f:
+            f.write("%s pid=%d %s%s\n" % (
+                _time.strftime("%Y-%m-%d %H:%M:%S"), os.getpid(), stage,
+                (" " + detail) if detail else ""))
+    except Exception:
+        pass
+
+
+def _autostart_attempt(argv=None):
+    """Attempt number carried by a logon relaunch (0 = the original launch)."""
+    argv = sys.argv if argv is None else argv
+    try:
+        return max(0, int(argv[argv.index("--attempt") + 1]))
+    except (ValueError, IndexError):
+        return 0
+
+
+_LOGON_WINDOW_S = 180
+
+
+def _uptime_seconds():
+    """Seconds since Windows booted (GetTickCount64); -1 when unavailable."""
+    try:
+        import ctypes
+        return ctypes.windll.kernel32.GetTickCount64() / 1000.0
+    except Exception:
+        return -1.0
+
+
+def _is_logon_launch(argv=None, uptime=None):
+    """Was this launch part of logon? Explicit: --autostart (what the Run
+    value / logon task pass). Implicit: any launch in the first minutes after
+    boot - covers logon mechanisms that predate the flag (an installer task,
+    an older Run value) at the cost of treating a hand launch right after
+    boot the same way, which is harmless: the same settling + retry applies."""
+    argv = sys.argv if argv is None else argv
+    if "--autostart" in argv:
+        return True
+    if "--serve" in argv:
+        # A transcription-server child spawned by the tray app's Settings
+        # toggle: ServeController tracks its pid, so it must not re-spawn
+        # itself behind the controller's back. Its LOGON Run value passes
+        # --autostart explicitly and takes the branch above.
+        return False
+    up = _uptime_seconds() if uptime is None else uptime
+    return 0 <= up < _LOGON_WINDOW_S
+
+
+def _autostart_relaunch_plan(argv=None, logon=None):
+    """Decide whether a FAILED launch should re-launch itself.
+
+    Only logon launches retry, at most _AUTOSTART_MAX_ATTEMPTS times, with a
+    growing delay (15s, 30s, 45s) so a still-booting machine gets time to
+    settle. Returns (delay_seconds, next_argv) or None. Pure given `logon`."""
+    argv = list(sys.argv if argv is None else argv)
+    if logon is None:
+        logon = _is_logon_launch(argv)
+    if not logon:
+        return None
+    n = _autostart_attempt(argv)
+    if n >= _AUTOSTART_MAX_ATTEMPTS:
+        return None
+    keep = [a for i, a in enumerate(argv)
+            if a != "--attempt" and not (i > 0 and argv[i - 1] == "--attempt")]
+    if keep:
+        keep[0] = os.path.abspath(keep[0])   # cwd-independent script path
+    if "--autostart" not in keep:
+        keep.append("--autostart")           # later attempts are explicit
+    if "--restarted" not in keep:
+        keep.append("--restarted")           # wait for the dying instance's mutex
+    return 15 * (n + 1), keep + ["--attempt", str(n + 1)]
+
+
+def _autostart_relaunch(reason):
+    """Spawn the next attempt per _autostart_relaunch_plan (detached, no
+    window) after its delay. Returns True when one was started."""
+    plan = _autostart_relaunch_plan()
+    if not plan:
+        return False
+    delay, next_argv = plan
+    _startup_trace("relaunch-scheduled", "in %ds after: %s" % (delay, reason))
+    try:
+        import time as _time
+        import subprocess
+        _time.sleep(delay)
+        kw = {}
+        if os.name == "nt":
+            kw["creationflags"] = 0x00000008 | 0x08000000  # DETACHED | NO_WINDOW
+        subprocess.Popen([sys.executable] + next_argv, close_fds=True, **kw)
+        _startup_trace("relaunched", " ".join(next_argv[1:]))
+        return True
+    except Exception as e:
+        _startup_trace("relaunch-failed", repr(e))
+        return False
+
+
+def _startup_excepthook(exc_type, exc, tb):
+    """Uncaught-exception hook: breadcrumb + lia.log (when up) + the logon
+    relaunch policy. Installed before any heavy import."""
+    try:
+        import traceback
+        text = "".join(traceback.format_exception(exc_type, exc, tb)).rstrip()
+    except Exception:
+        text = "%s: %s" % (getattr(exc_type, "__name__", exc_type), exc)
+    _startup_trace("CRASH", "\n    " + text.replace("\n", "\n    "))
+    try:
+        import logging as _logging
+        if _logging.getLogger("Lia").handlers or _logging.getLogger().handlers:
+            _logging.getLogger("Lia").critical("Uncaught exception:\n%s", text)
+    except Exception:
+        pass
+    try:
+        sys.__excepthook__(exc_type, exc, tb)
+    except Exception:
+        pass
+    _autostart_relaunch("uncaught %s" % getattr(exc_type, "__name__", exc_type))
+
+
+sys.excepthook = _startup_excepthook
+_startup_trace("launch", " ".join(sys.argv[1:]) or "(no args)")
+
 import json
 import asyncio
 import threading
@@ -11749,6 +11899,33 @@ def _stamp_lia_launcher(exe_path):
         return False
 
 
+def _is_portable_runtime_exe(exe=None):
+    """True when `exe` is the bundled interpreter of a full-runtime install:
+    <root>\\runtime\\{Lia,pythonw,python}.exe with <root>\\app\\lia.py beside
+    it (the Portable zip and the Setup.exe layout alike)."""
+    exe = os.path.abspath(exe or sys.executable)
+    rt_dir = os.path.dirname(exe)
+    if os.path.basename(exe).lower() not in ("lia.exe", "pythonw.exe", "python.exe"):
+        return False
+    if os.path.basename(rt_dir).lower() != "runtime":
+        return False
+    root = os.path.dirname(rt_dir)
+    return (os.path.isfile(os.path.join(root, "app", "lia.py"))
+            or os.path.isfile(os.path.join(root, "Lia.bat")))
+
+
+def _lia_owned_executable(exe=None):
+    """Is this process's executable UNIQUE to Lia - safe as the app's tray /
+    launch identity? The renamed launcher Lia.exe, a frozen build, or the
+    bundled runtime's signed pythonw.exe behind 'Lia (Work PC).bat'. A shared
+    interpreter (`python lia.py` dev runs) is not: its path is every Python
+    tray app's path."""
+    exe = os.path.abspath(exe or sys.executable)
+    if getattr(sys, "frozen", False) or os.path.basename(exe).lower() == "lia.exe":
+        return True
+    return _is_portable_runtime_exe(exe)
+
+
 def _ensure_lia_launcher():
     """Create a copy of pythonw.exe named 'Lia.exe' in the project folder.
 
@@ -11768,6 +11945,12 @@ def _ensure_lia_launcher():
     # already Lia.exe - no copy needed. Return the current executable so
     # callers use the runtime dir launcher, not a copy in the app dir.
     if os.path.basename(sys.executable).lower() == "lia.exe":
+        return sys.executable
+    # Locked-PC portable launch ('Lia (Work PC).bat' -> the code-SIGNED
+    # runtime\pythonw.exe): keep THAT identity. Copying it into app\Lia.exe
+    # would hand auto-start (and the tray identity) an unsigned binary that
+    # WDAC/AppLocker blocks at logon - the app would silently never start.
+    if _is_portable_runtime_exe(sys.executable):
         return sys.executable
 
     script_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
@@ -11877,7 +12060,7 @@ def _get_startup_target():
     if getattr(sys, 'frozen', False):
         # PyInstaller bundled exe
         target = sys.executable
-        args = ""
+        args = "--autostart"
         working = os.path.dirname(target)
     else:
         # Running from Python source
@@ -11891,7 +12074,9 @@ def _get_startup_target():
             py_dir = os.path.dirname(sys.executable)
             pythonw = os.path.join(py_dir, "pythonw.exe")
             target = pythonw if os.path.exists(pythonw) else sys.executable
-        args = f'"{script}"'
+        # --autostart marks a LOGON launch: the app then waits for the shell
+        # before building itself and re-launches on a transient failure.
+        args = f'"{script}" --autostart'
         working = script_dir
 
     return target, args, working, icon_path
@@ -12021,6 +12206,69 @@ def _set_autostart_runkey(enabled):
         return False
 
 
+def _autostart_cmdline():
+    """The exact Run-value command line for THIS install."""
+    target, args, _working, _icon = _get_startup_target()
+    return '"%s"' % target + ((" " + args) if args else "")
+
+
+def _cmdline_exe(cmd):
+    """First token of a Run-value command line (quoted or bare)."""
+    cmd = (cmd or "").strip()
+    if cmd.startswith('"'):
+        end = cmd.find('"', 1)
+        return cmd[1:end] if end > 0 else cmd[1:]
+    return cmd.split(" ", 1)[0]
+
+
+def _autostart_runkey_stale(current, expected, exists=os.path.exists):
+    """Should an existing Run value be rewritten to `expected`? Yes when it
+    already targets OUR executable but differs (typically: it predates the
+    --autostart logon flag), or when its target no longer exists (the install
+    moved). A value that runs a DIFFERENT, still-present Lia is left alone -
+    that install owns it. Pure - tested."""
+    cur = (current or "").strip()
+    if os.path.normcase(cur) == os.path.normcase((expected or "").strip()):
+        return False
+    cur_exe = _cmdline_exe(cur)
+    if not cur_exe or not exists(cur_exe):
+        return True
+    return os.path.normcase(cur_exe) == os.path.normcase(_cmdline_exe(expected))
+
+
+def _refresh_autostart_runkey():
+    """Every launch: rewrite a stale per-user Run value at the current path
+    (one registry read when nothing changed). Never CREATES a value - the
+    user's on/off choice stays theirs. Returns True when it rewrote."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY_PATH) as k:
+            current, _ = winreg.QueryValueEx(k, _RUN_KEY_NAME)
+    except OSError:
+        return False
+    expected = _autostart_cmdline()
+    if not _autostart_runkey_stale(str(current), expected):
+        return False
+    if _set_autostart_runkey(True):
+        log.info("Auto-start: refreshed a stale Run value: %s -> %s",
+                 current, expected)
+        return True
+    return False
+
+
+def _shell_tray_present():
+    """Is the taskbar notification area up? (FindWindow probe; True when the
+    probe itself is unavailable, so a caller never blocks on it.)"""
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        shell_tray = user32.FindWindowW("Shell_TrayWnd", None)
+        return bool(shell_tray and
+                    user32.FindWindowExW(shell_tray, 0, "TrayNotifyWnd", None))
+    except Exception:
+        return True
+
+
 def is_auto_start_enabled():
     """Auto-start is on if the scheduled task, the HKCU Run value, or a
     startup .lnk exists (including a pre-rebrand one, which still
@@ -12030,7 +12278,20 @@ def is_auto_start_enabled():
             or any(os.path.exists(p) for p in _LEGACY_STARTUP_SHORTCUTS))
 
 
-def _promote_tray_icon(timeout_sec=15.0):
+def _reregister_tray_icon(icon):
+    """Remove + re-add the live tray icon so Explorer re-reads its
+    NotifyIconSettings entry (a just-written IsPromoted applies when the icon
+    registers). Same window + id -> same entry; a one-off blink."""
+    try:
+        icon.visible = False
+        time.sleep(0.3)
+        icon.visible = True
+        log.info("Tray icon re-registered so the promotion applies now")
+    except Exception as e:
+        log.debug("Tray icon re-register skipped: %s", e)
+
+
+def _promote_tray_icon(timeout_sec=15.0, icon=None):
     """Pin Lia's tray icon to the VISIBLE taskbar corner on Windows 11.
 
     Windows 11 drops every newly registered tray icon into the hidden "^"
@@ -12045,19 +12306,23 @@ def _promote_tray_icon(timeout_sec=15.0):
     icon first registers, so poll briefly. On Windows 10 the key does not
     exist and this is a silent no-op.
 
-    Returns True when a matching entry exists and its promotion verifiably
-    landed (or was already set) - the signal to stop trying on later runs.
+    Returns True when at least one matching entry exists and EVERY matching
+    entry is verifiably promoted (or already was) - the signal to stop trying
+    on later runs. `icon` (the live pystray icon) lets a freshly written
+    promotion take effect NOW: Explorer applies IsPromoted when the icon
+    (re)registers, so the icon is re-added after the write - otherwise the
+    change only shows on the next launch, exactly the run a new user judges.
     """
     import winreg
     exe = os.path.normcase(os.path.abspath(sys.executable))
-    # Identity gate: only OUR launcher (the renamed-pythonw Lia.exe) or the
-    # frozen build has an ExecutablePath unique to Lia. Under a shared
-    # interpreter (`python lia.py` dev runs; run.bat's very first launch,
-    # before _ensure_lia_launcher creates Lia.exe) the path would match
-    # OTHER Python tray apps - promoting them and never us. Skip; once the
-    # launcher exists, the next run retries under the unique path.
-    if (os.path.basename(exe) != "lia.exe"
-            and not getattr(sys, "frozen", False)):
+    # Identity gate: only an executable UNIQUE to Lia (the renamed-pythonw
+    # Lia.exe, a frozen build, or the bundled runtime's signed pythonw.exe
+    # behind 'Lia (Work PC).bat') has a NotifyIconSettings ExecutablePath
+    # that is ours alone. Under a shared interpreter (`python lia.py` dev
+    # runs; run.bat's very first launch, before _ensure_lia_launcher creates
+    # Lia.exe) the path would match OTHER Python tray apps - promoting them
+    # and never us. Skip; once the launcher exists, the next run retries.
+    if not _lia_owned_executable():
         return False
     deadline = time.time() + timeout_sec
     delay = 0.5
@@ -12067,9 +12332,14 @@ def _promote_tray_icon(timeout_sec=15.0):
                                   r"Control Panel\NotifyIconSettings")
         except OSError:
             return False  # pre-22H2 Windows: no overflow registry, nothing to do
-        promoted = False
+        # Windows can hold SEVERAL entries for one executable (a re-registered
+        # icon, an earlier tooltip): promote every one, and count success
+        # only when all of them are pinned - a stale already-promoted entry
+        # must not mask a fresh hidden one.
+        matched = promoted = 0
+        fresh = False
         with root:
-            # Enumerate READ-only; only the matched entry is reopened writable.
+            # Enumerate READ-only; only a matched entry is reopened writable.
             i = 0
             while True:
                 try:
@@ -12082,6 +12352,7 @@ def _promote_tray_icon(timeout_sec=15.0):
                         path, _ = winreg.QueryValueEx(k, "ExecutablePath")
                         if os.path.normcase(str(path)) != exe:
                             continue
+                        matched += 1
                         try:
                             already = winreg.QueryValueEx(k, "IsPromoted")[0]
                         except OSError:
@@ -12089,7 +12360,7 @@ def _promote_tray_icon(timeout_sec=15.0):
                 except OSError:
                     continue
                 if already:
-                    promoted = True
+                    promoted += 1
                     continue
                 # Success only when the write verifiably landed - a denied
                 # write must NOT persist the one-time flag (no retry ever).
@@ -12099,13 +12370,16 @@ def _promote_tray_icon(timeout_sec=15.0):
                                           winreg.REG_DWORD, 1)
                     with winreg.OpenKey(root, sub, 0, winreg.KEY_READ) as rk:
                         if winreg.QueryValueEx(rk, "IsPromoted")[0] == 1:
-                            promoted = True
+                            promoted += 1
+                            fresh = True
                             log.info("Tray icon promoted out of the Windows 11 "
                                      "overflow (NotifyIconSettings\\%s)", sub)
                 except OSError as e:
                     log.warning("Tray icon promote write failed on %s: %s "
                                 "- will retry next launch", sub, e)
-        if promoted:
+        if matched and promoted == matched:
+            if fresh and icon is not None:
+                _reregister_tray_icon(icon)
             return True
         if time.time() >= deadline:
             return False  # entry never appeared / write denied; retry next launch
@@ -16218,9 +16492,9 @@ class LiaApp:
         # don't accumulate. Background — never blocks startup.
         threading.Thread(target=self._prune_meeting_audio, daemon=True).start()
 
-        # One-time cleanup of the orphaned pre-rebrand 'WhisperType' auto-start
-        # task (uses PowerShell → off the main thread).
-        threading.Thread(target=self._migrate_legacy_autostart, daemon=True).start()
+        # Auto-start housekeeping (off the main thread - may spawn PowerShell):
+        # refresh a stale Run value, then the one-time legacy-task cleanup.
+        threading.Thread(target=self._autostart_maintenance, daemon=True).start()
 
         # Start hotkey listener in background
         hotkey_thread = threading.Thread(target=self._hotkey_listener, daemon=True)
@@ -16411,6 +16685,7 @@ class LiaApp:
         def on_tray_ready(icon):
             icon.visible = True
             log.info("Tray icon registered and visible")
+            _startup_trace("tray-ready")
             threading.Thread(target=self._tray_first_run_onboarding,
                              args=(icon,), daemon=True).start()
 
@@ -16486,8 +16761,26 @@ class LiaApp:
                 self.config["_first_run_welcome_shown"] = True
                 dirty = True
             if not self.config.get("_tray_icon_promoted"):
-                if _promote_tray_icon():
+                # The first attempt polls long: Explorer creates the entry
+                # only after the icon registers, and a cold first start
+                # (WebView2 boot, model download) can push that past 15s.
+                first = not self.config.get("_tray_hint_shown")
+                if _promote_tray_icon(timeout_sec=45.0 if first else 15.0,
+                                      icon=icon):
                     self.config["_tray_icon_promoted"] = True
+                    dirty = True
+                elif first:
+                    # Could not pin it (Windows 10, a shared interpreter, a
+                    # denied write): say WHERE the app is, once. Promotion
+                    # itself keeps retrying silently on later launches.
+                    try:
+                        icon.notify("Windows keeps new tray icons in the ^ "
+                                    "overflow near the clock. Drag the Lia orb "
+                                    "onto the taskbar to keep it visible.",
+                                    "Where is Lia?")
+                    except Exception:
+                        pass
+                    self.config["_tray_hint_shown"] = True
                     dirty = True
             # One save for both flags (each save re-encrypts every DPAPI
             # secret). If it raises (fail-closed DPAPI), the in-memory flags
@@ -21001,8 +21294,8 @@ class LiaApp:
         try:
             if actual:
                 self.tray_icon.notify(
-                    "Lia will start automatically at logon — elevated, "
-                    "with no UAC prompt.", "Start with Windows: ON")
+                    "Lia will start automatically when you sign in to Windows.",
+                    "Start with Windows: ON")
             else:
                 self.tray_icon.notify("Auto-start disabled.", "Start with Windows: OFF")
         except Exception:
@@ -21011,6 +21304,16 @@ class LiaApp:
             self.tray_icon.update_menu()
         except Exception:
             pass
+
+    def _autostart_maintenance(self):
+        """Startup housekeeping for launch-at-logon (background thread): rewrite
+        a stale per-user Run value (a moved install, or one that predates the
+        --autostart logon flag), then the one-time legacy-task migration."""
+        try:
+            _refresh_autostart_runkey()
+        except Exception as e:
+            log.debug("Auto-start refresh skipped: %s", e)
+        self._migrate_legacy_autostart()
 
     def _migrate_legacy_autostart(self):
         """One-time: remove any orphaned pre-rebrand logon task ('WhisperType'
@@ -24078,7 +24381,9 @@ class LiaApp:
             return (False, "No interpreter available for auto-start.")
         script = os.path.abspath(sys.argv[0])
         port = self._serve.port()
-        cmd = '"%s" "%s" --serve --port %d' % (py, script, port)
+        # --autostart: a logon launch - the child retries a few times if the
+        # GPU driver / port isn't ready yet (see _autostart_relaunch_plan).
+        cmd = '"%s" "%s" --serve --port %d --autostart' % (py, script, port)
         try:
             import winreg
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self._SERVE_RUN_KEY,
@@ -24464,6 +24769,8 @@ class LiaApp:
                 "Contents:\n"
                 "  lia.log                - the app log (privacy-safe by "
                 "default: sizes, not your text)\n"
+                "  startup_trace.log      - one line per launch milestone "
+                "(launch / main / tray-ready) and any startup crash\n"
                 "  config.sanitized.json  - settings with API keys masked "
                 "and personal lists redacted\n"
                 "  sysinfo.txt            - OS/Python/model basics\n\n"
@@ -24473,6 +24780,12 @@ class LiaApp:
                 log_path = os.path.join(CONFIG_DIR, "lia.log")
                 if os.path.exists(log_path):
                     zf.write(log_path, "lia.log")
+                # The startup breadcrumbs: the only record of a launch that
+                # died before lia.log existed (e.g. at logon).
+                for name in ("startup_trace.log", "startup_trace.log.1"):
+                    tp = os.path.join(CONFIG_DIR, name)
+                    if os.path.exists(tp):
+                        zf.write(tp, name)
                 zf.writestr("config.sanitized.json",
                             _json.dumps(cfg, ensure_ascii=False, indent=2,
                                         default=str))
@@ -25527,6 +25840,23 @@ if __name__ == "__main__":
     # so a crashed / force-killed instance won't permanently block future launches.
     # If we were relaunched by a self-restart (--restarted), wait for the old
     # instance to release the mutex rather than exiting as a duplicate.
+    _startup_trace("main")
+    _autostart = _is_logon_launch()
+    _attempt = _autostart_attempt()
+    if _autostart:
+        # Logon launch: let the shell settle BEFORE building the app - in the
+        # first seconds after logon the notification area, audio endpoints
+        # and GPU driver are all still coming up. (run() waits for the tray
+        # again right before registering the icon; that returns at once here.)
+        _deadline = time.time() + 120
+        _polls = 0
+        while not _shell_tray_present() and time.time() < _deadline:
+            _polls += 1
+            time.sleep(0.5)
+        time.sleep(3.0 if (_polls == 0 and _attempt == 0)
+                   else min(8.0, 2.0 + _polls * 0.2))
+        _startup_trace("shell-ready", "attempt %d, polls %d" % (_attempt, _polls))
+
     import atexit
     _mutex_handle = _acquire_single_instance(
         wait_for_restart=("--restarted" in sys.argv))
@@ -25538,7 +25868,9 @@ if __name__ == "__main__":
         import ctypes
         atexit.register(lambda: ctypes.windll.kernel32.CloseHandle(_mutex_handle))
 
-    log.info("Lia starting...")
+    log.info("Lia starting...%s",
+             (" (logon auto-start, attempt %d)" % _attempt) if _autostart else "")
+    _startup_trace("logging-up")
     # Elevation status - least privilege is the NORM (2026-08-28 audit): the
     # packaged exe runs asInvoker, and hotkeys/paste work in normal apps
     # without elevation. Only dictation INTO elevated windows (Task Manager,
