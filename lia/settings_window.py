@@ -201,7 +201,7 @@ def _demo_state():
                   "port": 9090, "has_token": False,
                   "tailscale_ip": "100.70.229.87",
                   "ws_url": "ws://100.70.229.87:9090",
-                  "role": "server",
+                  "role": "server", "model": "",
                   "gpu": {"has_cuda": True, "name": "NVIDIA GeForce RTX 3090",
                           "vram_gb": 24.0, "verdict": "good",
                           "note": "NVIDIA GeForce RTX 3090 · 24 GB VRAM - good "
@@ -691,14 +691,26 @@ APP_JS = r"""
         '<input type="checkbox" data-toggle="toggle_serve"'+(sv.enabled?' checked':'')+(canServe?'':' disabled')+'>'+
         '<span class="bs-track"></span><span class="bs-knob"></span></label>'+
     '</div>';
+    // Which model the server loads. Add entries here to support more languages.
+    var svModel = sv.model || "";
+    var SERVE_MODELS = [
+      {id:"", label:"Hebrew - ivrit.ai turbo", note:"Specialised for Hebrew (default)"},
+      {id:"large-v3-turbo", label:"Multilingual - Whisper large-v3-turbo", note:"All languages, general purpose"}
+    ];
+    var modelPicker = '<div class="field"><label>Server model</label>'+
+      SERVE_MODELS.map(function(m){
+        return radio("svmodel","set_serve_model",m.id,"str",m.label,svModel===m.id,canServe,m.note);
+      }).join('')+
+      '<div class="hint">Which model runs on the server. Hebrew is specialised (it garbles other languages); the multilingual model handles any language the client sends. Changing this reloads the server.</div>'+
+    '</div>';
     var urlLine = sv.ws_url
       ? ('Other devices point their <b>Server URL</b> (the Use-a-server tab) here:<br><span class="mono copyable">' + esc(sv.ws_url) + '</span>')
       : ('Install <a href="https://tailscale.com/download" target="_blank" rel="noopener">Tailscale</a> and sign in (same account) on both machines to get a private address, then use <span class="mono">ws://&lt;this-ip&gt;:' + svPort + '</span>.');
     var serverPanel =
       '<div class="srv-panel">'+
         '<div class="srv-h"><span class="srv-ico" style="background:#7c5cff">&#128225;</span>'+
-          '<div><h3>Host a transcription server</h3><div class="sub">Runs Lia’s Hebrew model on this GPU. No Docker, no extra install.</div></div></div>'+
-        gpuCard + runControl +
+          '<div><h3>Host a transcription server</h3><div class="sub">Runs a Whisper model on this GPU. No Docker, no extra install.</div></div></div>'+
+        gpuCard + runControl + modelPicker +
         field("Port",'<input type="number" id="in_serve_port" class="mono" value="'+svPort+'" style="max-width:120px"'+(canServe?'':' disabled')+'>',"default 9090")+
         field("Access token (optional)",
           '<input type="password" id="in_serve_tok" class="mono" placeholder="'+

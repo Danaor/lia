@@ -4776,7 +4776,7 @@ def t_settings_actions_coverage():
         # Keys & Server
         "apply_key", "clear_key", "apply_remote", "test_remote",
         "toggle_serve", "toggle_serve_autostart", "apply_serve", "serve_status",
-        "set_transcription_role", "open_tailscale",
+        "set_transcription_role", "open_tailscale", "set_serve_model",
         # Meetings
         "toggle_auto_detect_meetings", "open_meetings_ask", "open_action_items",
         "open_meetings_folder", "edit_meeting_summary", "transcribe_file",

@@ -23870,6 +23870,18 @@ class LiaApp:
             self._serve.start()
         return (True, "Server settings saved.")
 
+    def _set_serve_model(self, model):
+        """Pick which model the hosted server loads (Hebrew ivrit vs a general
+        multilingual Whisper). '' = the default Hebrew model. Restarts a running
+        server child to load the new model."""
+        self.config["serve_model"] = (model or "").strip()
+        save_config(self.config)
+        if getattr(self, "_serve", None) and self._serve.owns_child():
+            self._serve.stop()
+            self._serve.start()
+            return (True, "Reloading the server with the new model…")
+        return (True, "")
+
     def _settings_toggle_serve(self):
         on = not bool(self.config.get("serve_enabled"))
         self.config["serve_enabled"] = on
@@ -23978,6 +23990,7 @@ class LiaApp:
             "tailscale_ip": ip,
             "ws_url": ("ws://%s:%d" % (ip, port)) if ip else "",
             "role": self.config.get("transcription_role", "") or "",
+            "model": self.config.get("serve_model", "") or "",
             "gpu": self._gpu_status(),
         }
 
@@ -24452,6 +24465,7 @@ class LiaApp:
         add("toggle_serve", self._settings_toggle_serve, True)
         add("toggle_serve_autostart", self._settings_toggle_serve_autostart, True)
         add("apply_serve", self._settings_apply_serve, True)
+        add("set_serve_model", self._set_serve_model, True)
         add("serve_status", self._settings_serve_status)
         add("set_transcription_role", self._set_transcription_role)
         add("open_tailscale", self._open_tailscale)
