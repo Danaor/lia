@@ -18530,15 +18530,28 @@ class LiaApp:
                         self.overlay.show_error("No speech detected")
                     return
                 if is_diarized:
-                    # AssemblyAI path: upload + poll, write diarized
-                    # markdown next to the source file.
-                    result = transcriber.transcribe_file_sync(
-                        file_path,
-                        language_code=lang,
-                        speaker_labels=True,
-                    )
-                    out_path = self._write_diarized_file_markdown(file_path, result)
-                    text = (result.get("text") or "").strip()
+                    if isinstance(transcriber, GeminiTranscriber):
+                        # Gemini diarization: decode the file -> transcribe_diarized
+                        # -> utterances (same shape _write_diarized_file_markdown
+                        # wants). GeminiTranscriber has no transcribe_file_sync
+                        # (that is AssemblyAI's) - this is its file path.
+                        from faster_whisper.audio import decode_audio
+                        audio_np = np.asarray(
+                            decode_audio(file_path, sampling_rate=16000),
+                            dtype=np.float32)
+                        utts = transcriber.transcribe_diarized(audio_np, language=lang)
+                        result = {"utterances": utts}
+                        out_path = self._write_diarized_file_markdown(
+                            file_path, result,
+                            engine="Gemini 3.5 transcribe (diarization)")
+                        text = " ".join((u.get("text") or "") for u in utts).strip()
+                    else:
+                        # AssemblyAI path: upload + poll, write diarized
+                        # markdown next to the source file.
+                        result = transcriber.transcribe_file_sync(
+                            file_path, language_code=lang, speaker_labels=True)
+                        out_path = self._write_diarized_file_markdown(file_path, result)
+                        text = (result.get("text") or "").strip()
                     log.info("Diarized file saved: %s (%d chars)", out_path, len(text))
                     if text:
                         add_history_entry(text, 0, model_key, "file", "transcribe")
