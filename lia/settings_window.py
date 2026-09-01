@@ -432,6 +432,10 @@ APP_JS = r"""
     // Each concern gets its OWN card (2026-08-29): one long undivided page
     // made 'Recording mode' / 'Paste' / the toggles read as one blur.
     return '<div class="content-head"><h1>General</h1></div>'+
+      '<div class="page"><div class="section-title">Startup</div>'+
+        sw("Start Lia automatically when Windows starts", !!S.auto_start, "toggle_auto_start")+
+        '<div class="hint">Lia launches to the system tray on every boot, ready to dictate.</div>'+
+      '</div>'+
       '<div class="page"><div class="section-title">Press-to-talk hotkey</div>'+
         '<div class="row-inline"><input type="text" id="hotkeyInput" style="max-width:220px" value="'+
           esc(draftOr("hotkeyInput", hk.main||"ctrl+space"))+'">'+
@@ -456,8 +460,7 @@ APP_JS = r"""
       '<div class="page"><div class="section-title">Behavior</div>'+
         sw("Restore clipboard after paste", !!cfg("clipboard_auto_restore", true), "toggle_clipboard_auto_restore")+'<br>'+
         sw("Press Enter after paste", !!cfg("press_enter_after_paste", false), "toggle_press_enter_after_paste")+'<br>'+
-        sw("Invisible mode (no overlay / waveform)", !!cfg("silent_mode", false), "toggle_silent_mode")+'<br>'+
-        sw("Start with Windows", !!S.auto_start, "toggle_auto_start")+
+        sw("Invisible mode (no overlay / waveform)", !!cfg("silent_mode", false), "toggle_silent_mode")+
       '</div>'+
       '<div class="page"><div class="section-title">Beep output</div>'+beepRows.join('')+'</div>'+
       '<div class="page"><div class="section-title">Keyboard shortcuts</div>'+shortcuts+'</div>'+
