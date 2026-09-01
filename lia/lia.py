@@ -23946,6 +23946,14 @@ class LiaApp:
         self._gpu_status_cache = (now, info)
         return info
 
+    def _open_tailscale(self):
+        """Open the Tailscale download page in the default browser."""
+        try:
+            os.startfile("https://tailscale.com/download")
+            return (True, "Opening tailscale.com/download…")
+        except Exception as e:
+            return (False, "Couldn't open the browser: %s" % e)
+
     def _set_transcription_role(self, role):
         """Remember whether this device is used as a CLIENT (points at a home
         server) or a SERVER (hosts one). UI-only - the actual behaviour still
@@ -24446,6 +24454,7 @@ class LiaApp:
         add("apply_serve", self._settings_apply_serve, True)
         add("serve_status", self._settings_serve_status)
         add("set_transcription_role", self._set_transcription_role)
+        add("open_tailscale", self._open_tailscale)
         # Meetings
         add("toggle_auto_detect_meetings", self._toggle_auto_detect_meetings)
         add("open_meetings_ask", self._open_meetings_ask)

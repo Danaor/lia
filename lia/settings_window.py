@@ -629,6 +629,16 @@ APP_JS = r"""
       modeCard("server","&#128225;","Host a server","Run the server on THIS machine’s GPU so your other devices transcribe against it.")+
     '</div>';
 
+    // Prominent prerequisite: both machines need Tailscale.
+    var tsBanner = '<div class="ts-banner">'+
+      '<div class="ts-left">'+
+        '<span class="ts-ico">&#128279;</span>'+
+        '<div class="ts-body"><div class="ts-title">First, install Tailscale on both machines</div>'+
+        '<div class="ts-sub">It’s a free app that puts your PCs on one private network so they can reach each other - <b>no router setup, no open ports</b>. Sign in with the <b>same account</b> on the server and every device that connects.</div></div>'+
+      '</div>'+
+      '<button class="btn primary ts-btn" data-call="open_tailscale" data-args="[]">&#11015;&#65039;&nbsp; Download Tailscale</button>'+
+    '</div>';
+
     // --- CLIENT panel (was Home Server) ---
     var url = draftOr("in_remote_url", cfg("remote_server_url",""));
     var clientPanel =
@@ -698,7 +708,7 @@ APP_JS = r"""
         '<div class="hint" id="st_serve"></div>'+
       '</div>';
 
-    var body = chooser;
+    var body = chooser + tsBanner;
     if(role==="client") body += clientPanel;
     else if(role==="server") body += serverPanel;
     else body += '<div class="empty" style="padding:26px 8px"><div class="sub">Pick whether this device <b>uses</b> a server or <b>hosts</b> one.</div></div>';

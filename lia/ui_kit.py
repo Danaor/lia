@@ -255,6 +255,21 @@ a:hover{text-decoration:underline;}
 .mono.copyable{display:inline-block; margin-top:4px; padding:3px 8px; border-radius:var(--r-s);
   background:var(--card-2); border:1px solid var(--line); user-select:all;}
 
+/* --- Tailscale prerequisite banner (prominent) ------------------------- */
+.ts-banner{display:flex; align-items:center; gap:var(--sp-4); flex-wrap:wrap;
+  padding:var(--sp-4) var(--sp-5); margin-bottom:var(--sp-5);
+  border:1.5px solid var(--accent); border-radius:var(--r-l);
+  background:var(--accent-soft); box-shadow:var(--shadow-sm);}
+.ts-banner .ts-left{display:flex; align-items:center; gap:var(--sp-4);
+  flex:1 1 300px; min-width:0;}
+.ts-banner .ts-ico{width:46px; height:46px; flex:none; border-radius:var(--r-m);
+  display:flex; align-items:center; justify-content:center; font-size:24px;
+  background:var(--accent); color:var(--on-accent);}
+.ts-banner .ts-title{font-weight:750; font-size:var(--fs-base); margin-bottom:2px;}
+.ts-banner .ts-sub{font-size:var(--fs-hint); color:var(--ink-2); line-height:1.45;}
+.ts-banner .ts-btn{flex:none; font-weight:700; padding:11px 20px; font-size:var(--fs-base);
+  box-shadow:var(--shadow-sm);}
+
 /* --- field: label + control + hint ------------------------------------- */
 .field{margin-bottom:var(--sp-5);}
 /* Group header: uppercase muted small-caps so it reads as a SECTION LABEL
