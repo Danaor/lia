@@ -23836,7 +23836,6 @@ class LiaApp:
             return (False, str(e)[:200])
 
     # --- serve mode HOST (this machine runs the built-in server) ---
-    _SERVE_TASK_NAME = "Lia Server"
 
     def _tailscale_ip(self):
         """This machine's Tailscale IPv4 (for the copy-paste ws:// URL), or ""."""
@@ -23994,37 +23993,43 @@ class LiaApp:
             "gpu": self._gpu_status(),
         }
 
+    # Per-user HKCU Run key - runs at logon with NO elevation. schtasks
+    # /Create needs admin (it failed "Access is denied" for a non-elevated
+    # app), so the server autostart uses the Run key instead, same as the
+    # app's own start-with-Windows.
+    _SERVE_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    _SERVE_RUN_NAME = "LiaTranscriptionServer"
+
     def _create_serve_task(self):
         py = find_python_interpreter()
         if not py:
-            return (False, "No interpreter available to schedule.")
+            return (False, "No interpreter available for auto-start.")
         script = os.path.abspath(sys.argv[0])
         port = self._serve.port()
-        tr = '"%s" "%s" --serve --port %d' % (py, script, port)
+        cmd = '"%s" "%s" --serve --port %d' % (py, script, port)
         try:
-            import subprocess
-            r = subprocess.run(
-                ["schtasks", "/Create", "/TN", self._SERVE_TASK_NAME,
-                 "/TR", tr, "/SC", "ONLOGON", "/RL", "LIMITED", "/F"],
-                capture_output=True, text=True,
-                creationflags=0x08000000, timeout=30)
-            if r.returncode != 0:
-                return (False, (r.stderr or r.stdout or "schtasks failed").strip()[:200])
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self._SERVE_RUN_KEY,
+                                0, winreg.KEY_SET_VALUE) as k:
+                winreg.SetValueEx(k, self._SERVE_RUN_NAME, 0, winreg.REG_SZ, cmd)
         except Exception as e:
-            return (False, "schtasks error: %s" % e)
-        log.info("Serve: logon task created (port %d)", port)
-        return (True, "Run-at-logon task created.")
+            return (False, "Couldn't enable auto-start: %s" % e)
+        log.info("Serve: logon auto-start enabled (Run key, port %d)", port)
+        return (True, "Will start at each logon.")
 
     def _delete_serve_task(self):
         try:
-            import subprocess
-            subprocess.run(["schtasks", "/Delete", "/TN", self._SERVE_TASK_NAME,
-                            "/F"], capture_output=True, text=True,
-                           creationflags=0x08000000, timeout=30)
-            log.info("Serve: logon task removed")
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self._SERVE_RUN_KEY,
+                                0, winreg.KEY_SET_VALUE) as k:
+                try:
+                    winreg.DeleteValue(k, self._SERVE_RUN_NAME)
+                except FileNotFoundError:
+                    pass
+            log.info("Serve: logon auto-start removed")
         except Exception as e:
-            log.warning("Serve task delete failed: %s", e)
-        return (True, "Run-at-logon task removed.")
+            log.warning("Serve auto-start removal failed: %s", e)
+        return (True, "Auto-start removed.")
 
     # --- hotkey capture/apply (capture runs in the parent — it owns the hook) ---
     def _capture_hotkey(self):
