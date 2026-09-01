@@ -568,18 +568,17 @@ APP_JS = r"""
     {svc:"openai", key:"openai_api_key", name:"OpenAI", badge:"O", color:"#0aa37f",
      sub:"Paid - best dictation, meeting transcription & summaries.",
      save:"Save & Verify", url:"https://platform.openai.com/api-keys", slow:true},
-    {svc:"groq", key:"groq_api_key", name:"Groq", badge:"G", color:"#d97706",
-     sub:"Free, fast cloud dictation (Whisper v3 Turbo).",
-     save:"Save & Verify", url:"https://console.groq.com/keys", slow:true},
     {svc:"gemini", key:"gemini_api_key", name:"Gemini", badge:"G", color:"#3b6fd4",
      sub:"Free meeting summaries + free AI cleanup (Google AI Studio).",
      save:"Save", url:"https://aistudio.google.com/apikey", slow:true},
     {svc:"hf", key:"hf_token", name:"Local Diarization", badge:"H", color:"#b08900",
      sub:"100% local speaker labels on your GPU (pyannote + ivrit.ai).",
      save:"Save & Download", url:"https://huggingface.co/settings/tokens", slow:true, noun:"token"},
-    {svc:"assemblyai", key:"assemblyai_api_key", name:"AssemblyAI", badge:"A", color:"#7a5cd0",
-     sub:"Paid - cloud speaker diarization for meetings.",
-     save:"Save & Verify", url:"https://www.assemblyai.com", slow:true}
+    {svc:"groq", key:"groq_api_key", name:"Groq", badge:"G", color:"#d97706",
+     sub:"Free, fast cloud dictation (Whisper v3 Turbo).",
+     save:"Save & Verify", url:"https://console.groq.com/keys", slow:true}
+    // AssemblyAI (paid cloud diarization) card removed 2026-09-01 - local
+    // pyannote + Gemini diarize cover meetings; the key/code path still exist.
   ];
 
   PAGES.keys = function(){
