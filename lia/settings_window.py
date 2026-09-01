@@ -625,8 +625,8 @@ APP_JS = r"""
         '<span class="mode-d">'+esc(desc)+'</span></button>';
     }
     var chooser = '<div class="mode-row">'+
-      modeCard("client","&#128421;","Use a server","Send audio to a transcription server running on another machine (your home GPU).")+
-      modeCard("server","&#128225;","Host a server","Run the server on THIS machine’s GPU so your other devices transcribe against it.")+
+      modeCard("client","&#128421;","Client mode","Use a server: send audio to a transcription server running on another machine (your home GPU).")+
+      modeCard("server","&#128225;","Server mode","Host a server: run one on THIS machine’s GPU so your other devices transcribe against it.")+
     '</div>';
 
     // Prominent prerequisite: both machines need Tailscale.
@@ -658,7 +658,7 @@ APP_JS = r"""
         '<div class="hint" id="st_remote"></div>'+
         '<details class="setup-help"><summary>How to set up (Tailscale)</summary><ol>'+
           '<li>Install <b>Tailscale</b> on both machines from <span class="mono">tailscale.com/download</span> and sign in with the <b>same account</b>.</li>'+
-          '<li>On the server machine, turn on <b>Host a server</b> (the other tab here) and note its <span class="mono">ws://…</span> address.</li>'+
+          '<li>On the server machine, switch to <b>Server mode</b> (the other tab here), turn it on, and note its <span class="mono">ws://…</span> address.</li>'+
           '<li>Paste that address above, click <b>Test</b>, then <b>Save</b>.</li>'+
           '<li>On the <b>Models</b> page, pick a <b>Home Server</b> model.</li>'+
         '</ol><div class="hint">Work PC that blocks Tailscale? Use a Cloudflare tunnel with a <span class="mono">wss://your-domain</span> URL + token.</div></details>'+
@@ -703,7 +703,7 @@ APP_JS = r"""
         '<details class="setup-help"><summary>How another device connects</summary><ol>'+
           '<li>Turn the server on above - it loads a local Hebrew model on this GPU.</li>'+
           '<li>Install <b>Tailscale</b> on both machines, same account.</li>'+
-          '<li>On the other device: <b>Transcription server → Use a server</b>, paste the URL above, <b>Test</b>, <b>Save</b>, then pick a <b>Home Server</b> model.</li>'+
+          '<li>On the other device: <b>Transcription server → Client mode</b>, paste the URL above, <b>Test</b>, <b>Save</b>, then pick a <b>Home Server</b> model.</li>'+
         '</ol><div class="hint">Hebrew only (one model); English falls back to the client’s own cloud/local.</div></details>'+
         '<div class="hint" id="st_serve"></div>'+
       '</div>';
