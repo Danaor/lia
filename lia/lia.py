@@ -253,7 +253,7 @@ DEFAULT_CONFIG = {
     "transcription_backend": "local",  # "local" / "groq" / "openai" / "remote" / "gemini"
     # Serve mode: a self-hosted WhisperLive + ivrit.ai server on a home GPU box,
     # reached over a Tailscale tailnet. "remote" backend + these two keys route
-    # dictation (and the "Hebrew Turbo Remote" meeting model) to that box — free,
+    # dictation (and the "Remote Transcription server" meeting model) to that box — free,
     # private, ivrit.ai Hebrew, no local GPU needed. Token = optional Bearer for a
     # reverse proxy in front of the server (WhisperLive itself has no auth).
     "remote_server_url": "",   # e.g. ws://100.x.y.z:9090  (host:9090 also OK)
@@ -19776,7 +19776,7 @@ class LiaApp:
         ("AssemblyAI", "assemblyai_diarize_only", ["assemblyai_api_key"]),
         ("OpenAI GPT transcribe", "openai_gpt_transcribe", ["openai_api_key"]),
         ("OpenAI GPT-4o transcribe", "openai_gpt4o", ["openai_api_key"]),
-        ("Hebrew Turbo Remote", "remote_hebrew_turbo", ["remote_server_url"]),
+        ("Remote Transcription server", "remote_hebrew_turbo", ["remote_server_url"]),
     ]
 
     # Meeting Summary Module — the LLM that writes summaries. (label, model,
@@ -19817,7 +19817,7 @@ class LiaApp:
         "openai_gpt4o_mini": "OpenAI GPT-4o-mini transcribe",
         "groq_turbo": "Groq Whisper Large v3 Turbo",
         "local_hebrew_turbo": "Hebrew Turbo (local)",
-        "remote_hebrew_turbo": "Hebrew Turbo (home GPU)",
+        "remote_hebrew_turbo": "Remote Transcription server",
         "local_english_distil": "English Distil (local)",
         "local_parakeet_english": "English Parakeet (local)",
         "local_pyannote_hebrew": "Hebrew Turbo (local) · pyannote speakers",
@@ -20750,7 +20750,7 @@ class LiaApp:
         ("OpenAI GPT-4o transcribe", "ivrit-ai/whisper-large-v3-turbo-ct2", "openai", False, "gpt-4o-transcribe"),
         ("Groq Whisper Large v3 Turbo", "large-v3-turbo", "groq", False, ""),
         ("Gemini 3.5 transcribe", "ivrit-ai/whisper-large-v3-turbo-ct2", "gemini", False, ""),
-        ("Hebrew Turbo Remote", "ivrit-ai/whisper-large-v3-turbo-ct2", "remote", False, ""),
+        ("Remote Transcription server", "ivrit-ai/whisper-large-v3-turbo-ct2", "remote", False, ""),
     ]
 
     def _set_model_backend_translate(self, model, backend, translate, openai_model=""):
