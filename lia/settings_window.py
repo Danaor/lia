@@ -200,7 +200,12 @@ def _demo_state():
         "serve": {"enabled": True, "autostart": False, "running": True,
                   "port": 9090, "has_token": False,
                   "tailscale_ip": "100.70.229.87",
-                  "ws_url": "ws://100.70.229.87:9090"},
+                  "ws_url": "ws://100.70.229.87:9090",
+                  "role": "server",
+                  "gpu": {"has_cuda": True, "name": "NVIDIA GeForce RTX 3090",
+                          "vram_gb": 24.0, "verdict": "good",
+                          "note": "NVIDIA GeForce RTX 3090 · 24 GB VRAM - good "
+                                  "for hosting a transcription server."}},
         "hotkeys": {"main": "ctrl+space", "undo": "ctrl+alt+z", "cancel": "esc",
                     "ask": "ctrl+alt+m", "actions": "ctrl+alt+t",
                     "email": "ctrl+alt+f", "chat": "ctrl+alt+c"},
@@ -290,10 +295,11 @@ BODY = """
     <button class="nav-item" data-page="audio"><span class="ico">&#127911;</span>Audio</button>
     <button class="nav-item" data-page="models"><span class="ico">&#129504;</span>Models</button>
     <button class="nav-item" data-page="cleanup"><span class="ico">&#10024;</span>AI Cleanup</button>
-    <button class="nav-item" data-page="keys"><span class="ico">&#128273;</span>Keys &amp; Server</button>
+    <button class="nav-item" data-page="keys"><span class="ico">&#128273;</span>API Keys</button>
     <button class="nav-item" data-page="meetings"><span class="ico">&#128220;</span>Meetings</button>
     <button class="nav-item" data-page="vocab"><span class="ico">&#128218;</span>Vocabulary</button>
     <button class="nav-item" data-page="snippets"><span class="ico">&#9998;</span>Snippets</button>
+    <button class="nav-item" data-page="server"><span class="ico">&#128225;</span>Transcription server</button>
     <div class="spacer"></div>
     <button class="nav-item" data-page="advanced"><span class="ico">&#8505;</span>Advanced</button>
   </nav>
@@ -599,72 +605,107 @@ APP_JS = r"""
         '<div class="hint" id="st_'+c.svc+'"></div>'+
       '</div>';
     }).join('');
-    // Home server
-    var url = draftOr("in_remote_url", cfg("remote_server_url",""));
-    var home = '<div class="credcard">'+
-      '<div class="head"><span class="bdg" style="background:#0aa37f">&#127968;</span>'+
-      '<div><h3>Home Server</h3><div class="sub">Self-hosted WhisperLive on your GPU (Tailscale / tunnel).</div></div></div>'+
-      field("Server URL",'<input type="text" id="in_remote_url" class="mono" placeholder="ws://host:9090" value="'+esc(url)+'">',
-        "host:9090 · ws://host:9090 · wss://your-domain")+
-      field("Access token (optional)",
-        '<input type="password" id="in_remote_tok" class="mono" placeholder="'+
-        (has.remote_server_token?"(saved - leave blank to keep)":"none")+'" value="'+esc(draftOr("in_remote_tok",""))+'">')+
-      '<div class="btnrow">'+
-        '<button class="btn primary" data-apply-remote="1" data-slow="1">Save</button>'+
-        '<button class="btn" data-test-remote="1" data-slow="1">Test</button>'+
-        '<button class="btn danger" data-call="clear_key" data-args=\'["remote"]\'>Clear</button>'+
-        '<span class="grow"></span></div>'+
-      '<div class="hint" id="st_remote"></div>'+
-      '<details class="setup-help">'+
-        '<summary>How to set up (Tailscale)</summary>'+
-        '<ol>'+
-          '<li>Install <b>Tailscale</b> on the server PC and on this PC from '+
-            '<span class="mono">tailscale.com/download</span>, and sign in with the '+
-            '<b>same account</b> on both. Tailscale is free for personal use and puts '+
-            'both machines on one private network - no ports to open on your router.</li>'+
-          '<li>Run your WhisperLive server on the GPU PC (see the self-hosted server '+
-            'guide). It listens on port <span class="mono">9090</span>.</li>'+
-          '<li>On the server PC, get its Tailscale address: <span class="mono">tailscale ip -4</span>.</li>'+
-          '<li>Set <b>Server URL</b> above to <span class="mono">ws://&lt;that-ip&gt;:9090</span>, '+
-            'click <b>Test</b>, then <b>Save</b>.</li>'+
-          '<li>On the <b>Models</b> page, pick a <b>Home Server</b> model.</li>'+
-        '</ol>'+
-        '<div class="hint">Work PC that blocks Tailscale? Use a Cloudflare tunnel with a '+
-          '<span class="mono">wss://your-domain</span> URL + an access token instead.</div>'+
-      '</details>'+
-    '</div>';
-    // This machine AS a server (serve mode host) - the flip side of Home Server.
+    return '<div class="content-head"><h1>API Keys</h1></div><div class="page keys-page">'+cards+'</div>';
+  };
+
+  // ---- Transcription server: choose CLIENT (use a home server) or SERVER
+  //      (host one on this GPU). Moved out of Keys into its own page. ----
+  PAGES.server = function(){
+    var has = S.has || {};
     var sv = S.serve || {};
+    var gpu = sv.gpu || {};
     var svPort = sv.port || 9090;
-    var statusTxt = sv.running
-      ? ('&#9679; Running on port ' + svPort)
-      : (sv.enabled ? 'Starting…' : 'Stopped');
-    var urlLine = sv.ws_url
-      ? ('Other devices point their <b>Home Server URL</b> here:<br>'+
-         '<span class="mono">' + esc(sv.ws_url) + '</span>')
-      : ('Install <a href="https://tailscale.com/download" target="_blank" rel="noopener">'+
-         'Tailscale</a> and sign in (same account) on both machines to get a '+
-         'private address, then use <span class="mono">ws://&lt;this-ip&gt;:' + svPort + '</span>.');
-    var serve = '<div class="credcard">'+
-      '<div class="head"><span class="bdg" style="background:#7c5cff">&#128225;</span>'+
-      '<div><h3>Host a transcription server</h3><div class="sub">Share this machine’s GPU - other devices transcribe against it (no Docker).</div></div></div>'+
-      sw("Run a server on this machine", !!sv.enabled, "toggle_serve")+
-      '<div class="hint" id="serve_status">'+statusTxt+'</div>'+
-      field("Port",'<input type="number" id="in_serve_port" class="mono" value="'+svPort+'" style="max-width:120px">',"default 9090")+
-      field("Access token (optional)",
-        '<input type="password" id="in_serve_tok" class="mono" placeholder="'+
-        (sv.has_token?"(saved - leave blank to keep)":"none")+'">')+
-      '<div class="btnrow"><button class="btn" data-apply-serve="1" data-slow="1">Save port / token</button><span class="grow"></span></div>'+
-      sw("Keep running after reboot (start at Windows logon)", !!sv.autostart, "toggle_serve_autostart")+
-      '<div class="hint">'+urlLine+'</div>'+
-      '<details class="setup-help"><summary>How another device connects</summary><ol>'+
-        '<li>Turn on the server here - it loads a local Hebrew model on this GPU.</li>'+
-        '<li>Install <b>Tailscale</b> on both machines and sign in with the same account.</li>'+
-        '<li>On the other device: <b>Keys &amp; Server → Home Server</b>, set the URL above, <b>Test</b>, <b>Save</b>, then pick a <b>Home Server</b> model.</li>'+
-      '</ol><div class="hint">Hebrew only (the server runs one model); English falls back to the client’s own cloud/local.</div></details>'+
-      '<div class="hint" id="st_serve"></div>'+
+    var role = sv.role || "";
+    if(!role){ role = sv.enabled ? "server" : (cfg("remote_server_url","") ? "client" : ""); }
+
+    function modeCard(r, icon, title, desc){
+      return '<button class="mode-card'+(role===r?' sel':'')+'" data-set-role="'+r+'">'+
+        '<span class="mode-ico">'+icon+'</span>'+
+        '<span class="mode-t">'+esc(title)+'</span>'+
+        '<span class="mode-d">'+esc(desc)+'</span></button>';
+    }
+    var chooser = '<div class="mode-row">'+
+      modeCard("client","&#128421;","Use a server","Send audio to a transcription server running on another machine (your home GPU).")+
+      modeCard("server","&#128225;","Host a server","Run the server on THIS machine’s GPU so your other devices transcribe against it.")+
     '</div>';
-    return '<div class="content-head"><h1>Keys &amp; Server</h1></div><div class="page keys-page">'+cards+home+serve+'</div>';
+
+    // --- CLIENT panel (was Home Server) ---
+    var url = draftOr("in_remote_url", cfg("remote_server_url",""));
+    var clientPanel =
+      '<div class="srv-panel">'+
+        '<div class="srv-h"><span class="srv-ico" style="background:#0aa37f">&#128421;</span>'+
+          '<div><h3>Connect to a transcription server</h3><div class="sub">Enter the address of the server you run at home (over Tailscale).</div></div></div>'+
+        field("Server URL",'<input type="text" id="in_remote_url" class="mono" placeholder="ws://host:9090" value="'+esc(url)+'">',
+          "host:9090 · ws://host:9090 · wss://your-domain")+
+        field("Access token (optional)",
+          '<input type="password" id="in_remote_tok" class="mono" placeholder="'+
+          (has.remote_server_token?"(saved - leave blank to keep)":"none")+'" value="'+esc(draftOr("in_remote_tok",""))+'">')+
+        '<div class="btnrow">'+
+          '<button class="btn primary" data-apply-remote="1" data-slow="1">Save</button>'+
+          '<button class="btn" data-test-remote="1" data-slow="1">Test</button>'+
+          '<button class="btn danger" data-call="clear_key" data-args=\'["remote"]\'>Clear</button>'+
+          '<span class="grow"></span></div>'+
+        '<div class="hint" id="st_remote"></div>'+
+        '<details class="setup-help"><summary>How to set up (Tailscale)</summary><ol>'+
+          '<li>Install <b>Tailscale</b> on both machines from <span class="mono">tailscale.com/download</span> and sign in with the <b>same account</b>.</li>'+
+          '<li>On the server machine, turn on <b>Host a server</b> (the other tab here) and note its <span class="mono">ws://…</span> address.</li>'+
+          '<li>Paste that address above, click <b>Test</b>, then <b>Save</b>.</li>'+
+          '<li>On the <b>Models</b> page, pick a <b>Home Server</b> model.</li>'+
+        '</ol><div class="hint">Work PC that blocks Tailscale? Use a Cloudflare tunnel with a <span class="mono">wss://your-domain</span> URL + token.</div></details>'+
+      '</div>';
+
+    // --- SERVER panel (host) with a GPU check + a graphical run control ---
+    var verdict = gpu.verdict || "none";
+    var gpuTitle = gpu.has_cuda
+      ? (esc(gpu.name || "CUDA GPU") + (gpu.vram_gb ? (' · ' + gpu.vram_gb + ' GB VRAM') : ''))
+      : "No dedicated GPU detected";
+    var gpuCard = '<div class="gpu-card '+verdict+'">'+
+      '<div class="gpu-h"><span class="gpu-dot"></span><span class="gpu-name">'+gpuTitle+'</span>'+
+        '<span class="gpu-tag '+verdict+'">'+({good:"Ready",marginal:"Marginal",none:"Not suitable"}[verdict])+'</span></div>'+
+      '<div class="gpu-note">'+esc(gpu.note||"")+'</div></div>';
+    var canServe = (verdict !== "none");
+    var runTitle = sv.running ? "Server is running" : (sv.enabled ? "Starting…" : "Server is off");
+    var runSub = sv.running ? ("Listening on port " + svPort)
+                            : (canServe ? "Turn on to host on this GPU" : "Needs a dedicated GPU");
+    var runState = sv.running ? "on" : (sv.enabled ? "starting" : "off");
+    var runControl = '<div class="run-box '+runState+(canServe?'':' locked')+'">'+
+      '<span class="run-led"></span>'+
+      '<div class="run-txt"><div class="run-title">'+runTitle+'</div><div class="run-sub">'+runSub+'</div></div>'+
+      '<label class="big-switch'+(canServe?'':' disabled')+'" title="'+(canServe?'':'No suitable GPU')+'">'+
+        '<input type="checkbox" data-toggle="toggle_serve"'+(sv.enabled?' checked':'')+(canServe?'':' disabled')+'>'+
+        '<span class="bs-track"></span><span class="bs-knob"></span></label>'+
+    '</div>';
+    var urlLine = sv.ws_url
+      ? ('Other devices point their <b>Server URL</b> (the Use-a-server tab) here:<br><span class="mono copyable">' + esc(sv.ws_url) + '</span>')
+      : ('Install <a href="https://tailscale.com/download" target="_blank" rel="noopener">Tailscale</a> and sign in (same account) on both machines to get a private address, then use <span class="mono">ws://&lt;this-ip&gt;:' + svPort + '</span>.');
+    var serverPanel =
+      '<div class="srv-panel">'+
+        '<div class="srv-h"><span class="srv-ico" style="background:#7c5cff">&#128225;</span>'+
+          '<div><h3>Host a transcription server</h3><div class="sub">Runs Lia’s Hebrew model on this GPU. No Docker, no extra install.</div></div></div>'+
+        gpuCard + runControl +
+        field("Port",'<input type="number" id="in_serve_port" class="mono" value="'+svPort+'" style="max-width:120px"'+(canServe?'':' disabled')+'>',"default 9090")+
+        field("Access token (optional)",
+          '<input type="password" id="in_serve_tok" class="mono" placeholder="'+
+          (sv.has_token?"(saved - leave blank to keep)":"none")+'"'+(canServe?'':' disabled')+'>')+
+        '<div class="btnrow"><button class="btn" data-apply-serve="1" data-slow="1"'+(canServe?'':' disabled')+'>Save port / token</button><span class="grow"></span></div>'+
+        sw("Keep running after reboot (start at Windows logon)", !!sv.autostart, "toggle_serve_autostart", !canServe)+
+        '<div class="hint">'+urlLine+'</div>'+
+        '<details class="setup-help"><summary>How another device connects</summary><ol>'+
+          '<li>Turn the server on above - it loads a local Hebrew model on this GPU.</li>'+
+          '<li>Install <b>Tailscale</b> on both machines, same account.</li>'+
+          '<li>On the other device: <b>Transcription server → Use a server</b>, paste the URL above, <b>Test</b>, <b>Save</b>, then pick a <b>Home Server</b> model.</li>'+
+        '</ol><div class="hint">Hebrew only (one model); English falls back to the client’s own cloud/local.</div></details>'+
+        '<div class="hint" id="st_serve"></div>'+
+      '</div>';
+
+    var body = chooser;
+    if(role==="client") body += clientPanel;
+    else if(role==="server") body += serverPanel;
+    else body += '<div class="empty" style="padding:26px 8px"><div class="sub">Pick whether this device <b>uses</b> a server or <b>hosts</b> one.</div></div>';
+
+    return '<div class="content-head"><h1>Transcription server</h1>'+
+      '<div class="sub">Run Lia’s Hebrew transcription on one machine’s GPU and reach it from your others - no Docker.</div></div>'+
+      '<div class="page">'+body+'</div>';
   };
 
   PAGES.meetings = function(){
@@ -928,6 +969,8 @@ APP_JS = r"""
       busy(asv,true); call("apply_serve",[sp,stk],true).then(function(r){ unbusy(asv);
         if(r.ok){ delete DRAFT["in_serve_port"]; delete DRAFT["in_serve_tok"]; }
         var st=document.getElementById("st_serve"); if(st) st.textContent=r.msg||""; }); return; }
+    var mc = e.target.closest('[data-set-role]');
+    if(mc){ call("set_transcription_role",[mc.getAttribute('data-set-role')]); return; }
     var sv = e.target.closest('[data-save-vocab]');
     if(sv){ var vt=(document.getElementById("vocabText")||{}).value||"";
       call("save_vocabulary",[vt]).then(function(r){ if(r.ok) delete DRAFT["vocabText"]; }); return; }

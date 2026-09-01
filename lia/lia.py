@@ -271,6 +271,8 @@ DEFAULT_CONFIG = {
     "serve_port": 9090,              # the port the server listens on
     "serve_model": "",               # "" = fall back to model_size (Hebrew turbo)
     "serve_token": "",               # optional Bearer clients must present
+    "transcription_role": "",        # "" / "client" / "server" - the Transcription
+                                     # Server page's remembered view (UI-only)
     "groq_api_key": "",  # Groq API key (from https://console.groq.com/keys)
     "groq_model": "whisper-large-v3-turbo",  # Groq Whisper model
     "openai_api_key": "",  # OpenAI API key (from https://platform.openai.com/api-keys)
@@ -23893,6 +23895,68 @@ class LiaApp:
         save_config(self.config)
         return (True, "Run at logon " + ("enabled." if on else "disabled."))
 
+    def _gpu_status(self):
+        """Detect a CUDA GPU + rough suitability for HOSTING a server. Cached
+        ~30s (nvidia-smi is a subprocess). verdict: good / marginal / none."""
+        cache = getattr(self, "_gpu_status_cache", None)
+        now = time.time()
+        if cache and now - cache[0] < 30:
+            return cache[1]
+        info = {"has_cuda": False, "name": "", "vram_gb": 0.0,
+                "verdict": "none", "note": ""}
+        try:
+            import ctranslate2
+            info["has_cuda"] = ctranslate2.get_cuda_device_count() > 0
+        except Exception:
+            info["has_cuda"] = False
+        if info["has_cuda"]:
+            try:
+                import subprocess
+                r = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=name,memory.total",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True,
+                    creationflags=0x08000000, timeout=5)
+                if r.returncode == 0 and (r.stdout or "").strip():
+                    parts = [p.strip() for p in
+                             r.stdout.strip().splitlines()[0].split(",")]
+                    info["name"] = parts[0]
+                    if len(parts) > 1:
+                        info["vram_gb"] = round(float(parts[1]) / 1024.0, 1)
+            except Exception:
+                pass
+        if not info["has_cuda"]:
+            info["verdict"] = "none"
+            info["note"] = ("No dedicated NVIDIA GPU detected. The server would "
+                            "fall back to CPU - far too slow to serve dictation "
+                            "for another device. Hosting is not recommended on "
+                            "this machine.")
+        elif info["vram_gb"] and info["vram_gb"] < 4:
+            info["verdict"] = "marginal"
+            info["note"] = ("%s has only %.0f GB VRAM - tight for the Hebrew "
+                            "model. Expect slow responses; a dedicated 6 GB+ "
+                            "card is recommended for a good experience."
+                            % (info["name"] or "This GPU", info["vram_gb"]))
+        else:
+            info["verdict"] = "good"
+            info["note"] = ("%s%s - good for hosting a transcription server."
+                            % (info["name"] or "CUDA GPU",
+                               (" · %.0f GB VRAM" % info["vram_gb"])
+                               if info["vram_gb"] else ""))
+        self._gpu_status_cache = (now, info)
+        return info
+
+    def _set_transcription_role(self, role):
+        """Remember whether this device is used as a CLIENT (points at a home
+        server) or a SERVER (hosts one). UI-only - the actual behaviour still
+        keys off remote_server_url / serve_enabled."""
+        role = (role or "").strip().lower()
+        if role not in ("client", "server", ""):
+            return (False, "Unknown role.")
+        self.config["transcription_role"] = role
+        save_config(self.config)
+        return (True, "")
+
     def _settings_serve_status(self):
         serve = getattr(self, "_serve", None) or ServeController(self.config)
         ip = self._tailscale_ip()
@@ -23905,6 +23969,8 @@ class LiaApp:
             "has_token": bool((self.config.get("serve_token") or "").strip()),
             "tailscale_ip": ip,
             "ws_url": ("ws://%s:%d" % (ip, port)) if ip else "",
+            "role": self.config.get("transcription_role", "") or "",
+            "gpu": self._gpu_status(),
         }
 
     def _create_serve_task(self):
@@ -24379,6 +24445,7 @@ class LiaApp:
         add("toggle_serve_autostart", self._settings_toggle_serve_autostart, True)
         add("apply_serve", self._settings_apply_serve, True)
         add("serve_status", self._settings_serve_status)
+        add("set_transcription_role", self._set_transcription_role)
         # Meetings
         add("toggle_auto_detect_meetings", self._toggle_auto_detect_meetings)
         add("open_meetings_ask", self._open_meetings_ask)

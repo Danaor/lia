@@ -189,6 +189,72 @@ a:hover{text-decoration:underline;}
 .setup-help ol li{margin:0 0 6px;}
 .setup-help .hint{margin-top:var(--sp-3);}
 
+/* --- Transcription-server page: mode chooser + GPU card + run control --- */
+.mode-row{display:flex; gap:var(--sp-4); margin-bottom:var(--sp-5); flex-wrap:wrap;}
+.mode-card{
+  flex:1 1 220px; text-align:left; cursor:pointer; display:flex; flex-direction:column;
+  gap:6px; padding:var(--sp-4) var(--sp-5); border:1.5px solid var(--line);
+  border-radius:var(--r-l); background:var(--card); transition:all var(--tr);
+}
+.mode-card:hover{border-color:var(--accent); background:var(--card-2);}
+.mode-card.sel{border-color:var(--accent); background:var(--accent-soft); box-shadow:var(--shadow-sm);}
+.mode-ico{font-size:26px; line-height:1;}
+.mode-t{font-weight:700; font-size:var(--fs-base);}
+.mode-d{font-size:var(--fs-hint); color:var(--muted);}
+.mode-card.sel .mode-d{color:var(--ink-2);}
+
+.srv-panel{margin-top:var(--sp-3);}
+.srv-h{display:flex; align-items:center; gap:var(--sp-3); margin-bottom:var(--sp-4);}
+.srv-h h3{margin:0; font-size:var(--fs-section);}
+.srv-h .sub{font-size:var(--fs-hint); color:var(--muted);}
+.srv-ico{width:38px; height:38px; border-radius:var(--r-m); display:flex;
+  align-items:center; justify-content:center; font-size:20px; color:#fff; flex:none;}
+
+.gpu-card{border:1px solid var(--line); border-radius:var(--r-m); padding:var(--sp-4);
+  margin-bottom:var(--sp-4); background:var(--card-2);}
+.gpu-card.good{border-color:var(--ok); background:var(--ok-soft);}
+.gpu-card.marginal{border-color:var(--warn); background:var(--warn-soft);}
+.gpu-card.none{border-color:var(--err); background:var(--err-soft);}
+.gpu-h{display:flex; align-items:center; gap:8px; flex-wrap:wrap;}
+.gpu-dot{width:10px; height:10px; border-radius:50%; flex:none; background:var(--muted);}
+.gpu-card.good .gpu-dot{background:var(--ok);}
+.gpu-card.marginal .gpu-dot{background:var(--warn);}
+.gpu-card.none .gpu-dot{background:var(--err);}
+.gpu-name{font-weight:650;}
+.gpu-tag{margin-left:auto; font-size:var(--fs-small); font-weight:700; text-transform:uppercase;
+  letter-spacing:.03em; padding:2px 9px; border-radius:var(--r-pill); color:#fff;}
+.gpu-tag.good{background:var(--ok);} .gpu-tag.marginal{background:var(--warn);}
+.gpu-tag.none{background:var(--err);}
+.gpu-note{margin-top:6px; font-size:var(--fs-hint); color:var(--ink-2);}
+
+.run-box{display:flex; align-items:center; gap:var(--sp-4); padding:var(--sp-4) var(--sp-5);
+  border:1px solid var(--line); border-radius:var(--r-l); background:var(--card);
+  margin-bottom:var(--sp-5);}
+.run-box.on{border-color:var(--ok); background:var(--ok-soft);}
+.run-box.starting{border-color:var(--warn); background:var(--warn-soft);}
+.run-box.locked{opacity:.65;}
+.run-led{width:14px; height:14px; border-radius:50%; flex:none; background:var(--faint);
+  box-shadow:0 0 0 4px transparent; transition:all var(--tr);}
+.run-box.on .run-led{background:var(--ok); box-shadow:0 0 0 4px var(--ok-soft);
+  animation:pulse 2s ease-in-out infinite;}
+.run-box.starting .run-led{background:var(--warn); box-shadow:0 0 0 4px var(--warn-soft);}
+@keyframes pulse{50%{box-shadow:0 0 0 7px transparent;}}
+.run-txt{flex:1 1 auto; min-width:0;}
+.run-title{font-weight:700;}
+.run-sub{font-size:var(--fs-hint); color:var(--muted);}
+
+.big-switch{position:relative; width:56px; height:30px; flex:none; cursor:pointer; display:inline-block;}
+.big-switch.disabled{cursor:not-allowed;}
+.big-switch input{position:absolute; opacity:0; width:0; height:0;}
+.big-switch .bs-track{position:absolute; inset:0; border-radius:var(--r-pill);
+  background:var(--line-2); transition:background var(--tr);}
+.big-switch .bs-knob{position:absolute; top:3px; left:3px; width:24px; height:24px;
+  border-radius:50%; background:#fff; box-shadow:var(--shadow-sm); transition:transform var(--tr);}
+.big-switch input:checked ~ .bs-track{background:var(--ok);}
+.big-switch input:checked ~ .bs-knob{transform:translateX(26px);}
+.mono.copyable{display:inline-block; margin-top:4px; padding:3px 8px; border-radius:var(--r-s);
+  background:var(--card-2); border:1px solid var(--line); user-select:all;}
+
 /* --- field: label + control + hint ------------------------------------- */
 .field{margin-bottom:var(--sp-5);}
 /* Group header: uppercase muted small-caps so it reads as a SECTION LABEL
