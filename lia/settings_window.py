@@ -697,12 +697,11 @@ APP_JS = r"""
       {id:"", label:"Hebrew - ivrit.ai turbo", note:"Specialised for Hebrew (default)"},
       {id:"large-v3-turbo", label:"Multilingual - Whisper large-v3-turbo", note:"All languages, general purpose"}
     ];
-    var modelPicker = '<div class="field"><label>Server model</label>'+
+    var modelPicker = '<div class="section-title">Server model</div>'+
       SERVE_MODELS.map(function(m){
         return radio("svmodel","set_serve_model",m.id,"str",m.label,svModel===m.id,canServe,m.note);
       }).join('')+
-      '<div class="hint">Which model runs on the server. Hebrew is specialised (it garbles other languages); the multilingual model handles any language the client sends. Changing this reloads the server.</div>'+
-    '</div>';
+      '<div class="hint">Which model runs on the server. Hebrew is specialised (it garbles other languages); the multilingual model handles any language the client sends. Changing this reloads the server.</div>';
     var urlLine = sv.ws_url
       ? ('Other devices point their <b>Server URL</b> (the Use-a-server tab) here:<br><span class="mono copyable">' + esc(sv.ws_url) + '</span>')
       : ('Install <a href="https://tailscale.com/download" target="_blank" rel="noopener">Tailscale</a> and sign in (same account) on both machines to get a private address, then use <span class="mono">ws://&lt;this-ip&gt;:' + svPort + '</span>.');
