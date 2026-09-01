@@ -20256,9 +20256,13 @@ class LiaApp:
         except Exception:
             pass
 
+    @staticmethod
     def _ollama_has(model, pulled):
         """True if `model` (e.g. 'gemma4:31b') is in the pulled-tag set, which
-        carry a ':tag' suffix (Ollama defaults missing tags to ':latest')."""
+        carry a ':tag' suffix (Ollama defaults missing tags to ':latest').
+        Static: called as self._ollama_has(model, pulled) - without the
+        decorator `self` was bound to `model` and it raised "takes 2 positional
+        arguments but 3 were given" whenever a local summary model was checked."""
         base = model.split(":")[0]
         return any(t == model or t.split(":")[0] == base for t in pulled)
 

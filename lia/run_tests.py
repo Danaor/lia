@@ -3343,7 +3343,11 @@ def t_remote_fail_reason_surfaced():
         def __init__(self, *a, **k):
             self.failed = True
             self.fail_reason = "boom: the real cause"
-            self._ready = threading.Event()   # never set -> not ready
+            # SET so load_model's _ready.wait() returns at once - failed=True
+            # still raises (with the reason); leaving it unset would block the
+            # full WARMUP_TIMEOUT_SEC (90s) and drag the whole suite.
+            self._ready = threading.Event()
+            self._ready.set()
         def start(self): pass
         def abort(self): pass
     orig = w.WhisperLiveStream
@@ -3411,6 +3415,24 @@ def t_serve_host():
 
 _test("serve: HOST port/probe + segment shape + fail-safe",
       t_serve_host)
+
+
+def t_ollama_has_staticmethod():
+    """_ollama_has is a @staticmethod: called as self._ollama_has(model, pulled)
+    it must NOT bind self to `model` (the 'takes 2 positional arguments but 3
+    were given' crash when a local summary model was selected, 2026-09-01)."""
+    import lia as w
+    app = w.LiaApp.__new__(w.LiaApp)
+    pulled = {"gemma4:31b", "llama3.3:70b"}
+    assert app._ollama_has("gemma4:31b", pulled) is True      # exact
+    assert app._ollama_has("gemma4", pulled) is True          # base-tag match
+    assert app._ollama_has("qwen:7b", pulled) is False        # absent
+    # also callable off the class directly (staticmethod)
+    assert w.LiaApp._ollama_has("llama3.3:70b", pulled) is True
+
+
+_test("ollama: _ollama_has is a staticmethod (self+model+pulled crash)",
+      t_ollama_has_staticmethod)
 
 
 def t_model_revision_pins():
