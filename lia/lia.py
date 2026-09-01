@@ -16653,6 +16653,11 @@ class LiaApp:
             self.overlay.show(f"  🔄  Loading: {model_label}  ", bg_color="#1e64c8")
 
             backend = self.config.get("transcription_backend")
+            # A machine with no dedicated GPU can't run the ~1.5GB local Whisper
+            # model without a painful download + slow CPU load that freezes
+            # startup - it's meant to be a CLIENT. We skip the local load on such
+            # machines (see the local-primary branch + the fallback gate below).
+            no_gpu = (self._gpu_status().get("verdict") == "none")
             cloud_primary_transcriber = None
             cloud_primary_label = None
             if backend == "groq" and self._groq_transcriber is not None:
@@ -16693,7 +16698,61 @@ class LiaApp:
                     finally:
                         self._local_load_event.set()
 
-                threading.Thread(target=_load_local_bg, daemon=True).start()
+                # No dedicated GPU -> don't download/load the ~1.5GB local
+                # fallback (it would be useless and hammer a weak laptop). This
+                # machine is a pure client of the cloud/remote backend.
+                if no_gpu:
+                    self._local_load_event.set()
+                    log.info("No dedicated GPU: skipping the local fallback load.")
+                else:
+                    threading.Thread(target=_load_local_bg, daemon=True).start()
+                return
+
+            # No cloud/remote primary was selected by the configured backend.
+            # On a machine with NO dedicated GPU the local model is unusable at
+            # startup (huge download + slow CPU load that can freeze the tray),
+            # so prefer ANY configured server/cloud instead of loading local;
+            # if none is set up, come up responsive and prompt the user rather
+            # than blocking on a local load.
+            if no_gpu:
+                alt = alt_backend = alt_label = None
+                if self._remote_transcriber is not None:
+                    alt, alt_backend, alt_label = self._remote_transcriber, "remote", "Remote server"
+                elif self._groq_transcriber is not None:
+                    alt, alt_backend, alt_label = self._groq_transcriber, "groq", "Groq"
+                elif self._openai_transcriber is not None:
+                    alt, alt_backend, alt_label = self._openai_transcriber, "openai", "OpenAI"
+                elif self._gemini_transcriber is not None:
+                    alt, alt_backend, alt_label = self._gemini_transcriber, "gemini", "Gemini"
+                self._local_load_event.set()   # never wait on a local load here
+                if alt is not None:
+                    try:
+                        alt.load_model(callback=lambda msg: log.info(msg))
+                    except Exception as alt_e:
+                        log.warning("No-GPU: %s primary load failed: %s", alt_label, alt_e)
+                    self.config["transcription_backend"] = alt_backend  # route (in-memory)
+                    self.model_loaded = True
+                    self.status_text = "Ready"
+                    log.info("No dedicated GPU: using %s instead of a local model.",
+                             alt_label)
+                    self._refresh_tray(update_menu=True)
+                    self.overlay.show_done()
+                    return
+                # Nothing to fall back to - stay responsive, prompt for setup.
+                self.model_loaded = False
+                self.status_text = "No GPU - set up a server"
+                log.warning("No dedicated GPU and no server/cloud configured - "
+                            "skipping the local model load. Open Settings > "
+                            "Transcription server to connect to one.")
+                if self.tray_icon:
+                    self.tray_icon.icon = self._create_icon("error")
+                    self.tray_icon.title = "Lia - no GPU: set up a Transcription server"
+                    self._refresh_tray(update_menu=True)
+                try:
+                    self._force_show_error_overlay(
+                        "No GPU here - open Settings > Transcription server to use a home server.")
+                except Exception:
+                    pass
                 return
 
             # Local is primary: load it synchronously. Also validate any
