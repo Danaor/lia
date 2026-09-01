@@ -274,6 +274,13 @@ a:hover{text-decoration:underline;}
 .ts-banner .ts-btn{flex:none; font-weight:700; padding:11px 20px; font-size:var(--fs-base);
   box-shadow:var(--shadow-sm);}
 
+/* --- privacy note: a small, greyish-but-noticeable warning callout ------ */
+.privacy-note{display:flex; gap:10px; align-items:flex-start;
+  padding:var(--sp-3) var(--sp-4); margin-bottom:var(--sp-4);
+  border:1px solid var(--warn); border-radius:var(--r-m); background:var(--warn-soft);
+  font-size:var(--fs-hint); color:var(--ink-2); line-height:1.5;}
+.privacy-note .pn-ico{flex:none; font-size:15px; line-height:1.4;}
+
 /* --- field: label + control + hint ------------------------------------- */
 .field{margin-bottom:var(--sp-5);}
 /* Group header: uppercase muted small-caps so it reads as a SECTION LABEL

@@ -604,7 +604,11 @@ APP_JS = r"""
         '<div class="hint" id="st_'+c.svc+'"></div>'+
       '</div>';
     }).join('');
-    return '<div class="content-head"><h1>API Keys</h1></div><div class="page keys-page">'+cards+'</div>';
+    var privacy = '<div class="privacy-note">'+
+      '<span class="pn-ico">&#9888;&#65039;</span>'+
+      '<span>Please note: on <b>free cloud tiers</b>, providers often use the audio and text you send to <b>train their models</b>. Be mindful of the sensitivity of what you dictate or share - avoid confidential information on free plans. Local models (on your own GPU) never leave this machine.</span>'+
+    '</div>';
+    return '<div class="content-head"><h1>API Keys</h1></div><div class="page keys-page">'+privacy+cards+'</div>';
   };
 
   // ---- Transcription server: choose CLIENT (use a home server) or SERVER
