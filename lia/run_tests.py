@@ -3391,7 +3391,7 @@ def t_serve_host():
     # LiaTranscriptionServer._transcribe: raw segments -> completed segments.
     class FakeTr:
         model_size = "x"
-        def transcribe_segments(self, audio, language=None):
+        def transcribe_segments(self, audio, language=None, beam_size=3):
             return [{"start": 0.0, "end": 1.2, "text": "שלום"},
                     {"start": 1.2, "end": 2.0, "text": "עולם"}]
     srv = w.LiaTranscriptionServer(FakeTr())
@@ -3404,7 +3404,7 @@ def t_serve_host():
     # A transcriber that raises must yield [] (client falls back), never crash.
     class BoomTr:
         model_size = "x"
-        def transcribe_segments(self, audio, language=None):
+        def transcribe_segments(self, audio, language=None, beam_size=3):
             raise RuntimeError("gpu gone")
     assert w.LiaTranscriptionServer(BoomTr())._transcribe(
         np.zeros(16000, dtype=np.float32), "he") == []

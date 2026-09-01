@@ -6654,6 +6654,7 @@ class LiaTranscriptionServer:
     (server), imported lazily so the tray app never loads it.
     """
     MAX_CLIP_BYTES = 16000 * 4 * 60 * 15   # 15 min of float32 - runaway guard
+    DEBOUNCE_S = 0.2           # transcribe this long after the last audio chunk
 
     def __init__(self, transcriber, host="0.0.0.0", port=9090, token="",
                  language="he"):
@@ -6683,6 +6684,67 @@ class LiaTranscriptionServer:
         uid = None
         lang = self.language
         dropped = False
+        loop = asyncio.get_running_loop()
+        emit_lock = asyncio.Lock()
+        frontier = 0.0            # last committed segment end (seconds)
+        sent = set()              # (round(start,2), round(end,2)) already sent
+        cache = {"blen": -1, "raw": None}
+        debounce = None
+
+        async def emit(final):
+            # Transcribe the settled buffer and push its NEW segments. The client
+            # always sends ONE complete clip (<=20s) as a fast burst, then waits,
+            # so once the feed settles (debounce) the buffer IS the whole clip -
+            # emit everything and bump the last segment's end to the buffer end
+            # to signal FULL coverage. That makes the client's coverage check
+            # break immediately instead of waiting out its ~6s "no progress"
+            # fallback (the reason the built-in server felt slower than the
+            # streaming WhisperLive container).
+            nonlocal frontier
+            async with emit_lock:
+                blen = len(buf)
+                if blen == 0:
+                    return
+                if cache["blen"] == blen and cache["raw"] is not None:
+                    raw = cache["raw"]          # buffer unchanged - reuse
+                else:
+                    audio = np.frombuffer(bytes(buf), dtype=np.float32)
+                    raw = await loop.run_in_executor(
+                        None, self._safe_segments, audio, lang)
+                    cache["blen"], cache["raw"] = blen, raw
+                dur = blen / 4.0 / 16000.0
+                out = []
+                for s in raw:
+                    if s["end"] > frontier + 0.02:
+                        k = (round(s["start"], 2), round(s["end"], 2))
+                        if k in sent:
+                            continue
+                        sent.add(k)
+                        out.append({"start": s["start"], "end": s["end"],
+                                    "text": s["text"], "completed": True})
+                if out:
+                    # Signal coverage to the clip end (VAD trims trailing silence,
+                    # so the last real segment ends short of `dur`).
+                    out[-1]["end"] = max(out[-1]["end"], dur - 0.02)
+                    frontier = out[-1]["end"]
+                    try:
+                        await ws.send(json.dumps({"uid": uid, "segments": out}))
+                    except Exception:
+                        pass
+
+        def schedule():
+            nonlocal debounce
+            if debounce is not None:
+                debounce.cancel()
+
+            async def _run():
+                try:
+                    await asyncio.sleep(self.DEBOUNCE_S)
+                    await emit(final=False)
+                except asyncio.CancelledError:
+                    pass
+            debounce = loop.create_task(_run())
+
         try:
             async for msg in ws:
                 if isinstance(msg, str):
@@ -6698,13 +6760,15 @@ class LiaTranscriptionServer:
                     continue
                 data = bytes(msg)
                 if data == b"END_OF_AUDIO":
-                    audio = np.frombuffer(bytes(buf), dtype=np.float32)
-                    buf = bytearray()
-                    segs = await asyncio.get_running_loop().run_in_executor(
-                        None, self._transcribe, audio, lang)
-                    await ws.send(json.dumps({"uid": uid, "segments": segs}))
-                    await ws.send(json.dumps({"uid": uid, "message": "DISCONNECT"}))
-                    continue
+                    if debounce is not None:
+                        debounce.cancel()
+                    await emit(final=True)
+                    try:
+                        await ws.send(json.dumps(
+                            {"uid": uid, "message": "DISCONNECT"}))
+                    except Exception:
+                        pass
+                    break            # Lia's client opens one connection per clip
                 if len(buf) + len(data) > self.MAX_CLIP_BYTES:
                     if not dropped:
                         log.warning("serve: client clip exceeded %d bytes - "
@@ -6712,21 +6776,34 @@ class LiaTranscriptionServer:
                         dropped = True
                     continue
                 buf.extend(data)
+                schedule()
         except Exception as e:
             log.debug("serve: client handler ended: %s", e)
+        finally:
+            if debounce is not None:
+                debounce.cancel()
 
-    def _transcribe(self, audio, lang):
-        """Blocking transcription (run in an executor). Never raises into the
-        event loop; an error just yields no segments so the client falls back."""
+    BEAM = 1   # greedy: a serve host prizes latency; beam>1 barely helps clean
+               # dictation audio and is 2-3x slower (measured vs the container).
+
+    def _safe_segments(self, audio, lang):
+        """Raw timestamped segments, run in an executor. Never raises into the
+        event loop; on error returns [] so the client falls back."""
         try:
             if audio is None or len(audio) == 0:
                 return []
-            raw = self.transcriber.transcribe_segments(audio, language=lang)
+            return self.transcriber.transcribe_segments(
+                audio, language=lang, beam_size=self.BEAM)
         except Exception as e:
             log.error("serve: transcription failed: %s", e)
             return []
+
+    def _transcribe(self, audio, lang):
+        """Batch helper (whole clip -> completed segments). Kept for the tests
+        and as the simple one-shot path; the live handler streams via
+        _safe_segments + a commit frontier instead."""
         return [{"start": s["start"], "end": s["end"], "text": s["text"],
-                 "completed": True} for s in raw]
+                 "completed": True} for s in self._safe_segments(audio, lang)]
 
     async def _serve(self):
         import websockets
