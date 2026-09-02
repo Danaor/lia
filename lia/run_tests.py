@@ -876,6 +876,94 @@ _test("Gemini: key decrypt guard + real API-error surfaced + backend-labelled",
       t_gemini_key_decrypt_and_error_surface)
 
 
+def t_gemini_diarize_request_constraints():
+    """More diarized-meeting failures surfaced once the real error was visible
+    (2026-09-02): (1) custom_vocabulary + WORD timestamps is a hard 400
+    ('incompatible with timestamps') - vocab must be dropped when word_ts is on,
+    kept otherwise; (2) a 40-min meeting = ~7 requests on a ~25/min tier, so the
+    diarized path retries a 429 with the server's retryDelay instead of aborting;
+    (3) the SAVED transcript credits the actual diarizer (Gemini), never a blanket
+    'AssemblyAI'."""
+    import inspect
+    import lia as w
+    G = w.GeminiTranscriber
+    t = G(api_key="fake")
+    t.custom_vocabulary = "AWS, Bedrock, EKS"
+    # (1) vocab present without word timestamps; DROPPED with them.
+    tc_plain = t._build_transcription_config(language=None, diarize=False, word_ts=False)
+    tc_word = t._build_transcription_config(language=None, diarize=True, word_ts=True)
+    assert tc_plain.get("custom_vocabulary"), "vocab should be sent when no word ts"
+    assert "custom_vocabulary" not in tc_word, \
+        "vocab must be dropped with word timestamps (API rejects the combo)"
+    assert tc_word["mode"].get("diarization_mode") == "speaker"
+    assert tc_word["mode"].get("timestamp_granularities") == ["word"]
+
+    # (2) retry-after parsing + a 429→200 retry (no real sleep).
+    class _R:
+        def __init__(self, code, payload=None, headers=None):
+            self.status_code = code
+            self._p = payload
+            self.headers = headers or {}
+            self.text = ""
+        def json(self):
+            if self._p is None:
+                raise ValueError("no json")
+            return self._p
+    rl = {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "details": [
+        {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "7s"}]}}
+    assert G._retry_after_seconds(_R(429, rl)) == 7.0
+    assert G._retry_after_seconds(_R(429, None, {"Retry-After": "12"})) == 12.0
+    assert G._retry_after_seconds(_R(429, {"error": {}})) is None
+
+    class _FakeSession:
+        def __init__(self, responses):
+            self.responses = responses
+            self.calls = 0
+        def post(self, *a, **k):
+            r = self.responses[min(self.calls, len(self.responses) - 1)]
+            self.calls += 1
+            return r
+    ok_payload = {"steps": [{"content": [{"type": "text", "text": "ok"}]}]}
+    sess = _FakeSession([_R(429, rl), _R(200, ok_payload)])
+    t._ensure_session = lambda: sess
+    waits = []
+    orig_sleep = time.sleep
+    try:
+        time.sleep = lambda s: waits.append(s)
+        out = t._post_interaction_retrying(b"wavbytes", {}, (10, 10), attempts=3)
+    finally:
+        time.sleep = orig_sleep
+    assert out == ok_payload, out
+    assert sess.calls == 2, "should retry once then succeed"
+    assert waits and 5.0 <= waits[0] <= 90.0, waits
+    # a persistent 429 eventually raises the friendly message
+    sess2 = _FakeSession([_R(429, rl)])
+    t._ensure_session = lambda: sess2
+    try:
+        time.sleep = lambda s: None
+        raised = False
+        try:
+            t._post_interaction_retrying(b"x", {}, (10, 10), attempts=2)
+        except RuntimeError as e:
+            raised = "rate limit" in str(e).lower()
+    finally:
+        time.sleep = orig_sleep
+    assert raised, "persistent 429 must surface a rate-limit error"
+
+    # the diarized loop uses the retrying POST.
+    dsrc = inspect.getsource(G.transcribe_diarized)
+    assert "_post_interaction_retrying" in dsrc, "diarize loop must retry 429s"
+
+    # (3) saved transcript credits Gemini, not AssemblyAI.
+    wsrc = inspect.getsource(w.MeetingSession._write_diarized_markdown)
+    assert '"gemini": "Gemini 3.5 transcribe"' in wsrc, "diarizer label for gemini missing"
+    assert "local_pyannote" in wsrc
+
+
+_test("Gemini diarize: vocab/timestamp constraint + 429 retry + diarizer label",
+      t_gemini_diarize_request_constraints)
+
+
 def t_gemini_key_clear_reverts():
     """Clearing the Gemini key reverts a gemini meeting/file model to local and
     drops cached transcribers, so the picker never keeps a dead selection."""

@@ -5336,8 +5336,14 @@ class GeminiTranscriber(BaseTranscriber):
         else:
             codes = list(self.language_codes)
         tc = {"language_codes": codes}
+        # custom_vocabulary and WORD timestamps are mutually exclusive: the
+        # diarized path (word_ts=True) that also sent vocab got a hard
+        # "Gemini API 400: custom_vocabulary is incompatible with timestamps"
+        # (surfaced 2026-09-02 - it was hidden behind the key error). Word
+        # offsets are REQUIRED to build utterances, so vocab is dropped there;
+        # the corrections table + the summary's own vocab still apply downstream.
         terms = self._vocab_terms()
-        if terms:
+        if terms and not word_ts:
             tc["custom_vocabulary"] = terms
         mode = {"type": "verbatim"}      # `type` is REQUIRED by the API
         if diarize:
@@ -5368,6 +5374,25 @@ class GeminiTranscriber(BaseTranscriber):
         except Exception:
             return (r.text or "")[:200]
 
+    @staticmethod
+    def _retry_after_seconds(r):
+        """Server-suggested wait for a 429, from RetryInfo.retryDelay ('17s') or
+        the Retry-After header; None when absent."""
+        try:
+            j = r.json()
+            if isinstance(j, list) and j:
+                j = j[0]
+            for d in ((j or {}).get("error") or {}).get("details") or []:
+                rd = isinstance(d, dict) and d.get("retryDelay")
+                if rd:
+                    return float(str(rd).rstrip("s"))
+        except Exception:
+            pass
+        try:
+            return float(r.headers.get("Retry-After", ""))
+        except (TypeError, ValueError):
+            return None
+
     def _raise_for_api_error(self, r):
         """Raise a descriptive RuntimeError on a non-2xx response. Unlike
         raise_for_status(), this includes Google's actual reason (API_KEY_INVALID
@@ -5379,6 +5404,41 @@ class GeminiTranscriber(BaseTranscriber):
         if r.status_code >= 400:
             raise RuntimeError("Gemini API %d: %s"
                                % (r.status_code, self._api_error_message(r)))
+
+    def _post_interaction_retrying(self, wav_bytes, tc, timeout,
+                                   attempts=4, on_wait=None):
+        """_post_interaction with backoff on a 429. For the ASYNC whole-file
+        paths (diarized meeting / file) a long recording makes several requests
+        and the free tier is ~25/min, so a transient rate-limit must wait, not
+        abort the whole job. Honors the server's retryDelay when given."""
+        import base64 as _b64
+        s = self._ensure_session()
+        body = {
+            "model": self.model_size,
+            "input": [{"type": "audio",
+                       "data": _b64.b64encode(wav_bytes).decode("ascii"),
+                       "mime_type": "audio/wav"}],
+            "generation_config": {"transcription_config": tc},
+        }
+        delay = 20.0
+        for i in range(attempts):
+            r = s.post(self.INTERACTIONS_URL, headers=self._headers(),
+                       json=body, timeout=timeout)
+            if r.status_code == 429 and i < attempts - 1:
+                wait = self._retry_after_seconds(r) or delay
+                wait = min(90.0, max(5.0, wait))
+                log.warning("Gemini rate-limited; retry %d/%d in %.0fs",
+                            i + 1, attempts - 1, wait)
+                if on_wait:
+                    try:
+                        on_wait(wait, i + 1, attempts - 1)
+                    except Exception:
+                        pass
+                time.sleep(wait)
+                delay = min(90.0, delay * 1.6)
+                continue
+            self._raise_for_api_error(r)
+            return r.json()
 
     def _post_interaction(self, wav_bytes, tc, timeout):
         """POST one audio segment to the Interactions API; return the JSON body.
@@ -5566,7 +5626,12 @@ class GeminiTranscriber(BaseTranscriber):
                 language=language, diarize=True, word_ts=True)
             wav = self._audio_to_wav_bytes(piece)
             http_timeout = (10, max(120, int(seg_dur * 6) + 30))
-            j = self._post_interaction(wav, tc, http_timeout)
+            # A 40-min meeting = ~7 requests; the free tier is ~25/min, so back
+            # off + retry on a 429 instead of aborting the whole diarize job.
+            j = self._post_interaction_retrying(
+                wav, tc, http_timeout,
+                on_wait=(lambda w, i, n: on_progress(idx + 1, len(pieces)))
+                        if on_progress else None)
             seg_prefix = f"S{idx + 1}-" if len(pieces) > 1 else ""
             utterances.extend(
                 self._utterances_from_response(j, seg_start_s, seg_prefix))
@@ -10540,9 +10605,13 @@ class MeetingSession:
                             label="diarized transcript (fresh)")
 
         lines = []
-        _diar_by = ("pyannote + ivrit.ai (local)"
-                    if getattr(self, "_diarize_backend", "assemblyai") == "local_pyannote"
-                    else "AssemblyAI")
+        # Credit the ACTUAL diarizer in the saved file (before 2026-09-02 every
+        # non-local backend was written "diarized via AssemblyAI" - so a Gemini
+        # meeting's transcript wrongly credited AssemblyAI).
+        _diar_by = {"local_pyannote": "pyannote + ivrit.ai (local)",
+                    "gemini": "Gemini 3.5 transcribe"}.get(
+                        getattr(self, "_diarize_backend", "assemblyai"),
+                        "AssemblyAI")
         lines.append(f"Meeting — {title or stamp}")
         lines.append(f"Source: {self.source} (diarized via {_diar_by})")
         lines.append(f"Duration: {_fmt_relative_ts(duration_sec)}")
