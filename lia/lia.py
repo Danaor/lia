@@ -5234,7 +5234,16 @@ class GeminiTranscriber(BaseTranscriber):
     def __init__(self, model_size="gemini-3.5-transcribe", api_key="",
                  language_codes=None):
         super().__init__(model_size=model_size, cpu_threads=0)
-        self.api_key = api_key
+        # The key MUST be plaintext here. load_config() normally decrypts it,
+        # but this is the single choke point for every Gemini path (dictation,
+        # meeting, file, verify), so decrypt defensively: if a still-encrypted
+        # "dpapi:" blob ever reaches this constructor it would be POSTed
+        # verbatim and Google answers 400 "API key not valid" - the exact
+        # meeting failure seen 2026-09-02, where the real reason was hidden
+        # behind a bare "400 Bad Request". unprotect() is idempotent on
+        # plaintext (returns it unchanged) and yields "" for a blob that
+        # cannot be decrypted on this machine (an unusable key by definition).
+        self.api_key = secret_store.unprotect(api_key) if api_key else ""
         self.custom_vocabulary = ""     # user terms -> transcription_config.custom_vocabulary
         # BOTH languages are always present: Naor dictates + meets in mixed
         # he+en, so the whitelist is the third-language GUARD, not a mono pin.
@@ -5338,6 +5347,39 @@ class GeminiTranscriber(BaseTranscriber):
         tc["mode"] = mode
         return tc
 
+    @staticmethod
+    def _api_error_message(r):
+        """Human-readable reason from a Gemini error response - the body a bare
+        raise_for_status() throws away. Handles both the object and the
+        list-wrapped shapes the Interactions API returns, and surfaces the
+        machine reason (e.g. API_KEY_INVALID) when present."""
+        try:
+            j = r.json()
+            if isinstance(j, list) and j:
+                j = j[0]
+            err = (j or {}).get("error") or {}
+            msg = err.get("message") or (r.text or "")[:200]
+            reason = ""
+            for d in err.get("details") or []:
+                if isinstance(d, dict) and d.get("reason"):
+                    reason = d["reason"]
+                    break
+            return "%s [%s]" % (msg, reason) if reason else msg
+        except Exception:
+            return (r.text or "")[:200]
+
+    def _raise_for_api_error(self, r):
+        """Raise a descriptive RuntimeError on a non-2xx response. Unlike
+        raise_for_status(), this includes Google's actual reason (API_KEY_INVALID
+        arrives as a 400, so the plain status line hid it entirely)."""
+        if r.status_code in (401, 403):
+            raise RuntimeError("Invalid Gemini API key")
+        if r.status_code == 429:
+            raise RuntimeError("Gemini rate limit exceeded")
+        if r.status_code >= 400:
+            raise RuntimeError("Gemini API %d: %s"
+                               % (r.status_code, self._api_error_message(r)))
+
     def _post_interaction(self, wav_bytes, tc, timeout):
         """POST one audio segment to the Interactions API; return the JSON body.
         Errors map like the other cloud transcribers so _transcribe_with_fallback
@@ -5353,11 +5395,7 @@ class GeminiTranscriber(BaseTranscriber):
         }
         r = s.post(self.INTERACTIONS_URL, headers=self._headers(),
                    json=body, timeout=timeout)
-        if r.status_code in (401, 403):
-            raise RuntimeError("Invalid Gemini API key")
-        if r.status_code == 429:
-            raise RuntimeError("Gemini rate limit exceeded")
-        r.raise_for_status()
+        self._raise_for_api_error(r)
         return r.json()
 
     @staticmethod
@@ -5490,11 +5528,7 @@ class GeminiTranscriber(BaseTranscriber):
             s = self._ensure_session()
             r = s.post(self.INTERACTIONS_URL, headers=self._headers(),
                        json=body, timeout=(10, 240))
-            if r.status_code in (401, 403):
-                raise RuntimeError("Invalid Gemini API key")
-            if r.status_code == 429:
-                raise RuntimeError("Gemini rate limit exceeded")
-            r.raise_for_status()
+            self._raise_for_api_error(r)
             text = self._extract_text(r.json())
             return self._rtl_mark(strip_hallucinated_tail(text)) if text else ""
         # Over the ~20 MB inline cap. Gemini decodes any format server-side, so
@@ -10272,13 +10306,26 @@ class MeetingSession:
         except Exception as e:
             log.error("Diarized meeting transcription failed: %s", e)
             log.info("WAV preserved for manual retry: %s", self._wav_path)
-            # Map known errors to friendlier messages. Local diarization already
-            # raises a clear, actionable message (pyannote missing / HF token /
-            # model terms), so pass it through; only the AssemblyAI cloud path
-            # needs the raw-API-string translation.
+            # Map known errors to friendlier messages, LABELLED BY BACKEND.
+            # (Before 2026-09-02 every non-local failure was labelled
+            # "AssemblyAI failed" - so a Gemini 400 showed the user the wrong
+            # service entirely, and the real reason "API key not valid" was
+            # hidden behind a bare "400 Bad Request". Now each backend names
+            # itself and key/auth errors point at the right Settings card.)
             msg = str(e).lower()
             if is_local:
+                # pyannote raises a clear, actionable message already.
                 friendly = str(e)[:140]
+            elif is_gemini:
+                if ('api key' in msg or 'api_key_invalid' in msg
+                        or 'invalid gemini' in msg):
+                    friendly = "Gemini key rejected — check it in Settings → API Keys"
+                elif 'rate limit' in msg or '429' in msg:
+                    friendly = "Gemini rate-limited — try again later"
+                elif 'no spoken audio' in msg or 'language_detection' in msg:
+                    friendly = "No speech in recording — check mic / audio source"
+                else:
+                    friendly = "Gemini transcription failed: %s" % str(e)[:100]
             elif 'no spoken audio' in msg or 'language_detection' in msg:
                 friendly = "No speech in recording — check mic / audio source"
             elif 'too small' in msg or 'too short' in msg:

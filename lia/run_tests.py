@@ -796,6 +796,86 @@ _test("Gemini meeting models registered + diarize backend wired",
       t_gemini_meeting_registered)
 
 
+def t_gemini_key_decrypt_and_error_surface():
+    """2026-09-02 diarized-meeting failure: a dpapi:-encrypted key reaching the
+    Gemini client was POSTed verbatim → 400 'API key not valid', and both the
+    real reason AND the backend name were hidden (the card said 'AssemblyAI
+    failed'). Regression guards:
+    (1) the constructor defensively decrypts a dpapi: blob (idempotent on
+        plaintext) so ciphertext never reaches Google;
+    (2) _api_error_message surfaces Google's message + machine reason from both
+        the object and list-wrapped error shapes;
+    (3) _raise_for_api_error raises that detail on a 400 (not a bare status);
+    (4) the diarize-job error mapping labels Gemini as Gemini and points key
+        errors at the right Settings card."""
+    import inspect
+    import lia as w
+    import secret_store
+
+    # (1) plaintext passes through unchanged; a dpapi blob is decrypted.
+    assert w.GeminiTranscriber(api_key="AIzaPlain").api_key == "AIzaPlain"
+    assert w.GeminiTranscriber(api_key="").api_key == ""
+    if secret_store.available():
+        blob = secret_store.protect("AIzaSECRET-key-value")
+        assert secret_store.is_protected(blob), "test setup: expected a dpapi blob"
+        g = w.GeminiTranscriber(api_key=blob)
+        assert g.api_key == "AIzaSECRET-key-value", "constructor must decrypt the blob"
+        assert not g.api_key.startswith("dpapi:")
+
+    # (2)/(3) real error surfaced from both response shapes.
+    class _Resp:
+        def __init__(self, code, payload=None, text=""):
+            self.status_code = code
+            self._payload = payload
+            self.text = text
+        def json(self):
+            if self._payload is None:
+                raise ValueError("no json")
+            return self._payload
+    err_obj = {"error": {"code": 400, "message": "API key not valid.",
+                         "status": "INVALID_ARGUMENT",
+                         "details": [{"reason": "API_KEY_INVALID"}]}}
+    G = w.GeminiTranscriber
+    m_list = G._api_error_message(_Resp(400, [err_obj]))     # list-wrapped
+    m_obj = G._api_error_message(_Resp(400, err_obj))        # object
+    assert "API key not valid." in m_list and "API_KEY_INVALID" in m_list, m_list
+    assert "API key not valid." in m_obj and "API_KEY_INVALID" in m_obj, m_obj
+    # non-JSON body falls back to text
+    assert "boom" in G._api_error_message(_Resp(500, None, "boom"))
+    t = G(api_key="fake")
+    try:
+        t._raise_for_api_error(_Resp(400, [err_obj]))
+        assert False, "expected a raise on 400"
+    except RuntimeError as e:
+        assert "400" in str(e) and "API_KEY_INVALID" in str(e), str(e)
+    for code, needle in ((401, "Invalid Gemini API key"),
+                         (429, "rate limit")):
+        try:
+            t._raise_for_api_error(_Resp(code))
+            assert False, "expected a raise on %d" % code
+        except RuntimeError as e:
+            assert needle in str(e), (code, str(e))
+    assert t._raise_for_api_error(_Resp(200)) is None      # 2xx: no raise
+
+    # (4) the diarize-job maps a Gemini key error to a Gemini-labelled message,
+    #     never "AssemblyAI failed". Anchor on the except-block comment so the
+    #     'elif is_gemini:' of the STAGE selection higher up isn't matched.
+    dsrc = inspect.getsource(w.MeetingSession._run_diarize_job)
+    err_block = dsrc[dsrc.index("Map known errors"):]
+    assert "elif is_gemini:" in err_block, "diarize job lost its gemini error branch"
+    gi = err_block.index("elif is_gemini:")
+    gseg = err_block[gi:gi + 700]
+    assert "Gemini key rejected" in gseg and "API Keys" in gseg, gseg[:300]
+    assert "api_key_invalid" in gseg.lower()
+    # the gemini branch must resolve to a Gemini-labelled message, never fall
+    # through to the AssemblyAI label.
+    assert "AssemblyAI" not in gseg[:gseg.index("elif", 5)], gseg[:300]
+
+
+_test("Gemini: key decrypt guard + real API-error surfaced + backend-labelled",
+      t_gemini_key_decrypt_and_error_surface)
+
+
 def t_gemini_key_clear_reverts():
     """Clearing the Gemini key reverts a gemini meeting/file model to local and
     drops cached transcribers, so the picker never keeps a dead selection."""
