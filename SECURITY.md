@@ -28,7 +28,13 @@ anywhere unless you configure a cloud backend or API key.
   `%APPDATA%\Lia` yourself). The uninstaller offers deletion (default: keep).
 - **Log privacy**: the log records only the SIZE of user content (dictations,
   questions, detected meeting titles). Full text is logged only if you opt in
-  with `log_transcripts: true`.
+  with `log_transcripts: true`. (The "Report a problem" bundle omits the log
+  entirely when that opt-in is on, so full text is never packaged for an issue.)
+- **Data at rest**: API keys and tokens are DPAPI-encrypted (below), but the
+  transcripts, meeting audio, dictation history, and the email/meeting search
+  indexes are stored unencrypted under `%APPDATA%\Lia`. On a shared or corporate
+  machine, rely on full-disk encryption (BitLocker) to protect them; anyone with
+  file access to your profile can read them.
 
 ## API keys
 
@@ -57,11 +63,25 @@ session**, not only the moment of dictation.
 - Fully local by default: local Whisper/Parakeet models, local Ollama for
   summaries and RAG. Cloud backends (Groq / OpenAI / Gemini / AssemblyAI) run
   only if you add a key and select them.
-- Self-hosted server mode: plaintext `ws://` is accepted only toward private
-  addresses (loopback, RFC1918, the 100.64.0.0/10 mesh-VPN range, `.local` /
-  `.ts.net`). A `ws://` URL to a public host is refused unless you explicitly
-  set `remote_allow_insecure_ws: true`; use `wss://` through a tunnel instead
-  (see `docs/SELF_HOSTED_SERVER.md`).
+- Self-hosted server mode (client side): plaintext `ws://` is accepted only
+  toward private addresses (loopback, RFC1918, the 100.64.0.0/10 mesh-VPN range,
+  `.local` / `.ts.net`). A `ws://` URL to a public host is refused unless you
+  explicitly set `remote_allow_insecure_ws: true`; use `wss://` through a tunnel
+  instead (see `docs/SELF_HOSTED_SERVER.md`). Note that transcribed text from a
+  self-hosted server is pasted into the focused window; a compromised server (or
+  a man-in-the-middle on a plaintext `ws://` link) could return crafted text, so
+  point the client only at a server you control, and prefer `wss://` or Tailscale.
+  (Control characters are stripped before paste, but the text itself is trusted.)
+- Hosting a server (host side): the built-in transcription server is secure by
+  default. It binds to your Tailscale address (or loopback when Tailscale is
+  off), never to every interface implicitly. Choosing "All networks" in
+  Settings, or setting `serve_host: all`, is refused unless an access token is
+  set - a server on a network interface always requires a token, which clients
+  present as `Authorization: Bearer`. Cross-site WebSocket connections (a browser
+  page) are rejected by an Origin check, per-message and per-connection limits
+  bound resource use, and the host's private vocabulary is never fed to an
+  untrusted client. Never port-forward the server to the public internet; reach
+  it over Tailscale (or a `wss://` reverse proxy).
 
 ## Supply chain
 

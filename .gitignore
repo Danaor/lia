@@ -71,6 +71,11 @@ hf_token.local
 # Never commit.
 config.seed.json
 
+# Logo/brand-artwork iteration drafts (e.g. lia-edited.png, lia-highlighted.png,
+# lia-shape-centered.png). The master artwork lia.png (no hyphen suffix) stays
+# tracked; these hyphenated drafts never do.
+lia/lia-*.png
+
 # Design-iteration leftovers (the retired drawn-logo experiment's previews)
 _lia_logo/
 _*.py

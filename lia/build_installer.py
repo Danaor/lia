@@ -21,6 +21,8 @@ import sys
 import shutil
 from pathlib import Path
 
+from make_checksums import write_sha256sums
+
 HERE = Path(__file__).resolve().parent
 DIST_EXE = HERE / "dist" / "Lia.exe"
 ISS_FILE = HERE / "installer.iss"
@@ -139,6 +141,17 @@ def main():
         print(f"    (delete {DIST_EXE.name} or edit lia.py to force a rebuild)")
 
     run_iscc(iscc)
+
+    # SHA256SUMS.txt for the release (audit WP4 #15): covers the Setup.exe and
+    # any Portable zip dropped into installer_output. SECURITY.md's checksum
+    # promise is now produced by the build, not by hand.
+    try:
+        out, files = write_sha256sums([str(OUT_DIR)])
+        print("  [OK] %s (%d artifacts):" % (Path(out).name, len(files)))
+        for fp in files:
+            print("     %s" % Path(fp).name)
+    except Exception as e:
+        print("  (checksums step skipped: %s)" % e)
 
 
 if __name__ == "__main__":

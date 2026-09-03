@@ -3022,7 +3022,7 @@ def t_bilingual_short_clip_clamp():
             self.custom_vocabulary = ""
             self.calls = []
         def transcribe(self, audio_np, language=None, beam_size=3,
-                       task="transcribe"):
+                       task="transcribe", bias_ok=True):
             self.calls.append(language)
             return "ok"
 
@@ -3051,6 +3051,68 @@ def t_bilingual_short_clip_clamp():
 
 _test("bilingual: short-clip third-language clamp (the German-dictation fix)",
       t_bilingual_short_clip_clamp)
+
+
+def t_vocab_prompt_bias_gate():
+    """2026-09-03 regression: the English-dominant vocab initial_prompt was
+    copied into SHORT / LOW-SIGNAL Hebrew clips, emitting Latin-letter
+    hallucinations ("text, Teaching Center", "-M-M"). The gate
+    (_vocab_prompt_bias_ok) decides per clip, FasterWhisperTranscriber.transcribe
+    drops initial_prompt when bias_ok is False, and the bilingual router
+    forwards the flag and no longer reuses a stale route on a sub-3s clip."""
+    import types, threading as _th
+    import numpy as _np
+    import lia as w
+    # -- pure gate: long+loud keeps the prompt; short OR quiet drops it
+    assert w._vocab_prompt_bias_ok(30.0, 0.10, 5.0, 0.02) is True
+    assert w._vocab_prompt_bias_ok(3.9, 0.12, 5.0, 0.02) is False    # the 11:42 clip
+    assert w._vocab_prompt_bias_ok(1.6, 0.03, 5.0, 0.02) is False    # the 11:22 clip
+    assert w._vocab_prompt_bias_ok(30.0, 0.005, 5.0, 0.02) is False  # long but near-silent
+    assert w._vocab_prompt_bias_ok(None, None) is True               # unknown -> keep
+    # -- FasterWhisperTranscriber.transcribe honors bias_ok: capture the prompt
+    captured = {}
+    class _Seg:
+        text = "שלום עולם"
+    class _Info:
+        language = "he"
+    class _FakeModel:
+        def transcribe(self, audio, **kw):
+            captured["initial_prompt"] = kw.get("initial_prompt")
+            return ([_Seg()], _Info())
+    T = w.FasterWhisperTranscriber
+    tr = T.__new__(T)
+    tr.model = _FakeModel()
+    tr.custom_vocabulary = "AWS, Kubernetes, Docker"
+    tr._infer_lock = _th.Lock()
+    tr._demote_to_cpu = lambda *a, **k: False
+    audio = _np.zeros(16000, dtype=_np.float32)
+    tr.transcribe(audio, language="he", bias_ok=True)
+    assert captured["initial_prompt"] == "Common terms: AWS, Kubernetes, Docker", captured
+    tr.transcribe(audio, language="he", bias_ok=False)
+    assert captured["initial_prompt"] is None, captured
+    # -- the router forwards bias_ok to the chosen child
+    R = w.BilingualRouterTranscriber
+    r = R.__new__(R)
+    seen = {}
+    class _Child:
+        model = object()
+        def transcribe(self, audio, language=None, beam_size=3, task="transcribe", bias_ok=True):
+            seen["bias_ok"] = bias_ok
+            return "x"
+    r.he = _Child(); r.general = _Child(); r.en = None
+    r.primary = "he"; r._last_route = "he"
+    r.transcribe(_np.zeros(1600, dtype=_np.float32), language="he", bias_ok=False)
+    assert seen.get("bias_ok") is False, seen
+    # -- WP-C: a sub-MIN_DETECT_SEC clip falls back to primary, never a stale route
+    r2 = R.__new__(R)
+    r2.he = _Child(); r2.general = _Child(); r2.en = None
+    r2.primary = "he"; r2._last_route = "en"        # a stale English lean
+    route = R._route(r2, _np.zeros(int(1.0 * 16000), dtype=_np.float32))
+    assert route == "he", ("short clip must fall back to primary, got %r" % route)
+
+
+_test("dictation: vocab-prompt confidence gate (no English letters on short/quiet clips)",
+      t_vocab_prompt_bias_gate)
 
 
 def t_parakeet_cache_self_heal():
@@ -3559,7 +3621,8 @@ def t_serve_host():
     # LiaTranscriptionServer._transcribe: raw segments -> completed segments.
     class FakeTr:
         model_size = "x"
-        def transcribe_segments(self, audio, language=None, beam_size=3):
+        def transcribe_segments(self, audio, language=None, beam_size=3,
+                                use_vocabulary=True):
             return [{"start": 0.0, "end": 1.2, "text": "שלום"},
                     {"start": 1.2, "end": 2.0, "text": "עולם"}]
     srv = w.LiaTranscriptionServer(FakeTr())
@@ -3572,7 +3635,8 @@ def t_serve_host():
     # A transcriber that raises must yield [] (client falls back), never crash.
     class BoomTr:
         model_size = "x"
-        def transcribe_segments(self, audio, language=None, beam_size=3):
+        def transcribe_segments(self, audio, language=None, beam_size=3,
+                                use_vocabulary=True):
             raise RuntimeError("gpu gone")
     assert w.LiaTranscriptionServer(BoomTr())._transcribe(
         np.zeros(16000, dtype=np.float32), "he") == []
@@ -3584,6 +3648,162 @@ def t_serve_host():
 _test("serve: HOST port/probe + segment shape + fail-safe",
       t_serve_host)
 
+def t_serve_secure_defaults():
+    """WP1 security: serve mode is secure by default - resolve never yields
+    0.0.0.0 implicitly, a non-loopback bind requires a token, auth is
+    constant-time, only same-origin is allowed, the host vocab is gated to
+    trusted clients, and the settings surface exposes the choice + a generator."""
+    import types, threading as _th
+    import numpy as _np
+    import lia as w
+    orig = w._tailscale_ipv4
+    try:
+        w._tailscale_ipv4 = lambda: ""
+        assert w._resolve_serve_host({"serve_host": "auto"})[0] == "127.0.0.1"
+        assert w._resolve_serve_host({"serve_host": "tailscale"})[0] is None
+        w._tailscale_ipv4 = lambda: "100.70.1.2"
+        assert w._resolve_serve_host({"serve_host": "auto"})[0] == "100.70.1.2"
+        assert w._resolve_serve_host({"serve_host": "tailscale"})[0] == "100.70.1.2"
+    finally:
+        w._tailscale_ipv4 = orig
+    assert w._resolve_serve_host({"serve_host": "loopback"})[0] == "127.0.0.1"
+    assert w._resolve_serve_host({"serve_host": "all"})[0] == "0.0.0.0"
+    assert w._serve_policy_check("127.0.0.1", "")[0] is True
+    assert w._serve_policy_check("0.0.0.0", "")[0] is False
+    assert w._serve_policy_check("0.0.0.0", "tok")[0] is True
+    # default constructor binds loopback, never 0.0.0.0
+    assert w.LiaTranscriptionServer(None).host == "127.0.0.1"
+    srv = w.LiaTranscriptionServer(None, host="0.0.0.0", token="s3cret")
+    R = lambda h: types.SimpleNamespace(request=types.SimpleNamespace(headers=h))
+    assert srv._authorized(R({"Authorization": "Bearer s3cret"})) is True
+    assert srv._authorized(R({"Authorization": "Bearer no"})) is False
+    assert srv._authorized(R({})) is False
+    assert srv._origin_ok(R({"Host": "h:9090", "Origin": "http://h:9090"})) is True
+    assert srv._origin_ok(R({"Host": "h:9090"})) is True
+    assert srv._origin_ok(R({"Host": "h:9090", "Origin": "http://evil.example"})) is False
+    assert srv._request_trusted(R({"Authorization": "Bearer s3cret"})) is True
+    assert srv._request_trusted(R({})) is False
+    assert w.LiaTranscriptionServer(None, host="127.0.0.1", token="")._request_trusted(R({})) is True
+    # transcribe_segments honors use_vocabulary (WP1 #19 vocab gating)
+    cap = {}
+    class _M:
+        def transcribe(self, a, **kw):
+            cap["p"] = kw.get("initial_prompt"); return ([], None)
+    F = w.FasterWhisperTranscriber.__new__(w.FasterWhisperTranscriber)
+    F.model = _M(); F.custom_vocabulary = "AWS, Docker"
+    F._infer_lock = _th.Lock(); F._demote_to_cpu = lambda *a, **k: False
+    F.transcribe_segments(_np.zeros(16000, dtype=_np.float32), use_vocabulary=True)
+    assert cap["p"] and "AWS" in cap["p"]
+    F.transcribe_segments(_np.zeros(16000, dtype=_np.float32), use_vocabulary=False)
+    assert cap["p"] is None
+    # settings surface
+    App = w.LiaApp; app = App.__new__(App)
+    app.config = dict(w.DEFAULT_CONFIG); app._serve = None
+    ok, _m = App._set_serve_host(app, "all")
+    assert ok and app.config["serve_host"] == "all"
+    assert App._set_serve_host(app, "bogus")[0] is False
+    ok, tok = App._gen_serve_token(app)
+    assert ok and len(tok) >= 20 and app.config["serve_token"] == tok
+    # ServeController refuses to start a network bind without a token
+    app.config["serve_host"] = "all"; app.config["serve_token"] = ""
+    sc = w.ServeController(app.config)
+    ok, msg = sc.start()
+    assert ok is False and "token" in msg.lower(), (ok, msg)
+
+
+_test("serve: secure-by-default bind + token policy + origin + vocab gate (WP1)",
+      t_serve_secure_defaults)
+
+def t_privilege_boundaries():
+    """WP3: system tools resolve to absolute trusted paths (no cwd/app-dir
+    binary planting), elevated RunLevel-Highest autostart is refused from a
+    user-writable install root, and a de-elevated serve child is tracked by pid
+    for owns_child/stop."""
+    import os as _os
+    import lia as w
+    ps = w._sys_exe("powershell")
+    assert _os.path.isabs(ps) and ps.lower().endswith("powershell.exe")
+    assert "system32" in ps.lower()
+    exp = w._sys_exe("explorer")
+    assert _os.path.isabs(exp) and exp.lower().endswith("explorer.exe")
+    assert w._sys_exe("no_such_tool_xyz123") == "no_such_tool_xyz123"
+    assert w._which_trusted("no_such_tool_xyz123") is None
+    pf = _os.environ.get("ProgramFiles", r"C:\Program Files")
+    assert w._install_root_is_protected(_os.path.join(pf, "Lia")) is True
+    home = _os.environ.get("LOCALAPPDATA") or _os.path.join(
+        _os.environ.get("USERPROFILE") or _os.path.expanduser("~"), "AppData", "Local")
+    assert w._install_root_is_protected(_os.path.join(home, "Programs", "Lia")) is False
+    downloads = _os.path.join(_os.environ.get("USERPROFILE") or _os.path.expanduser("~"),
+                              "Downloads", "WhisperType", "lia")
+    assert w._install_root_is_protected(downloads) is False
+    sc = w.ServeController({})
+    sc._pid = _os.getpid(); sc._proc = None
+    assert sc.owns_child() is True
+    sc._pid = 0x7FFFFFF0; sc._proc = None
+    assert sc.owns_child() is False
+
+
+_test("security WP3: absolute system-tool paths + elevated-autostart ACL + serve pid track",
+      t_privilege_boundaries)
+
+def t_build_supply_chain_pins():
+    """WP4: the shipped CPython embeddable AND get-pip.py are hash-pinned (no
+    silent execution of an updated download), the working-tree copy fallback is
+    gone, every offered faster-whisper model is revision-pinned, and
+    make_checksums emits a correct SHA256SUMS.txt."""
+    import os as _os, re as _re, hashlib, tempfile
+    import lia as w
+    import make_checksums as mc
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    br = open(_os.path.join(here, "build_runtime.py"), encoding="utf-8").read()
+    assert _re.search(r'PYTHON_EMBED_SHA256 = "[0-9a-f]{64}"', br), "embeddable SHA unpinned"
+    assert _re.search(r'GET_PIP_SHA256 = "[0-9a-f]{64}"', br), "get-pip SHA unpinned"
+    assert "falling back to direct copy" not in br, "working-tree copy fallback must be gone (#12)"
+    for mid in w.MODELS:
+        if mid.startswith("parakeet"):
+            continue                     # onnx-asr: no revision API (documented)
+        assert mid in w.MODEL_REVISIONS, "unpinned model offered: " + mid
+    d = tempfile.mkdtemp()
+    open(_os.path.join(d, "Lia-Setup-9.9.9.exe"), "wb").write(b"abc")
+    open(_os.path.join(d, "Lia-Portable-9.9.9.zip"), "wb").write(b"xyz")
+    out, files = mc.write_sha256sums([d])
+    assert len(files) == 2 and _os.path.basename(out) == "SHA256SUMS.txt"
+    body = open(out, encoding="utf-8").read()
+    assert hashlib.sha256(b"abc").hexdigest() in body
+    assert hashlib.sha256(b"xyz").hexdigest() in body
+
+
+_test("security WP4: build supply-chain pins (embeddable/get-pip) + checksums",
+      t_build_supply_chain_pins)
+
+def t_client_hardening():
+    """WP5/WP6: pasted text is control-char sanitized (keeps newlines + bidi
+    marks), a summary base_url that would leak an API key over cleartext http to
+    a public host is refused, no API key rides a URL query string, and the
+    compose editor sanitizes saved summary HTML on load."""
+    import os as _os
+    import lia as w
+    s = w._sanitize_for_paste
+    assert s("hello" + chr(10) + "world" + chr(9) + "!") == "hello" + chr(10) + "world" + chr(9) + "!"
+    assert s("a" + chr(0) + "b" + chr(7) + "c" + chr(27) + "d") == "abcd"
+    assert s(chr(0x200f) + "\u05e9\u05dc\u05d5\u05dd") == chr(0x200f) + "\u05e9\u05dc\u05d5\u05dd"
+    assert s("") == "" and s(None) is None
+    ok = w._summary_base_url_ok
+    assert ok("")[0] is True
+    assert ok("https://api.openai.com/v1")[0] is True
+    assert ok("http://localhost:11434/v1")[0] is True
+    assert ok("http://127.0.0.1:11434")[0] is True
+    assert ok("http://192.168.1.9:11434")[0] is True
+    assert ok("http://evil.example.com/v1")[0] is False
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    src = open(_os.path.join(here, "lia.py"), encoding="utf-8").read()
+    assert '"?key=" + self.api_key' not in src, "GeminiLiveStream still puts the key in the URL"
+    ce = open(_os.path.join(here, "compose_editor.py"), encoding="utf-8").read()
+    assert "sanitizeCardHtml(d.card_html" in ce, "compose editor must sanitize card_html on load"
+
+
+_test("security WP5/WP6: paste sanitizer + base_url guard + no key-in-URL + compose sanitize",
+      t_client_hardening)
 
 def t_ollama_has_staticmethod():
     """_ollama_has is a @staticmethod: called as self._ollama_has(model, pulled)
@@ -6170,6 +6390,42 @@ _test("settings: _settings_state shape + secret masking (no raw key leaks)",
       t_settings_state_shape)
 
 
+def t_bundle_secret_scrub():
+    """WP2: one secret list covers config.json, the diagnostic bundle, and the
+    settings-state payload. serve_token is a real credential (the serve Bearer)
+    and must be on it; the bundle sanitizer must not leak any secret, must
+    redact private network addresses, and must size-redact personal lists."""
+    import re as _re
+    import json as _json
+    import lia as w
+    # every secret-shaped default key is on the single list
+    for k in w.DEFAULT_CONFIG:
+        if _re.search(r"(_api_key|_token|_secret|password)$", k):
+            assert k in w._SECRET_CONFIG_KEYS, "unlisted secret config key: " + k
+    assert "serve_token" in w._SECRET_CONFIG_KEYS
+    cfg = dict(w.DEFAULT_CONFIG)
+    cfg.update({
+        "openai_api_key": "sk-SENTINELKEY1234",
+        "serve_token": "TOKSENTINEL9999",
+        "remote_server_url": "ws://100.70.229.87:9090",
+        "custom_vocabulary": "SECRETPROJECTNAME, another",
+    })
+    out = w._sanitize_config_for_bundle(cfg)
+    blob = _json.dumps(out, ensure_ascii=False)
+    for leak in ("sk-SENTINELKEY1234", "TOKSENTINEL9999", "100.70.229.87",
+                 "SECRETPROJECTNAME"):
+        assert leak not in blob, "bundle leaked %r" % leak
+    assert out["openai_api_key"] == "set" and out["serve_token"] == "set"
+    assert out["remote_server_url"].startswith("ws://<redacted-host>")
+    assert out["custom_vocabulary"].startswith("<redacted:")
+    # empty secret -> "" (not "set")
+    assert w._sanitize_config_for_bundle({"groq_api_key": ""})["groq_api_key"] == ""
+
+
+_test("security WP2: one secret list covers config + bundle + settings; serve_token masked",
+      t_bundle_secret_scrub)
+
+
 def t_settings_prewarm():
     """Settings pre-warm: build_window boots the window HIDDEN only when the
     payload carries prewarm; _reveal_window shows it + marks ready; _stdin_reader
@@ -6398,9 +6654,11 @@ _test("startup: logon relaunch policy (retries, flags, cap) + logon detection",
 def t_startup_trace_and_excepthook():
     """Breadcrumbs + the crash net: _startup_trace appends stage lines and
     never raises; the excepthook records a CRASH line without relaunching a
-    manual launch, and IS the installed sys.excepthook, installed before the
-    heavy imports - so a failure at module level before logging exists is no
-    longer invisible (the 2026-09-01 "didn't start at logon" report)."""
+    manual launch, and is armed ONLY for a real launch (__main__), defined
+    before the heavy imports - so a failure at module level before logging
+    exists is no longer invisible (the 2026-09-01 "didn't start at logon"
+    report) while an importing script/test never pollutes the breadcrumbs.
+    The worker-thread counterpart (_thread_excepthook) logs a THREAD-CRASH."""
     import lia as w
     tmp = tempfile.mkdtemp()
     orig, orig_argv, orig_err = w._STARTUP_TRACE, sys.argv, sys.stderr
@@ -6418,12 +6676,28 @@ def t_startup_trace_and_excepthook():
             txt = f.read()
         assert "launch x y" in txt and " main" in txt and "CRASH" in txt, txt
         assert "boom at import" in txt and "relaunch" not in txt, txt
-        assert sys.excepthook is w._startup_excepthook
+        # Armed only for a REAL launch: importing lia.py - as this suite and
+        # any diagnostic script do - must not install the crash nets.
+        import threading as _th, types as _types
+        assert sys.excepthook is not w._startup_excepthook
+        assert _th.excepthook is not w._thread_excepthook
+        # the worker-thread net records a THREAD-CRASH breadcrumb + traceback
+        try:
+            raise ValueError("thread boom")
+        except ValueError as e:
+            w._thread_excepthook(_types.SimpleNamespace(
+                exc_type=type(e), exc_value=e, exc_traceback=e.__traceback__,
+                thread=_types.SimpleNamespace(name="worker-7")))
+        with open(w._STARTUP_TRACE, encoding="utf-8") as f:
+            txt = f.read()
+        assert "THREAD-CRASH worker-7" in txt and "thread boom" in txt, txt
     finally:
         w._STARTUP_TRACE, sys.argv, sys.stderr = orig, orig_argv, orig_err
     src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "lia.py"),
                encoding="utf-8").read()
-    assert src.index("sys.excepthook = _startup_excepthook") < src.index("import numpy")
+    gate = src.index('_ARM_CRASH_NET = (__name__ == "__main__")')
+    assert gate < src.index("sys.excepthook = _startup_excepthook") < src.index("import numpy")
+    assert src.index("threading.excepthook = _thread_excepthook") < src.index("import numpy")
     # the tray app marks its milestones and the logon launch waits for the shell
     assert '_startup_trace("main")' in src and '_startup_trace("tray-ready")' in src
     assert "_shell_tray_present()" in src.split('if __name__ == "__main__":')[1]
@@ -6431,6 +6705,116 @@ def t_startup_trace_and_excepthook():
 
 _test("startup: breadcrumb file + crash excepthook (before the heavy imports)",
       t_startup_trace_and_excepthook)
+
+
+def t_hook_probe_watchdog_and_restart_notice():
+    """The keyboard-hook liveness probe (2026-09-03, "Lia crashed after the
+    reboot" = a dead WH_KEYBOARD_LL hook + the reactive self-restart): the
+    probe helper's tri-state, _verify_keyboard_hook's decision matrix (skip
+    while blocked, alive, transient stall, dead -> ONE restart with the probe
+    reason, then rate-limited, disabled when the observer failed), the reason
+    riding the relaunch argv, the notice the fresh instance shows for it, and
+    the logon relaunch plan dropping a stale reason."""
+    import types, threading as _th, subprocess as _sp
+    import lia as w
+    App = w.LiaApp
+    # --- probe helper: None when nothing could be injected, True on echo,
+    # False when the hook stays silent
+    seen = _th.Event()
+    assert w._probe_keyboard_hook(seen, wait_s=0.05, inject=lambda: False) is None
+    assert w._probe_keyboard_hook(seen, wait_s=0.05,
+                                  inject=lambda: (seen.set() or True)) is True
+    assert w._probe_keyboard_hook(seen, wait_s=0.05, inject=lambda: True) is False
+    # --- decision matrix on a stub app
+    app = App.__new__(App)
+    app._hook_probe_seen = _th.Event()
+    app._hook_probe_enabled = True
+    app.model_loaded = True
+    app.is_recording = False
+    app._is_meeting_active = lambda: False
+    app._compose_active = app._compose_instr_active = False
+    app._voice_ask_active = app._hotkey_capture_active = False
+    restarts = []
+    app._restart_app = lambda reason="manual": restarts.append(reason)
+    orig_probe, orig_idle = w._probe_keyboard_hook, w.get_system_idle_seconds
+    results = []
+    try:
+        w.get_system_idle_seconds = lambda: 5.0
+        w._probe_keyboard_hook = lambda seen, wait_s=0.5, inject=None: results.pop(0)
+        app.is_recording = True                      # blocked -> nothing probed
+        results[:] = [False, False]
+        assert App._verify_keyboard_hook(app, recheck_delay_s=0) is None
+        assert results == [False, False]
+        app.is_recording = False
+        w.get_system_idle_seconds = lambda: 0.2      # user mid-typing
+        assert App._verify_keyboard_hook(app, recheck_delay_s=0) is None
+        w.get_system_idle_seconds = lambda: 600.0    # long idle: leave the timers alone
+        assert App._verify_keyboard_hook(app, recheck_delay_s=0) is None
+        w.get_system_idle_seconds = lambda: 5.0
+        results[:] = [True]                          # alive
+        assert App._verify_keyboard_hook(app, recheck_delay_s=0) is True and not restarts
+        results[:] = [False, True]                   # transient stall -> alive
+        assert App._verify_keyboard_hook(app, recheck_delay_s=0) is True and not restarts
+        results[:] = [None]                          # could not inject -> unknown
+        assert App._verify_keyboard_hook(app, recheck_delay_s=0) is None and not restarts
+        results[:] = [False, False]                  # dead twice -> ONE restart
+        assert App._verify_keyboard_hook(app, recheck_delay_s=0) is False
+        assert restarts == ["dead-hotkey-hook-probe"], restarts
+        results[:] = [False, False]                  # dead again <120s -> rate-limited
+        assert App._verify_keyboard_hook(app, recheck_delay_s=0) is False
+        assert restarts == ["dead-hotkey-hook-probe"], restarts
+        app._hook_probe_enabled = False              # observer failed -> never probes
+        results[:] = [False, False]
+        assert App._verify_keyboard_hook(app, recheck_delay_s=0) is None
+        assert results == [False, False]
+    finally:
+        w._probe_keyboard_hook, w.get_system_idle_seconds = orig_probe, orig_idle
+    # --- the reason rides the relaunch argv ...
+    launched = []
+
+    class _FakePopen:
+        def __init__(self, cmd, **kw):
+            launched.append(list(cmd))
+    app2 = App.__new__(App)
+    app2.overlay = types.SimpleNamespace(show=lambda *a, **k: None)
+    app2._quit = lambda: None
+    orig_target, orig_popen, orig_sleep = w._get_startup_target, _sp.Popen, w.time.sleep
+    try:
+        w._get_startup_target = lambda: ("C:\\x\\Lia.exe", '"C:\\x\\lia.py"', "C:\\x", None)
+        _sp.Popen = _FakePopen
+        w.time.sleep = lambda s: None
+        App._restart_app(app2, reason="dead-hotkey-hook-probe")
+    finally:
+        w._get_startup_target, _sp.Popen, w.time.sleep = orig_target, orig_popen, orig_sleep
+    assert launched and launched[0][-2:] == [
+        "--restarted", "--restart-reason=dead-hotkey-hook-probe"], launched
+    # ... is read back by the fresh instance; only FELT reasons have a notice
+    assert w._restart_reason_from_argv(
+        ["lia.py", "--restarted", "--restart-reason=dead-hotkey-hook"]) == "dead-hotkey-hook"
+    assert w._restart_reason_from_argv(["lia.py"]) == ""
+    for r in ("dead-hotkey-hook", "dead-hotkey-hook-probe"):
+        title, msg = w._RESTART_NOTICES[r]
+        assert title and "hook" in msg.lower(), r
+    assert "manual" not in w._RESTART_NOTICES
+    # the fresh instance shows the notice once its icon is up (onboarding path)
+    shown = []
+    icon = types.SimpleNamespace(notify=lambda msg, title: shown.append((title, msg)))
+    orig_argv = sys.argv
+    try:
+        sys.argv = ["lia.py", "--restarted", "--restart-reason=dead-hotkey-hook"]
+        App._tray_first_run_onboarding(types.SimpleNamespace(config={
+            "_first_run_welcome_shown": True, "_tray_icon_promoted": True}), icon)
+    finally:
+        sys.argv = orig_argv
+    assert shown and shown[0][0] == "Lia restarted itself", shown
+    # a logon relaunch chain must not carry a stale reason
+    _d, argv2 = w._autostart_relaunch_plan(
+        ["lia.py", "--restart-reason=dead-hotkey-hook", "--autostart"])
+    assert not any(a.startswith("--restart-reason=") for a in argv2), argv2
+
+
+_test("hotkey: OS-hook liveness probe + proactive restart + restart notice",
+      t_hook_probe_watchdog_and_restart_notice)
 
 
 def t_startup_target_autostart_flag():

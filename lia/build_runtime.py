@@ -39,10 +39,16 @@ PYTHON_EMBED_URL = (
     f"https://www.python.org/ftp/python/{PYTHON_VERSION}/"
     f"python-{PYTHON_VERSION}-embed-amd64.zip"
 )
-# SHA-256 of the zip (verify after bumping version).
-PYTHON_EMBED_SHA256 = ""  # TODO: fill on first download, then pin
+# SHA-256 of the zip (verify after bumping version). PINNED 2026-09-03:
+# cross-checked - this file's MD5 equals python.org's published md5
+# 77f294ec267596827a2ab06e8fa3f18c for python-3.13.7-embed-amd64.zip.
+PYTHON_EMBED_SHA256 = "f6cca216a359be84797cabb54149ce5e062afb16cc7567eb7fc51cacb2d86b65"
 
 GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
+# bootstrap.pypa.io serves the LATEST get-pip.py, so this pin will fail the
+# build when pypa updates it - that is deliberate: inspect the new file, then
+# re-pin. Never blank this to "make the build pass". (2026-09-03 audit #6)
+GET_PIP_SHA256 = "fb24e693bab954209a063d90953621412ccad4a500905a726286e038f508ddf6"
 
 # ---------- helpers ----------
 
@@ -174,6 +180,16 @@ def phase_4_install_deps():
     get_pip = os.path.join(cache_dir, "get-pip.py")
     if not os.path.exists(get_pip):
         _download(GET_PIP_URL, get_pip)
+    got = _sha256(get_pip)
+    if GET_PIP_SHA256 and got != GET_PIP_SHA256:
+        raise RuntimeError(
+            "get-pip.py SHA-256 mismatch - refusing to run unverified code:\n"
+            f"  expected: {GET_PIP_SHA256}\n"
+            f"  got:      {got}\n"
+            "  bootstrap.pypa.io updated get-pip.py. Inspect the new file, then "
+            "update GET_PIP_SHA256 (delete build/get-pip.py to re-download).")
+    elif not GET_PIP_SHA256:
+        print(f"  get-pip.py SHA-256 (pin this): {got}")
     _python(get_pip, "--no-warn-script-location")
     # Install from lock file
     lock = os.path.join(HERE, "requirements.lock")
@@ -220,7 +236,7 @@ def phase_5_create_launcher():
             VSVersionInfo, FixedFileInfo, StringFileInfo, StringTable,
             StringStruct, VarFileInfo, VarStruct,
             write_version_info_to_executable)
-        v = (1, 3, 0, 0)   # app version (was derived from the Python version by mistake)
+        v = (1, 3, 1, 0)   # app version (was derived from the Python version by mistake)
         vi = VSVersionInfo(
             ffi=FixedFileInfo(filevers=v, prodvers=v, mask=0x3f,
                               flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0),
@@ -229,11 +245,11 @@ def phase_5_create_launcher():
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription',
                                  'Lia - Local Inference Assistant'),
-                    StringStruct('FileVersion', '1.3.0'),
+                    StringStruct('FileVersion', '1.3.1'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.3.0'),
+                    StringStruct('ProductVersion', '1.3.1'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -358,19 +374,14 @@ def phase_6_copy_sources():
         os.remove(archive)
         print(f"  Exported sources via git archive")
     except Exception as e:
-        # Fallback: direct copy (includes private files but works without git)
-        print(f"  git archive failed ({e}), falling back to direct copy")
-        for item in os.listdir(HERE):
-            src = os.path.join(HERE, item)
-            if item in ("build", "build_runtime", "dist", "installer_output",
-                        "__pycache__", "build_installer.py"):
-                continue
-            dst = os.path.join(APP_DIR, item)
-            if os.path.isdir(src):
-                shutil.copytree(src, dst, dirs_exist_ok=True)
-            else:
-                shutil.copy2(src, dst)
-        print(f"  Copied sources directly")
+        # NO working-tree fallback (2026-09-03 audit #12): a direct copy would
+        # ship whatever untracked file happens to sit in lia/ - config.seed.json,
+        # hf_token.local, scratch. The build exports TRACKED sources only, via
+        # git archive HEAD. Commit first, then rebuild.
+        raise RuntimeError(
+            "git archive HEAD failed (%s). The build ships tracked sources ONLY "
+            "(so a stray untracked secret can never leak). Commit your changes "
+            "and rebuild - the working-tree copy fallback was removed." % e)
     # Also copy top-level files
     for f in ("README.md", "LICENSE"):
         src = os.path.join(repo_root, f)

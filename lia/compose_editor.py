@@ -610,7 +610,34 @@ SUMMARY_HTML = r"""<!DOCTYPE html>
     // Inject the document's OWN css first so the card looks identical to the file.
     var s=document.createElement('style'); s.textContent=d.css||'';
     document.head.insertBefore(s, document.head.firstChild);
-    card.innerHTML = d.card_html || '';
+    // #16 (2026-09-03 audit): the summary HTML we re-hydrate came from a file
+    // on disk. Every writer escapes it (_summary_to_html), but a hand-placed or
+    // externally-obtained *_meeting_summary.html could carry <img onerror=...>
+    // or a javascript: href that would run in THIS api-privileged webview.
+    // Sanitize on load: allowlist tags, drop every on*/style/src/href attribute.
+    var sanitizeCardHtml = function(raw){
+      try {
+        var doc = new DOMParser().parseFromString('<div id="__w">'+(raw||'')+'</div>', 'text/html');
+        var root = doc.getElementById('__w');
+        var ALLOW = {P:1,H1:1,H2:1,H3:1,H4:1,H5:1,UL:1,OL:1,LI:1,B:1,STRONG:1,
+                     I:1,EM:1,U:1,BR:1,SPAN:1,DIV:1,BLOCKQUOTE:1,HR:1,
+                     TABLE:1,THEAD:1,TBODY:1,TR:1,TD:1,TH:1};
+        var all = root.querySelectorAll('*');
+        for (var i=all.length-1;i>=0;i--){
+          var el=all[i];
+          if(!ALLOW[el.tagName]){
+            while(el.firstChild){ el.parentNode.insertBefore(el.firstChild, el); }
+            el.parentNode.removeChild(el); continue;
+          }
+          for (var j=el.attributes.length-1;j>=0;j--){
+            var an=el.attributes[j].name.toLowerCase();
+            if(an!=="dir" && an!=="class"){ el.removeAttribute(el.attributes[j].name); }
+          }
+        }
+        return root.innerHTML;
+      } catch(e){ return ''; }
+    };
+    card.innerHTML = sanitizeCardHtml(d.card_html || '');
     try{ document.execCommand('styleWithCSS', false, false); }catch(e){} // semantic <b>/<i>
     card.focus();
     setStatus('');

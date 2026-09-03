@@ -199,8 +199,10 @@ def _demo_state():
         "vocab_pending": 4, "auto_start": True,
         "serve": {"enabled": True, "autostart": False, "running": True,
                   "port": 9090, "has_token": False,
-                  "tailscale_ip": "100.70.229.87",
-                  "ws_url": "ws://100.70.229.87:9090",
+                  "tailscale_ip": "100.100.100.100",
+                  "ws_url": "ws://100.100.100.100:9090",
+                  "host": "auto", "host_label": "Tailscale 100.100.100.100",
+                  "insecure": False,
                   "role": "server", "model": "",
                   "gpu": {"has_cuda": True, "name": "NVIDIA GeForce RTX 3090",
                           "vram_gb": 24.0, "verdict": "good",
@@ -710,10 +712,16 @@ APP_JS = r"""
         '<div class="srv-h"><span class="srv-ico" style="background:#7c5cff">&#128225;</span>'+
           '<div><h3>Host a transcription server</h3><div class="sub">Runs a Whisper model on this GPU. No Docker, no extra install.</div></div></div>'+
         gpuCard + runControl + modelPicker +
+        '<div class="section-title">Listen on</div>'+
+        radio("svhost","set_serve_host","auto","str","Tailscale, else this PC (recommended)", (sv.host||"auto")==="auto", canServe, "Reachable by your other devices over Tailscale; falls back to this-PC-only if Tailscale is off.")+
+        radio("svhost","set_serve_host","loopback","str","This PC only", (sv.host)==="loopback", canServe, "Nothing on the network can reach it.")+
+        radio("svhost","set_serve_host","all","str","All networks (needs a token)", (sv.host)==="all", canServe, "Every interface, including the LAN. Requires an access token.")+
+        '<div class="hint">Now bound to: <b>'+esc(sv.host_label||"")+'</b>.'+(sv.insecure?' <b style="color:#d08770">Set a token below - the server will refuse to start on a network interface without one.</b>':'')+'</div>'+
         field("Port",'<input type="number" id="in_serve_port" class="mono" value="'+svPort+'" style="max-width:120px"'+(canServe?'':' disabled')+'>',"default 9090")+
-        field("Access token (optional)",
+        field("Access token"+(((sv.host)==="all"||sv.insecure)?" (required)":" (optional)"),
           '<input type="password" id="in_serve_tok" class="mono" placeholder="'+
-          (sv.has_token?"(saved - leave blank to keep)":"none")+'"'+(canServe?'':' disabled')+'>')+
+          (sv.has_token?"(saved - leave blank to keep)":"none")+'"'+(canServe?'':' disabled')+'>'+
+          ' <button class="btn" data-gen-token="1" data-slow="1"'+(canServe?'':' disabled')+'>Generate</button>')+
         '<div class="btnrow"><button class="btn" data-apply-serve="1" data-slow="1"'+(canServe?'':' disabled')+'>Save port / token</button><span class="grow"></span></div>'+
         sw("Keep running after reboot (start at Windows logon)", !!sv.autostart, "toggle_serve_autostart", !canServe)+
         '<div class="hint">'+urlLine+'</div>'+
@@ -990,6 +998,12 @@ APP_JS = r"""
       var tk2=(document.getElementById("in_remote_tok")||{}).value||"";
       busy(tr,true); call("test_remote",[u2,tk2],true).then(function(r){ unbusy(tr);
         var st=document.getElementById("st_remote"); if(st) st.textContent=r.msg||""; }); return; }
+    var gtk = e.target.closest('[data-gen-token]');
+    if(gtk){ busy(gtk,true); call("gen_serve_token",[],true).then(function(r){ unbusy(gtk);
+        var st=document.getElementById("st_serve");
+        if(r.ok){ var inp=document.getElementById("in_serve_tok"); if(inp){ inp.type="text"; inp.value=r.msg; }
+          if(st) st.textContent="New token generated - copy it into the client's Server token, then Save."; }
+        else if(st){ st.textContent=r.msg||""; } }); return; }
     var asv = e.target.closest('[data-apply-serve]');
     if(asv){ var sp=(document.getElementById("in_serve_port")||{}).value||"";
       var stk=(document.getElementById("in_serve_tok")||{}).value||"";

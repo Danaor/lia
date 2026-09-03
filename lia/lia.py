@@ -112,7 +112,8 @@ def _autostart_relaunch_plan(argv=None, logon=None):
     if n >= _AUTOSTART_MAX_ATTEMPTS:
         return None
     keep = [a for i, a in enumerate(argv)
-            if a != "--attempt" and not (i > 0 and argv[i - 1] == "--attempt")]
+            if a != "--attempt" and not (i > 0 and argv[i - 1] == "--attempt")
+            and not a.startswith("--restart-reason=")]
     if keep:
         keep[0] = os.path.abspath(keep[0])   # cwd-independent script path
     if "--autostart" not in keep:
@@ -167,12 +168,48 @@ def _startup_excepthook(exc_type, exc, tb):
     _autostart_relaunch("uncaught %s" % getattr(exc_type, "__name__", exc_type))
 
 
-sys.excepthook = _startup_excepthook
-_startup_trace("launch", " ".join(sys.argv[1:]) or "(no args)")
+# Only a REAL launch (this file run as the program) arms the crash nets and
+# writes the "launch" breadcrumb. A script or the test suite that merely
+# imports lia.py must not land its own tracebacks in startup_trace.log as
+# CRASH entries or add phantom "launch" lines (2026-09-02: a diagnostic
+# script's failures were read as app crashes).
+_ARM_CRASH_NET = (__name__ == "__main__")
+if _ARM_CRASH_NET:
+    sys.excepthook = _startup_excepthook
+    _startup_trace("launch", " ".join(sys.argv[1:]) or "(no args)")
 
 import json
 import asyncio
 import threading
+
+
+def _thread_excepthook(args):
+    """Uncaught exception in a WORKER thread. Python's default only prints it
+    to stderr - a devnull sink under the pythonw launcher - so a watchdog or
+    listener thread could die silently and the app would look alive with a
+    feature quietly gone. sys.excepthook (above) covers only the main thread;
+    this is its counterpart: lia.log (once logging is up) + a breadcrumb."""
+    try:
+        import traceback
+        text = "".join(traceback.format_exception(
+            args.exc_type, args.exc_value, args.exc_traceback)).rstrip()
+    except Exception:
+        text = "%s: %s" % (getattr(args.exc_type, "__name__", args.exc_type),
+                           args.exc_value)
+    name = getattr(getattr(args, "thread", None), "name", "?")
+    try:
+        import logging as _logging
+        if _logging.getLogger("Lia").handlers or _logging.getLogger().handlers:
+            _logging.getLogger("Lia").critical(
+                "Uncaught exception in thread %s:\n%s", name, text)
+    except Exception:
+        pass
+    _startup_trace("THREAD-CRASH", "%s\n    %s"
+                   % (name, text.replace("\n", "\n    ")))
+
+
+if _ARM_CRASH_NET:
+    threading.excepthook = _thread_excepthook
 import time
 import wave
 import tempfile
@@ -420,7 +457,10 @@ DEFAULT_CONFIG = {
     "serve_autostart": False,        # also run at Windows logon (Scheduled Task)
     "serve_port": 9090,              # the port the server listens on
     "serve_model": "",               # "" = fall back to model_size (Hebrew turbo)
-    "serve_token": "",               # optional Bearer clients must present
+    "serve_token": "",               # Bearer clients must present (REQUIRED for
+                                     # any non-loopback bind - see _serve_policy_check)
+    "serve_host": "auto",            # auto(=Tailscale/loopback) | tailscale |
+                                     # loopback | all(=0.0.0.0, needs a token)
     "transcription_role": "",        # "" / "client" / "server" - the Transcription
                                      # Server page's remembered view (UI-only)
     "groq_api_key": "",  # Groq API key (from https://console.groq.com/keys)
@@ -728,7 +768,17 @@ DEFAULT_CONFIG = {
     # never boosted into a false positive.
     "auto_gain": True,
     "auto_gain_target_rms": 0.06,  # Whisper/gpt-4o sweet spot
-    "auto_gain_max": 8.0,          # hard cap on boost factor
+    "auto_gain_max": 4.0,          # hard cap on boost factor (2026-09-03: was
+                                   # 8.0; 8x blows a near-silent clip's noise
+                                   # floor into garbage the model hallucinates on)
+    # Vocab initial_prompt confidence gate (2026-09-03 regression: short/quiet
+    # Hebrew dictation came back as English letters - the decoder COPIES the
+    # English-dominant vocab prompt when there is little acoustic evidence).
+    # The prompt is applied only when the clip is BOTH long enough AND not
+    # near-silent; short or quiet clips transcribe with NO prompt (measured to
+    # remove the injection while keeping the spelling benefit on real dictation).
+    "vocab_prompt_bias_min_sec": 5.0,   # keep the prompt only for clips >= this
+    "vocab_prompt_bias_min_rms": 0.02,  # ...and with pre-gain peak RMS >= this
     # Idle watchdog: silently restart Lia after N hours of no
     # recording activity, to avoid stale-PortAudio silent captures after
     # long idle (e.g. overnight). Set to 0 to disable. Default 4 hours.
@@ -1020,7 +1070,15 @@ def audio_peak_rms(audio_np, sample_rate=16000, window_ms=300):
     return max_rms
 
 
-def apply_auto_gain(audio_np, target_rms=0.06, max_gain=8.0):
+# Near-noise guard for apply_auto_gain: a clip quieter than this is mostly
+# noise floor, so cap its boost hard - amplifying it toward the target raises
+# the noise, lowers SNR, and pushes the decoder to lean on (and hallucinate
+# from) its prompt. Real quiet speech still gets a modest lift.
+_AUTO_GAIN_QUIET_RMS = 0.02
+_AUTO_GAIN_QUIET_MAX = 3.0
+
+
+def apply_auto_gain(audio_np, target_rms=0.06, max_gain=4.0):
     """Boost quiet recordings toward a target loudness so the ASR has
     a stronger signal to work with — addresses 'it misses words' on
     low-level mics (e.g. a gooseneck set to a modest Windows input
@@ -1050,11 +1108,27 @@ def apply_auto_gain(audio_np, target_rms=0.06, max_gain=8.0):
     if peak > 0:
         # Don't let the boost push the peak past 0.97 (avoid clipping).
         gain = min(gain, 0.97 / peak)
+    if rms < _AUTO_GAIN_QUIET_RMS:
+        gain = min(gain, _AUTO_GAIN_QUIET_MAX)   # near-noise: cap hard
     gain = max(1.0, gain)
     if gain <= 1.01:
         return audio_np  # negligible — return original untouched
     boosted = np.clip(samples * gain, -1.0, 1.0)
     return boosted.astype(np.float32)
+
+
+def _vocab_prompt_bias_ok(duration_sec, peak_rms, min_sec=5.0, min_rms=0.02):
+    """Should the vocab initial_prompt be applied to THIS dictation clip?
+
+    The English-dominant prompt fixes term spelling on normal dictation, but on
+    a SHORT / LOW-SIGNAL clip the decoder has too little acoustic evidence and
+    COPIES the prompt, emitting Latin-letter hallucinations (2026-09-03
+    "English letters" report). Apply it only when the clip is long enough AND
+    not near-silent. Pure + unit-tested; unknown metrics keep the old behavior."""
+    try:
+        return float(duration_sec) >= float(min_sec) and float(peak_rms) >= float(min_rms)
+    except (TypeError, ValueError):
+        return True
 
 
 def smart_cut_tail(audio_np, sample_rate=16000, window_s=2.5, frame_s=0.03,
@@ -1772,7 +1846,52 @@ def bundled_seed_config():
 # plaintext value in the file is accepted and encrypted on the next save
 # (automatic migration for pre-encryption configs).
 _SECRET_CONFIG_KEYS = ("groq_api_key", "openai_api_key", "gemini_api_key",
-                       "assemblyai_api_key", "hf_token", "remote_server_token")
+                       "assemblyai_api_key", "hf_token", "remote_server_token",
+                       "serve_token")
+# Network-location keys: not secrets, but a private tailnet/host address should
+# not travel in a diagnostic bundle bound for a public issue.
+_PRIVACY_CONFIG_KEYS = ("remote_server_url", "serve_host")
+# Personal free-text lists: redacted to a size in the bundle.
+_PERSONAL_CONFIG_KEYS = ("custom_vocabulary", "snippets", "notetaker_names")
+
+
+def _redact_bundle_url(u):
+    """Keep the scheme + port of a ws(s)://host URL but hide the host, so a
+    diagnostic bundle never discloses a private/tailnet address."""
+    u = str(u or "").strip()
+    if not u:
+        return ""
+    try:
+        from urllib.parse import urlsplit
+        p = urlsplit(u)
+        if p.scheme:
+            port = (":%d" % p.port) if p.port else ""
+            return "%s://<redacted-host>%s" % (p.scheme, port)
+    except Exception:
+        pass
+    return "<set>"
+
+
+def _sanitize_config_for_bundle(config):
+    """Config dict for the 'Report a problem' bundle: secrets -> set/empty,
+    network locations redacted, personal lists -> sizes, everything else kept.
+    Pure + unit-tested so the 'never ship a plaintext key' guarantee is
+    enforced by a test, and adding a secret to _SECRET_CONFIG_KEYS covers the
+    bundle automatically (no more three hand-kept lists)."""
+    secrets = set(_SECRET_CONFIG_KEYS)
+    privacy = set(_PRIVACY_CONFIG_KEYS)
+    personal = set(_PERSONAL_CONFIG_KEYS)
+    out = {}
+    for k, v in (config or {}).items():
+        if k in secrets:
+            out[k] = "set" if str(v or "").strip() else ""
+        elif k in privacy:
+            out[k] = _redact_bundle_url(v)
+        elif k in personal:
+            out[k] = "<redacted: %d chars>" % len(str(v or ""))
+        else:
+            out[k] = v
+    return out
 
 
 def _fmt_user_text(cfg, text, limit=None):
@@ -1915,6 +2034,47 @@ def is_user_admin():
         return False
 
 
+def _which_trusted(name):
+    """shutil.which(name) but reject a hit in the cwd or the app dir - those are
+    searched BEFORE System32 by a bare CreateProcess, the binary-planting risk."""
+    try:
+        import shutil
+        exe = shutil.which(name)
+        if not exe:
+            return None
+        d = os.path.dirname(os.path.abspath(exe)).lower()
+        bad = {os.getcwd().lower(),
+               os.path.dirname(os.path.abspath(sys.argv[0])).lower()}
+        return None if d in bad else exe
+    except Exception:
+        return None
+
+
+def _sys_exe(name):
+    """Absolute path to a Windows system/tool executable from TRUSTED locations
+    only (System32, Program Files, a trusted PATH entry) - never the cwd or app
+    dir, which a bare exe name would search first (2026-09-03 audit #7: binary
+    planting). Falls back to the bare name so callers that already tolerate a
+    missing tool still degrade gracefully."""
+    if os.name != "nt":
+        return name
+    sysroot = os.environ.get("SystemRoot", r"C:\Windows")
+    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+    table = {
+        "powershell": [os.path.join(sysroot, "System32", "WindowsPowerShell",
+                                    "v1.0", "powershell.exe")],
+        "explorer": [os.path.join(sysroot, "explorer.exe")],
+        "nvidia-smi": [os.path.join(sysroot, "System32", "nvidia-smi.exe"),
+                       os.path.join(pf, "NVIDIA Corporation", "NVSMI",
+                                    "nvidia-smi.exe")],
+        "tailscale": [os.path.join(pf, "Tailscale", "tailscale.exe")],
+    }
+    for cand in table.get(name, []):
+        if os.path.exists(cand):
+            return cand
+    return _which_trusted(name) or name
+
+
 def spawn_deelevated(args, env=None, creationflags=0, cwd=None):
     """Launch ``args`` (a list) at the shell's MEDIUM integrity, de-elevating
     from an elevated parent. Lia runs elevated (global keyboard hook),
@@ -2020,8 +2180,39 @@ def spawn_helper(args, env=None, creationflags=0, cwd=None):
             log.info("Spawned de-elevated (pid %s).", pid)
             return
         except Exception as e:
-            log.warning("De-elevation failed (%s) — spawning at current level.", e)
+            log.warning("De-elevation failed (%s) - spawning at the current "
+                        "(elevated) integrity level; a child window then runs "
+                        "elevated (audit #22, accepted: the webviews are XSS-"
+                        "hardened and the helper must still open).", e)
     subprocess.Popen(args, env=env, creationflags=creationflags, cwd=cwd)
+
+
+def _pid_alive(pid):
+    """True if a process with `pid` is still running (Windows)."""
+    try:
+        import ctypes
+        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))  # QUERY_LIMITED
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        ok = ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+        ctypes.windll.kernel32.CloseHandle(h)
+        return bool(ok) and code.value == 259   # STILL_ACTIVE
+    except Exception:
+        return False
+
+
+def _terminate_pid(pid):
+    """Terminate a process by pid (Windows) - a de-elevated child is tracked by
+    pid, not by a Popen handle."""
+    try:
+        import ctypes
+        h = ctypes.windll.kernel32.OpenProcess(0x0001, False, int(pid))   # TERMINATE
+        if h:
+            ctypes.windll.kernel32.TerminateProcess(h, 1)
+            ctypes.windll.kernel32.CloseHandle(h)
+    except Exception as e:
+        log.warning("Terminate pid %s failed: %s", pid, e)
 
 
 def _ensure_cuda_dll_path():
@@ -3894,7 +4085,7 @@ class BaseTranscriber:
     def load_model(self, callback=None):
         raise NotImplementedError
 
-    def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe"):
+    def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe", bias_ok=True):
         raise NotImplementedError
 
     def transcribe_file(self, file_path, language=None, task="transcribe"):
@@ -4021,7 +4212,7 @@ class FasterWhisperTranscriber(BaseTranscriber):
         finally:
             self._loading = False
 
-    def transcribe(self, audio_np, language=None, beam_size=5, task="transcribe"):
+    def transcribe(self, audio_np, language=None, beam_size=5, task="transcribe", bias_ok=True):
         if self.model is None:
             raise RuntimeError("Model not loaded")
         if len(audio_np) == 0:
@@ -4030,9 +4221,15 @@ class FasterWhisperTranscriber(BaseTranscriber):
         lang = language if language and language != "auto" else None
         # initial_prompt biases Whisper toward user's terms (prevents
         # 'git push' → 'בגד פושע' style errors). None if no vocab set.
+        # bias_ok=False (short / low-signal clip, decided by the caller): drop
+        # the English-dominant vocab prompt so the decoder cannot copy it into
+        # Latin-letter hallucinations (2026-09-03 regression).
         init_prompt = None
-        if self.custom_vocabulary and self.custom_vocabulary.strip():
+        if bias_ok and self.custom_vocabulary and self.custom_vocabulary.strip():
             init_prompt = f"Common terms: {self.custom_vocabulary.strip()}"
+        elif self.custom_vocabulary and self.custom_vocabulary.strip():
+            log.debug("Vocab prompt suppressed for a low-signal clip (%.1fs) "
+                      "to avoid English-letter hallucination", len(audio_np) / 16000)
         def _run():
             # Hold the model lock across BOTH the call and the (lazy) segment
             # iteration — the real GPU work happens while consuming `segments`.
@@ -4089,18 +4286,21 @@ class FasterWhisperTranscriber(BaseTranscriber):
 
         return text.strip()
 
-    def transcribe_segments(self, audio_np, language=None, beam_size=3):
+    def transcribe_segments(self, audio_np, language=None, beam_size=3,
+                            use_vocabulary=True):
         """RAW timestamped segments for the built-in serve mode (host mode).
         Returns [{"start": s, "end": s, "text": str}, ...] with NO cleanup /
         RTL marking / hallucination strip - the CONSUMING client applies those.
-        Shares the model + infer-lock + CPU-demote-retry with transcribe()."""
+        Shares the model + infer-lock + CPU-demote-retry with transcribe().
+        use_vocabulary=False (an untrusted serve client) drops the initial_prompt
+        so the host's private terms cannot be echoed back (WP1 #19)."""
         if self.model is None:
             raise RuntimeError("Model not loaded")
         if len(audio_np) == 0:
             return []
         lang = language if language and language != "auto" else None
         init_prompt = None
-        if self.custom_vocabulary and self.custom_vocabulary.strip():
+        if use_vocabulary and self.custom_vocabulary and self.custom_vocabulary.strip():
             init_prompt = f"Common terms: {self.custom_vocabulary.strip()}"
 
         def _run():
@@ -4382,7 +4582,12 @@ class BilingualRouterTranscriber(BaseTranscriber):
                 self._general_dead_logged = True
             return "he"
         if len(audio_np) < int(self.MIN_DETECT_SEC * 16000):
-            return self._last_route
+            # Too little audio to detect reliably. Do NOT reuse a stale
+            # _last_route - a prior 'en' would drag this short Hebrew clip to
+            # the English model (part of the 2026-09-03 "English letters"
+            # report). Dictation presses are independent utterances, so fall
+            # back to the fail-safe primary instead of cross-press hysteresis.
+            return self.primary
         try:
             # detect_language is an encoder-only pass (~30s window) — cheap.
             # Hold the general model's inference lock: meeting chunk workers
@@ -4425,7 +4630,7 @@ class BilingualRouterTranscriber(BaseTranscriber):
 
     # -- Transcription entry points ----------------------------------
 
-    def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe"):
+    def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe", bias_ok=True):
         if len(audio_np) == 0:
             return ""
         # An explicit language (not auto) from the caller wins — the router
@@ -4434,7 +4639,7 @@ class BilingualRouterTranscriber(BaseTranscriber):
         if task == "translate":
             child = self.general if (self.general and self.general.model) else self.he
             return child.transcribe(audio_np, language=None, beam_size=beam_size,
-                                    task=task)
+                                    task=task, bias_ok=bias_ok)
         if language and language != "auto":
             if language == "he":
                 child = self.he
@@ -4445,7 +4650,7 @@ class BilingualRouterTranscriber(BaseTranscriber):
                 child = (self.general if (self.general and self.general.model)
                          else self.he)
             return child.transcribe(audio_np, language=language,
-                                    beam_size=beam_size, task=task)
+                                    beam_size=beam_size, task=task, bias_ok=bias_ok)
         # Long audio (meeting chunks / diarized turns that ran long): split at
         # speech pauses so a mid-segment he→en switch doesn't force one
         # language onto both halves — the 2026-07-31 [48:48] failure, which
@@ -4468,7 +4673,7 @@ class BilingualRouterTranscriber(BaseTranscriber):
             self._last_route = route
         child, lang = self._child_for(route)
         return child.transcribe(audio_np, language=lang, beam_size=beam_size,
-                                task=task)
+                                task=task, bias_ok=bias_ok)
 
     def _transcribe_split(self, audio_np, beam_size, task):
         """Split long audio into utterance groups at >=GROUP_GAP_SEC pauses,
@@ -4670,7 +4875,7 @@ class ParakeetTranscriber(BaseTranscriber):
         text = strip_hallucinated_tail(text.strip())
         return collapse_repetition_hallucinations(text).strip()
 
-    def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe"):
+    def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe", bias_ok=True):
         # `language`/`beam_size` accepted for BaseTranscriber contract parity.
         if task == "translate":
             raise RuntimeError("Parakeet cannot translate — use a Whisper model")
@@ -4774,7 +4979,7 @@ class OpenVINOTranscriber(BaseTranscriber):
                                       revision=MODEL_REVISIONS.get(self.model_size))
         return local_dir
 
-    def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe"):
+    def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe", bias_ok=True):
         if self.model is None:
             raise RuntimeError("Model not loaded")
         if len(audio_np) == 0:
@@ -4822,7 +5027,7 @@ class OpenVINOTranscriber(BaseTranscriber):
         except ImportError:
             import subprocess
             cmd = [
-                "ffmpeg", "-i", file_path,
+                _sys_exe("ffmpeg"), "-i", file_path,
                 "-ar", "16000", "-ac", "1", "-f", "f32le", "-"
             ]
             proc = subprocess.run(cmd, capture_output=True, check=True)
@@ -5086,7 +5291,7 @@ class GroqTranscriber(BaseTranscriber):
         winner["language"] = winner_lang
         return winner
 
-    def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe"):
+    def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe", bias_ok=True):
         if self.model is None:
             raise RuntimeError("Groq transcriber not initialized")
         if len(audio_np) == 0:
@@ -5533,7 +5738,7 @@ class GeminiTranscriber(BaseTranscriber):
                      for c in text)
         return ('‏' + text) if is_rtl else text
 
-    def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe"):
+    def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe", bias_ok=True):
         """Batch transcript of a numpy clip. `task="translate"` is unsupported by
         the transcribe model, so it degrades to a plain transcript (the meeting /
         file paths never request translation on this backend)."""
@@ -5728,10 +5933,12 @@ class GeminiLiveStream:
         """Open the socket + send setup + block until setupComplete. Raises
         RuntimeError on setup/auth/quota failure so callers can fall back."""
         import websocket
-        url = self.WS_URL + "?key=" + self.api_key
+        # Key in a header, not the URL query string (2026-09-03 audit #14: URLs
+        # leak via proxy/exception logs). The Live API accepts x-goog-api-key.
         self._ws = websocket.create_connection(
-            url, timeout=self.connect_timeout,
-            header=["Content-Type: application/json"])
+            self.WS_URL, timeout=self.connect_timeout,
+            header=["Content-Type: application/json",
+                    "x-goog-api-key: " + self.api_key])
         setup = {"setup": {"model": self.MODEL,
                            "generationConfig": {"responseModalities": ["TEXT"]},
                            "inputAudioTranscription": {
@@ -6015,7 +6222,7 @@ class OpenAITranscriber(BaseTranscriber):
             return raw
         return (body.get("text") or "").strip()
 
-    def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe"):
+    def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe", bias_ok=True):
         if self.model is None:
             raise RuntimeError("OpenAI transcriber not initialized")
         if len(audio_np) == 0:
@@ -6658,7 +6865,7 @@ class RemoteTranscriber(BaseTranscriber):
             callback("Remote transcription server ready: %s" % self.url)
 
     def transcribe(self, audio_np, language=None, beam_size=3,
-                   task="transcribe", progress_cb=None):
+                   task="transcribe", progress_cb=None, bias_ok=True):
         """Send the recording, return the full transcript (RTL-marked, tail
         hallucinations stripped). Returns "" for genuinely silent audio; raises
         only when the SERVER produced nothing on real speech (the caller then
@@ -6884,6 +7091,69 @@ class RemoteTranscriber(BaseTranscriber):
 # ============================================================
 # Serve mode HOST — a built-in WhisperLive-compatible server
 # ============================================================
+# --- Serve-mode bind + auth policy (2026-09-03 security audit WP1) ----------
+# The server used to bind 0.0.0.0 with no token by default - any LAN peer could
+# drive the GPU (compute theft + DoS) and could pull back the host's private
+# vocabulary. These make it secure by default: bind Tailscale/loopback unless
+# the user explicitly opts into a network interface WITH a token.
+SERVE_MAX_FRAME = 8 * 1024 * 1024   # per-message cap (a whole 20s float32 clip
+                                    # in one frame is ~1.3MB; Lia streams ~16KB)
+SERVE_MAX_CLIENTS = 8               # concurrent connections (DoS guard)
+SERVE_MAX_CONN_SECONDS = 180        # per-connection wall-clock cap
+_LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost", "")
+
+
+def _tailscale_ipv4():
+    """This machine's Tailscale IPv4, or "". Module-level so the --serve child
+    (which has no LiaApp) can also bind to the tailnet interface."""
+    try:
+        import subprocess
+        r = subprocess.run(
+            [_sys_exe("tailscale"), "ip", "-4"], capture_output=True, text=True,
+            creationflags=(0x08000000 if os.name == "nt" else 0), timeout=5)
+        out = (r.stdout or "").strip()
+        if r.returncode == 0 and out:
+            return out.splitlines()[0].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _is_loopback_bind(host):
+    return str(host or "").strip().lower() in _LOOPBACK_HOSTS
+
+
+def _resolve_serve_host(cfg):
+    """Map the serve_host config choice to a real bind address. Returns
+    (host, label, err); host is None only when a REQUIRED address is
+    unavailable (e.g. serve_host='tailscale' but Tailscale is down)."""
+    choice = str(cfg.get("serve_host", "auto") or "auto").strip().lower()
+    if choice in ("", "auto"):
+        ip = _tailscale_ipv4()
+        return (ip, "Tailscale " + ip, "") if ip else                ("127.0.0.1", "this PC only (Tailscale not up)", "")
+    if choice == "tailscale":
+        ip = _tailscale_ipv4()
+        return (ip, "Tailscale " + ip, "") if ip else                (None, "", "Tailscale is not running - start it, or pick a "
+                          "different 'Listen on' option.")
+    if choice == "loopback":
+        return ("127.0.0.1", "this PC only", "")
+    if choice == "all":
+        return ("0.0.0.0", "ALL networks", "")
+    return (choice, choice, "")   # a literal address the user configured
+
+
+def _serve_policy_check(host, token):
+    """A server on a NON-loopback interface must have a token, or any device
+    that can reach the port could use it. Returns (ok, msg)."""
+    if _is_loopback_bind(host):
+        return True, ""
+    if (token or "").strip():
+        return True, ""
+    return (False, "Set an access token before the server listens on a network "
+                   "interface (otherwise any device that reaches the port could "
+                   "use your GPU).")
+
+
 class LiaTranscriptionServer:
     """Host a WhisperLive-compatible WebSocket server backed by Lia's OWN local
     faster-whisper model, so another Lia install (or the same user's laptop) can
@@ -6907,7 +7177,9 @@ class LiaTranscriptionServer:
     MAX_CLIP_BYTES = 16000 * 4 * 60 * 15   # 15 min of float32 - runaway guard
     DEBOUNCE_S = 0.2           # transcribe this long after the last audio chunk
 
-    def __init__(self, transcriber, host="0.0.0.0", port=9090, token="",
+    _active_clients = 0
+
+    def __init__(self, transcriber, host="127.0.0.1", port=9090, token="",
                  language="he"):
         self.transcriber = transcriber
         self.host = host
@@ -6915,22 +7187,88 @@ class LiaTranscriptionServer:
         self.token = (token or "").strip()
         self.language = language
 
+    def _peer(self, ws):
+        try:
+            return getattr(ws, "remote_address", None)
+        except Exception:
+            return None
+
+    async def _reject(self, ws, code, reason):
+        try:
+            await ws.close(code=code, reason=reason)
+        except Exception:
+            pass
+
     def _authorized(self, ws):
+        """Proceed when no token is set (allowed only on a loopback bind, which
+        _serve_policy_check enforces at start) or the exact Bearer is presented.
+        Constant-time compare so the token is not timing-attackable."""
         if not self.token:
             return True
+        import hmac
         try:
-            auth = ws.request.headers.get("Authorization", "")
+            auth = ws.request.headers.get("Authorization", "") or ""
         except Exception:
             auth = ""
-        return auth == ("Bearer " + self.token)
+        expected = "Bearer " + self.token
+        return hmac.compare_digest(auth.encode("utf-8"), expected.encode("utf-8"))
+
+    def _request_trusted(self, ws):
+        """Trusted = same machine (loopback bind) OR a valid token. Gates the
+        host's private vocabulary out of a request that merely reached us."""
+        if _is_loopback_bind(self.host):
+            return True
+        return bool(self.token) and self._authorized(ws)
+
+    def _origin_ok(self, ws):
+        """Block cross-site WebSocket hijacking: a browser page can open a ws to
+        us with no preflight. Allow a missing Origin (non-browser clients incl.
+        Lia's websocket-client) or one whose host matches our Host header;
+        reject a foreign web origin."""
+        try:
+            h = ws.request.headers
+        except Exception:
+            return True
+        origin = h.get("Origin") or h.get("origin")
+        if not origin:
+            return True
+        host = h.get("Host") or h.get("host") or ""
+        try:
+            from urllib.parse import urlsplit
+            oh = (urlsplit(origin).hostname or "").lower()
+        except Exception:
+            return False
+        rhost = host.rsplit(":", 1)[0].strip("[]").lower() if host else ""
+        return bool(oh) and oh == rhost
 
     async def _handler(self, ws):
-        if not self._authorized(ws):
-            try:
-                await ws.close(code=1008, reason="unauthorized")
-            except Exception:
-                pass
+        peer = self._peer(ws)
+        if LiaTranscriptionServer._active_clients >= SERVE_MAX_CLIENTS:
+            log.warning("serve: at capacity (%d) - refusing %r",
+                        SERVE_MAX_CLIENTS, peer)
+            await self._reject(ws, 1013, "server busy")
             return
+        if not self._authorized(ws):
+            log.warning("serve: unauthorized client rejected (%r)", peer)
+            await self._reject(ws, 1008, "unauthorized")
+            return
+        if not self._origin_ok(ws):
+            log.warning("serve: cross-origin client rejected (%r)", peer)
+            await self._reject(ws, 1008, "forbidden origin")
+            return
+        authorized = self._request_trusted(ws)
+        LiaTranscriptionServer._active_clients += 1
+        try:
+            await asyncio.wait_for(self._serve_client(ws, authorized),
+                                   timeout=SERVE_MAX_CONN_SECONDS)
+        except asyncio.TimeoutError:
+            log.warning("serve: client %r exceeded %ds - closing",
+                        peer, SERVE_MAX_CONN_SECONDS)
+            await self._reject(ws, 1011, "timeout")
+        finally:
+            LiaTranscriptionServer._active_clients -= 1
+
+    async def _serve_client(self, ws, authorized):
         buf = bytearray()
         uid = None
         lang = self.language
@@ -6961,7 +7299,7 @@ class LiaTranscriptionServer:
                 else:
                     audio = np.frombuffer(bytes(buf), dtype=np.float32)
                     raw = await loop.run_in_executor(
-                        None, self._safe_segments, audio, lang)
+                        None, self._safe_segments, audio, lang, authorized)
                     cache["blen"], cache["raw"] = blen, raw
                 dur = blen / 4.0 / 16000.0
                 out = []
@@ -7029,7 +7367,7 @@ class LiaTranscriptionServer:
                 buf.extend(data)
                 schedule()
         except Exception as e:
-            log.debug("serve: client handler ended: %s", e)
+            log.debug("serve: client handler ended: %r", e)
         finally:
             if debounce is not None:
                 debounce.cancel()
@@ -7037,14 +7375,16 @@ class LiaTranscriptionServer:
     BEAM = 1   # greedy: a serve host prizes latency; beam>1 barely helps clean
                # dictation audio and is 2-3x slower (measured vs the container).
 
-    def _safe_segments(self, audio, lang):
+    def _safe_segments(self, audio, lang, use_vocabulary=True):
         """Raw timestamped segments, run in an executor. Never raises into the
-        event loop; on error returns [] so the client falls back."""
+        event loop; on error returns [] so the client falls back. The host's
+        private vocabulary is applied only for a trusted client (WP1 #19)."""
         try:
             if audio is None or len(audio) == 0:
                 return []
             return self.transcriber.transcribe_segments(
-                audio, language=lang, beam_size=self.BEAM)
+                audio, language=lang, beam_size=self.BEAM,
+                use_vocabulary=use_vocabulary)
         except Exception as e:
             log.error("serve: transcription failed: %s", e)
             return []
@@ -7059,9 +7399,13 @@ class LiaTranscriptionServer:
     async def _serve(self):
         import websockets
         async with websockets.serve(self._handler, self.host, self.port,
-                                    max_size=None, ping_interval=20):
-            log.info("Lia serve: listening on ws://%s:%d (model=%s)",
-                     self.host, self.port, self.transcriber.model_size)
+                                    max_size=SERVE_MAX_FRAME, max_queue=16,
+                                    ping_interval=20, ping_timeout=20,
+                                    close_timeout=5):
+            log.info("Lia serve: listening on ws://%s:%d (model=%s, token=%s, "
+                     "max %d clients)", self.host, self.port,
+                     self.transcriber.model_size,
+                     "yes" if self.token else "no", SERVE_MAX_CLIENTS)
             await asyncio.Future()   # run until the process is killed
 
     def serve_forever(self):
@@ -7078,7 +7422,7 @@ def run_transcription_server(argv=None):
     p.add_argument("--serve", action="store_true")
     p.add_argument("--port", type=int, default=None)
     p.add_argument("--model", default=None)
-    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--host", default=None)   # None -> resolve from config
     args, _ = p.parse_known_args(
         argv if argv is not None else sys.argv[1:])
 
@@ -7090,6 +7434,27 @@ def run_transcription_server(argv=None):
     device = cfg.get("whisper_device", "auto")
     language = cfg.get("primary_language", "he") or "he"
 
+    # Resolve the bind address (secure by default; --host overrides). A required
+    # address that is not up yet (Tailscale at logon) is waited for, then falls
+    # back to loopback rather than not starting at all.
+    if args.host:
+        host, err = args.host, ""
+    else:
+        host, _label, err = _resolve_serve_host(cfg)
+        if host is None:
+            for _ in range(36):        # up to ~3 min for Tailscale to come up
+                time.sleep(5)
+                host, _label, err = _resolve_serve_host(cfg)
+                if host:
+                    break
+            if host is None:
+                log.error("Lia serve: %s - falling back to 127.0.0.1", err)
+                host = "127.0.0.1"
+    ok, msg = _serve_policy_check(host, token)
+    if not ok:
+        log.error("Lia serve: refusing to start - %s", msg)
+        return
+
     log.info("Lia serve: loading model %s (device=%s) ...", model, device)
     tr = FasterWhisperTranscriber(
         model_size=model, device=device,
@@ -7097,7 +7462,7 @@ def run_transcription_server(argv=None):
     tr.custom_vocabulary = cfg.get("custom_vocabulary", "") or ""
     tr.load_model()
     log.info("Lia serve: model ready on %s", tr.active_device)
-    LiaTranscriptionServer(tr, host=args.host, port=port,
+    LiaTranscriptionServer(tr, host=host, port=port,
                            token=token, language=language).serve_forever()
 
 
@@ -11802,6 +12167,88 @@ def _vk_for_hotkey_part(name):
     return None
 
 
+# Windows "reserved" virtual key (VK_NONAME). A key-UP of it is the keyboard
+# hook liveness PROBE: no application acts on it, TranslateMessage yields no
+# character, and a key-up with no preceding key-down is a no-op everywhere -
+# yet a live WH_KEYBOARD_LL hook still sees it. Verified 2026-09-03: echoed
+# by the keyboard library's observer in ~0ms, also throughout a CT2 model
+# load and a transcribe (78/78 probes), so a missing echo means the hook is
+# gone, not busy.
+_HOOK_PROBE_VK = 0xFC
+
+
+def _inject_hook_probe():
+    """SendInput one key-UP of _HOOK_PROBE_VK. True when Windows accepted the
+    event; False when it refused it (UIPI: an elevated window is in the
+    foreground - the event never entered the input queue, so a missing echo
+    would prove nothing) or on any error."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _KI(ctypes.Structure):
+            _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                        ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+        class _U(ctypes.Union):      # padded to MOUSEINPUT's size (32 bytes)
+            _fields_ = [("ki", _KI), ("pad", ctypes.c_byte * 32)]
+
+        class _INPUT(ctypes.Structure):
+            _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+
+        inp = _INPUT(type=1)                                  # INPUT_KEYBOARD
+        inp.u.ki = _KI(_HOOK_PROBE_VK, 0, 0x0002, 0, None)    # KEYEVENTF_KEYUP
+        return ctypes.windll.user32.SendInput(
+            1, ctypes.byref(inp), ctypes.sizeof(_INPUT)) == 1
+    except Exception:
+        return False
+
+
+def _probe_keyboard_hook(seen, wait_s=0.5, inject=None):
+    """Is the OS-level keyboard hook alive? Inject the probe key and wait for
+    the observer that runs INSIDE the hook to flag `seen`. True = alive,
+    False = dead (nothing echoed), None = unknown (the probe could not be
+    injected - must not count as a miss)."""
+    inject = inject or _inject_hook_probe
+    try:
+        seen.clear()
+        if not inject():
+            return None
+        return bool(seen.wait(wait_s))
+    except Exception:
+        return None
+
+
+# What the FRESH instance tells the user after a self-restart, keyed by the
+# --restart-reason it was launched with. Only reasons the user could have
+# FELT are listed: a hook repair looks exactly like a crash otherwise (the
+# tray orb vanishes and returns, and the press that triggered it did
+# nothing). Routine restarts say nothing.
+_RESTART_NOTICES = {
+    "dead-hotkey-hook": (
+        "Lia restarted itself",
+        "Windows had dropped Lia's keyboard hook, so your last hotkey press "
+        "did nothing. Lia restarted to reinstall it - please repeat that "
+        "dictation."),
+    "dead-hotkey-hook-probe": (
+        "Lia repaired its hotkey",
+        "Windows had silently dropped Lia's keyboard hook. Lia restarted "
+        "itself to reinstall it before you needed it - nothing was lost."),
+}
+
+
+def _restart_reason_from_argv(argv=None):
+    """The --restart-reason=<slug> a self-restart passed to us, or ''."""
+    argv = sys.argv if argv is None else argv
+    for a in argv:
+        if isinstance(a, str) and a.startswith("--restart-reason="):
+            return a.split("=", 1)[1].strip()
+    return ""
+
+
 def _chord_physically_held(parts):
     """True iff EVERY key in the chord is physically down RIGHT NOW per
     Win32 GetAsyncKeyState — the OS-level physical state, immune to the
@@ -11921,12 +12368,53 @@ def expand_snippet(text, snippets):
     return text
 
 
+_PASTE_STRIP_RE = None
+
+
+def _sanitize_for_paste(text):
+    """Strip control characters that could execute or corrupt when pasted
+    (2026-09-03 audit #5: a compromised or MITM'd remote transcription server
+    can return control sequences that a terminal/REPL would act on). Keeps
+    \n \r \t - multi-line dictation is a feature - and the bidi marks the app
+    inserts itself (U+200E/U+200F). Removes only C0/C1 control chars."""
+    if not text:
+        return text
+    global _PASTE_STRIP_RE
+    if _PASTE_STRIP_RE is None:
+        import re as _re
+        _PASTE_STRIP_RE = _re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+    return _PASTE_STRIP_RE.sub("", text)
+
+
+def _summary_base_url_ok(url):
+    """(ok, reason) for a summary/cleanup base_url that will receive a cloud API
+    key. https is fine; http is fine ONLY to a loopback/private host (a local
+    Ollama). http to a public host would send the key in the clear -> refused
+    (2026-09-03 audit #10)."""
+    u = (url or "").strip()
+    if not u:
+        return True, ""
+    try:
+        from urllib.parse import urlsplit
+        p = urlsplit(u)
+    except Exception:
+        return False, "unparseable summary_base_url %r" % (u,)
+    if p.scheme == "https":
+        return True, ""
+    if p.scheme == "http" and _is_private_ws_host(p.hostname or ""):
+        return True, ""
+    return (False, "summary_base_url must be https:// (or http:// only to a "
+                   "local/private host) - refusing to send an API key to %r"
+                   % (p.hostname or u))
+
+
 def output_text(text, mode="auto_paste"):
     """Output transcribed text based on the selected mode.
 
     Returns True on success, False if the output couldn't be delivered
     (clipboard failure, etc.). Caller can surface an error overlay.
     """
+    text = _sanitize_for_paste(text)
     if mode == "clipboard_only":
         ok, msg = _copy_with_retry(text)
         if ok:
@@ -11998,11 +12486,11 @@ def _stamp_lia_launcher(exe_path):
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.3.0.0'),
+                    StringStruct('FileVersion', '1.3.1.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.3.0.0'),
+                    StringStruct('ProductVersion', '1.3.1.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -12246,7 +12734,7 @@ def _set_autostart_task(enabled):
         for name in (TASK_NAME,) + _LEGACY_TASK_NAMES:
             try:
                 subprocess.run(
-                    ["powershell", "-NoProfile", "-Command",
+                    [_sys_exe("powershell"), "-NoProfile", "-Command",
                      "Unregister-ScheduledTask -TaskName '%s' -Confirm:$false "
                      "-ErrorAction SilentlyContinue" % name],
                     capture_output=True, text=True, creationflags=0x08000000, timeout=30)
@@ -12268,7 +12756,7 @@ def _set_autostart_task(enabled):
         % (_ps_quote(target), _ps_quote(args or " "), _ps_quote(working), TASK_NAME)
     )
     try:
-        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+        r = subprocess.run([_sys_exe("powershell"), "-NoProfile", "-Command", ps],
                            capture_output=True, text=True,
                            creationflags=0x08000000, timeout=45)
         if r.returncode == 0 and "OK" in (r.stdout or ""):
@@ -12510,21 +12998,26 @@ def _set_startup_shortcut(enabled):
     elevated launcher behind it would prompt at every boot."""
     if enabled:
         target, args, working, icon_path = _get_startup_target()
+        # All install-path values go through _ps_quote (single-quote + escape)
+        # so a path containing a quote or a PowerShell metacharacter cannot break
+        # out of the string (2026-09-03 audit #13).
         ps_cmd = (
-            f'$ws = New-Object -ComObject WScript.Shell; '
-            f'$s = $ws.CreateShortcut("{STARTUP_SHORTCUT}"); '
-            f'$s.TargetPath = "{target}"; '
-            f'$s.Arguments = \'{args}\'; '
-            f'$s.WorkingDirectory = "{working}"; '
-            f'$s.Description = "Lia - Local Inference Assistant"; '
-            f'$s.WindowStyle = 7; '
+            "$ws = New-Object -ComObject WScript.Shell; "
+            "$s = $ws.CreateShortcut(%s); "
+            "$s.TargetPath = %s; "
+            "$s.Arguments = %s; "
+            "$s.WorkingDirectory = %s; "
+            "$s.Description = 'Lia - Local Inference Assistant'; "
+            "$s.WindowStyle = 7; "
+            % (_ps_quote(STARTUP_SHORTCUT), _ps_quote(target),
+               _ps_quote(args or ""), _ps_quote(working))
         )
         if os.path.exists(icon_path):
-            ps_cmd += f'$s.IconLocation = "{icon_path},0"; '
+            ps_cmd += "$s.IconLocation = %s; " % _ps_quote(icon_path + ",0")
         ps_cmd += '$s.Save()'
 
         import subprocess
-        result = subprocess.run(["powershell", "-Command", ps_cmd],
+        result = subprocess.run([_sys_exe("powershell"), "-Command", ps_cmd],
                                 capture_output=True, text=True,
                                 creationflags=0x08000000)  # CREATE_NO_WINDOW
         if result.returncode != 0:
@@ -12538,6 +13031,27 @@ def _set_startup_shortcut(enabled):
         _remove_legacy_startup_shortcuts()
 
 
+def _install_root_is_protected(path=None):
+    """True when the startup target dir is a location only admins can write
+    (Program Files / Windows). An elevated RunLevel-Highest logon task pointed at
+    a USER-writable dir is a privilege-escalation primitive: same-user malware
+    edits the target (or plants a DLL) and it runs at High integrity next logon
+    (2026-09-03 audit #4). Path-based + deterministic."""
+    try:
+        if path is None:
+            _t, _a, working, _i = _get_startup_target()
+            path = working
+        p = os.path.abspath(path or "").lower()
+        roots = []
+        for env in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "SystemRoot"):
+            v = os.environ.get(env)
+            if v:
+                roots.append(os.path.abspath(v).lower())
+        return any(p == r or p.startswith(r + os.sep) for r in roots)
+    except Exception:
+        return False
+
+
 def set_auto_start(enabled):
     """Enable/disable launch-at-logon, least-privilege first:
     - non-elevated (the default install): a per-user HKCU Run value - no
@@ -12546,11 +13060,22 @@ def set_auto_start(enabled):
       launches skip UAC and dictation reaches elevated windows too.
     Cleans up whichever mechanisms the OTHER mode (or a legacy install) left."""
     if enabled:
-        if is_user_admin():
+        # Elevated (RunLevel-Highest) autostart ONLY when the install root is
+        # admin-writable - otherwise it is a local privilege-escalation vector
+        # (#4). A user-writable install (per-user / portable / dev tree) falls
+        # back to the non-elevated Run key, which still auto-starts.
+        if is_user_admin() and _install_root_is_protected():
             ok = _set_autostart_task(True)
             if ok:
                 _set_autostart_runkey(False)   # one mechanism at a time
         else:
+            if is_user_admin():
+                log.warning("Elevated auto-start declined: the install dir (%s) "
+                            "is user-writable, so a HIGHEST logon task there "
+                            "would be a privilege-escalation risk. Using a "
+                            "non-elevated logon instead.",
+                            _get_startup_target()[2])
+                _set_autostart_task(False)     # clear any prior elevated task
             ok = _set_autostart_runkey(True)
         # Remove the legacy Startup shortcut regardless of path.
         try:
@@ -16014,6 +16539,7 @@ class ServeController:
     def __init__(self, config):
         self.config = config
         self._proc = None
+        self._pid = None       # set instead of _proc when the child is de-elevated
         self._lock = threading.Lock()
 
     def port(self):
@@ -16036,7 +16562,11 @@ class ServeController:
 
     def owns_child(self):
         with self._lock:
-            return self._proc is not None and self._proc.poll() is None
+            if self._proc is not None:
+                return self._proc.poll() is None
+            if self._pid is not None:
+                return _pid_alive(self._pid)
+            return False
 
     def is_running(self):
         """True if THIS app's child is alive, or something is already listening
@@ -16053,29 +16583,58 @@ class ServeController:
             return True, "Server already running (this app)."
         if self._port_listening(port):
             return True, "Server already running on port %d (autostart?)." % port
+        host, _label, err = _resolve_serve_host(self.config)
+        if host is None:
+            return False, (err or "Could not resolve the server bind address.")
+        ok, msg = _serve_policy_check(host, self.config.get("serve_token", ""))
+        if not ok:
+            return False, msg
         py = find_python_interpreter()
         if not py:
             return False, "No Python interpreter available to launch the server."
         script = os.path.abspath(sys.argv[0])
-        args = [py, script, "--serve", "--port", str(port)]
+        args = [py, script, "--serve", "--port", str(port), "--host", host]
+        cwd = os.path.dirname(script) or None
+        NW = 0x08000000   # CREATE_NO_WINDOW
+        # #21: the serve child is the NETWORK-facing process (it parses
+        # attacker-supplied bytes -> native CTranslate2). When the tray app runs
+        # elevated, de-elevate the child to Medium integrity so a future
+        # memory-safety bug there cannot land at High integrity. Falls back to a
+        # normal spawn so a de-elevation hiccup never stops the server.
+        if os.name == "nt" and is_user_admin():
+            try:
+                pid = spawn_deelevated(args, creationflags=NW, cwd=cwd)
+                with self._lock:
+                    self._pid = pid
+                    self._proc = None
+                log.info("Serve: spawned de-elevated server child pid=%s on %s:%d",
+                         pid, host, port)
+                return True, "Server starting on %s:%d." % (host, port)
+            except Exception as e:
+                log.warning("Serve: de-elevation failed (%s) - starting at the "
+                            "current integrity level", e)
         try:
             import subprocess
-            proc = subprocess.Popen(
-                args, creationflags=0x08000000,   # CREATE_NO_WINDOW
-                cwd=os.path.dirname(script) or None)
+            proc = subprocess.Popen(args, creationflags=NW, cwd=cwd)
         except Exception as e:
             log.error("Serve: launch failed: %s", e)
             return False, "Server launch failed: %s" % e
         with self._lock:
             self._proc = proc
-        log.info("Serve: spawned server child pid=%s on port %d", proc.pid, port)
-        return True, "Server starting on port %d." % port
+            self._pid = None
+        log.info("Serve: spawned server child pid=%s on %s:%d",
+                 proc.pid, host, port)
+        return True, "Server starting on %s:%d." % (host, port)
 
     def stop(self):
-        """Terminate the app's OWN child (never the logon-task server)."""
+        """Terminate the app's OWN child (never the logon-task server). Handles
+        both a Popen (non-elevated spawn) and a bare pid (de-elevated child)."""
         with self._lock:
             proc = self._proc
+            pid = self._pid
             self._proc = None
+            self._pid = None
+        stopped = False
         if proc is not None and proc.poll() is None:
             try:
                 proc.terminate()
@@ -16085,6 +16644,11 @@ class ServeController:
                     proc.kill()
             except Exception as e:
                 log.warning("Serve: stop failed: %s", e)
+            stopped = True
+        elif pid is not None and _pid_alive(pid):
+            _terminate_pid(pid)
+            stopped = True
+        if stopped:
             log.info("Serve: server child stopped")
             return True, "Server stopped."
         return True, "Server was not running (this app)."
@@ -16863,6 +17427,18 @@ class LiaApp:
         flag, so a user who later hides the icon or never wants another
         balloon is left alone."""
         try:
+            # A self-restart carries its reason (--restart-reason=...): say
+            # what happened when the user could have felt it, e.g. a hotkey
+            # press that did nothing because Windows dropped the hook. Not
+            # routine noise, so silent_mode does not apply. Shown before the
+            # onboarding halves so it never waits behind the promote poll.
+            reason = _restart_reason_from_argv()
+            if reason in _RESTART_NOTICES:
+                title, msg = _RESTART_NOTICES[reason]
+                try:
+                    icon.notify(msg, title)
+                except Exception:
+                    pass
             dirty = False
             # Balloon FIRST: it must not wait behind the promote poll (up to
             # 15s on a slow Explorer - exactly when the user needs the signal).
@@ -17319,9 +17895,17 @@ class LiaApp:
         # typematic-repeat refresh, so its stamp goes stale. Kept deliberately
         # cheap (runs on the keyboard library's event thread for every key).
         self._mod_last_down = {}
+        # Hook-liveness echo: _hotkey_watchdog injects a key-UP of the reserved
+        # _HOOK_PROBE_VK and waits for THIS observer - which runs inside the
+        # OS-level hook - to flag it. No echo == Windows dropped the hook.
+        self._hook_probe_seen = threading.Event()
+        self._hook_probe_enabled = True
 
         def _stamp_modifier(event):
             try:
+                if abs(int(getattr(event, "scan_code", 0) or 0)) == _HOOK_PROBE_VK:
+                    self._hook_probe_seen.set()
+                    return
                 if event.event_type == "down" and event.name:
                     name = event.name.lower()
                     for tok in ("ctrl", "shift", "alt", "windows"):
@@ -17334,9 +17918,12 @@ class LiaApp:
             keyboard.hook(_stamp_modifier)
         except Exception as e:
             # Guard fails OPEN: with no stamps, modifiers count as fresh and
-            # the staleness check never blocks anything.
+            # the staleness check never blocks anything. The liveness probe
+            # rides this observer too: without it a probe can never echo, so
+            # disable probing rather than restart on every check.
+            self._hook_probe_enabled = False
             log.warning("Modifier-freshness hook failed (stale-modifier "
-                        "guard disabled): %s", e)
+                        "guard + hook liveness probe disabled): %s", e)
         self._register_hotkey(self.config["hotkey"])
         # Fallback "" (OFF), matching DEFAULT_CONFIG — the old inline
         # "insert" default was the exact numpad-0/NumLock value that caused
@@ -17754,18 +18341,46 @@ class LiaApp:
         emitted because the listener thread is still blocked on
         self._hotkey_event.wait().
 
-        Workaround: tear down and reinstall both hotkey registrations
-        on a 2-minute cadence. Re-installing is cheap (milliseconds);
-        re-installing while the hook is alive is a no-op user-side.
-        If the hook had silently died, the new registration brings it
-        back. Net effect: worst-case 2-minute window between a hook
-        death and recovery, no manual restart needed.
+        The 2-minute re-registration below keeps the Python-side handlers
+        fresh but CANNOT revive a dead OS hook: keyboard.add_hotkey only
+        adds a handler behind the library's single WH_KEYBOARD_LL hook,
+        which lives on its listener thread and is never reinstalled
+        (proven 2026-09-03: a hook installed 40s after logon was dead at
+        the user's first press 19 minutes later, after nine refreshes).
+        The only reinstall is a process restart, so this watchdog also
+        PROBES the hook: it injects a harmless key-up of a reserved
+        virtual key and checks that the observer inside the hook echoes
+        it (_verify_keyboard_hook). Two misses 3s apart == dead -> a
+        self-restart while the user is between keystrokes, BEFORE they
+        reach for the hotkey - instead of the reactive path (kept as a
+        backstop in _hook_health_watchdog) that first ate two presses and
+        then restarted in their face, which reads as "Lia crashed".
         """
         REFRESH_INTERVAL_SEC = 120  # 2 minutes
+        TICK_SEC = 5.0
         # Wait one full interval before the first refresh so we don't
-        # double-register a hotkey that was just installed at startup.
+        # double-register a hotkey that was just installed at startup. The
+        # liveness probe is due right after the model loads (the riskiest
+        # window) and on every refresh; a due probe is retried each tick
+        # until the moment is right (_hook_probe_blocked).
+        next_refresh = time.monotonic() + REFRESH_INTERVAL_SEC
+        probe_due = False
+        load_probed = False
         while True:
-            time.sleep(REFRESH_INTERVAL_SEC)
+            time.sleep(TICK_SEC)
+            if not load_probed and getattr(self, "model_loaded", False):
+                load_probed = True
+                probe_due = True
+            if probe_due and not self._hook_probe_blocked():
+                probe_due = False
+                try:
+                    self._verify_keyboard_hook()
+                except Exception as e:
+                    log.warning("Hook probe failed: %s", e)
+            if time.monotonic() < next_refresh:
+                continue
+            next_refresh = time.monotonic() + REFRESH_INTERVAL_SEC
+            probe_due = True
             try:
                 hk = self.config.get("hotkey", "ctrl+space")
                 self._register_hotkey(hk, quiet=True)
@@ -17800,6 +18415,67 @@ class LiaApp:
                 log.debug("Hotkey watchdog: refreshed registrations")
             except Exception as e:
                 log.warning("Hotkey watchdog refresh failed: %s", e)
+
+    def _hook_probe_blocked(self):
+        """True when probing now would be meaningless or disruptive: model
+        still loading, a recording / meeting / dialog in progress, the user
+        mid-typing (idle < 1s), or idle so long (>= 60s) that an injected
+        event would needlessly reset the display/lock idle timers - the
+        probe piggybacks on the user's own recent activity instead."""
+        try:
+            if not getattr(self, "model_loaded", False):
+                return True
+            if (self.is_recording or self._is_meeting_active()
+                    or getattr(self, "_compose_active", False)
+                    or getattr(self, "_compose_instr_active", False)
+                    or getattr(self, "_voice_ask_active", False)
+                    or getattr(self, "_hotkey_capture_active", False)):
+                return True
+            idle = get_system_idle_seconds()
+            return idle < 1.0 or idle >= 60.0
+        except Exception:
+            return True
+
+    def _verify_keyboard_hook(self, recheck_delay_s=3.0):
+        """Probe the OS keyboard hook (see _hotkey_watchdog). Two misses
+        `recheck_delay_s` apart == dead -> restart to reinstall it, at most
+        once per 120s. Returns True (alive), False (dead), or None (skipped /
+        could not probe)."""
+        seen = getattr(self, "_hook_probe_seen", None)
+        if seen is None or not getattr(self, "_hook_probe_enabled", True):
+            return None
+        if self._hook_probe_blocked():
+            return None
+        r = _probe_keyboard_hook(seen)
+        if r is None:
+            log.debug("Hook probe: could not inject (elevated window in "
+                      "front?) - skipped")
+            return None
+        if r:
+            if not getattr(self, "_hook_probe_logged_ok", False):
+                self._hook_probe_logged_ok = True
+                log.info("Hook liveness probe: alive")
+            return True
+        log.warning("Hook probe: the keyboard hook did not echo the probe "
+                    "(miss 1/2) - re-checking in %.0fs", recheck_delay_s)
+        time.sleep(recheck_delay_s)
+        if self._hook_probe_blocked():
+            return None
+        r = _probe_keyboard_hook(seen)
+        if r is None:
+            return None
+        if r:
+            log.info("Hook probe: alive on re-check (transient stall)")
+            return True
+        if time.time() - getattr(self, "_last_hook_restart", 0.0) <= 120:
+            log.warning("Hook probe: DEAD, but a hook restart ran under 120s "
+                        "ago - not restarting again yet")
+            return False
+        self._last_hook_restart = time.time()
+        log.error("Keyboard hook is DEAD (probe not echoed twice) - "
+                  "restarting Lia to reinstall it before the user needs it.")
+        self._restart_app(reason="dead-hotkey-hook-probe")
+        return False
 
     def _hook_health_watchdog(self):
         """Detect a silently-dead keyboard hook and auto-restart to revive it.
@@ -18659,6 +19335,16 @@ class LiaApp:
         # that wasn't meant to be sent).
         press_enter_pinned = bool(getattr(self, "_recording_press_enter", False))
 
+        # Vocab-prompt confidence gate (2026-09-03 regression: short/quiet
+        # Hebrew clips came back as English letters because the decoder copied
+        # the English-dominant vocab initial_prompt). Decide ONCE from the
+        # pre-gain peak RMS + duration and pass to every transcribe call below;
+        # the meeting/voice paths do not pass it, so they keep the prompt.
+        bias_ok = _vocab_prompt_bias_ok(
+            duration_sec, audio_rms,
+            float(self.config.get("vocab_prompt_bias_min_sec", 5.0)),
+            float(self.config.get("vocab_prompt_bias_min_rms", 0.02)))
+
         # Transcribe in background to not block
         def do_transcribe():
             # Tracks whether we already signalled an error state via
@@ -18678,6 +19364,7 @@ class LiaApp:
                                     language=self._get_language(),
                                     beam_size=self.config["beam_size"],
                                     task=self._get_task(),
+                                    bias_ok=bias_ok,
                                 )
                             if tail_text:
                                 clean_tail = tail_text.replace('\u200F', '').replace('\u200E', '').strip()
@@ -18693,6 +19380,7 @@ class LiaApp:
                                 language=self._get_language(),
                                 beam_size=self.config["beam_size"],
                                 task=self._get_task(),
+                                bias_ok=bias_ok,
                             )
                         if text:
                             clipboard_paste(text)
@@ -18722,6 +19410,7 @@ class LiaApp:
                                     language=self._get_language(),
                                     beam_size=self.config["beam_size"],
                                     task=self._get_task(),
+                                    bias_ok=bias_ok,
                                 )
                             if tail_text:
                                 clean_partial = last_partial.rstrip('\u200F\u200E').rstrip()
@@ -18799,6 +19488,7 @@ class LiaApp:
                             language=self._get_language(),
                             beam_size=beam,
                             task=self._get_task(),
+                            bias_ok=bias_ok,
                         )
 
                     # Same hallucination guard as the partial path.
@@ -19288,6 +19978,10 @@ class LiaApp:
             return False  # AI summaries explicitly disabled - transcript only
         base = (self.config.get("summary_base_url", "") or "").strip()
         if base:
+            ok, why = _summary_base_url_ok(base)
+            if not ok:
+                log.warning("Summary disabled: %s", why)
+                return False
             # Gemini needs its own key; a local Ollama endpoint needs nothing.
             if _is_gemini_url(base):
                 return bool((self.config.get("gemini_api_key", "") or "").strip())
@@ -19304,6 +19998,10 @@ class LiaApp:
             return None  # AI summaries disabled
         base_url = (self.config.get("summary_base_url", "") or "").strip()
         if base_url:
+            ok, why = _summary_base_url_ok(base_url)
+            if not ok:
+                log.warning("Summary cleaner refused: %s", why)
+                return None
             if _is_gemini_url(base_url):
                 # Gemini (AI Studio, OpenAI-compat) authenticates with its OWN key.
                 key = (self.config.get("gemini_api_key", "") or "").strip()
@@ -21472,7 +22170,7 @@ class LiaApp:
                 for n in legacy:
                     try:
                         subprocess.run(
-                            ["powershell", "-NoProfile", "-Command",
+                            [_sys_exe("powershell"), "-NoProfile", "-Command",
                              "Unregister-ScheduledTask -TaskName '%s' -Confirm:$false "
                              "-ErrorAction SilentlyContinue" % n],
                             capture_output=True, text=True,
@@ -24330,16 +25028,7 @@ class LiaApp:
 
     def _tailscale_ip(self):
         """This machine's Tailscale IPv4 (for the copy-paste ws:// URL), or ""."""
-        try:
-            import subprocess
-            r = subprocess.run(["tailscale", "ip", "-4"], capture_output=True,
-                               text=True, creationflags=0x08000000, timeout=5)
-            out = (r.stdout or "").strip()
-            if r.returncode == 0 and out:
-                return out.splitlines()[0].strip()
-        except Exception:
-            pass
-        return ""
+        return _tailscale_ipv4()
 
     def _settings_apply_serve(self, port=None, token=None):
         """Persist port + token from the UI. Applies to the NEXT server start;
@@ -24371,6 +25060,37 @@ class LiaApp:
             self._serve.start()
             return (True, "Reloading the server with the new model…")
         return (True, "")
+
+    def _set_serve_host(self, host):
+        """Which interface the server listens on (WP1 secure-default). auto =
+        Tailscale/loopback; loopback = this PC only; all = every interface (a
+        token is then REQUIRED). Restarts a running server to apply."""
+        host = (host or "auto").strip().lower()
+        if host not in ("auto", "tailscale", "loopback", "all"):
+            return (False, "Unknown option.")
+        self.config["serve_host"] = host
+        save_config(self.config)
+        if host == "all" and not (self.config.get("serve_token") or "").strip():
+            return (True, "Generate an access token below before starting on all "
+                          "networks.")
+        if getattr(self, "_serve", None) and self._serve.owns_child():
+            self._serve.stop()
+            ok, msg = self._serve.start()
+            return (ok, msg)
+        return (True, "")
+
+    def _gen_serve_token(self):
+        """Generate a strong random access token, store it (DPAPI at rest), and
+        return it ONCE for the user to copy to the client. Restarts a running
+        server so it takes effect."""
+        import secrets
+        tok = secrets.token_urlsafe(24)
+        self.config["serve_token"] = tok
+        save_config(self.config)
+        if getattr(self, "_serve", None) and self._serve.owns_child():
+            self._serve.stop()
+            self._serve.start()
+        return (True, tok)
 
     def _settings_toggle_serve(self):
         on = not bool(self.config.get("serve_enabled"))
@@ -24415,7 +25135,7 @@ class LiaApp:
             try:
                 import subprocess
                 r = subprocess.run(
-                    ["nvidia-smi", "--query-gpu=name,memory.total",
+                    [_sys_exe("nvidia-smi"), "--query-gpu=name,memory.total",
                      "--format=csv,noheader,nounits"],
                     capture_output=True, text=True,
                     creationflags=0x08000000, timeout=5)
@@ -24481,6 +25201,10 @@ class LiaApp:
             "ws_url": ("ws://%s:%d" % (ip, port)) if ip else "",
             "role": self.config.get("transcription_role", "") or "",
             "model": self.config.get("serve_model", "") or "",
+            "host": str(self.config.get("serve_host", "auto") or "auto"),
+            "host_label": _resolve_serve_host(self.config)[1],
+            "insecure": (not _is_loopback_bind(_resolve_serve_host(self.config)[0])
+                         and not (self.config.get("serve_token") or "").strip()),
             "gpu": self._gpu_status(),
         }
 
@@ -24857,17 +25581,7 @@ class LiaApp:
             os.makedirs(out_dir, exist_ok=True)
             stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
             zpath = os.path.join(out_dir, "lia_diagnostics_%s.zip" % stamp)
-            SECRETS = {"openai_api_key", "groq_api_key", "gemini_api_key",
-                       "assemblyai_api_key", "hf_token", "remote_server_token"}
-            PERSONAL = {"custom_vocabulary", "snippets", "notetaker_names"}
-            cfg = {}
-            for k, v in self.config.items():
-                if k in SECRETS:
-                    cfg[k] = "set" if str(v or "").strip() else ""
-                elif k in PERSONAL:
-                    cfg[k] = "<redacted: %d chars>" % len(str(v or ""))
-                else:
-                    cfg[k] = v
+            cfg = _sanitize_config_for_bundle(self.config)
             sysinfo = "\n".join([
                 "Lia diagnostic bundle - %s" % stamp,
                 "OS: %s" % platform.platform(),
@@ -24884,7 +25598,8 @@ class LiaApp:
                 "This bundle was created by Lia's 'Report a problem' button.\n"
                 "Contents:\n"
                 "  lia.log                - the app log (privacy-safe by "
-                "default: sizes, not your text)\n"
+                "default: sizes, not your text; OMITTED when log_transcripts "
+                "is on)\n"
                 "  startup_trace.log      - one line per launch milestone "
                 "(launch / main / tray-ready) and any startup crash\n"
                 "  config.sanitized.json  - settings with API keys masked "
@@ -24894,7 +25609,16 @@ class LiaApp:
                 "  https://github.com/Danaor/lia/issues/new\n")
             with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
                 log_path = os.path.join(CONFIG_DIR, "lia.log")
-                if os.path.exists(log_path):
+                if self.config.get("log_transcripts"):
+                    # Transcript logging writes full user text into lia.log -
+                    # never ship it in a bundle bound for a public issue.
+                    zf.writestr(
+                        "lia.log.OMITTED.txt",
+                        "lia.log was omitted because log_transcripts is ON (the "
+                        "log then contains your full dictation/meeting text). "
+                        "Turn it off in config.json, restart, reproduce, and "
+                        "report again to include a privacy-safe log.\n")
+                elif os.path.exists(log_path):
                     zf.write(log_path, "lia.log")
                 # The startup breadcrumbs: the only record of a launch that
                 # died before lia.log existed (e.g. at logon).
@@ -24908,7 +25632,7 @@ class LiaApp:
                 zf.writestr("sysinfo.txt", sysinfo)
                 zf.writestr("README.txt", readme)
             try:
-                subprocess.Popen(["explorer", "/select,", zpath])
+                subprocess.Popen([_sys_exe("explorer"), "/select,", zpath])
             except Exception:
                 os.startfile(out_dir)
             webbrowser.open("https://github.com/Danaor/lia/issues/new")
@@ -24972,6 +25696,8 @@ class LiaApp:
         add("toggle_serve_autostart", self._settings_toggle_serve_autostart, True)
         add("apply_serve", self._settings_apply_serve, True)
         add("set_serve_model", self._set_serve_model, True)
+        add("set_serve_host", self._set_serve_host, True)
+        add("gen_serve_token", self._gen_serve_token, True)
         add("serve_status", self._settings_serve_status)
         add("set_transcription_role", self._set_transcription_role)
         add("open_tailscale", self._open_tailscale)
@@ -25257,8 +25983,7 @@ class LiaApp:
 
     def _settings_state(self, *, devices=True, ollama=True):
         c = self.config
-        SECRETS = ["openai_api_key", "groq_api_key", "gemini_api_key",
-                   "assemblyai_api_key", "hf_token", "remote_server_token"]
+        SECRETS = list(_SECRET_CONFIG_KEYS)
         cfg = {}
         for k, v in c.items():
             if k in SECRETS:
@@ -25842,6 +26567,13 @@ class LiaApp:
                     arg = arg[1:-1]
                 cmd.append(arg)
             cmd.append("--restarted")  # tell the new instance to wait for the mutex
+            # Carry WHY: the fresh instance tells the user what happened when
+            # the reason is one they could have felt (a hook repair reads as
+            # a crash otherwise - see _RESTART_NOTICES).
+            safe = "".join(c for c in str(reason).lower()
+                           if c.isalnum() or c in "-_")
+            if safe:
+                cmd.append("--restart-reason=" + safe)
             log.info("Launching fresh instance: %s", cmd)
             # FAIL-SAFE: only quit the current process if the replacement was
             # actually spawned. If the spawn raises, we STAY ALIVE (dead hook,
