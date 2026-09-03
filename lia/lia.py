@@ -12486,11 +12486,11 @@ def _stamp_lia_launcher(exe_path):
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.3.1.0'),
+                    StringStruct('FileVersion', '1.3.2.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.3.1.0'),
+                    StringStruct('ProductVersion', '1.3.2.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -25979,7 +25979,8 @@ class LiaApp:
 
     def _settings_mask(self, v):
         v = (v or "")
-        return (v[:6] + "…" + v[-4:]) if len(v) > 12 else ("set" if v else "")
+        # Show a short recognizable hint, not a large slice (audit #17).
+        return (v[:4] + "…" + v[-2:]) if len(v) >= 10 else ("set" if v else "")
 
     def _settings_state(self, *, devices=True, ollama=True):
         c = self.config

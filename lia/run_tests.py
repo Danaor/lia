@@ -3741,6 +3741,14 @@ def t_privilege_boundaries():
     assert sc.owns_child() is True
     sc._pid = 0x7FFFFFF0; sc._proc = None
     assert sc.owns_child() is False
+    # .bat launchers hardened (#7/#13): absolute powershell, no %~f0 / %VAR%
+    # interpolated into a single-quoted PowerShell string.
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    for b in ("run.bat", "add_to_startup.bat"):
+        txt = open(_os.path.join(here, b), encoding="utf-8").read()
+        assert ("WindowsPowerShell" in txt and "powershell.exe" in txt), b + ": bare powershell"
+        assert "-Verb RunAs" not in txt or "$env:LIA_SELF" in txt, b + ": %~f0 interpolated into PS"
+        assert "CreateShortcut('%" not in txt, b + ": %VAR% interpolated into PS"
 
 
 _test("security WP3: absolute system-tool paths + elevated-autostart ACL + serve pid track",
@@ -6379,7 +6387,8 @@ def t_settings_state_shape():
         assert k in st["secrets"] and k in st["has"], k
         assert k not in st["config"], "secret must not be in config blob: " + k
     assert st["has"]["openai_api_key"] is True and st["has"]["groq_api_key"] is False
-    assert st["secrets"]["openai_api_key"].startswith("sk-sec") and "…" in st["secrets"]["openai_api_key"]
+    assert st["secrets"]["openai_api_key"].startswith("sk-s") and "…" in st["secrets"]["openai_api_key"]
+    assert "secretsecret" not in st["secrets"]["openai_api_key"]  # only a short hint, not a large slice
     for grp in ("dictation", "meeting", "summary", "file", "device",
                 "cleanup_styles", "cleanup_models"):
         assert grp in st["tables"], "state tables missing " + grp
