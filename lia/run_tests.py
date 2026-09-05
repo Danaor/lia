@@ -4962,6 +4962,195 @@ _test("model state: 'Loading model' only while actually loading; failed/unloaded
       t_model_state_truth)
 
 
+def t_fresh_install_defaults_1_4_4():
+    """Naor, 2026-09-05: after install, recording mode is TOGGLE, the beep is
+    OFF, and a machine without a compatible GPU boots on English Parakeet with
+    a one-time notice (a GPU machine keeps the language default). The runtime
+    no-GPU branch switches an existing heavy-model config to Parakeet too."""
+    import inspect
+    import lia as w
+    assert w.DEFAULT_CONFIG["recording_mode"] == "toggle"
+    assert w.DEFAULT_CONFIG["beep_device_index"] == "off"
+    # _default_dictation_model: no GPU -> Parakeet + notice; GPU -> unchanged
+    saved = w._has_cuda_gpu
+    try:
+        w._has_cuda_gpu = lambda: False
+        cfg = {"model_size": "ivrit-ai/whisper-large-v3-turbo-ct2"}
+        assert w._default_dictation_model(cfg) == w.PARAKEET_MODEL
+        assert cfg.get("_no_gpu_parakeet_notice") is True
+        w._has_cuda_gpu = lambda: True
+        cfg = {"model_size": "ivrit-ai/whisper-large-v3-turbo-ct2"}
+        assert w._default_dictation_model(cfg) == "ivrit-ai/whisper-large-v3-turbo-ct2"
+        assert "_no_gpu_parakeet_notice" not in cfg
+        # a FRESH load_config (no file) on a GPU-less box lands on Parakeet
+        w._has_cuda_gpu = lambda: False
+        tmp = tempfile.mkdtemp()
+        od, of = w.CONFIG_DIR, w.CONFIG_FILE
+        w.CONFIG_DIR, w.CONFIG_FILE = tmp, os.path.join(tmp, "config.json")
+        try:
+            fresh = w.load_config()
+        finally:
+            w.CONFIG_DIR, w.CONFIG_FILE = od, of
+        seed = w.bundled_seed_config() or {}
+        if "model_size" not in seed:
+            assert fresh["model_size"] == w.PARAKEET_MODEL, fresh["model_size"]
+            assert fresh.get("_no_gpu_parakeet_notice") is True
+        assert fresh["recording_mode"] == "toggle" and fresh["beep_device_index"] == "off"
+    finally:
+        w._has_cuda_gpu = saved
+    # the beep default really silences the done-beep
+    App = w.LiaApp
+    app = App.__new__(App)
+    app.config = dict(w.DEFAULT_CONFIG)
+    called = []
+    sp = w.play_beep
+    w.play_beep = lambda *a, **k: called.append(1)
+    try:
+        app._play_done_beep()
+    finally:
+        w.play_beep = sp
+    assert not called, "beep must be off by default"
+    # notices queue until the tray exists, then flush once (config flag cleared)
+    app.config["_no_gpu_parakeet_notice"] = True
+    app.tray_icon = None
+    app._queue_notice("t", "m")
+    assert app._pending_notices == [("t", "m")]
+    shown = []
+
+    class _Icon:
+        visible = True
+        def notify(self, msg, title):
+            shown.append(title)
+    sc = w.save_config
+    w.save_config = lambda c: None
+    try:
+        app._flush_notices(_Icon())
+    finally:
+        w.save_config = sc
+    assert shown == ["t", "No compatible GPU"], shown
+    assert "_no_gpu_parakeet_notice" not in app.config and app._pending_notices == []
+    # runtime safety net + welcome text + chained-reload flag ownership
+    src = inspect.getsource(App._load_model)
+    assert "switching dictation to English Parakeet" in src
+    assert "_queue_notice(*self._NO_GPU_PARAKEET_NOTICE)" in src
+    assert 'getattr(self, "_model_load_t0", None) == my_t0' in src
+    ob = inspect.getsource(App._tray_first_run_onboarding)
+    assert "press it again to stop" in ob
+    assert "_flush_notices(icon)" in inspect.getsource(App.run)
+
+
+_test("defaults 1.4.4: toggle recording, beep off, Parakeet on GPU-less machines + notice",
+      t_fresh_install_defaults_1_4_4)
+
+
+def t_serve_token_own_and_copy():
+    """Naor, 2026-09-05: setting a memorable token + getting it onto the
+    clipboard. apply_serve stores ANY typed token (not just Generated ones);
+    gen_serve_token copies to the clipboard; copy_serve_token grabs the saved
+    one without regenerating; the UI exposes a Copy button + a type-your-own
+    hint + the copy action is allowlisted."""
+    import inspect
+    import lia as w
+    App = w.LiaApp
+    app = App.__new__(App)
+    app.config = dict(w.DEFAULT_CONFIG)
+
+    class _Serve:
+        def owns_child(self):
+            return False
+    app._serve = _Serve()
+    copied = []
+    saved = []
+    sc, scw = w.save_config, w._copy_with_retry
+    w.save_config = lambda c: saved.append(1)
+    w._copy_with_retry = lambda t, *a, **k: (copied.append(t) or True)
+    try:
+        # a plain typed passphrase is stored verbatim - no "must be generated"
+        ok, _ = app._settings_apply_serve(token="my-lab-server-2026")
+        assert ok and app.config["serve_token"] == "my-lab-server-2026"
+        # copy the saved one without regenerating
+        ok, msg = app._copy_serve_token()
+        assert ok and copied[-1] == "my-lab-server-2026" and "clipboard" in msg.lower()
+        # empty -> a helpful refusal, nothing copied
+        app.config["serve_token"] = ""
+        n = len(copied)
+        ok, msg = app._copy_serve_token()
+        assert not ok and len(copied) == n
+        # generate: random + saved + auto-copied + returned once
+        ok, tok = app._gen_serve_token()
+        assert ok and tok and app.config["serve_token"] == tok and copied[-1] == tok
+    finally:
+        w.save_config, w._copy_with_retry = sc, scw
+    src = inspect.getsource(w)
+    assert 'add("copy_serve_token"' in src, "copy_serve_token must be allowlisted"
+    sw_src = open(w.os.path.join(w.os.path.dirname(w.os.path.abspath(w.__file__)),
+                                 "settings_window.py"), encoding="utf-8").read()
+    assert "data-copy-token" in sw_src
+    assert "does not have to be the Generated one" in sw_src
+
+
+_test("serve token: set your own + Copy to clipboard (no forced regenerate)",
+      t_serve_token_own_and_copy)
+
+
+def t_remote_blank_token_keeps_saved():
+    """Naor, 2026-09-05 "Test doesn't work": the client token field loads BLANK
+    (the secret is never sent to the webview), so a blank Test/Save must FALL
+    BACK to the saved token, not connect with none (rejected) or wipe it. Plus
+    a 1008 close before ready surfaces a clear 'token doesn't match' message."""
+    import inspect
+    import lia as w
+    App = w.LiaApp
+
+    # Save with a blank field keeps the saved token (does NOT erase it)
+    app = App.__new__(App)
+    app.config = dict(w.DEFAULT_CONFIG)
+    app.config["remote_server_token"] = "123123123"
+    app._remote_transcriber = None
+    app._local_transcriber = object()
+    app._meeting_xcribers = {}
+    app._composed_vocabulary = lambda: ""
+    saved = []
+    sc = w.save_config
+    w.save_config = lambda c: saved.append(dict(c))
+    made = {}
+    RT = w.RemoteTranscriber
+    w.RemoteTranscriber = lambda **k: made.update(k) or type("X", (), {"custom_vocabulary": None})()
+    try:
+        ok, _ = app._apply_remote_server("ws://100.70.229.87:9090", "")
+        assert ok and app.config["remote_server_token"] == "123123123", app.config["remote_server_token"]
+        assert made.get("token") == "123123123", made
+    finally:
+        w.save_config, w.RemoteTranscriber = sc, RT
+
+    # Test with a blank field probes with the saved token, not an empty one
+    app2 = App.__new__(App)
+    app2.config = dict(w.DEFAULT_CONFIG)
+    app2.config["remote_server_token"] = "123123123"
+    probed = {}
+
+    class _Probe:
+        def __init__(self, **k):
+            probed.update(k)
+        def load_model(self):
+            pass
+    w.RemoteTranscriber = _Probe
+    try:
+        ok, msg = app2._test_remote_server("ws://100.70.229.87:9090", "")
+        assert ok and probed.get("token") == "123123123", probed
+    finally:
+        w.RemoteTranscriber = RT
+
+    # a 1008 close before ready -> a clear unauthorized message
+    src = inspect.getsource(w.WhisperLiveStream._recv_loop)
+    assert "close_status_code" in src and "1008" in src
+    assert "unauthorized" in src.lower()
+
+
+_test("remote: blank token keeps the saved one (Test/Save) + clear unauthorized message",
+      t_remote_blank_token_keeps_saved)
+
+
 def t_tray_title_cap_and_prewarm_loop_guard():
     """2026-09-05 laptop bugs: (1) a tray title over Windows' 128-char
     NOTIFYICONDATAW limit crashed the thread that set it (a long model-load

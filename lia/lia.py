@@ -407,7 +407,7 @@ DEFAULT_CONFIG = {
                                          # = a DEDICATED meeting mic (e.g. a headset the
                                          # user talks into on calls, while a desk mic
                                          # stays free for dictating mid-meeting)
-    "recording_mode": "hold",  # "hold" = hold-to-record, "toggle" = press-to-start/press-to-stop
+    "recording_mode": "toggle",  # "toggle" = press-to-start/press-to-stop (default since 1.4.4), "hold" = hold-to-record
     # Press-to-talk safety cap (minutes). The recording watchdog force-stops a
     # runaway dictation at this age (stuck key / forgotten toggle). On a FORCED
     # stop the transcript goes to the CLIPBOARD ONLY — never auto-pasted into
@@ -550,7 +550,7 @@ DEFAULT_CONFIG = {
     # display name, names[1:] = ASR alias spellings. Default: the app itself -
     # harmless when no notetaker attends.
     "notetaker_names": ["Lia", "ליה", "לייה"],
-    "beep_device_index": None,  # None = default Windows output, or PyAudio output device index for beep routing
+    "beep_device_index": "off",  # "off" (default since 1.4.4) / None = default Windows output / a PyAudio output index
     "groq_he_en_bias": True,  # True = bias Groq language detection to Hebrew/English only (prevents false French/etc. detection)
     # AI cleanup: post-process Whisper output via a Groq LLM to remove filler
     # words, add punctuation, fix obvious mis-hearings. Costs ~$0.00005 per
@@ -1812,6 +1812,33 @@ def cuda_is_available():
     return _CUDA_AVAILABLE
 
 
+def _has_cuda_gpu():
+    """True when a CUDA-capable GPU is visible to CTranslate2 (the runtime the
+    local Whisper models need). Module-level so first-run defaults can use it;
+    LiaApp._gpu_status() is the richer, cached version for the UI."""
+    try:
+        import ctranslate2
+        return ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        return False
+
+
+PARAKEET_MODEL = "parakeet-tdt-0.6b-v2"
+
+
+def _default_dictation_model(cfg):
+    """Fresh-install dictation model. A machine WITHOUT a compatible (CUDA) GPU
+    boots on English Parakeet - the CPU model (int8 ONNX, several-x realtime) -
+    instead of a 1.5 GB Whisper model that crawls or is skipped on CPU (Naor,
+    2026-09-05: "start with Parakeet by default when there is no GPU, and say
+    so"). The notice is queued in the config and shown once by the tray. A GPU
+    machine keeps the language-derived default (Hebrew Turbo / Parakeet for en)."""
+    if not _has_cuda_gpu():
+        cfg["_no_gpu_parakeet_notice"] = True
+        return PARAKEET_MODEL
+    return cfg.get("model_size", DEFAULT_CONFIG["model_size"])
+
+
 def _default_meeting_model():
     """Default for a FRESH install: plain CHUNKED local transcription — even on a
     CUDA GPU. Chunked keeps the live transcript working, is lighter/faster, and
@@ -2060,12 +2087,19 @@ def load_config():
     # flavor of the GPU-smart meeting default.
     if cfg.get("primary_language") == "en":
         if "model_size" not in seed:
-            cfg["model_size"] = "parakeet-tdt-0.6b-v2"
+            cfg["model_size"] = PARAKEET_MODEL
         if "meeting_model" not in seed:
             cfg["meeting_model"] = {
                 "local_hebrew_turbo": "local_parakeet_english",
                 "local_pyannote_hebrew": "local_pyannote_parakeet",
             }.get(cfg["meeting_model"], cfg["meeting_model"])
+    # No compatible GPU -> Parakeet (CPU) is the dictation default, with a
+    # one-time notice (see _default_dictation_model). The seed still wins.
+    if "model_size" not in seed:
+        cfg["model_size"] = _default_dictation_model(cfg)
+        if cfg.get("_no_gpu_parakeet_notice"):
+            log.info("First run without a compatible GPU: dictation model -> "
+                     "English Parakeet (CPU)")
     # A seed config may carry pre-protected secrets; decrypt like a real load.
     return _unprotect_config_secrets(cfg)
 
@@ -6720,7 +6754,16 @@ class WhisperLiveStream:
             except Exception as e:
                 self._disconnected.set()
                 if not self._closed and not self._ready.is_set():
-                    self._fail("WhisperLive WS dropped before ready: %s" % e)
+                    # A 1008 close before READY = the server rejected our token
+                    # (or origin). Say so plainly instead of "dropped before
+                    # ready" - the 2026-09-05 token-mismatch report.
+                    code = getattr(self._ws, "close_status_code", None)
+                    if code == 1008:
+                        self._fail("Access token doesn't match the server "
+                                   "(unauthorized). Check the token is identical "
+                                   "on both machines.")
+                    else:
+                        self._fail("WhisperLive WS dropped before ready: %s" % e)
                 return
             if not raw:
                 continue
@@ -12532,18 +12575,18 @@ def _stamp_lia_launcher(exe_path):
         return False
     try:
         vi = VSVersionInfo(
-            ffi=FixedFileInfo(filevers=(1, 4, 3, 0), prodvers=(1, 4, 3, 0),
+            ffi=FixedFileInfo(filevers=(1, 4, 4, 0), prodvers=(1, 4, 4, 0),
                               mask=0x3f, flags=0x0, OS=0x40004,
                               fileType=0x1, subtype=0x0),
             kids=[
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.4.3.0'),
+                    StringStruct('FileVersion', '1.4.4.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.4.3.0'),
+                    StringStruct('ProductVersion', '1.4.4.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -17688,6 +17731,10 @@ class LiaApp:
             icon.visible = True
             log.info("Tray icon registered and visible")
             _startup_trace("tray-ready")
+            try:
+                self._flush_notices(icon)
+            except Exception as e:
+                log.debug("notice flush failed: %s", e)
             # The loader may have finished (or given up: no GPU, no backend)
             # BEFORE the icon existed - the icon was born "Loading model..."
             # and nothing would ever repaint it. Re-apply the real state.
@@ -17771,10 +17818,12 @@ class LiaApp:
             # 15s on a slow Explorer - exactly when the user needs the signal).
             if not self.config.get("_first_run_welcome_shown"):
                 hotkey = self.config.get("hotkey", "ctrl+space")
+                how = ("Press %s to start dictating and press it again to stop."
+                       if self.config.get("recording_mode") == "toggle"
+                       else "Hold %s and speak to dictate.") % hotkey
                 try:
-                    icon.notify("Lia is running. Hold %s and speak to dictate. "
-                                "The orb near the clock is the app." % hotkey,
-                                "Welcome to Lia")
+                    icon.notify("Lia is running. %s The orb near the clock is "
+                                "the app." % how, "Welcome to Lia")
                 except Exception:
                     pass  # notify unsupported on this backend - promotion still helps
                 self.config["_first_run_welcome_shown"] = True
@@ -17960,7 +18009,7 @@ class LiaApp:
         # ONLY while this thread is actually running (see _model_state). A user
         # must never sit on "Loading model" when nothing is loading.
         self._model_loading = True
-        self._model_load_t0 = time.time()
+        my_t0 = self._model_load_t0 = time.time()
         self._model_load_error = None
         try:
             # Show blue icon while loading
@@ -18058,6 +18107,23 @@ class LiaApp:
                     self._refresh_tray(update_menu=True)
                     self.overlay.show_done()
                     return
+                # Nothing to fall back to. If the CPU model (Parakeet) is
+                # installed, switch to it and reload instead of a dead red X -
+                # an existing config that still names a heavy Whisper model on
+                # a GPU-less machine gets the same treatment as a fresh install.
+                if (self._parakeet_available()
+                        and self.config.get("model_size") not in CPU_FRIENDLY_MODELS):
+                    log.warning("No dedicated GPU and no server/cloud configured - "
+                                "switching dictation to English Parakeet (CPU).")
+                    self.config["model_size"] = PARAKEET_MODEL
+                    save_config(self.config)
+                    self._local_transcriber = self._make_local_transcriber(PARAKEET_MODEL)
+                    if self.config.get("transcription_backend", "local") == "local":
+                        self.transcriber = self._local_transcriber
+                    self._local_load_event.clear()
+                    self._queue_notice(*self._NO_GPU_PARAKEET_NOTICE)
+                    threading.Thread(target=self._load_model, daemon=True).start()
+                    return
                 # Nothing to fall back to - stay responsive, prompt for setup.
                 self.model_loaded = False
                 self._needs_setup = True
@@ -18140,7 +18206,10 @@ class LiaApp:
             # home server, instead of hunting from a mystery red X.
             self._auto_open_settings_on_error(page="models")
         finally:
-            self._model_loading = False
+            # A chained reload (the no-GPU -> Parakeet switch) owns the flag
+            # now; only the run that set this t0 may clear it.
+            if getattr(self, "_model_load_t0", None) == my_t0:
+                self._model_loading = False
             # Repaint from the final state (loaded / failed / needs setup) so
             # the icon born as "Loading model..." never outlives the load.
             if self.tray_icon:
@@ -18148,6 +18217,45 @@ class LiaApp:
                     self._refresh_tray(update_menu=True)
                 except Exception:
                     pass
+
+    _NO_GPU_PARAKEET_NOTICE = (
+        "No compatible GPU",
+        "No NVIDIA GPU found, so dictation uses English Parakeet on the CPU. "
+        "For Hebrew, add a free Groq key or a Transcription server in Settings.")
+
+    def _queue_notice(self, title, msg):
+        """Show a tray balloon (+ overlay) now, or queue it until the tray icon
+        exists (the model loader often finishes before the icon is registered).
+        Balloons are informational, not routine noise - silent_mode does not apply."""
+        icon = getattr(self, "tray_icon", None)
+        if icon is None or not getattr(icon, "visible", False):
+            self._pending_notices = getattr(self, "_pending_notices", []) + [(title, msg)]
+            return
+        try:
+            icon.notify(msg, title)
+        except Exception:
+            pass
+        try:
+            self.overlay.show("  " + msg + "  ", bg_color="#d08770", duration=6000)
+        except Exception:
+            pass
+
+    def _flush_notices(self, icon):
+        """Called from on_tray_ready: deliver queued balloons + the first-run
+        no-GPU notice load_config left in the config (shown once, then cleared)."""
+        if self.config.pop("_no_gpu_parakeet_notice", None):
+            self._pending_notices = getattr(self, "_pending_notices", []) + [
+                self._NO_GPU_PARAKEET_NOTICE]
+            try:
+                save_config(self.config)
+            except Exception:
+                pass
+        pending, self._pending_notices = getattr(self, "_pending_notices", []), []
+        for title, msg in pending:
+            try:
+                icon.notify(msg, title)
+            except Exception:
+                pass
 
     def _model_state(self):
         """ONE truthful answer to "why isn't Lia ready?" for every surface
@@ -25760,6 +25868,11 @@ class LiaApp:
     def _apply_remote_server(self, url, token):
         url = (url or "").strip()
         token = (token or "").strip()
+        # "leave blank to keep": the token field loads BLANK (the secret is
+        # never sent to the webview), so an empty field means "unchanged", not
+        # "erase". Fall back to the saved token; the Clear button erases it.
+        if not token:
+            token = (self.config.get("remote_server_token") or "").strip()
         allow_insecure = bool(self.config.get("remote_allow_insecure_ws"))
         ws_warn = ""
         if url:
@@ -25795,9 +25908,15 @@ class LiaApp:
         url = (url or "").strip()
         if not url:
             return (False, "Enter a server URL first.")
+        token = (token or "").strip()
+        # Blank field = use the saved token (the field never carries the secret;
+        # otherwise Test connects with NO token and the server rejects it - the
+        # 2026-09-05 "Test doesn't work" report).
+        if not token:
+            token = (self.config.get("remote_server_token") or "").strip()
         try:
             probe = RemoteTranscriber(
-                url=url, token=(token or "").strip(),
+                url=url, token=token,
                 allow_insecure_ws=bool(self.config.get("remote_allow_insecure_ws")))
             probe.load_model()
             return (True, "Server reachable and ready.")
@@ -25860,17 +25979,31 @@ class LiaApp:
         return (True, "")
 
     def _gen_serve_token(self):
-        """Generate a strong random access token, store it (DPAPI at rest), and
-        return it ONCE for the user to copy to the client. Restarts a running
+        """Generate a strong random access token, store it (DPAPI at rest), copy
+        it to the clipboard (so the user doesn't have to select it out of a
+        field), and return it ONCE so the UI can show it. Restarts a running
         server so it takes effect."""
         import secrets
         tok = secrets.token_urlsafe(24)
         self.config["serve_token"] = tok
         save_config(self.config)
+        _copy_with_retry(tok)   # already on the clipboard for the client paste
         if getattr(self, "_serve", None) and self._serve.owns_child():
             self._serve.stop()
             self._serve.start()
         return (True, tok)
+
+    def _copy_serve_token(self):
+        """Copy the saved server access token to the clipboard (the Copy button
+        next to the field) - lets the user grab an EXISTING token without
+        regenerating it (a regen would invalidate the token on any client that
+        already has it)."""
+        tok = (self.config.get("serve_token") or "").strip()
+        if not tok:
+            return (False, "No token yet - type one or click Generate first.")
+        if _copy_with_retry(tok):
+            return (True, "Token copied to the clipboard.")
+        return (False, "Couldn't reach the clipboard - try again.")
 
     def _settings_toggle_serve(self):
         on = not bool(self.config.get("serve_enabled"))
@@ -26497,6 +26630,7 @@ class LiaApp:
         add("set_serve_model", self._set_serve_model, True)
         add("set_serve_host", self._set_serve_host, True)
         add("gen_serve_token", self._gen_serve_token, True)
+        add("copy_serve_token", self._copy_serve_token, True)
         add("serve_status", self._settings_serve_status)
         add("set_transcription_role", self._set_transcription_role)
         add("open_tailscale", self._open_tailscale)

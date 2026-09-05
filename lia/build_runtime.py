@@ -236,7 +236,7 @@ def phase_5_create_launcher():
             VSVersionInfo, FixedFileInfo, StringFileInfo, StringTable,
             StringStruct, VarFileInfo, VarStruct,
             write_version_info_to_executable)
-        v = (1, 4, 3, 0)   # app version (was derived from the Python version by mistake)
+        v = (1, 4, 4, 0)   # app version (was derived from the Python version by mistake)
         vi = VSVersionInfo(
             ffi=FixedFileInfo(filevers=v, prodvers=v, mask=0x3f,
                               flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0),
@@ -245,11 +245,11 @@ def phase_5_create_launcher():
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription',
                                  'Lia - Local Inference Assistant'),
-                    StringStruct('FileVersion', '1.4.3'),
+                    StringStruct('FileVersion', '1.4.4'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.4.3'),
+                    StringStruct('ProductVersion', '1.4.4'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],

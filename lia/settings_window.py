@@ -175,7 +175,7 @@ def _demo_state():
     """A canned state that exercises every page (for --demo / --html QA)."""
     return {
         "config": {
-            "hotkey": "ctrl+space", "recording_mode": "hold",
+            "hotkey": "ctrl+space", "recording_mode": "toggle",
             "paste_mode": "auto_paste", "clipboard_auto_restore": True,
             "press_enter_after_paste": False, "silent_mode": True,
             "beep_device_index": "off", "recording_source": "both",
@@ -737,7 +737,9 @@ APP_JS = r"""
         field("Access token"+(((sv.host)==="all"||sv.insecure)?" (required)":" (optional)"),
           '<input type="password" id="in_serve_tok" class="mono" placeholder="'+
           (sv.has_token?"(saved - leave blank to keep)":"none")+'"'+(canServe?'':' disabled')+'>'+
-          ' <button class="btn" data-gen-token="1" data-slow="1"'+(canServe?'':' disabled')+'>Generate</button>')+
+          ' <button class="btn" data-gen-token="1" data-slow="1"'+(canServe?'':' disabled')+'>Generate</button>'+
+          (sv.has_token?' <button class="btn" data-copy-token="1"'+(canServe?'':' disabled')+'>Copy</button>':''))+
+        '<div class="hint">Type any secret you like (a memorable passphrase is fine) and click <b>Save port / token</b> - it does not have to be the Generated one. <b>Generate</b> makes a strong random token and copies it to the clipboard. Put the <b>same</b> value in the client\'s <b>Access token</b> on your other device.</div>'+
         '<div class="btnrow"><button class="btn" data-apply-serve="1" data-slow="1"'+(canServe?'':' disabled')+'>Save port / token</button><span class="grow"></span></div>'+
         sw("Keep running after reboot (start at Windows logon)", !!sv.autostart, "toggle_serve_autostart", !canServe)+
         '<div class="hint">'+urlLine+'</div>'+
@@ -1051,8 +1053,11 @@ APP_JS = r"""
     if(gtk){ busy(gtk,true); call("gen_serve_token",[],true).then(function(r){ unbusy(gtk);
         var st=document.getElementById("st_serve");
         if(r.ok){ var inp=document.getElementById("in_serve_tok"); if(inp){ inp.type="text"; inp.value=r.msg; }
-          if(st) st.textContent="New token generated - copy it into the client's Server token, then Save."; }
+          if(st) st.textContent="New token generated and copied to the clipboard - paste it into the client's Access token on your other device."; }
         else if(st){ st.textContent=r.msg||""; } }); return; }
+    var ctk = e.target.closest('[data-copy-token]');
+    if(ctk){ busy(ctk,true); call("copy_serve_token",[],true).then(function(r){ unbusy(ctk);
+        var st=document.getElementById("st_serve"); if(st) st.textContent=r.msg||""; }); return; }
     var asv = e.target.closest('[data-apply-serve]');
     if(asv){ var sp=(document.getElementById("in_serve_port")||{}).value||"";
       var stk=(document.getElementById("in_serve_tok")||{}).value||"";

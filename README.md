@@ -16,7 +16,7 @@ Local-first, Hebrew and English, zero friction.
 
 ---
 
-Hold a hotkey, speak, release - your words appear wherever your cursor is. Record a meeting and get a live transcript, speaker names, and a faithful AI summary with a real task list. Ask questions about everything your meetings ever said - fully on your own machine.
+Press a hotkey, speak, press it again - your words appear wherever your cursor is. Record a meeting and get a live transcript, speaker names, and a faithful AI summary with a real task list. Ask questions about everything your meetings ever said - fully on your own machine.
 
 <div align="center">
 <table><tr>
@@ -44,7 +44,7 @@ Most dictation tools are subscriptions (SuperWhisper, Wispr Flow), cloud-locked 
 
 | | |
 |---|---|
-| **Push-to-talk** | Hold `Ctrl+Space`, speak, release - text is pasted at your cursor |
+| **Push-to-talk** | Press `Ctrl+Space`, speak, press again - text is pasted at your cursor (hold-to-record is a one-click option) |
 | **Local engines** | ivrit.ai Hebrew Whisper, NVIDIA Parakeet (English), general Whisper |
 | **Cloud engines** | Groq Whisper (free tier, ~0.5s), OpenAI gpt-transcribe |
 | **Bilingual auto-routing** | Each utterance is language-detected and sent to the best model |
