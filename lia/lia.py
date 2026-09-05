@@ -12522,18 +12522,18 @@ def _stamp_lia_launcher(exe_path):
         return False
     try:
         vi = VSVersionInfo(
-            ffi=FixedFileInfo(filevers=(1, 4, 1, 0), prodvers=(1, 4, 1, 0),
+            ffi=FixedFileInfo(filevers=(1, 4, 2, 0), prodvers=(1, 4, 2, 0),
                               mask=0x3f, flags=0x0, OS=0x40004,
                               fileType=0x1, subtype=0x0),
             kids=[
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.4.1.0'),
+                    StringStruct('FileVersion', '1.4.2.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.4.1.0'),
+                    StringStruct('ProductVersion', '1.4.2.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -17436,6 +17436,12 @@ class LiaApp:
             # default=True → double-clicking the tray icon opens Settings.
             pystray.MenuItem("Settings…", lambda: self._open_settings_window(),
                              default=True),
+            # Native escape hatch (2026-09-05): on a locked-down machine the
+            # Settings window (pywebview/.NET) can be blocked by policy; this
+            # opens the config folder so config.json (backend, API keys, server
+            # URL) can be edited by hand. Always works - no pywebview, no .NET.
+            pystray.MenuItem("Open config folder",
+                             lambda: self._settings_open_config_dir()),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self._quit),
         )
@@ -18105,7 +18111,7 @@ class LiaApp:
                 # the app is ready; user would press hotkey and nothing
                 # would happen with no visible indication of why.
                 self.tray_icon.icon = self._create_icon("error")
-                self.tray_icon.title = f"Lia - Model load failed: {e}"
+                self._set_title(f"Lia - Model load failed: {e}")
             self.overlay.show_error("Model load failed - opening Settings")
             # Drop the user straight into Settings so they can pick a backend /
             # home server, instead of hunting from a mystery red X.
@@ -20754,6 +20760,22 @@ class LiaApp:
                 audio = apply_auto_gain(audio, target_rms=target, max_gain=max_g)
         self._do_compose_generate(audio)
 
+    def _set_title(self, text):
+        """Set the tray tooltip, TRUNCATED to Windows' NOTIFYICONDATAW.szTip
+        limit (128 wchars). A longer title raises ValueError inside pystray and
+        crashes the tray update on the thread that set it - a long model-load
+        error ("Lia - Model load failed: <cuDNN/CUDA text>" = 146 chars) did
+        exactly this on Naor's laptop (2026-09-05). Never raises."""
+        if not self.tray_icon:
+            return
+        try:
+            t = str(text or "")
+            if len(t) > 120:
+                t = t[:119] + "…"
+            self.tray_icon.title = t
+        except Exception as e:
+            log.debug("tray title set failed: %s", e)
+
     def _refresh_tray(self, update_menu=True):
         """THE tray-state arbiter: set icon/title from CURRENT app state
         (meeting > compose draft > recording > idle). Every flow that wants
@@ -20767,8 +20789,8 @@ class LiaApp:
         try:
             if self._is_meeting_active():
                 self.tray_icon.icon = self._create_icon("meeting")
-                self.tray_icon.title = getattr(
-                    self, "_meeting_tray_title", "Lia - Meeting recording...")
+                self._set_title(getattr(
+                    self, "_meeting_tray_title", "Lia - Meeting recording..."))
             elif self._compose_active:
                 self.tray_icon.icon = self._create_icon("recording")
                 self.tray_icon.title = "Lia - Compose: recording draft…"
@@ -22804,7 +22826,7 @@ class LiaApp:
         my_gen = self._recording_generation
         try:
             self.tray_icon.icon = self._create_icon("error")
-            self.tray_icon.title = f"Lia - {msg}"
+            self._set_title(f"Lia - {msg}")
         except Exception as e:
             log.warning("_flash_error_tray: setting error icon failed: %s", e)
             return
@@ -23297,7 +23319,7 @@ class LiaApp:
             # can restore it after transient states (dictation done, error
             # flash) instead of a generic label.
             self._meeting_tray_title = f"Lia - {label}"
-            self.tray_icon.title = f"Lia - {label}"
+            self._set_title(f"Lia - {label}")
             # Refresh the menu so the dynamic 'Start Meeting' label
             # flips to '⏹ Stop Meeting' and the Status line updates. On Windows
             # the menu text callables aren't re-evaluated until update_menu(), so
@@ -26929,6 +26951,7 @@ class LiaApp:
 
     def _settings_reader(self, proc, ppath):
         first = True
+        booted = False
         try:
             for raw in iter(proc.stdout.readline, b""):
                 try:
@@ -26943,6 +26966,8 @@ class LiaApp:
                     continue
                 if first:
                     first = False
+                    booted = True
+                    self._settings_boot_fails = 0   # a healthy boot resets the counter
                     log.info("Settings window ready in %d ms",
                              int((time.time() - getattr(self, "_settings_spawn_t0",
                                                          time.time())) * 1000))
@@ -26966,14 +26991,27 @@ class LiaApp:
             self._hotkey_capture_active = False
             _safe_remove(ppath)
             log.info("Settings window closed")
-            # Re-arm the pre-warm so the NEXT open is instant again (unless we're
-            # quitting). Delayed so the just-closed process fully exits first.
+            # A child that closed WITHOUT ever sending a message crashed on boot
+            # (a missing/blocked WebView2 on a locked-down machine). Re-arming the
+            # pre-warm on such a crash spun a forever respawn loop (Naor's laptop,
+            # 2026-09-05: pre-warm -> closed every few seconds). Count boot-crashes
+            # and STOP re-arming after a few so the loop can't run away.
+            if not booted:
+                self._settings_boot_fails = getattr(self, "_settings_boot_fails", 0) + 1
+            fails = getattr(self, "_settings_boot_fails", 0)
             if (not getattr(self, "_shutting_down", False)
-                    and self.config.get("settings_prewarm", True)):
+                    and self.config.get("settings_prewarm", True)
+                    and fails < 3):
                 try:
                     threading.Timer(2.0, self._prewarm_settings_window).start()
                 except Exception:
                     pass
+            elif fails >= 3 and not getattr(self, "_settings_prewarm_disabled_logged", False):
+                self._settings_prewarm_disabled_logged = True
+                log.warning("Settings window crashed on boot %d times - disabling "
+                            "pre-warm for this session. The Settings UI needs the "
+                            "Microsoft WebView2 runtime; see settings_window.log.",
+                            fails)
 
     def _settings_handle_call(self, msg):
         cid = msg.get("id")
@@ -27484,6 +27522,19 @@ if __name__ == "__main__":
                  "ELEVATED windows (Task Manager, admin consoles) won't work "
                  "in this mode - use run.bat / the installer's elevated "
                  "auto-start if you need that.")
+    # A browser-downloaded, Explorer-extracted portable carries the Mark of
+    # the Web on every file; the .NET Framework then refuses to load pythonnet's
+    # Python.Runtime.dll and NO pywebview window (Settings...) can open (the
+    # 2026-09-05 laptop bug: "Failed to resolve Python.Runtime.Loader.Initialize").
+    # Strip it BEFORE the first child spawn (sync, a few ms).
+    try:
+        import ui_kit as _uk
+        _n_unblocked = _uk.unblock_dotnet_assemblies()
+        if _n_unblocked:
+            log.info("Unblocked %d downloaded .NET/WebView2 DLLs (Mark of the Web) "
+                     "so the Settings windows can open.", _n_unblocked)
+    except Exception as _e:
+        log.debug("MOTW unblock sweep skipped: %s", _e)
     # Create the renamed launcher on first run so future launches show
     # as "Lia.exe" in Task Manager instead of "pythonw.exe".
     _ensure_lia_launcher()

@@ -82,6 +82,12 @@ No Python or command line needed. Windows SmartScreen may warn you on first run 
 
 **Locked / corporate PCs:** if `Lia.exe` is blocked with "Access denied" (WDAC or AppLocker policies block unsigned executables), run **`Lia (Work PC).bat`** instead. It launches Lia through the code-signed `pythonw.exe`, which those policies allow. Same app - it just shows as `pythonw.exe` in Task Manager.
 
+**Settings window won't open after extracting the zip?** A browser-downloaded zip carries Windows' "Mark of the Web", and extracting with File Explorer stamps it on every file. The .NET Framework then refuses to load the WebView2 bridge and no Settings/History window opens. Lia 1.4.2+ clears the mark automatically on startup; on an older build, right-click the zip > Properties > **Unblock** before extracting, or run in PowerShell:
+
+```powershell
+Get-ChildItem -Recurse "C:\path\to\Lia-Portable" | Unblock-File
+```
+
 ### Option 2: Install from source
 
 Requires [Python 3.11+](https://www.python.org/downloads/) (check "Add to PATH" during install). Open PowerShell and paste:

@@ -884,6 +884,58 @@ def _redirect(log_path, *, stdout, stderr):
         sys.stderr = sink
 
 
+_DOTNET_PACKAGES = ("pythonnet", "clr_loader", "webview")
+
+
+def unblock_dotnet_assemblies(roots=None):
+    """Strip the Windows "Mark of the Web" (the Zone.Identifier alternate data
+    stream) from the .NET / WebView2 DLLs pywebview loads. Returns how many
+    streams were removed.
+
+    WHY (2026-09-05 field bug): a Portable.zip downloaded by a browser carries
+    the mark, and Explorer's extract propagates it to EVERY file. The .NET
+    Framework refuses to load a managed assembly tagged like that (CAS policy:
+    loadFromRemoteSources), so pythonnet fails with the opaque
+    "Failed to resolve Python.Runtime.Loader.Initialize from ...
+    Python.Runtime.dll" and NO pywebview window (Settings, History, ...) can
+    open - in every launch shape, admin or not. Reproduced 1:1 by tagging the
+    DLL; removing the stream fixes it. The mark only exists on NTFS; deleting
+    the stream is a plain DeleteFile on "<path>:Zone.Identifier". Best-effort
+    and silent: a read-only location (Program Files) simply keeps whatever it
+    has (the installer never marks files anyway). Runs in a few ms.
+
+    roots: explicit directories to sweep (tests); default = the installed
+    pythonnet / clr_loader / webview packages, located WITHOUT importing them
+    (importing webview in the parent is forbidden - see the lazy-import rule).
+    """
+    if os.name != "nt":
+        return 0
+    if roots is None:
+        import importlib.util
+        roots = []
+        for pkg in _DOTNET_PACKAGES:
+            try:
+                spec = importlib.util.find_spec(pkg)
+            except Exception:
+                spec = None
+            if spec is not None and spec.submodule_search_locations:
+                roots.extend(list(spec.submodule_search_locations))
+    removed = 0
+    for root in roots:
+        for d, _dirs, files in os.walk(root):
+            for f in files:
+                if not f.lower().endswith((".dll", ".exe")):
+                    continue
+                try:
+                    os.remove(os.path.join(d, f) + ":Zone.Identifier")
+                    removed += 1
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+    return removed
+
+
 def child_main(build_window, *, log_path=None, ready_check=None, watchdog_s=30):
     """Shared subprocess entry point for a pywebview window.
 
@@ -901,6 +953,16 @@ def child_main(build_window, *, log_path=None, ready_check=None, watchdog_s=30):
     if log_path:
         # default: redirect both (override by redirecting yourself before calling)
         install_stdout_sink(log_path)
+    # A downloaded+extracted portable carries the Mark of the Web on every
+    # DLL, and the .NET Framework then refuses to load Python.Runtime.dll
+    # (see unblock_dotnet_assemblies). The parent sweeps at startup; this is
+    # the belt for a child launched any other way.
+    try:
+        n = unblock_dotnet_assemblies()
+        if n:
+            _warn("ui_kit.child_main: unblocked %d marked .NET/WebView2 DLLs\n" % n)
+    except Exception as e:
+        _warn("ui_kit.child_main: unblock sweep failed: %r\n" % (e,))
     try:
         import webview
     except Exception as e:  # pragma: no cover - env without pywebview

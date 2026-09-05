@@ -4027,6 +4027,9 @@ def t_tray_lean_layout():
                 '"Settings…"', '"Quit"'):
         assert lbl in run_src, "lean tray missing " + lbl
     assert "self._open_settings_window()" in run_src, "Settings… not wired"
+    # native escape hatch: opens the config folder (works when pywebview/.NET
+    # Settings is blocked on a locked-down machine)
+    assert '"Open config folder"' in run_src and "self._settings_open_config_dir()" in run_src
     # the old deep submenus are gone from the tray
     for gone in ('"Behavior"', '"Input Selection"', '"Model Selection"',
                  '"API Keys"', '"Custom Vocabulary"', '"Beep Output"'):
@@ -4818,6 +4821,56 @@ _test("startup: model-load failure recovers onto cloud/server + auto-opens Setti
       t_model_load_failure_recovery)
 
 
+def t_tray_title_cap_and_prewarm_loop_guard():
+    """2026-09-05 laptop bugs: (1) a tray title over Windows' 128-char
+    NOTIFYICONDATAW limit crashed the thread that set it (a long model-load
+    error) - _set_title truncates and never raises; (2) a Settings window that
+    crashed on boot re-armed the pre-warm forever - the reader stops after a few
+    boot-crashes."""
+    import inspect
+    import lia as w
+    App = w.LiaApp
+
+    class _FakeTray:
+        def __init__(self):
+            self._t = None
+        @property
+        def title(self):
+            return self._t
+        @title.setter
+        def title(self, v):
+            if v is not None and len(v) > 128:   # mimic NOTIFYICONDATAW.szTip
+                raise ValueError("string too long (%d, maximum length 128)" % len(v))
+            self._t = v
+
+    app = App.__new__(App)
+    app.tray_icon = _FakeTray()
+    # a 146-char title must NOT raise and must be truncated in range
+    long_err = "Lia - Model load failed: " + ("cuDNN library cublas64_12.dll not "
+                                               "found or cannot be loaded; " * 3)
+    assert len(long_err) > 128
+    app._set_title(long_err)                       # must not raise
+    assert len(app.tray_icon.title) <= 120 and app.tray_icon.title.endswith("…")
+    app._set_title("Lia - Ready")                  # short -> unchanged
+    assert app.tray_icon.title == "Lia - Ready"
+    app._set_title(None)                           # None -> "" , no crash
+    assert app.tray_icon.title == ""
+    app.tray_icon = None
+    app._set_title("x" * 200)                      # no tray -> no-op, no raise
+    # the crashing dynamic title sites go through _set_title now
+    src = inspect.getsource(App._load_model)
+    assert 'self._set_title(f"Lia - Model load failed:' in src
+    assert "self.tray_icon.title = f\"Lia - Model load failed" not in src
+    # the pre-warm loop guard: reader tracks boot + stops re-arming after crashes
+    rsrc = inspect.getsource(App._settings_reader)
+    assert "_settings_boot_fails" in rsrc and "booted" in rsrc
+    assert "fails < 3" in rsrc
+
+
+_test("tray: title capped to 128 (no crash) + Settings pre-warm loop stops on repeat boot-crash",
+      t_tray_title_cap_and_prewarm_loop_guard)
+
+
 # ---- Ask your meetings (RAG index) ----------------------------------------
 # Synthetic fixtures reproduce the REAL on-disk format verified 2026-08-15:
 # every line RLM-prefixed (U+200F), title header "Meeting <EM DASH> ...", a
@@ -5525,6 +5578,39 @@ def t_ui_kit_no_webview_import():
 
 _test("ui_kit: import does not load webview (lazy in child_main)",
       t_ui_kit_no_webview_import)
+
+
+def t_ui_kit_unblock_motw():
+    """A downloaded portable's DLLs carry the Mark of the Web (Zone.Identifier
+    ADS) and the .NET Framework then refuses to load Python.Runtime.dll (the
+    2026-09-05 laptop bug). unblock_dotnet_assemblies must strip the stream
+    from .dll/.exe files only, be idempotent, and never raise."""
+    import os
+    import tempfile
+    import ui_kit
+    with tempfile.TemporaryDirectory() as d:
+        sub = os.path.join(d, "runtime")
+        os.makedirs(sub)
+        dll = os.path.join(sub, "Python.Runtime.dll")
+        txt = os.path.join(d, "readme.txt")
+        for p in (dll, txt):
+            with open(p, "wb") as f:
+                f.write(b"x")
+            with open(p + ":Zone.Identifier", "w") as f:
+                f.write("[ZoneTransfer]\r\nZoneId=3\r\n")
+        assert os.path.exists(dll + ":Zone.Identifier"), "ADS setup failed"
+        n = ui_kit.unblock_dotnet_assemblies(roots=[d])
+        assert n == 1, "expected 1 stream removed, got %r" % n
+        assert not os.path.exists(dll + ":Zone.Identifier"), "dll still marked"
+        assert os.path.exists(txt + ":Zone.Identifier"), "non-DLL must be left alone"
+        assert ui_kit.unblock_dotnet_assemblies(roots=[d]) == 0, "not idempotent"
+        assert ui_kit.unblock_dotnet_assemblies(roots=[os.path.join(d, "nope")]) == 0
+    # the real sweep (installed packages) must never raise
+    ui_kit.unblock_dotnet_assemblies()
+
+
+_test("ui_kit: Mark-of-the-Web strip on .NET/WebView2 DLLs (laptop Settings fix)",
+      t_ui_kit_unblock_motw)
 
 
 def t_settings_actions_coverage():
