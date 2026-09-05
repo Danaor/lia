@@ -27,7 +27,7 @@ import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-VERSION = "1.3.2"
+VERSION = "1.4.0"
 _v = tuple(int(x) for x in VERSION.split(".")) + (0,)
 
 

@@ -50,7 +50,7 @@ Most dictation tools are subscriptions (SuperWhisper, Wispr Flow), cloud-locked 
 | **Bilingual auto-routing** | Each utterance is language-detected and sent to the best model |
 | **AI cleanup** (optional) | Removes fillers / resolves self-corrections ("meet at 5, actually 6" -> "meet at 6") |
 | **Self-learning vocabulary** | Learns your domain terms and fixes recurring speech-to-text garbles |
-| **Snippets, undo, history** | Voice snippets, `Ctrl+Alt+Z` undo-paste, searchable history window |
+| **Snippets, undo, history** | Voice snippets, `Ctrl+Alt+Z` undo-paste, searchable history window (auto-pruned after 2 weeks by default, adjustable 1-12 weeks, plus a Delete-all button) |
 
 ### Meetings
 
@@ -182,6 +182,7 @@ MIT for Lia's code. The models it uses carry their own licenses:
 
 - [NVIDIA Parakeet TDT 0.6B v2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) - CC-BY-4.0 (local English ASR), via [onnx-asr](https://github.com/istupakov/onnx-asr)
 - [ivrit.ai Whisper models](https://huggingface.co/ivrit-ai) - Hebrew fine-tunes of OpenAI Whisper
+- [hspell Hebrew word list](http://hspell.ivrix.org.il/) via [dictionary-he](https://github.com/wooorm/dictionaries/tree/main/dictionaries/he) - AGPL-3.0 (downloaded on demand for the Hebrew spelling guard; not bundled)
 - [pyannote speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) - CC-BY-4.0 (local diarization)
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper) / CTranslate2 - fast local Whisper inference
 - [PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch) - WASAPI loopback recording

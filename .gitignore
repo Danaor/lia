@@ -59,6 +59,12 @@ version_info.txt
 # token-free product.
 diarization_models/
 
+# Hebrew lexicon (hspell-derived .dic, AGPL) - downloaded at runtime, NEVER
+# shipped/committed (keeps Lia's MIT distribution clean). Lives in %APPDATA%;
+# this guards against a stray scratch copy landing in the tree.
+lia/lexicon/
+*.dic
+
 # Shipped HuggingFace token FALLBACK for local diarization (bundled_hf_token()).
 # NEVER commit - this repo is public; a committed HF token gets auto-revoked by
 # GitHub/HF secret scanning. Included in distribution builds, never in source.

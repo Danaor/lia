@@ -208,6 +208,8 @@ def _demo_state():
                           "vram_gb": 24.0, "verdict": "good",
                           "note": "NVIDIA GeForce RTX 3090 · 24 GB VRAM - good "
                                   "for hosting a transcription server."}},
+        "lexicon": {"installed": True, "loaded": True, "enabled": True,
+                    "suggest": True, "size_mb": 5.7, "words": 341806},
         "hotkeys": {"main": "ctrl+space", "undo": "ctrl+alt+z", "cancel": "esc",
                     "ask": "ctrl+alt+m", "actions": "ctrl+alt+t",
                     "email": "ctrl+alt+f", "chat": "ctrl+alt+c"},
@@ -419,6 +421,9 @@ APP_JS = r"""
 
   PAGES.general = function(){
     var hk = (S.hotkeys||{});
+    var histWeeks = parseInt(cfg("history_retention_weeks", 2), 10);
+    if(isNaN(histWeeks) || histWeeks < 0) histWeeks = 2;
+    if(histWeeks > 12) histWeeks = 12;
     var beep = cfg("beep_device_index", "off");
     var beepRows = [
       radio("beep","set_beep_device","off","str","None (no beep)", beep==="off"),
@@ -463,6 +468,17 @@ APP_JS = r"""
         sw("Restore clipboard after paste", !!cfg("clipboard_auto_restore", true), "toggle_clipboard_auto_restore")+'<br>'+
         sw("Press Enter after paste", !!cfg("press_enter_after_paste", false), "toggle_press_enter_after_paste")+'<br>'+
         sw("Invisible mode (no overlay / waveform)", !!cfg("silent_mode", false), "toggle_silent_mode")+
+      '</div>'+
+      '<div class="page"><div class="section-title">History</div>'+
+        field("Keep transcription history for",
+          '<select id="sel_hist_weeks" data-select="set_history_retention_weeks" style="max-width:220px">'+
+            [1,2,3,4,5,6,7,8,9,10,11,12].map(function(w){
+              return '<option value="'+w+'"'+(histWeeks===w?' selected':'')+'>'+w+' week'+(w===1?'':'s')+(w===2?' (default)':'')+'</option>';
+            }).join('')+
+            '<option value="0"'+(histWeeks===0?' selected':'')+'>Keep everything</option>'+
+          '</select>',
+          "Older entries are removed automatically at startup and after each dictation.")+
+        '<div class="btnrow"><button class="btn danger" data-clear-history="1">Delete all history…</button></div>'+
       '</div>'+
       '<div class="page"><div class="section-title">Beep output</div>'+beepRows.join('')+'</div>'+
       '<div class="page"><div class="section-title">Keyboard shortcuts</div>'+shortcuts+'</div>'+
@@ -807,8 +823,31 @@ APP_JS = r"""
           '<input type="text" id="corrRight" class="mono" placeholder="Right" style="max-width:180px">'+
           '<button class="btn" data-add-corr="1">Add</button></div>'+
       '</div>'+
+      lexiconPanel()+
       '<div class="page"><div class="btnrow">'+btn("Scan meetings for new terms","vocab_rebuild",[],"ghost",true)+'</div></div>';
   };
+
+  function lexiconPanel(){
+    var lx = S.lexicon||{};
+    var status = lx.installed
+      ? (lx.loaded ? ('Installed &amp; active - '+(lx.words||0).toLocaleString()+' words')
+                   : ('Installed ('+(lx.size_mb||0)+' MB) - enable the fix to load it'))
+      : 'Not installed';
+    var head = '<div class="page"><div class="section-title">Hebrew spelling guard</div>'+
+      '<div class="hint">Fixes the fast-speech plural Whisper mishears, e.g. <b>&#1489;&#1497;&#1496;&#1493;&#1500;&#1497;&#1503;</b> &#8594; <b>&#1489;&#1497;&#1496;&#1493;&#1500;&#1497;&#1501;</b>. '+
+      'Uses the hspell Hebrew word list (AGPL-3.0), downloaded to your config folder - <b>not</b> bundled with Lia. '+
+      'Only the &#1497;&#1503;/&#1497;&#1501; plural is fixed automatically; every other unknown word is only <i>suggested</i> below.</div>'+
+      '<div class="kv"><span class="k">Status</span><span>'+status+'</span></div>';
+    var controls = lx.installed
+      ? (sw("Fix Hebrew plural &#1497;&#1503; &#8594; &#1497;&#1501; (&#1489;&#1497;&#1496;&#1493;&#1500;&#1497;&#1503; &#8594; &#1489;&#1497;&#1496;&#1493;&#1500;&#1497;&#1501;)", !!lx.enabled, "toggle_lexicon_fix")+'<br>'+
+         sw("Suggest other unknown Hebrew words", lx.suggest!==false, "toggle_lexicon_suggest"))
+      : '<div class="btnrow"><button class="btn primary" data-call="lexicon_download" data-args="[]" data-slow="1">Download dictionary (5.7 MB)</button></div>';
+    var sugg = '<div class="section-title" style="margin-top:14px">Suggested unknown words</div>'+
+      '<div class="hint">Words not in the dictionary that were left untouched. Add a fix (it joins the corrections table) or dismiss.</div>'+
+      '<div class="btnrow">'+btn("Load suggestions","__load_oov",[],"")+'</div>'+
+      '<div id="oovList"></div>';
+    return head + controls + sugg + '</div>';
+  }
 
   PAGES.snippets = function(){
     return '<div class="content-head"><h1>Snippets</h1></div>'+
@@ -839,8 +878,17 @@ APP_JS = r"""
       '<div class="page"><div class="section-title">Privacy &amp; data</div>'+
         '<div class="hint">Everything Lia stores lives in the config folder above: recordings '+
         '(WAV kept ~30 days, Opus ~2 years), transcripts, summaries, history, indexes and settings. '+
-        'Transcripts are kept until you delete them.</div>'+
+        'Meeting transcripts are kept until you delete them; dictation history is pruned after '+
+        'the number of weeks set on the General page. The Hebrew dictionary (if downloaded) '+
+        'lives in the <span class="mono">lexicon</span> subfolder.</div>'+
         '<div class="btnrow"><button class="btn danger" data-wipe="1">Delete all my data…</button></div>'+
+      '</div>'+
+      '<div class="page"><div class="section-title">Diagnostics</div>'+
+        sw("Keep dictation clips for tuning", !!cfg("debug_keep_dictation_clips", false), "toggle_debug_capture")+
+        '<div class="hint">Saves your last '+esc(cfg("debug_clips_ring", 100))+' dictation clips (audio + text) under '+
+        'the config folder’s <span class="mono">debug_clips</span> subfolder, for tuning punctuation / question-mark '+
+        'detection. Off by default; stays entirely on this PC and is removed by Delete all my data.</div>'+
+        '<div class="btnrow">'+btn("Open clips folder","open_debug_clips_dir",[],"ghost")+'</div>'+
       '</div>';
   };
 
@@ -932,6 +980,7 @@ APP_JS = r"""
       if(m==="__scan_corr"){ busy(cb,true); call("vocab_corrections_scan",[],true).then(function(r){ unbusy(cb); renderCorr(r.data||[]); }); return; }
       if(m==="harvest_corrections_now"){ busy(cb,true); call(m,args,true).then(function(){ unbusy(cb); loadCorr(); }); return; }
       if(m==="__load_snips"){ loadSnips(); return; }
+      if(m==="__load_oov"){ loadOov(); return; }
       busy(cb, slow);
       call(m, args, slow).then(function(){ unbusy(cb); });
       return;
@@ -1029,6 +1078,13 @@ APP_JS = r"""
         var a=document.getElementById("corrWrong"); var b=document.getElementById("corrRight"); if(a)a.value=""; if(b)b.value=""; } }); return; }
     var dc = e.target.closest('[data-del-corr]');
     if(dc){ call("vocab_remove_correction",[dc.getAttribute('data-del-corr')]).then(loadCorr); return; }
+    var oa = e.target.closest('[data-oov-add]');
+    if(oa){ var ow=oa.getAttribute('data-oov-add');
+      var inp=document.querySelector('[data-oov-right="'+ow+'"]'); var ri=(inp&&inp.value||"").trim();
+      if(!ri){ RK.toast("Type the correct spelling first","err"); return; }
+      call("vocab_add_correction",[ow,ri]).then(function(r){ if(r.ok){ call("lexicon_oov_dismiss",[[ow]]).then(loadOov); } }); return; }
+    var od = e.target.closest('[data-oov-dismiss]');
+    if(od){ call("lexicon_oov_dismiss",[[od.getAttribute('data-oov-dismiss')]]).then(loadOov); return; }
     var cun = e.target.closest('[data-corr-unused]');
     if(cun){ Array.prototype.slice.call(document.querySelectorAll('#corrList tr.corr-unused input[data-ck]'))
       .forEach(function(x){ x.checked=true; }); return; }
@@ -1046,6 +1102,9 @@ APP_JS = r"""
     if(ss){ saveSnips(); return; }
     var q = e.target.closest('[data-quit]');
     if(q){ if(confirm("Quit Lia? Dictation and meetings will stop.")) call("quit_app",[]); return; }
+    var ch = e.target.closest('[data-clear-history]');
+    if(ch){ if(!confirm("Delete ALL transcription history?\n\nThis cannot be undone.")) return;
+      call("clear_history",[]); return; }
     var dw = e.target.closest('[data-wipe]');
     if(dw){
       var msg = "Delete ALL Lia data?\n\nThis permanently removes:\n"+
@@ -1065,6 +1124,7 @@ APP_JS = r"""
   document.addEventListener('change', function(e){
     var t = e.target;
     if(t.matches('[data-toggle]')){ call(t.getAttribute('data-toggle'),[]); return; }
+    if(t.matches('[data-select]')){ call(t.getAttribute('data-select'),[parseInt(t.value,10)]); return; }
     if(t.matches('[data-radio]')){ if(t.checked){ var m=t.getAttribute('data-radio'), a=argOf(t);
       call(m, m==="set_cleanup_provider_model"?a:[a], t.getAttribute('data-slow')==="1"); } return; }
   });
@@ -1135,6 +1195,19 @@ APP_JS = r"""
     }).join('')+'</table>';
   }
   function loadCorr(){ call("vocab_corrections_list",[]).then(function(r){ renderCorr(r.data||[]); }); }
+  function renderOov(data){
+    var el=document.getElementById("oovList"); if(!el) return;
+    if(!data.length){ el.innerHTML='<div class="hint">No unknown words recorded yet.</div>'; return; }
+    el.innerHTML='<table class="tbl">'+data.map(function(o){
+      var w=esc(o.word);
+      return '<tr>'+
+        '<td class="rtl-auto" dir="auto">'+w+' <small class="muted">&#215;'+(o.count||0)+'</small></td>'+
+        '<td><input type="text" class="mono" data-oov-right="'+w+'" placeholder="Fix to&#8230;" style="max-width:150px"></td>'+
+        '<td class="act"><button class="btn sm" data-oov-add="'+w+'">Add</button> '+
+          '<button class="btn ghost sm" data-oov-dismiss="'+w+'">Dismiss</button></td></tr>';
+    }).join('')+'</table>';
+  }
+  function loadOov(){ call("lexicon_oov_list",[]).then(function(r){ renderOov(r.data||[]); }); }
   function loadSnips(){
     call("snippets_get",[]).then(function(r){
       var data=r.data||[]; var el=document.getElementById("snipList"); if(!el) return;

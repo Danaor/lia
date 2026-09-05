@@ -1,10 +1,12 @@
 """Lia - Transcription history window (pywebview, on ui_kit).
 
 Replaces the old "dump history.txt and open Notepad" flow with a real searchable
-window: newest-first list, live filter, click-to-copy any entry. 100% local and
-READ-ONLY (it reads %APPDATA%/Lia/history.json directly; it never writes it, so
-it can't race the running app's history appends). Spawned by the tray/History
-item via spawn_helper (fire-and-forget, like the other read-only windows).
+window: newest-first list, live filter, click-to-copy any entry, and a
+"Delete all" button. 100% local: it reads %APPDATA%/Lia/history.json directly.
+The ONLY write it ever makes is Delete-all (an atomic tmp+replace of an empty
+list); the running app re-reads the file on every append, so the worst case is
+a dictation that was mid-flight at that exact instant landing in a fresh file.
+Spawned by the tray/History item via spawn_helper (fire-and-forget).
 
 ALWAYS launch with  python -X utf8  (Hebrew stdout crashes under cp1252).
 """
@@ -64,6 +66,20 @@ class HistoryApi:
     def copy(self, text):
         return uk.copy_text(text)
 
+    def clear_all(self):
+        """Delete every history entry (atomic write of an empty list). Returns
+        {"ok": bool, "removed": n}."""
+        try:
+            n = len(load_history())
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            tmp = HISTORY_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump([], f)
+            os.replace(tmp, HISTORY_FILE)
+            return {"ok": True, "removed": n}
+        except Exception as e:
+            return {"ok": False, "removed": 0, "error": str(e)[:200]}
+
     def mark_ready(self):
         global _READY
         _READY = True
@@ -94,6 +110,7 @@ BODY = """
     <span class="status ok" id="cnt"><span class="dot"></span></span>
     <span class="grow"></span>
     <input type="search" id="q" placeholder="Search transcriptions…" autocomplete="off">
+    <button class="btn danger" id="btnClear" title="Delete every entry">Delete all…</button>
   </div>
   <div id="list" class="list"></div>
   <div id="empty" class="empty" style="display:none">
@@ -144,7 +161,21 @@ APP_JS = r"""
         '<div class="h-text rtl-auto" dir="auto">'+t+'</div></div>';
     }).join('');
   }
+  function setCount(){
+    var c = RK.$("cnt"); if(c) c.innerHTML = '<span class="dot"></span>'+ALL.length+' entries';
+  }
   document.addEventListener("click", function(ev){
+    if(ev.target.closest("#btnClear")){
+      if(!ALL.length){ RK.toast("Nothing to delete", "ok"); return; }
+      if(!confirm("Delete ALL "+ALL.length+" history entries?\n\nThis cannot be undone.")) return;
+      RK.ready(function(api){
+        api.clear_all().then(function(r){
+          if(r && r.ok){ ALL = []; setCount(); render(""); RK.toast("History deleted", "ok"); }
+          else { RK.toast("Delete failed: "+((r&&r.error)||"?"), "err"); }
+        });
+      });
+      return;
+    }
     var it = ev.target.closest(".h-item");
     if(it){ var txt = it.getAttribute("data-t");
       RK.ready(function(api){ api.copy(txt); }); RK.toast("Copied", "ok"); }
@@ -156,7 +187,7 @@ APP_JS = r"""
     try{ api.mark_ready(); }catch(e){}
     api.get_initial().then(function(d){
       ALL = (d && d.entries) || [];
-      var c = RK.$("cnt"); if(c) c.innerHTML = '<span class="dot"></span>'+ALL.length+' entries';
+      setCount();
       render("");
     });
   });

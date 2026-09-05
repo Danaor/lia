@@ -513,12 +513,35 @@ _test("strip: whole-text hallucinations → empty", t_strip_whole_hallucination)
 
 def t_strip_tail_only():
     import lia as w
-    assert w.strip_hallucinated_tail("Hello world. Thank you.") == "Hello world"
-    assert w.strip_hallucinated_tail("שלום עולם. תודה רבה") == "שלום עולם"
-    assert w.strip_hallucinated_tail("Real content here. bye.") == "Real content here"
+    # The real sentence's TERMINAL punctuation is preserved (2026-09-05): only
+    # the hallucination and the whitespace/separator joining it are cut.
+    assert w.strip_hallucinated_tail("Hello world. Thank you.") == "Hello world."
+    assert w.strip_hallucinated_tail("שלום עולם. תודה רבה") == "שלום עולם."
+    assert w.strip_hallucinated_tail("Real content here. bye.") == "Real content here."
+    # A dangling comma/separator before the hallucination is still trimmed.
+    assert w.strip_hallucinated_tail("Hello world, thank you") == "Hello world"
+    assert w.strip_hallucinated_tail("סיכמנו, תודה רבה") == "סיכמנו"
 
 
-_test("strip: tail hallucinations removed, prefix kept", t_strip_tail_only)
+_test("strip: tail hallucinations removed, prefix + its terminal mark kept", t_strip_tail_only)
+
+
+def t_strip_keeps_question_mark():
+    """2026-09-05: dictating "זה עובד?" then a silent tail Whisper renders as
+    "תודה רבה" must NOT lose the "?" (the strip trimmed all trailing punctuation
+    of the preceding sentence). Every backend routes through this function."""
+    import lia as w
+    assert w.strip_hallucinated_tail("זה עובד? תודה רבה") == "זה עובד?"
+    assert w.strip_hallucinated_tail("אתה מגיע? תודה") == "אתה מגיע?"
+    assert w.strip_hallucinated_tail("Does it work? Thank you.") == "Does it work?"
+    assert w.strip_hallucinated_tail("נגמר! תודה רבה") == "נגמר!"
+    # The RLM-prefixed variant (ivrit/gpt-4o output) also survives.
+    assert w.strip_hallucinated_tail("‏זה עובד? תודה רבה") == "זה עובד?"
+    # No hallucination -> a real trailing "?" is obviously untouched.
+    assert w.strip_hallucinated_tail("זה עובד?") == "זה עובד?"
+
+
+_test("strip: a real '?' survives a following hallucination", t_strip_keeps_question_mark)
 
 
 def t_strip_preserves_real_text():
@@ -3053,6 +3076,65 @@ _test("bilingual: short-clip third-language clamp (the German-dictation fix)",
       t_bilingual_short_clip_clamp)
 
 
+def t_debug_capture_dictation():
+    """WP0 (2026-09-05): the diagnostic dictation-clip capture writes a WAV +
+    JSON sidecar only when enabled, records the raw text + pre-gain RMS +
+    bias_ok, ring-buffers to N, and is a silent no-op when off."""
+    import json as _json, os as _os, tempfile, wave as _wave
+    import numpy as _np
+    import lia as w
+    App = w.LiaApp
+    app = App.__new__(App)
+    tmp = tempfile.mkdtemp()
+    saved_dir = w.CONFIG_DIR
+    w.CONFIG_DIR = tmp
+    try:
+        audio = (_np.sin(_np.linspace(0, 40, 16000)) * 0.3).astype(_np.float32)
+        # OFF -> nothing written
+        app.config = {"debug_keep_dictation_clips": False}
+        app._debug_capture_dictation(audio, "זה עובד?", bias_ok=True,
+                                     duration_sec=1.0, pre_gain_peak_rms=0.11,
+                                     source="microphone")
+        assert not _os.path.isdir(_os.path.join(tmp, "debug_clips")) or \
+            not _os.listdir(_os.path.join(tmp, "debug_clips")), "off must write nothing"
+        # ON -> wav + sidecar with the right fields
+        app.config = {"debug_keep_dictation_clips": True, "debug_clips_ring": 2,
+                      "model_size": "ivrit-ai/whisper-large-v3-turbo-ct2",
+                      "transcription_backend": "local", "cleanup_style": "off"}
+        app._debug_capture_dictation(audio, "זה עובד?", bias_ok=True,
+                                     duration_sec=1.0, pre_gain_peak_rms=0.11,
+                                     source="microphone")
+        d = _os.path.join(tmp, "debug_clips")
+        wavs = [f for f in _os.listdir(d) if f.endswith(".wav")]
+        jsons = [f for f in _os.listdir(d) if f.endswith(".json")]
+        assert len(wavs) == 1 and len(jsons) == 1, (wavs, jsons)
+        with _wave.open(_os.path.join(d, wavs[0]), "rb") as wf:
+            assert wf.getframerate() == 16000 and wf.getnchannels() == 1
+            assert wf.getnframes() == 16000
+        sc = _json.load(open(_os.path.join(d, jsons[0]), encoding="utf-8"))
+        assert sc["text"] == "זה עובד?" and sc["bias_ok"] is True
+        assert sc["pre_gain_peak_rms"] == 0.11 and sc["route"] is None
+        assert sc["model"] == "ivrit-ai/whisper-large-v3-turbo-ct2"
+        # ring-buffer: a 3rd + 4th capture leaves only the newest 2 pairs
+        import time as _t
+        for _ in range(3):
+            _t.sleep(0.002)
+            app._debug_capture_dictation(audio, "עוד", bias_ok=False,
+                                         duration_sec=0.5, pre_gain_peak_rms=0.02,
+                                         source="microphone")
+        assert len([f for f in _os.listdir(d) if f.endswith(".wav")]) == 2
+        assert len([f for f in _os.listdir(d) if f.endswith(".json")]) == 2
+        # the action map exposes the toggle + folder opener
+        actions = App._settings_action_map(app)
+        assert "toggle_debug_capture" in actions and "open_debug_clips_dir" in actions
+    finally:
+        w.CONFIG_DIR = saved_dir
+
+
+_test("debug: dictation-clip capture (opt-in, sidecar fields, ring-buffer)",
+      t_debug_capture_dictation)
+
+
 def t_vocab_prompt_bias_gate():
     """2026-09-03 regression: the English-dominant vocab initial_prompt was
     copied into SHORT / LOW-SIGNAL Hebrew clips, emitting Latin-letter
@@ -4449,6 +4531,193 @@ _test("vocab: corrections engine (splitter/applier/guards/seed/wiring)",
       t_vocab_corrections)
 
 
+def t_lexicon_oov_fix():
+    """Hebrew lexicon post-pass (2026-09-05): the guarded -ין->-ים auto-fix.
+    Uses a TEMP .dic (the suite NEVER downloads). Fixes the plural confusion,
+    the yod-guard protects ktiv-haser singulars, legit -ין plurals + names +
+    protected terms survive, RLM/punctuation preserved, not-loaded = no-op."""
+    import os, tempfile
+    import lexicon as lx
+    # a tiny .dic: first line is a count header (dropped by load())
+    forms = ["ביטולים", "תשלומים", "מכונים", "משתמשים",  # valid -ים targets
+             "ביטול", "תשלום",                            # singular stems (prefix base)
+             "מעוניין", "בניין", "עניין",                 # ktiv-male: the yod-guard bases
+             "נישואין", "גירושין",                        # legit -ין plurals (valid)
+             "שלום", "עולם", "חברה", "רבין"]              # misc + a name that IS valid
+    fd, p = tempfile.mkstemp(suffix=".dic")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("%d\n" % len(forms))
+        f.write("\n".join(forms) + "\n")
+    try:
+        L = lx.Lexicon(p)
+        # not loaded yet => everything valid, fix is a pure no-op
+        assert L.valid("ביטולין") is True
+        assert L.fix("זה ביטולין") == ("זה ביטולין", [], [])
+        L.load()
+        assert L.word_count() == len(forms)
+        # the target + prefixes fix
+        assert L.fix_word("ביטולין") == "ביטולים"
+        assert L.fix_word("לביטולין") == "לביטולים"     # ל prefix
+        assert L.fix_word("ולביטולין") == "ולביטולים"   # stacked prefix
+        assert L.fix_word("תשלומין") == "תשלומים"
+        # yod-guard: מעונין/בנין/ענין are ktiv-haser singulars (X-יין valid) -> hands off
+        assert L.fix_word("מעונין") is None
+        assert L.fix_word("בנין") is None
+        assert L.fix_word("ענין") is None
+        # legit -ין plurals are valid -> untouched
+        assert L.fix_word("נישואין") is None
+        assert L.fix_word("גירושין") is None
+        # a name in STOPLIST (also valid here) -> untouched
+        assert L.fix_word("רבין") is None
+        # a protected term is never rewritten even if it would otherwise match
+        assert L.fix_word("ביטולין", protected={"ביטולין"}) is None
+        # OOV word with no -ין ending and no candidate -> left alone, reported as OOV
+        out, fixes, oov = L.fix("‏זה ביטולין, נכון?  אלעל טסה.")
+        assert out == "‏זה ביטולים, נכון?  אלעל טסה.", repr(out)   # RLM + punctuation + spacing kept
+        assert fixes == [("ביטולין", "ביטולים")], fixes
+        assert "אלעל" in oov and "ביטולין" not in oov, oov
+        # too-short / non-hebrew ignored
+        assert L.fix_word("דין") is None      # < 4 chars guard
+        # latency sanity: a 30-word line is sub-millisecond (just don't hang)
+        big = " ".join(["ביטולין", "שלום", "אלעל"] * 10)
+        import time as _t
+        t0 = _t.time(); L.fix(big); assert _t.time() - t0 < 0.05
+    finally:
+        os.remove(p)
+
+
+_test("lexicon: guarded Hebrew -ין->-ים OOV fix (yod-guard, prefixes, RLM, no-op)",
+      t_lexicon_oov_fix)
+
+
+def t_lexicon_wiring():
+    """The lexicon fix wires into _vocab_apply_corrections AFTER the user
+    corrections table (user fixes win), records OTHER OOV words as store
+    suggestions, and is a byte-identical no-op when disabled. Also the store's
+    OOV suggestion API (add/list/dismiss, dedup vs corrections, persistence)."""
+    import os, tempfile, json as _json
+    import lia as w
+    import lexicon as lx
+    App = w.LiaApp
+
+    # -- store OOV API --
+    vp = tempfile.mktemp(suffix=".json")
+    st = w.vocab_learn.VocabStore(vp)
+    assert st.add_oov_candidates(["ישראייר", "פרודקשן", "abc"]) == 2   # "abc"<4 skipped
+    assert st.add_oov_candidates(["ישראייר"]) == 0                     # dedup, count++
+    cands = {o["word"]: o for o in st.oov_candidates()}
+    assert cands["ישראייר"]["count"] == 2 and "פרודקשן" in cands
+    # a word already a correction is never suggested
+    st.add_corrections([{"wrong": "בטולין", "right": "ביטולים"}], force=True)
+    assert st.add_oov_candidates(["בטולין"]) == 0
+    st.save()
+    st2 = w.vocab_learn.VocabStore(vp)          # persistence round-trip
+    assert {o["word"] for o in st2.oov_candidates()} == {"ישראייר", "פרודקשן"}
+    assert st2.dismiss_oov(["ישראייר"]) == 1
+    assert {o["word"] for o in st2.oov_candidates()} == {"פרודקשן"}
+    os.remove(vp)
+
+    # -- a temp lexicon --
+    forms = ["ביטולים", "ביטול", "מעוניין", "שלום", "עולם", "טסה"]
+    fd, dp = tempfile.mkstemp(suffix=".dic")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("%d\n%s\n" % (len(forms), "\n".join(forms)))
+    L = lx.Lexicon(dp); L.load()
+
+    # -- wire through _vocab_apply_corrections --
+    app = App.__new__(App)
+    sp = tempfile.mktemp(suffix=".json")
+    app._vocab_store = w.vocab_learn.VocabStore(sp)
+    app._lexicon = L
+    app._lexicon_protected_cache = None
+    app.config = {"vocab_corrections": True, "lexicon_fix_enabled": True,
+                  "lexicon_suggest_enabled": True}
+    out = app._vocab_apply_corrections("‏זה ביטולין, אלעל טסה.", label="dictation")
+    assert out == "‏זה ביטולים, אלעל טסה.", repr(out)        # auto-fix applied
+    assert "אלעל" in {o["word"] for o in app._vocab_store.oov_candidates()}  # other OOV suggested
+    # the USER table wins: a user correction ביטולין->ביטול runs first, so the
+    # lexicon never sees ביטולין
+    app2 = App.__new__(App)
+    app2._vocab_store = w.vocab_learn.VocabStore(tempfile.mktemp(suffix=".json"))
+    app2._vocab_store.add_corrections([{"wrong": "ביטולין", "right": "ביטול"}], force=True)
+    app2._lexicon = L
+    app2._lexicon_protected_cache = None
+    app2.config = dict(app.config)
+    assert app2._vocab_apply_corrections("זה ביטולין.", label="d") == "זה ביטול."
+    # kill-switch: disabled -> byte-identical, no suggestions recorded
+    app3 = App.__new__(App)
+    app3._vocab_store = w.vocab_learn.VocabStore(tempfile.mktemp(suffix=".json"))
+    app3._lexicon = L
+    app3._lexicon_protected_cache = None
+    app3.config = {"vocab_corrections": True, "lexicon_fix_enabled": False}
+    assert app3._vocab_apply_corrections("זה ביטולין.", label="d") == "זה ביטולין."
+    assert app3._vocab_store.oov_candidates() == []
+    for f in (dp, sp):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+
+_test("lexicon: wiring into _vocab_apply_corrections + store OOV suggestions",
+      t_lexicon_wiring)
+
+
+def t_lexicon_download_and_ui():
+    """_lexicon_install verifies the pinned sha256 (fail-loud) and installs; the
+    Settings > Vocabulary page renders the Hebrew-spelling-guard section with the
+    download/toggle/suggestions controls; the action allowlist covers them."""
+    import os, hashlib, tempfile, inspect
+    import lia as w
+    App = w.LiaApp
+    # -- install: mismatch installs nothing, match installs + enables + loads --
+    tmpdir = tempfile.mkdtemp()
+    saved = w.CONFIG_DIR
+    w.CONFIG_DIR = tmpdir
+    saved_save = w.save_config
+    w.save_config = lambda cfg: None
+    try:
+        app = App.__new__(App)
+        app.config = {"lexicon_fix_enabled": False}
+        app._lexicon = None
+        # a tiny valid .dic; set the pin to its real hash so the test is hermetic
+        content = ("3\nביטולים\nמעוניין\nשלום\n").encode("utf-8")
+        real_pin = w.LEXICON_HE_SHA256
+        w.LEXICON_HE_SHA256 = hashlib.sha256(content).hexdigest()
+        try:
+            ok, _ = app._lexicon_install(b"garbage-not-the-dict")
+            assert ok is False, "checksum mismatch must refuse"
+            assert not os.path.exists(app._lexicon_dic_path()), "nothing installed on mismatch"
+            assert app.config["lexicon_fix_enabled"] is False
+            ok, _ = app._lexicon_install(content, license_text="AGPL text")
+            assert ok is True and os.path.exists(app._lexicon_dic_path())
+            assert app.config["lexicon_fix_enabled"] is True
+            assert app._lexicon is not None and app._lexicon.ready
+            assert app._lexicon.fix_word("ביטולין") == "ביטולים"   # loaded + works
+            assert os.path.exists(os.path.join(app._lexicon_dir(), "LICENSE-hspell.txt"))
+            st = app._lexicon_status()
+            assert st["installed"] and st["loaded"] and st["enabled"] and st["words"] == 3
+        finally:
+            w.LEXICON_HE_SHA256 = real_pin
+    finally:
+        w.CONFIG_DIR = saved
+        w.save_config = saved_save
+    # -- Settings page renders the section (demo --html) --
+    import settings_window as sw
+    src = inspect.getsource(sw)
+    assert "Hebrew spelling guard" in src
+    for token in ('data-call="lexicon_download"', "toggle_lexicon_fix",
+                  "toggle_lexicon_suggest", "__load_oov", "data-oov-add",
+                  "data-oov-dismiss", "lexicon_oov_list", "lexicon_oov_dismiss"):
+        assert token in src, "settings missing " + token
+    html = sw._demo_html()
+    assert "Hebrew spelling guard" in html and "oovList" in html
+
+
+_test("lexicon: sha256-verified install (fail-loud) + Settings UI",
+      t_lexicon_download_and_ui)
+
+
 # ---- Ask your meetings (RAG index) ----------------------------------------
 # Synthetic fixtures reproduce the REAL on-disk format verified 2026-08-15:
 # every line RLM-prefixed (U+200F), title header "Meeting <EM DASH> ...", a
@@ -5173,6 +5442,7 @@ def t_settings_actions_coverage():
         "set_primary_language",
         "toggle_clipboard_auto_restore", "toggle_press_enter_after_paste",
         "toggle_silent_mode", "toggle_auto_start", "set_beep_device",
+        "set_history_retention_weeks", "clear_history",
         # Audio
         "toggle_record_mic", "toggle_record_system", "toggle_mic_device",
         "set_meeting_mic_device", "toggle_loopback_device", "refresh",
@@ -5196,10 +5466,13 @@ def t_settings_actions_coverage():
         "vocab_learned_list", "vocab_remove_learned", "vocab_corrections_list",
         "vocab_corrections_scan", "vocab_add_correction", "vocab_remove_correction",
         "vocab_remove_corrections", "vocab_rebuild", "toggle_vocab_autolearn",
+        "lexicon_download", "toggle_lexicon_fix", "toggle_lexicon_suggest",
+        "lexicon_oov_list", "lexicon_oov_dismiss",
         # Snippets
         "snippets_get", "snippets_set",
         # Advanced
         "restart_app", "open_log", "open_config_dir", "quit_app",
+        "toggle_debug_capture", "open_debug_clips_dir",
     ]
     missing = [a for a in expected if a not in actions]
     assert not missing, "Settings actions missing: %s" % missing
@@ -6581,6 +6854,149 @@ def t_history_window_wiring():
 
 _test("history: pywebview window + txt fallback + ui_kit prefs/geometry",
       t_history_window_wiring)
+
+
+def t_history_retention():
+    """History retention (2026-09-04): entries older than N weeks are pruned at
+    startup and on append (default 2, clamp 0..12, 0 = keep all; unparseable
+    timestamps survive), Delete-all empties the file from both the Settings
+    action and the History window, and the Settings page exposes both."""
+    import datetime, inspect, os, tempfile, json as _json
+    import lia as w
+    tmp = tempfile.mkdtemp()
+    w.HISTORY_FILE = os.path.join(tmp, "history.json")
+    now = datetime.datetime(2026, 9, 4, 12, 0, 0)
+    old = (now - datetime.timedelta(weeks=3)).isoformat()
+    mid = (now - datetime.timedelta(weeks=1, days=6)).isoformat()
+    fresh = (now - datetime.timedelta(hours=1)).isoformat()
+    rows = [{"timestamp": old, "text": "old"}, {"timestamp": mid, "text": "mid"},
+            {"timestamp": "garbage", "text": "unparseable"},
+            {"timestamp": fresh, "text": "fresh"}]
+    # clamp
+    assert w.normalize_history_retention_weeks("2") == 2
+    assert w.normalize_history_retention_weeks(99) == 12
+    assert w.normalize_history_retention_weeks(-3) == 0
+    assert w.normalize_history_retention_weeks("x") == 2
+    assert w.normalize_history_retention_weeks(None, default=7) == 7
+    assert w.DEFAULT_CONFIG.get("history_retention_weeks") == 2
+    # prune @ 2 weeks: drops "old" only; keeps the unparseable one
+    w.save_history(rows)
+    assert w.prune_history(2, now=now) == 1
+    kept = [e["text"] for e in w.load_history()]
+    assert kept == ["mid", "unparseable", "fresh"], kept
+    # 1 week drops "mid" too; 0 = keep everything; no-op writes nothing
+    assert w.prune_history(1, now=now) == 1
+    assert [e["text"] for e in w.load_history()] == ["unparseable", "fresh"]
+    w.save_history(rows)
+    assert w.prune_history(0, now=now) == 0
+    assert len(w.load_history()) == 4
+    # append prunes by the module-level retention
+    saved = w.HISTORY_RETENTION_WEEKS
+    try:
+        w.HISTORY_RETENTION_WEEKS = 2
+        w.add_history_entry("new one", 1.0, "m", "microphone", "transcribe")
+        texts = [e["text"] for e in w.load_history()]
+        assert "old" not in texts and "new one" in texts, texts
+    finally:
+        w.HISTORY_RETENTION_WEEKS = saved
+    # clear
+    assert w.clear_history() == len(texts)
+    assert w.load_history() == []
+    # app wiring: actions exist, setter clamps + persists, startup prune hook
+    App = w.LiaApp
+    app = App.__new__(App)
+    app.config = {"history_retention_weeks": 2}
+    actions = App._settings_action_map(app)
+    assert "set_history_retention_weeks" in actions and "clear_history" in actions
+    assert "_apply_history_retention" in inspect.getsource(App.run)
+    w.CONFIG_FILE = os.path.join(tmp, "config.json")
+    w.save_history(rows)
+    ok, msg = app._set_history_retention_weeks(3)
+    assert ok and app.config["history_retention_weeks"] == 3, (ok, msg)
+    assert w.HISTORY_RETENTION_WEEKS == 3
+    ok, msg = app._set_history_retention_weeks("nope")
+    assert not ok, msg
+    ok, msg = app._set_history_retention_weeks(0)
+    assert ok and app.config["history_retention_weeks"] == 0
+    ok, msg = app._clear_history()
+    assert ok and w.load_history() == []
+    # the History window's Delete-all writes an empty list atomically
+    import history_window as hw
+    hw.HISTORY_FILE = w.HISTORY_FILE
+    hw.CONFIG_DIR = tmp
+    w.save_history(rows)
+    r = hw.HistoryApi().clear_all()
+    assert r["ok"] and r["removed"] == 4, r
+    assert w.load_history() == []
+    assert "btnClear" in hw.BODY and "clear_all" in hw.APP_JS
+    # Settings page: the weeks picker + the delete button dispatch the actions
+    import settings_window as sw
+    src = inspect.getsource(sw)
+    assert 'data-select="set_history_retention_weeks"' in src
+    assert 'call("clear_history",[])' in src
+    assert "[data-select]" in src, "select change must dispatch"
+
+
+_test("history: retention prune (default 2w, 0-12 clamp) + delete-all (Settings + window)",
+      t_history_retention)
+
+
+def t_tray_start_meeting_color_icon():
+    """Start Meeting gets a COLOR menu icon (Win32 menus draw emoji mono):
+    the emoji renders to a 32bpp HBITMAP, attaches to the right item via
+    MIIM_BITMAP (not the wrong one), caches, and the app hooks _update_menu to
+    repaint after every rebuild. Windows-only; skips elsewhere."""
+    import sys
+    if sys.platform != "win32":
+        return
+    import ctypes, inspect
+    from ctypes import wintypes
+    import lia as w
+    size = w._menu_icon_size()
+    assert 12 <= size <= 64, size
+    hb = w._render_emoji_menu_bitmap("\U0001F4DD", size)
+    assert hb, "color menu bitmap failed to build"
+    assert w._render_emoji_menu_bitmap("\U0001F4DD", size) == hb, "not cached"
+    user = ctypes.windll.user32
+    hmenu = user.CreatePopupMenu()
+    for i, txt in enumerate(["Record my microphone", "Start Meeting", "History"]):
+        user.AppendMenuW(hmenu, 0x0, 1000 + i, txt)
+    try:
+        assert w._set_menu_item_bitmap(hmenu, "Start Meeting", hb) is True
+
+        class MII(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT), ("fMask", wintypes.UINT),
+                        ("fType", wintypes.UINT), ("fState", wintypes.UINT),
+                        ("wID", wintypes.UINT), ("hSubMenu", wintypes.HMENU),
+                        ("hbmpChecked", wintypes.HBITMAP),
+                        ("hbmpUnchecked", wintypes.HBITMAP),
+                        ("dwItemData", ctypes.c_void_p),
+                        ("dwTypeData", wintypes.LPWSTR), ("cch", wintypes.UINT),
+                        ("hbmpItem", wintypes.HBITMAP)]
+        got = MII(); got.cbSize = ctypes.sizeof(MII); got.fMask = 0x80
+        assert user.GetMenuItemInfoW(hmenu, 1, True, ctypes.byref(got))
+        assert got.hbmpItem == hb, "bitmap not on Start Meeting"
+        other = MII(); other.cbSize = ctypes.sizeof(MII); other.fMask = 0x80
+        user.GetMenuItemInfoW(hmenu, 0, True, ctypes.byref(other))
+        assert not other.hbmpItem, "bitmap leaked onto the wrong item"
+        assert w._set_menu_item_bitmap(hmenu, "Nope", hb) is False
+    finally:
+        user.DestroyMenu(hmenu)
+    # app wiring: repaint method exists, run() prebuilds the bitmap + hooks
+    # _update_menu, and the painter no-ops safely without a menu handle.
+    App = w.LiaApp
+    assert hasattr(App, "_apply_tray_menu_icons")
+    run_src = inspect.getsource(App.run)
+    assert "_render_emoji_menu_bitmap" in run_src
+    assert "_update_menu" in run_src and "_apply_tray_menu_icons" in run_src
+    app = App.__new__(App)
+    app._meeting_menu_hbitmap = None
+    app.tray_icon = None
+    app._apply_tray_menu_icons()   # must not raise with nothing set up
+
+
+_test("tray: Start Meeting color menu icon (32bpp HBITMAP via MIIM_BITMAP + repaint hook)",
+      t_tray_start_meeting_color_icon)
 
 
 def t_summarize_window():

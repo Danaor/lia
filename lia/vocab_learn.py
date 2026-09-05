@@ -192,6 +192,7 @@ class VocabStore:
         self._lock = threading.Lock()
         self._terms = {}          # norm key -> dict
         self._corrections = {}    # norm(wrong) -> {wrong, right, ...}
+        self._oov = {}            # norm(word) -> {word, count, first_seen, last_seen, label}
         self._flags = {}          # one-time seeds etc.
         self._dirty_usage = 0
         self._last_save = time.time()
@@ -208,6 +209,9 @@ class VocabStore:
             for c in data.get("corrections", []):
                 if isinstance(c, dict) and c.get("wrong") and c.get("right"):
                     self._corrections[_norm(c["wrong"])] = c
+            for o in data.get("oov_candidates", []):
+                if isinstance(o, dict) and o.get("word"):
+                    self._oov[_norm(o["word"])] = o
             self._flags = dict(data.get("flags") or {})
         except FileNotFoundError:
             pass
@@ -223,6 +227,7 @@ class VocabStore:
         with self._lock:
             data = {"version": 1, "terms": list(self._terms.values()),
                     "corrections": list(self._corrections.values()),
+                    "oov_candidates": list(self._oov.values()),
                     "flags": self._flags}
             tmp = self.path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -439,6 +444,73 @@ class VocabStore:
     def corrections(self):
         with self._lock:
             return [dict(c) for c in self._corrections.values()]
+
+    # ---------- OOV suggestions (lexicon post-pass, 2026-09-05) ----------
+    def approved_terms(self):
+        """Every approved vocabulary term (manual + auto). Used as the
+        'protected' set the lexicon fix must never rewrite."""
+        with self._lock:
+            return [t["term"] for t in self._terms.values()
+                    if t.get("status") == "approved" and t.get("term")]
+
+    def add_oov_candidates(self, words, label="", cap=500):
+        """Record out-of-lexicon Hebrew words the lexicon flagged but did NOT
+        auto-fix, as suggestions for the corrections table. A word already in
+        the corrections table or an approved term is ignored (nothing to
+        suggest). Buffered save; caps the map (drops the least-recently-seen)."""
+        if not words:
+            return 0
+        today = time.strftime("%Y-%m-%d")
+        added = 0
+        with self._lock:
+            for w in words:
+                w = (w or "").strip()
+                if len(w) < 4:
+                    continue
+                wk = _norm(w)
+                if wk in self._corrections:
+                    continue
+                term = self._terms.get(wk)
+                if term is not None and term.get("status") == "approved":
+                    continue
+                o = self._oov.get(wk)
+                if o is None:
+                    self._oov[wk] = {"word": w, "count": 1, "first_seen": today,
+                                     "last_seen": today, "label": label}
+                    added += 1
+                else:
+                    o["count"] = int(o.get("count", 0)) + 1
+                    o["last_seen"] = today
+            if len(self._oov) > cap:
+                # keep the most-recently-seen `cap` entries
+                keep = sorted(self._oov.values(),
+                              key=lambda o: o.get("last_seen", ""), reverse=True)[:cap]
+                self._oov = {_norm(o["word"]): o for o in keep}
+            self._dirty_usage += added
+            need_save = added and (self._dirty_usage >= 25
+                                   or time.time() - self._last_save > 180)
+        if need_save:
+            self.save()
+        return added
+
+    def oov_candidates(self):
+        """OOV suggestions, most-frequent first."""
+        with self._lock:
+            out = [dict(o) for o in self._oov.values()]
+        out.sort(key=lambda o: -int(o.get("count", 0)))
+        return out
+
+    def dismiss_oov(self, words):
+        """Drop OOV suggestions by word (approved into corrections, or ignored).
+        Returns #removed."""
+        removed = 0
+        with self._lock:
+            for w in words or []:
+                if self._oov.pop(_norm(w), None) is not None:
+                    removed += 1
+        if removed:
+            self.save()
+        return removed
 
     def set_corpus_hits(self, mapping):
         """Stamp each correction with how many times it matched the archive scan

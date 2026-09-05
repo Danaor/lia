@@ -303,6 +303,13 @@ try:
 except Exception:
     vocab_learn = None
 
+# Hebrew lexicon post-pass (fixes the -ין/-ים plural confusion). Optional: a
+# missing module or an un-downloaded dictionary degrades to a no-op.
+try:
+    import lexicon as lexicon_mod
+except Exception:
+    lexicon_mod = None
+
 LOG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Lia")
 # One-time rebrand migrations (WhisperType -> Recap -> Lia): if the app was
 # previously installed under an older name, move the whole data folder to
@@ -408,6 +415,11 @@ DEFAULT_CONFIG = {
     # 10-min cap fired mid-meeting and pasted a transcript straight into the
     # user's open document). 0 disables the cap entirely.
     "dictation_max_minutes": 30,
+    # Transcription history retention (weeks). Entries older than this are
+    # pruned at startup and on every append (2026-09-04, Naor's call: history
+    # is a short-term "what did I just dictate" aid, not an archive). 1-12;
+    # 0 = keep everything up to MAX_HISTORY. Also: History window -> Delete all.
+    "history_retention_weeks": 2,
     # Spurious-trigger guards (2026-08-14: Lia self-recorded repeatedly while
     # the user worked over Chrome Remote Desktop from an Android phone — CRD
     # injects keyboard input, and the `keyboard` hook can't tell it from
@@ -646,6 +658,13 @@ DEFAULT_CONFIG = {
     # curated seed + what the summary model spots while it summarises anyway
     # (===CORRECTIONS=== tail). False disables all applications.
     "vocab_corrections": True,
+    # Hebrew lexicon post-pass (S44, 2026-09-05): auto-fix the -ין/-ים plural
+    # confusion Whisper makes on fast Hebrew ("ביטולין" -> "ביטולים"). Needs the
+    # hspell-derived word list (AGPL) downloaded on first enable (Settings >
+    # Vocabulary) - never bundled. False (default) = no-op. suggest = record
+    # OTHER out-of-lexicon Hebrew words as suggestions for the corrections table.
+    "lexicon_fix_enabled": False,
+    "lexicon_suggest_enabled": True,
     # Custom vocabulary — user-specific terms (programming, names, product
     # names) that Whisper otherwise mis-transcribes. Sent as Whisper's
     # `prompt`/`initial_prompt` to bias detection, AND included in the LLM
@@ -779,6 +798,14 @@ DEFAULT_CONFIG = {
     # remove the injection while keeping the spelling benefit on real dictation).
     "vocab_prompt_bias_min_sec": 5.0,   # keep the prompt only for clips >= this
     "vocab_prompt_bias_min_rms": 0.02,  # ...and with pre-gain peak RMS >= this
+    # Diagnostic dictation capture (S44, 2026-09-05): when True, each dictation
+    # clip is saved (post auto-gain WAV as the model sees it + a JSON sidecar
+    # with the raw text, bias_ok, duration, pre-gain peak RMS, route) under
+    # %APPDATA%\Lia\debug_clips\, ring-buffered to the last N. OFF by default;
+    # opt-in for the question-mark / prosody bench (bench_qmark.py). Wiped by
+    # delete-all-data. NEVER writes from a session shell - the running app does.
+    "debug_keep_dictation_clips": False,
+    "debug_clips_ring": 100,
     # Idle watchdog: silently restart Lia after N hours of no
     # recording activity, to avoid stale-PortAudio silent captures after
     # long idle (e.g. overnight). Set to 0 to disable. Default 4 hours.
@@ -1498,9 +1525,15 @@ def strip_hallucinated_tail(text):
             m = rx.search(cleaned)
             if m:
                 removed = m.group(0).strip()
-                # Cut the match and trim trailing punctuation/whitespace
+                # Cut the match, then trim only the dangling SEPARATOR that
+                # joined the real sentence to the hallucination (whitespace +
+                # comma/semicolon/colon). Do NOT strip sentence-TERMINAL marks
+                # (. ! ? ۔ ؟) - that used to delete a legitimate "?" when a
+                # hallucination followed a real question, e.g. dictating
+                # "זה עובד?" then a silent tail Whisper renders as "תודה רבה"
+                # came out as "זה עובד" (2026-09-05).
                 cleaned = cleaned[:m.start()]
-                cleaned = re.sub(r'[\s.!?,;:،۔؟]+$', '', cleaned)
+                cleaned = re.sub(r'[\s,;:،]+$', '', cleaned)
                 log.info("Stripped hallucinated tail: %r", removed)
                 found = True
                 break
@@ -1742,6 +1775,16 @@ MODEL_REVISIONS = {
     "large-v3-turbo": "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf",
     "large-v3": "edaa852ec7e145841d8ffdb056a99866b5f0a478",
 }
+
+# Hebrew word list for the lexicon post-pass (S44). AGPL-3.0 (hspell-derived);
+# NEVER bundled - downloaded on first enable, verified against the pinned
+# sha256 (fail-loud, S43 WP4 policy). Pinned to a wooorm/dictionaries commit so
+# the file can't change under us. index.dic only (the .aff is not used).
+LEXICON_HE_URL = ("https://raw.githubusercontent.com/wooorm/dictionaries/"
+                  "8cfea406b505e4d7df52d5a19bce525df98c54ab/dictionaries/he/index.dic")
+LEXICON_HE_SHA256 = "9bd95042a927e13ab422231e355caa8a7018456e7c49b889f2e6c62ddb5a0552"
+LEXICON_HE_LICENSE_URL = ("https://raw.githubusercontent.com/wooorm/dictionaries/"
+                          "8cfea406b505e4d7df52d5a19bce525df98c54ab/dictionaries/he/license")
 
 
 _CUDA_AVAILABLE = None  # cached tri-state (None=unknown → resolved to bool once)
@@ -12479,18 +12522,18 @@ def _stamp_lia_launcher(exe_path):
         return False
     try:
         vi = VSVersionInfo(
-            ffi=FixedFileInfo(filevers=(1, 3, 0, 0), prodvers=(1, 3, 0, 0),
+            ffi=FixedFileInfo(filevers=(1, 4, 0, 0), prodvers=(1, 4, 0, 0),
                               mask=0x3f, flags=0x0, OS=0x40004,
                               fileType=0x1, subtype=0x0),
             kids=[
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.3.2.0'),
+                    StringStruct('FileVersion', '1.4.0.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.3.2.0'),
+                    StringStruct('ProductVersion', '1.4.0.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -13102,10 +13145,70 @@ def set_auto_start(enabled):
 # ============================================================
 HISTORY_FILE = os.path.join(CONFIG_DIR, "history.json")
 MAX_HISTORY = 500
+HISTORY_RETENTION_MAX_WEEKS = 12
+# Effective retention (weeks) used by add_history_entry's prune. The app sets
+# it from config at startup / on change (module-level so the module function
+# needs no config read per append). 0 = no age-based pruning.
+HISTORY_RETENTION_WEEKS = 2
 
 # Serialize read-modify-write of history — add_history_entry can be called
 # from multiple transcription threads (live dictation, streaming, final).
 _history_lock = threading.Lock()
+
+
+def normalize_history_retention_weeks(value, default=2):
+    """Clamp a config value to the allowed retention range: an int in
+    0..HISTORY_RETENTION_MAX_WEEKS (0 = keep everything). Garbage -> default."""
+    try:
+        w = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0, min(HISTORY_RETENTION_MAX_WEEKS, w))
+
+
+def _prune_history_list(history, weeks, now=None):
+    """Drop entries older than `weeks` weeks. Entries whose timestamp can't be
+    parsed are KEPT (never destroy data over a parse error). Returns
+    (kept_list, removed_count). weeks <= 0 = no-op."""
+    import datetime
+    weeks = normalize_history_retention_weeks(weeks, default=0)
+    if weeks <= 0 or not history:
+        return list(history), 0
+    now = now or datetime.datetime.now()
+    cutoff = now - datetime.timedelta(weeks=weeks)
+    kept = []
+    for e in history:
+        ts = e.get("timestamp") if isinstance(e, dict) else None
+        try:
+            when = datetime.datetime.fromisoformat(ts)
+        except (TypeError, ValueError):
+            kept.append(e)
+            continue
+        if when >= cutoff:
+            kept.append(e)
+    return kept, len(history) - len(kept)
+
+
+def prune_history(weeks=None, now=None):
+    """Age-prune history.json in place (thread-safe). Returns the number of
+    entries removed. Writes only when something was dropped."""
+    if weeks is None:
+        weeks = HISTORY_RETENTION_WEEKS
+    with _history_lock:
+        history = load_history()
+        kept, removed = _prune_history_list(history, weeks, now=now)
+        if removed:
+            save_history(kept)
+    return removed
+
+
+def clear_history():
+    """Delete every history entry (thread-safe, atomic write). Returns the
+    number of entries removed."""
+    with _history_lock:
+        n = len(load_history())
+        save_history([])
+    return n
 
 
 def load_history():
@@ -13145,8 +13248,159 @@ def add_history_entry(text, duration_sec=0, model="", source="microphone", task=
     }
     with _history_lock:
         history = load_history()
+        history, _ = _prune_history_list(history, HISTORY_RETENTION_WEEKS)
         history.append(entry)
         save_history(history)
+
+
+# ============================================================
+# Colored menu-item icons (Win32 native menus render emoji MONOCHROME)
+# ============================================================
+# pystray builds the tray menu as a classic Win32 popup menu with MIIM_STRING
+# items, so an emoji in the label (e.g. "📝  Start Meeting") is drawn by the
+# menu font in monochrome. To get a COLOR icon we render the emoji glyph to a
+# premultiplied 32bpp DIB and attach it to the item via MIIM_BITMAP (a standard,
+# alpha-blended menu-item bitmap). Fully defensive: any failure returns None and
+# the caller keeps the plain monochrome-emoji label, so the tray never breaks.
+_MENU_ICON_CACHE = {}
+
+
+def _render_emoji_menu_bitmap(emoji, size):
+    """Render a color emoji to a premultiplied top-down 32bpp DIB HBITMAP for a
+    Win32 menu item. Returns an HBITMAP (int) cached for the process, or None on
+    any failure."""
+    key = (emoji, int(size))
+    if key in _MENU_ICON_CACHE:
+        return _MENU_ICON_CACHE[key]
+    try:
+        import ctypes
+        from ctypes import wintypes
+        from PIL import Image, ImageFont, ImageDraw
+        size = int(size)
+        font_path = os.path.join(
+            os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "seguiemj.ttf")
+        if not os.path.exists(font_path):
+            _MENU_ICON_CACHE[key] = None
+            return None
+        # Render large for crisp downscaled edges; the color glyph needs
+        # embedded_color=True (Segoe UI Emoji is a COLR/CPAL font).
+        render_px = max(size * 4, 64)
+        img = Image.new("RGBA", (render_px, render_px), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        font = ImageFont.truetype(font_path, int(render_px * 0.75))
+        draw.text((render_px / 2, render_px / 2), emoji, font=font,
+                  embedded_color=True, anchor="mm")
+        img = img.resize((size, size), Image.LANCZOS)
+        # Premultiply alpha into BGRA (menus AlphaBlend 32bpp item bitmaps).
+        src = img.load()
+        buf = bytearray(size * size * 4)
+        i = 0
+        for y in range(size):
+            for x in range(size):
+                r, g, b, a = src[x, y]
+                buf[i] = b * a // 255
+                buf[i + 1] = g * a // 255
+                buf[i + 2] = r * a // 255
+                buf[i + 3] = a
+                i += 4
+
+        class BITMAPINFOHEADER(ctypes.Structure):
+            _fields_ = [("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
+                        ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
+                        ("biBitCount", wintypes.WORD),
+                        ("biCompression", wintypes.DWORD),
+                        ("biSizeImage", wintypes.DWORD),
+                        ("biXPelsPerMeter", wintypes.LONG),
+                        ("biYPelsPerMeter", wintypes.LONG),
+                        ("biClrUsed", wintypes.DWORD),
+                        ("biClrImportant", wintypes.DWORD)]
+        gdi = ctypes.windll.gdi32
+        user = ctypes.windll.user32
+        bmi = BITMAPINFOHEADER()
+        bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.biWidth = size
+        bmi.biHeight = -size          # negative => top-down
+        bmi.biPlanes = 1
+        bmi.biBitCount = 32
+        bmi.biCompression = 0         # BI_RGB
+        ppv = ctypes.c_void_p()
+        gdi.CreateDIBSection.restype = wintypes.HBITMAP
+        hdc = user.GetDC(None)
+        try:
+            hbmp = gdi.CreateDIBSection(
+                hdc, ctypes.byref(bmi), 0, ctypes.byref(ppv), None, 0)
+        finally:
+            user.ReleaseDC(None, hdc)
+        if not hbmp or not ppv.value:
+            _MENU_ICON_CACHE[key] = None
+            return None
+        ctypes.memmove(ppv, bytes(buf), len(buf))
+        _MENU_ICON_CACHE[key] = hbmp
+        return hbmp
+    except Exception:
+        _MENU_ICON_CACHE[key] = None
+        return None
+
+
+def _set_menu_item_bitmap(hmenu, contains, hbitmap):
+    """Attach `hbitmap` (MIIM_BITMAP) to the first item in `hmenu` whose caption
+    contains `contains`. Returns True on success, False otherwise. Defensive."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user = ctypes.windll.user32
+        MIIM_STRING = 0x00000040
+        MIIM_BITMAP = 0x00000080
+
+        class MENUITEMINFOW(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT), ("fMask", wintypes.UINT),
+                        ("fType", wintypes.UINT), ("fState", wintypes.UINT),
+                        ("wID", wintypes.UINT), ("hSubMenu", wintypes.HMENU),
+                        ("hbmpChecked", wintypes.HBITMAP),
+                        ("hbmpUnchecked", wintypes.HBITMAP),
+                        ("dwItemData", ctypes.c_void_p),
+                        ("dwTypeData", wintypes.LPWSTR), ("cch", wintypes.UINT),
+                        ("hbmpItem", wintypes.HBITMAP)]
+        count = user.GetMenuItemCount(hmenu)
+        if count < 0:
+            return False
+        for i in range(count):
+            info = MENUITEMINFOW()
+            info.cbSize = ctypes.sizeof(MENUITEMINFOW)
+            info.fMask = MIIM_STRING
+            info.dwTypeData = None
+            info.cch = 0
+            if not user.GetMenuItemInfoW(hmenu, i, True, ctypes.byref(info)):
+                continue
+            n = info.cch
+            if not n:
+                continue
+            buf = ctypes.create_unicode_buffer(n + 1)
+            info.dwTypeData = ctypes.cast(buf, wintypes.LPWSTR)
+            info.cch = n + 1
+            info.fMask = MIIM_STRING
+            if not user.GetMenuItemInfoW(hmenu, i, True, ctypes.byref(info)):
+                continue
+            if contains in buf.value:
+                setinfo = MENUITEMINFOW()
+                setinfo.cbSize = ctypes.sizeof(MENUITEMINFOW)
+                setinfo.fMask = MIIM_BITMAP
+                setinfo.hbmpItem = hbitmap
+                return bool(user.SetMenuItemInfoW(
+                    hmenu, i, True, ctypes.byref(setinfo)))
+        return False
+    except Exception:
+        return False
+
+
+def _menu_icon_size():
+    """The pixel size for a menu-item icon (small-icon metric), fallback 16."""
+    try:
+        import ctypes
+        n = ctypes.windll.user32.GetSystemMetrics(49)   # SM_CXSMICON
+        return n if 12 <= n <= 64 else 16
+    except Exception:
+        return 16
 
 
 # ============================================================
@@ -16742,6 +16996,27 @@ class LiaApp:
                 log.warning("Vocabulary store init failed (manual list only): %s", e)
                 self._vocab_store = None
 
+        # Hebrew lexicon post-pass (fixes ביטולין -> ביטולים). The dictionary is
+        # downloaded on first enable (Settings > Vocabulary); loaded here on a
+        # daemon thread so it never delays model load. No-op until loaded.
+        self._lexicon = None
+        self._lexicon_protected_cache = None
+        if lexicon_mod is not None:
+            try:
+                dic = os.path.join(CONFIG_DIR, "lexicon", "he_IL.dic")
+                self._lexicon = lexicon_mod.Lexicon(dic)
+                if self.config.get("lexicon_fix_enabled") and os.path.exists(dic):
+                    def _load_lex():
+                        try:
+                            self._lexicon.load()
+                            log.info("Lexicon loaded: %d words", self._lexicon.word_count())
+                        except Exception as e:
+                            log.warning("Lexicon load failed (no-op): %s", e)
+                    threading.Thread(target=_load_lex, daemon=True).start()
+            except Exception as e:
+                log.warning("Lexicon init failed (no-op): %s", e)
+                self._lexicon = None
+
         # One-time: tighten the forgotten-meeting nets. The old default first
         # reminder (60 min) let sub-hour meetings slip through with no nudge; a
         # ~45-min Teams call on 2026-06-07 ended with neither a reminder nor a
@@ -17094,6 +17369,13 @@ class LiaApp:
         # thread, otherwise _load_model's `if self.tray_icon:` guard skips
         # the state changes and the icon never reflects loading progress.
         icon_image = self._create_icon("loading")
+        # Color icon for "Start Meeting" (native menus draw emoji monochrome).
+        # If the bitmap builds, drop the label emoji and let the color bitmap be
+        # the icon; otherwise keep the monochrome-emoji label as a fallback.
+        self._meeting_menu_hbitmap = _render_emoji_menu_bitmap(
+            "\U0001F4DD", _menu_icon_size())
+        start_meeting_label = ("Start Meeting" if self._meeting_menu_hbitmap
+                               else "\U0001F4DD  Start Meeting")
         menu = pystray.Menu(
             # Lean tray (2026-08-15 makeover): a status line + the daily-use
             # capture/meeting actions + History, then a single Settings entry
@@ -17121,7 +17403,7 @@ class LiaApp:
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
-                "📝  Start Meeting",
+                start_meeting_label,
                 lambda: self._toggle_meeting(summarize=True),
                 visible=lambda item: not self._is_meeting_active(),
             ),
@@ -17162,6 +17444,23 @@ class LiaApp:
         # the tray icon tells the user what Lia is doing right now.
         self.tray_icon = pystray.Icon("Lia", icon_image,
                                        "Lia - Loading model...", menu)
+
+        # Re-apply the color menu icon after every menu (re)build. pystray
+        # rebuilds the native HMENU on the first show (_mark_ready -> update_menu)
+        # and after every menu interaction, dropping any bitmap we set; a single
+        # hook on _update_menu covers all of them. Fully defensive: if anything
+        # fails the menu just shows the plain text label.
+        if self._meeting_menu_hbitmap:
+            try:
+                _orig_update_menu = self.tray_icon._update_menu
+
+                def _hooked_update_menu():
+                    _orig_update_menu()
+                    self._apply_tray_menu_icons()
+
+                self.tray_icon._update_menu = _hooked_update_menu
+            except Exception as e:
+                log.debug("Could not hook menu-icon painter: %s", e)
 
         # Now that self.tray_icon exists, start the model loader. It can
         # safely switch the icon between "loading" and "idle" based on state.
@@ -17306,6 +17605,13 @@ class LiaApp:
                 threading.Thread(target=self._display_wake_watchdog, daemon=True).start()
                 log.info("Display-wake watchdog running (threshold: %.0f min idle)",
                          wake_threshold)
+
+        # Age-prune the transcription history once per launch (the per-append
+        # prune only runs when the user dictates; this catches weeks away).
+        try:
+            self._apply_history_retention(startup=True)
+        except Exception as e:
+            log.warning("History retention prune failed: %s", e)
 
         # Audio device hot-plug detection. Runs regardless of recorder type
         # because PortAudio's MME device-list cache is process-wide — the
@@ -19433,6 +19739,11 @@ class LiaApp:
 
                     # Single paste of complete text
                     if text:
+                        # Diagnostic capture (WP0) BEFORE cleanup/snippets so the
+                        # sidecar holds the model's RAW output. No-op unless on.
+                        self._debug_capture_dictation(
+                            audio, text, bias_ok=bias_ok, duration_sec=duration_sec,
+                            pre_gain_peak_rms=audio_rms, source=source)
                         # LLM cleanup (removes filler words, fixes punctuation)
                         # before we log/paste. Best-effort — never blocks paste.
                         text = self._cleanup_if_enabled(text, is_translation=(self._get_task() == "translate"))
@@ -19496,6 +19807,10 @@ class LiaApp:
                         text = ""
 
                     if text:
+                        # Diagnostic capture (WP0), raw model output. No-op unless on.
+                        self._debug_capture_dictation(
+                            audio, text, bias_ok=bias_ok, duration_sec=duration_sec,
+                            pre_gain_peak_rms=audio_rms, source=source)
                         # LLM cleanup (see comment in partial-path above)
                         text = self._cleanup_if_enabled(text, is_translation=(self._get_task() == "translate"))
                         # Expand a whole-utterance snippet cue BEFORE log/history so
@@ -22223,6 +22538,69 @@ class LiaApp:
             return
         play_beep(1000, 100, device_index=device)
 
+    def _debug_capture_dictation(self, audio, text, *, bias_ok, duration_sec,
+                                 pre_gain_peak_rms, source):
+        """Diagnostic capture for the question-mark / prosody bench (WP0). When
+        debug_keep_dictation_clips is on, save this clip (post auto-gain WAV,
+        exactly what the model saw) + a JSON sidecar (raw text, bias_ok,
+        duration, pre-gain peak RMS, model, route, source) under
+        %APPDATA%\\Lia\\debug_clips\\, ring-buffered to debug_clips_ring. Fully
+        defensive - never raises into the dictation path; a capture failure is
+        logged once and dictation continues untouched."""
+        if not self.config.get("debug_keep_dictation_clips", False):
+            return
+        try:
+            import datetime as _dt
+            import wave as _wave
+            d = os.path.join(CONFIG_DIR, "debug_clips")
+            os.makedirs(d, exist_ok=True)
+            stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S_") + \
+                f"{_dt.datetime.now().microsecond // 1000:03d}"
+            wav_path = os.path.join(d, f"dict_{stamp}.wav")
+            pcm = (np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0)
+                   * 32767.0).astype("<i2")
+            with _wave.open(wav_path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(16000)
+                w.writeframes(pcm.tobytes())
+            route = None
+            lt = getattr(self, "_local_transcriber", None)
+            if isinstance(lt, BilingualRouterTranscriber):
+                route = getattr(lt, "_last_route", None)
+            sidecar = {
+                "wav": os.path.basename(wav_path),
+                "text": text or "",
+                "bias_ok": bool(bias_ok),
+                "duration_sec": round(float(duration_sec), 3),
+                "pre_gain_peak_rms": round(float(pre_gain_peak_rms), 5),
+                "model": self.config.get("model_size"),
+                "backend": self.config.get("transcription_backend"),
+                "route": route,
+                "source": source,
+                "cleanup_style": self.config.get("cleanup_style", "off"),
+                "ts": stamp,
+            }
+            with open(wav_path[:-4] + ".json", "w", encoding="utf-8") as f:
+                json.dump(sidecar, f, ensure_ascii=False, indent=2)
+            # Ring-buffer: keep only the newest N (WAV+JSON pairs) by name (the
+            # stamp sorts chronologically).
+            try:
+                ring = max(1, int(self.config.get("debug_clips_ring", 100)))
+            except (TypeError, ValueError):
+                ring = 100
+            wavs = sorted(f for f in os.listdir(d) if f.endswith(".wav"))
+            for old in wavs[:-ring]:
+                for ext in (".wav", ".json"):
+                    try:
+                        os.remove(os.path.join(d, old[:-4] + ext))
+                    except OSError:
+                        pass
+        except Exception as e:
+            if not getattr(self, "_debug_capture_warned", False):
+                self._debug_capture_warned = True
+                log.warning("Dictation debug-capture failed (will not re-log): %s", e)
+
     def _is_likely_hallucination(self, text, audio_rms, duration_sec):
         """Heuristic: post-transcription, decide whether the model invented
         words from near-silent audio.
@@ -22530,6 +22908,57 @@ class LiaApp:
         self.config["clipboard_auto_restore"] = new_val
         save_config(self.config)
         log.info("Clipboard auto-restore: %s", "ON" if new_val else "OFF")
+
+    def _apply_tray_menu_icons(self):
+        """Paint the color bitmap onto the 'Start Meeting' menu item. Called
+        after every pystray menu rebuild (see the _update_menu hook). No-op if
+        the bitmap didn't build or the menu handle isn't ready yet."""
+        hb = getattr(self, "_meeting_menu_hbitmap", None)
+        icon = getattr(self, "tray_icon", None)
+        if not hb or icon is None:
+            return
+        handle = getattr(icon, "_menu_handle", None)
+        if not handle:
+            return
+        try:
+            _set_menu_item_bitmap(handle[0], "Start Meeting", hb)
+        except Exception:
+            pass
+
+    def _apply_history_retention(self, startup=False):
+        """Sync the module-level retention from config and prune now."""
+        global HISTORY_RETENTION_WEEKS
+        weeks = normalize_history_retention_weeks(
+            self.config.get("history_retention_weeks", 2))
+        HISTORY_RETENTION_WEEKS = weeks
+        removed = prune_history(weeks)
+        if removed or startup:
+            log.info("History retention: %s - pruned %d entr%s",
+                     ("%d week(s)" % weeks) if weeks else "keep all",
+                     removed, "y" if removed == 1 else "ies")
+        return removed
+
+    def _set_history_retention_weeks(self, weeks):
+        """Settings -> General -> History: keep entries for N weeks (1-12;
+        0 = keep all). Prunes immediately."""
+        w = normalize_history_retention_weeks(weeks, default=-1)
+        if w < 0:
+            return (False, "Weeks must be a number 0-%d" % HISTORY_RETENTION_MAX_WEEKS)
+        self.config["history_retention_weeks"] = w
+        save_config(self.config)
+        removed = self._apply_history_retention()
+        if not w:
+            return (True, "History kept until you delete it")
+        return (True, "Keeping %d week%s of history%s" % (
+            w, "" if w == 1 else "s",
+            (" - removed %d older entr%s" % (removed, "y" if removed == 1 else "ies"))
+            if removed else ""))
+
+    def _clear_history(self):
+        """Settings / History window -> Delete all history."""
+        n = clear_history()
+        log.info("History cleared by the user (%d entries)", n)
+        return (True, "Deleted %d history entr%s" % (n, "y" if n == 1 else "ies"))
 
     def _toggle_press_enter_after_paste(self):
         """Flip the 'press Enter after auto-paste' setting — dictate + send
@@ -24192,6 +24621,7 @@ class LiaApp:
         """Push the current composed vocabulary into every LIVE transcriber
         (dictation backends + cached meeting/file transcribers) so the next
         recording uses it without a restart."""
+        self._lexicon_protected_cache = None   # vocab changed -> rebuild protected set
         vocab = self._composed_vocabulary()
         targets = [getattr(self, n, None) for n in
                    ("_local_transcriber", "_groq_transcriber",
@@ -24239,10 +24669,186 @@ class LiaApp:
                 log.info("Vocab corrections applied (%s): %s", label or "text",
                          _fmt_user_text(self.config,
                                         ", ".join("%s×%d" % kv for kv in counts.items())))
-            return fixed
         except Exception as e:
             log.warning("Vocab corrections failed (%s): %s", label, e)
-            return text
+            fixed = text
+        # Hebrew lexicon post-pass: runs AFTER the user table (the user's fixes
+        # win). Auto-applies ONLY the guarded -ין->-ים plural; other unknown
+        # Hebrew words become suggestions for the corrections table. Fully
+        # guarded - a no-op unless enabled AND the dictionary is loaded.
+        lex = getattr(self, "_lexicon", None)
+        if (lex is not None and lex.ready
+                and self.config.get("lexicon_fix_enabled")):
+            try:
+                fixed, fixes, oov = lex.fix(fixed, protected=self._lexicon_protected())
+                if fixes:
+                    log.info("Lexicon fix (%s): %s", label or "text",
+                             _fmt_user_text(self.config,
+                                            "; ".join("%s→%s" % p for p in fixes)))
+                if oov and self.config.get("lexicon_suggest_enabled", True):
+                    store.add_oov_candidates(oov, label=label or "")
+            except Exception as e:
+                log.warning("Lexicon fix failed (%s): %s", label, e)
+        return fixed
+
+    def _lexicon_protected(self):
+        """Words the lexicon fix must never rewrite: the user's approved
+        vocabulary terms + the RIGHT sides of the corrections table (things the
+        user explicitly wants spelled that way). Cached; invalidated when the
+        vocabulary changes (see _push_vocabulary_live)."""
+        cache = getattr(self, "_lexicon_protected_cache", None)
+        if cache is not None:
+            return cache
+        prot = set()
+        store = getattr(self, "_vocab_store", None)
+        if store is not None:
+            try:
+                for t in store.approved_terms():
+                    prot.update((t or "").split())
+                for c in store.corrections():
+                    prot.update((c.get("right") or "").split())
+            except Exception:
+                pass
+        self._lexicon_protected_cache = prot
+        return prot
+
+    # ---- Hebrew lexicon post-pass: download + settings actions --------------
+    def _lexicon_dir(self):
+        return os.path.join(CONFIG_DIR, "lexicon")
+
+    def _lexicon_dic_path(self):
+        return os.path.join(self._lexicon_dir(), "he_IL.dic")
+
+    def _lexicon_status(self):
+        """Status for the Settings > Vocabulary panel."""
+        dic = self._lexicon_dic_path()
+        lex = getattr(self, "_lexicon", None)
+        installed = os.path.exists(dic)
+        size_mb = round(os.path.getsize(dic) / 1e6, 1) if installed else 0.0
+        return {
+            "installed": installed,
+            "loaded": bool(lex is not None and lex.ready),
+            "enabled": bool(self.config.get("lexicon_fix_enabled")),
+            "suggest": bool(self.config.get("lexicon_suggest_enabled", True)),
+            "size_mb": size_mb,
+            "words": lex.word_count() if (lex is not None and lex.ready) else 0,
+        }
+
+    def _lexicon_install(self, raw_bytes, license_text=None):
+        """Verify `raw_bytes` against the pinned sha256, install as the dictionary,
+        load it, and enable the fix. Returns (ok, msg). No network - the caller
+        supplies the bytes (testable, and keeps hashlib off the download thread's
+        error paths). A checksum mismatch installs NOTHING (fail-loud, S43 WP4)."""
+        import hashlib
+        got = hashlib.sha256(raw_bytes).hexdigest()
+        if got != LEXICON_HE_SHA256:
+            log.error("Lexicon checksum mismatch: got %s expected %s",
+                      got, LEXICON_HE_SHA256)
+            return (False, "Dictionary checksum mismatch - not installed")
+        d = self._lexicon_dir()
+        os.makedirs(d, exist_ok=True)
+        tmp = self._lexicon_dic_path() + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(raw_bytes)
+        os.replace(tmp, self._lexicon_dic_path())
+        if license_text:
+            try:
+                with open(os.path.join(d, "LICENSE-hspell.txt"), "w",
+                          encoding="utf-8") as f:
+                    f.write(license_text)
+            except Exception as e:
+                log.warning("Lexicon license write failed (non-fatal): %s", e)
+        if self._lexicon is None and lexicon_mod is not None:
+            self._lexicon = lexicon_mod.Lexicon(self._lexicon_dic_path())
+        if self._lexicon is not None:
+            self._lexicon.load()
+        self.config["lexicon_fix_enabled"] = True
+        save_config(self.config)
+        log.info("Lexicon installed + loaded: %d words",
+                 self._lexicon.word_count() if self._lexicon else 0)
+        return (True, "Hebrew dictionary ready")
+
+    def _lexicon_download(self):
+        """Fetch the Hebrew word list (AGPL, ~5.7 MB) from the pinned URL and
+        install it via _lexicon_install (sha256-verified). NOT shipped with Lia -
+        the model-weights pattern. Runs on a daemon thread; returns immediately."""
+        if lexicon_mod is None:
+            return (False, "Lexicon module unavailable")
+
+        def worker():
+            try:
+                import requests
+            except Exception:
+                self.overlay.show_error("requests unavailable - cannot download")
+                return
+            self.overlay.show("  ⬇  Downloading Hebrew dictionary (5.7 MB, one-time)…  ",
+                              bg_color="#1e64c8", duration=4000)
+            try:
+                r = requests.get(LEXICON_HE_URL, timeout=60)
+                r.raise_for_status()
+                lic = None
+                try:
+                    lr = requests.get(LEXICON_HE_LICENSE_URL, timeout=30)
+                    lic = lr.text if lr.ok else None
+                except Exception as e:
+                    log.warning("Lexicon license fetch failed (non-fatal): %s", e)
+                ok, msg = self._lexicon_install(r.content, license_text=lic)
+                if ok:
+                    self.overlay.show("  ✓  Hebrew dictionary ready - ביטולין → ביטולים  ",
+                                      bg_color="#1a7a3a", duration=4000)
+                    self._settings_push_state()
+                else:
+                    self.overlay.show_error(msg)
+            except Exception as e:
+                log.warning("Lexicon download failed: %s", e)
+                self.overlay.show_error("Dictionary download failed: %s" % str(e)[:80])
+
+        threading.Thread(target=worker, daemon=True).start()
+        return (True, "Downloading the Hebrew dictionary…")
+
+    def _toggle_lexicon_fix(self):
+        """Flip the -ין->-ים auto-fix. Loads the dictionary if enabling and it's
+        installed but not yet loaded."""
+        new_val = not bool(self.config.get("lexicon_fix_enabled"))
+        self.config["lexicon_fix_enabled"] = new_val
+        save_config(self.config)
+        log.info("Lexicon fix: %s", "ON" if new_val else "OFF")
+        lex = getattr(self, "_lexicon", None)
+        if new_val and lex is not None and not lex.ready \
+                and os.path.exists(self._lexicon_dic_path()):
+            def _load():
+                try:
+                    lex.load()
+                    log.info("Lexicon loaded: %d words", lex.word_count())
+                except Exception as e:
+                    log.warning("Lexicon load failed: %s", e)
+            threading.Thread(target=_load, daemon=True).start()
+
+    def _toggle_lexicon_suggest(self):
+        new_val = not bool(self.config.get("lexicon_suggest_enabled", True))
+        self.config["lexicon_suggest_enabled"] = new_val
+        save_config(self.config)
+        log.info("Lexicon suggestions: %s", "ON" if new_val else "OFF")
+
+    def _lexicon_oov_list(self):
+        """OOV suggestions (unknown Hebrew words the fix did NOT auto-correct),
+        most-frequent first, for the Vocabulary page."""
+        st = getattr(self, "_vocab_store", None)
+        return st.oov_candidates() if st else []
+
+    def _lexicon_oov_dismiss(self, words):
+        st = getattr(self, "_vocab_store", None)
+        if not st:
+            return (False, "No vocabulary store")
+        n = st.dismiss_oov(words or [])
+        return (True, "%d suggestion(s) dismissed." % n)
+
+    def _settings_push_state(self):
+        """Push a fresh settings state to an open child (no-op if none)."""
+        try:
+            self._settings_send({"t": "state", "state": self._settings_state()})
+        except Exception:
+            pass
 
     def _vocab_take_corrections(self, source="summary"):
         """Collect the pairs the summary model just proposed (cleaner
@@ -25649,6 +26255,23 @@ class LiaApp:
         except Exception as e:
             return (False, str(e)[:120])
 
+    def _toggle_debug_capture(self):
+        """Flip the diagnostic dictation-clip capture (WP0 bench)."""
+        new_val = not bool(self.config.get("debug_keep_dictation_clips", False))
+        self.config["debug_keep_dictation_clips"] = new_val
+        save_config(self.config)
+        log.info("Dictation debug-capture: %s", "ON" if new_val else "OFF")
+
+    def _open_debug_clips_dir(self):
+        """Open (creating if needed) the diagnostic clips folder."""
+        d = os.path.join(CONFIG_DIR, "debug_clips")
+        try:
+            os.makedirs(d, exist_ok=True)
+            os.startfile(d)
+            return (True, "Opened debug_clips folder.")
+        except Exception as e:
+            return (False, str(e)[:120])
+
     # --- the action allowlist (name -> (bound callable, is_slow)) ---
     def _settings_action_map(self):
         A = {}
@@ -25666,6 +26289,8 @@ class LiaApp:
         add("toggle_silent_mode", self._toggle_silent_mode)
         add("toggle_auto_start", self._toggle_auto_start, True)
         add("set_beep_device", self._set_beep_device)
+        add("set_history_retention_weeks", self._set_history_retention_weeks)
+        add("clear_history", self._clear_history)
         # Audio
         add("toggle_record_mic", self._toggle_record_mic)
         add("toggle_record_system", self._toggle_record_system)
@@ -25729,6 +26354,12 @@ class LiaApp:
         add("toggle_corrections_autoharvest", self._toggle_corrections_autoharvest)
         add("vocab_rebuild", self._vocab_rebuild, True)
         add("toggle_vocab_autolearn", self._toggle_vocab_autolearn)
+        # Hebrew lexicon post-pass
+        add("lexicon_download", self._lexicon_download, True)
+        add("toggle_lexicon_fix", self._toggle_lexicon_fix)
+        add("toggle_lexicon_suggest", self._toggle_lexicon_suggest)
+        add("lexicon_oov_list", self._lexicon_oov_list)
+        add("lexicon_oov_dismiss", self._lexicon_oov_dismiss)
         # Snippets
         add("snippets_get", self._snippets_get)
         add("snippets_set", self._snippets_set_result)
@@ -25737,6 +26368,8 @@ class LiaApp:
         add("open_log", self._settings_open_log)
         add("open_config_dir", self._settings_open_config_dir)
         add("report_problem", self._settings_report_problem, True)
+        add("toggle_debug_capture", self._toggle_debug_capture)
+        add("open_debug_clips_dir", self._open_debug_clips_dir)
         add("quit_app", self._quit)
         add("delete_all_data", self._settings_delete_all_data, True)
         return A
@@ -25753,7 +26386,7 @@ class LiaApp:
     _SETTINGS_READONLY_METHODS = {"vocab_pending_list", "vocab_learned_list",
                                   "vocab_corrections_list", "vocab_corrections_scan",
                                   "snippets_get", "capture_hotkey", "test_remote",
-                                  "serve_status"}
+                                  "serve_status", "lexicon_oov_list"}
 
     def _settings_status_line(self):
         if self._is_meeting_active():
@@ -26024,6 +26657,7 @@ class LiaApp:
                       "meetings": MEETINGS_DIR},
             "tables": self._settings_tables(ollama=ollama),
             "serve": self._settings_serve_status(),
+            "lexicon": self._lexicon_status(),
         }
         if devices:
             state["mics"] = [{"idx": i, "name": n} for i, n in list_input_devices()]
