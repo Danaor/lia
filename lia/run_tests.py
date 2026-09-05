@@ -182,12 +182,19 @@ def t_config_corrupt():
     try:
         cfg = w.load_config()
         assert cfg["hotkey"] == "ctrl+space", "should fall back to defaults"
+        # A hand-edited file saved by Notepad carries a UTF-8 BOM - that is a
+        # VALID config, not a corrupt one (laptop, 2026-09-05: the whole
+        # config was silently discarded to defaults).
+        with open(cfg_path, "w", encoding="utf-8-sig") as f:
+            f.write(json.dumps({"hotkey": "ctrl+shift+b", "transcription_backend": "groq"}))
+        cfg = w.load_config()
+        assert cfg["hotkey"] == "ctrl+shift+b", "BOM config must load, got %r" % cfg["hotkey"]
     finally:
         w.CONFIG_DIR = original_dir
         w.CONFIG_FILE = original_file
 
 
-_test("corrupt config falls back to defaults gracefully", t_config_corrupt)
+_test("corrupt config falls back to defaults gracefully (BOM is NOT corrupt)", t_config_corrupt)
 
 
 def t_secret_store_config_encryption():
@@ -4819,6 +4826,140 @@ def t_model_load_failure_recovery():
 
 _test("startup: model-load failure recovers onto cloud/server + auto-opens Settings",
       t_model_load_failure_recovery)
+
+
+def t_no_gpu_needs_setup_state():
+    """Laptop 2026-09-05: no GPU + no backend left the tray BLUE "Loading
+    model..." forever (the loader gave up before the tray existed, and the
+    direct icon set was clobbered by _refresh_tray) and Settings said "Loading
+    model". The arbiter + status line must render a setup prompt, and it must
+    clear itself once a backend loads."""
+    import inspect
+    import lia as w
+    App = w.LiaApp
+    app = App.__new__(App)
+    app.model_loaded = False
+    app._needs_setup = True
+    app.is_recording = False
+    app._compose_active = False
+    app._compose_instr_active = False
+    app._voice_ask_active = False
+    app._is_meeting_active = lambda: False
+    app._create_icon = lambda state: state
+    app._set_title = lambda t: setattr(app.tray_icon, "title", t)
+
+    class _Tray:
+        icon = None
+        title = None
+        def update_menu(self):
+            pass
+    app.tray_icon = _Tray()
+    app._refresh_tray(update_menu=True)
+    assert app.tray_icon.icon == "error", app.tray_icon.icon
+    assert "Transcription server" in app.tray_icon.title, app.tray_icon.title
+    assert "Loading" not in app._settings_status_line()
+    assert "set up" in app._settings_status_line()
+    # a backend loaded later -> the prompt clears by itself
+    app.model_loaded = True
+    app._refresh_tray(update_menu=True)
+    assert app.tray_icon.icon == "idle" and app._settings_status_line() == "Ready"
+    # default (attribute never set) is NOT needs-setup
+    fresh = App.__new__(App)
+    fresh.model_loaded = False
+    assert fresh._needs_setup_state() is False
+    # the no-backend branch sets the flag + routes through the arbiter; the
+    # tray-ready callback re-applies state that landed before the icon existed
+    src = inspect.getsource(App._load_model)
+    assert "self._needs_setup = True" in src
+    assert 'self.tray_icon.icon = self._create_icon("error")' not in src.split("_needs_setup = True")[1].split("_auto_open_settings_on_error")[0]
+    run_src = inspect.getsource(App.run)   # tray-ready repaints from the real state
+    assert "_model_loading" in run_src and "self._refresh_tray(update_menu=True)" in run_src
+    # selecting a cloud/server backend from Settings makes dictation usable at
+    # once (model_loaded) - no restart after the no-GPU first run
+    sb = inspect.getsource(App._set_backend)
+    assert 'if backend != "local" and self.transcriber is not None' in sb
+    assert "self.model_loaded = True" in sb
+    # the no-GPU gate must not skip the CPU-by-design local model (Parakeet)
+    assert "parakeet-tdt-0.6b-v2" in w.CPU_FRIENDLY_MODELS
+    assert 'not in CPU_FRIENDLY_MODELS' in src, "no_gpu gate must exempt CPU-friendly models"
+
+
+_test("startup: no GPU + no backend shows a setup prompt, never a stuck blue 'Loading model'",
+      t_no_gpu_needs_setup_state)
+
+
+def t_model_state_truth():
+    """Naor, 2026-09-05: nobody may sit on "LOADING MODEL". One truthful
+    _model_state drives the tray icon/title, the menu status line and the
+    Settings status: "Loading model" ONLY while _load_model is running;
+    failed / needs-setup / never-loaded each say what to do; the tray is never
+    green while the model is not loaded; the loader's finally repaints."""
+    import inspect
+    import lia as w
+    App = w.LiaApp
+
+    def fresh():
+        app = App.__new__(App)
+        app.model_loaded = False
+        app.is_recording = False
+        app._compose_active = app._compose_instr_active = app._voice_ask_active = False
+        app._is_meeting_active = lambda: False
+        app._create_icon = lambda state: state
+        app._set_title = lambda t: setattr(app.tray_icon, "title", t)
+
+        class _Tray:
+            icon = None
+            title = None
+            def update_menu(self):
+                pass
+        app.tray_icon = _Tray()
+        return app
+
+    # loading: only while the loader runs
+    app = fresh()
+    app._model_loading = True
+    app._model_load_t0 = w.time.time()
+    assert app._model_state()[0] == "loading"
+    assert app._settings_status_line().startswith("Loading model")
+    app._refresh_tray()
+    assert app.tray_icon.icon == "loading", app.tray_icon.icon
+    app._model_load_t0 = w.time.time() - 3 * 60     # long load -> elapsed + hint
+    assert "3 min" in app._settings_status_line() and "Settings > Models" in app._settings_status_line()
+    # loader finished without loading anything, no error, no setup flag
+    app._model_loading = False
+    kind, text = app._model_state()
+    assert kind == "unloaded" and "Loading" not in text and "Restart" in text, (kind, text)
+    app._refresh_tray()
+    assert app.tray_icon.icon == "error" and app.tray_icon.title.startswith("Lia - Model not loaded")
+    # failed
+    app._model_load_error = "CUDA out of memory"
+    kind, text = app._model_state()
+    assert kind == "failed" and "CUDA" in text and "Loading" not in text
+    app._refresh_tray()
+    assert app.tray_icon.icon == "error"
+    # needs setup wins over a stale error text
+    app._needs_setup = True
+    assert app._model_state()[0] == "needs_setup"
+    # ready clears everything
+    app.model_loaded = True
+    assert app._model_state() == ("ready", "Ready") and app._settings_status_line() == "Ready"
+    app._refresh_tray()
+    assert app.tray_icon.icon == "idle"
+    # a brand-new app (loader thread not yet started) is "unloaded", not "loading"
+    assert fresh()._model_state()[0] == "unloaded"
+    # wiring: the loader sets/clears the flag in a finally + repaints; the
+    # hotkey drop path shows WHY; status line is the single source of truth
+    src = inspect.getsource(App._load_model)
+    assert "self._model_loading = True" in src and "finally:" in src
+    assert src.index("finally:") < src.index("self._model_loading = False")
+    assert "_model_load_error = str(e)" in src
+    assert "_model_state()" in inspect.getsource(App._hotkey_listener)
+    assert "_model_state()[1]" in inspect.getsource(App._settings_status_line)
+    assert "Loading model" not in inspect.getsource(App._settings_status_line)
+
+
+_test("model state: 'Loading model' only while actually loading; failed/unloaded say what to do",
+      t_model_state_truth)
 
 
 def t_tray_title_cap_and_prewarm_loop_guard():

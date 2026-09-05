@@ -1727,6 +1727,13 @@ MODELS = {
     "large-v3": "General Large (best translation)",
 }
 
+# Local models that are the CPU story by design (int8 ONNX, several-x realtime
+# on a plain CPU). The no-GPU startup gate skips the heavy Whisper models on a
+# GPU-less machine, but must NOT skip these - a user who picks Parakeet on a
+# laptop wants exactly that (2026-09-05: it was skipped, tray green, Settings
+# stuck on "Loading model", no dictation).
+CPU_FRIENDLY_MODELS = {"parakeet-tdt-0.6b-v2"}
+
 # Auto-detect language from model
 MODEL_LANGUAGE = {
     "ivrit-ai/whisper-large-v3-turbo-ct2": "he",
@@ -1968,7 +1975,10 @@ def load_config():
     os.makedirs(CONFIG_DIR, exist_ok=True)
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            # utf-8-sig: Notepad saves a hand-edited config.json WITH a BOM,
+            # and plain utf-8 then rejected the whole file ("Unexpected UTF-8
+            # BOM") and silently fell back to defaults (laptop, 2026-09-05).
+            with open(CONFIG_FILE, "r", encoding="utf-8-sig") as f:
                 cfg = json.load(f)
         except (json.JSONDecodeError, IOError) as e:
             log.warning("Config file corrupt or unreadable (%s) — using defaults", e)
@@ -12522,18 +12532,18 @@ def _stamp_lia_launcher(exe_path):
         return False
     try:
         vi = VSVersionInfo(
-            ffi=FixedFileInfo(filevers=(1, 4, 2, 0), prodvers=(1, 4, 2, 0),
+            ffi=FixedFileInfo(filevers=(1, 4, 3, 0), prodvers=(1, 4, 3, 0),
                               mask=0x3f, flags=0x0, OS=0x40004,
                               fileType=0x1, subtype=0x0),
             kids=[
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.4.2.0'),
+                    StringStruct('FileVersion', '1.4.3.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.4.2.0'),
+                    StringStruct('ProductVersion', '1.4.3.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -17678,6 +17688,11 @@ class LiaApp:
             icon.visible = True
             log.info("Tray icon registered and visible")
             _startup_trace("tray-ready")
+            # The loader may have finished (or given up: no GPU, no backend)
+            # BEFORE the icon existed - the icon was born "Loading model..."
+            # and nothing would ever repaint it. Re-apply the real state.
+            if not getattr(self, "_model_loading", False):
+                self._refresh_tray(update_menu=True)
             threading.Thread(target=self._tray_first_run_onboarding,
                              args=(icon,), daemon=True).start()
 
@@ -17941,6 +17956,12 @@ class LiaApp:
         return None
 
     def _load_model(self):
+        # Truthful model state for the tray + Settings: "Loading model" is shown
+        # ONLY while this thread is actually running (see _model_state). A user
+        # must never sit on "Loading model" when nothing is loading.
+        self._model_loading = True
+        self._model_load_t0 = time.time()
+        self._model_load_error = None
         try:
             # Show blue icon while loading
             if self.tray_icon:
@@ -17954,7 +17975,8 @@ class LiaApp:
             # model without a painful download + slow CPU load that freezes
             # startup - it's meant to be a CLIENT. We skip the local load on such
             # machines (see the local-primary branch + the fallback gate below).
-            no_gpu = (self._gpu_status().get("verdict") == "none")
+            no_gpu = (self._gpu_status().get("verdict") == "none"
+                      and self.config.get("model_size") not in CPU_FRIENDLY_MODELS)
             cloud_primary_transcriber = None
             cloud_primary_label = None
             if backend == "groq" and self._groq_transcriber is not None:
@@ -18038,14 +18060,14 @@ class LiaApp:
                     return
                 # Nothing to fall back to - stay responsive, prompt for setup.
                 self.model_loaded = False
+                self._needs_setup = True
                 self.status_text = "No GPU - set up a server"
                 log.warning("No dedicated GPU and no server/cloud configured - "
                             "skipping the local model load. Open Settings > "
                             "Transcription server to connect to one.")
-                if self.tray_icon:
-                    self.tray_icon.icon = self._create_icon("error")
-                    self.tray_icon.title = "Lia - no GPU: set up a Transcription server"
-                    self._refresh_tray(update_menu=True)
+                # The arbiter renders this state (red X + what-to-do title); if
+                # the tray does not exist yet, on_tray_ready re-applies it.
+                self._refresh_tray(update_menu=True)
                 try:
                     self._force_show_error_overlay(
                         "No GPU here - open Settings > Transcription server to use a home server.")
@@ -18113,9 +18135,45 @@ class LiaApp:
                 self.tray_icon.icon = self._create_icon("error")
                 self._set_title(f"Lia - Model load failed: {e}")
             self.overlay.show_error("Model load failed - opening Settings")
+            self._model_load_error = str(e)[:160]
             # Drop the user straight into Settings so they can pick a backend /
             # home server, instead of hunting from a mystery red X.
             self._auto_open_settings_on_error(page="models")
+        finally:
+            self._model_loading = False
+            # Repaint from the final state (loaded / failed / needs setup) so
+            # the icon born as "Loading model..." never outlives the load.
+            if self.tray_icon:
+                try:
+                    self._refresh_tray(update_menu=True)
+                except Exception:
+                    pass
+
+    def _model_state(self):
+        """ONE truthful answer to "why isn't Lia ready?" for every surface
+        (tray icon/title, tray menu status line, Settings status, hotkey
+        feedback). Returns (kind, text):
+          ready       - a backend is loaded
+          loading     - _load_model is RUNNING right now (with elapsed minutes)
+          needs_setup - no GPU and no server/cloud backend configured
+          failed      - the load raised and nothing recovered
+          unloaded    - nothing is loading and nothing loaded (loader thread
+                        never ran or died) -> tell the user to restart/pick.
+        Guarantee: "Loading model" appears ONLY in the loading state."""
+        if getattr(self, "model_loaded", False):
+            return "ready", "Ready"
+        if getattr(self, "_model_loading", False):
+            mins = int((time.time() - getattr(self, "_model_load_t0", time.time())) // 60)
+            if mins >= 2:
+                return "loading", ("Loading model… %d min (a first download can take "
+                                   "a while; Settings > Models to switch)" % mins)
+            return "loading", "Loading model…"
+        if self._needs_setup_state():
+            return "needs_setup", "No GPU - set up a Transcription server or an API key"
+        err = getattr(self, "_model_load_error", None)
+        if err:
+            return "failed", "Model load failed - pick another model or backend (%s)" % err[:60]
+        return "unloaded", "Model not loaded - pick a model in Settings or Restart Lia"
 
     def _first_available_cloud_backend(self):
         """The first configured cloud/remote transcriber (built only when its
@@ -18392,8 +18450,15 @@ class LiaApp:
                     while not self.model_loaded and time.time() < wait_deadline:
                         time.sleep(0.05)
                     if not self.model_loaded:
-                        log.warning("Model still not ready after 20s — dropping "
-                                    "this press.")
+                        kind, text = self._model_state()
+                        log.warning("Model still not ready after 20s (%s) — dropping "
+                                    "this press.", kind)
+                        # Visible feedback (bypasses silent mode - this is an
+                        # error): the user pressed, nothing recorded, say why.
+                        try:
+                            self._force_show_error_overlay(text[:90])
+                        except Exception:
+                            pass
                         while keyboard.is_pressed(primary):
                             time.sleep(0.1)
                         time.sleep(0.1)
@@ -20797,6 +20862,16 @@ class LiaApp:
             elif self.is_recording or self._compose_instr_active or self._voice_ask_active:
                 self.tray_icon.icon = self._create_icon("recording")
                 self.tray_icon.title = "Lia - Recording..."
+            elif not self.model_loaded:
+                # Not ready: paint the TRUTH (blue only while a load is actually
+                # running; red X with a what-to-do title otherwise). Green used
+                # to lie here - "Ready" over a model that never loaded, or a
+                # blue "Loading model..." that outlived the loader when it
+                # finished before the tray existed (laptop, 2026-09-05).
+                kind, text = self._model_state()
+                self.tray_icon.icon = self._create_icon(
+                    "loading" if kind == "loading" else "error")
+                self._set_title("Lia - " + text)
             else:
                 self.tray_icon.icon = self._create_icon("idle")
                 self.tray_icon.title = "Lia - Ready"
@@ -20804,6 +20879,14 @@ class LiaApp:
                 self.tray_icon.update_menu()
         except Exception as e:
             log.debug("refresh tray failed: %s", e)
+
+    def _needs_setup_state(self):
+        """True while the no-GPU path found NO server/cloud backend and nothing
+        has been loaded since - the tray and the Settings status line show a
+        setup prompt instead of "Loading model...". Clears itself the moment a
+        backend loads (model_loaded)."""
+        return (bool(getattr(self, "_needs_setup", False))
+                and not getattr(self, "model_loaded", False))
 
     def _reset_tray_idle(self):
         """Back-compat alias — routes through the arbiter."""
@@ -25435,6 +25518,15 @@ class LiaApp:
 
         self.config["transcription_backend"] = backend
         save_config(self.config)
+        # A cloud/server backend is usable the moment it is selected. On the
+        # no-GPU path the startup loader left model_loaded=False (nothing to
+        # load), and the hotkey gate would keep refusing dictation until a
+        # restart even after the user set up a key/server here (laptop,
+        # 2026-09-05). Mark ready + repaint the tray (clears the setup prompt).
+        if backend != "local" and self.transcriber is not None:
+            self.model_loaded = True
+            self.status_text = "Ready"
+            self._refresh_tray(update_menu=True)
 
     # ================= Shared premium credential dialog =================
     # Every API-key / token screen is built by this ONE function, so they all
@@ -26477,9 +26569,7 @@ class LiaApp:
             return "Compose: recording draft…"
         if getattr(self, "is_recording", False):
             return "Recording..."
-        if not getattr(self, "model_loaded", False):
-            return "Loading model…"
-        return "Ready"
+        return self._model_state()[1]
 
     @staticmethod
     def _parakeet_available():
