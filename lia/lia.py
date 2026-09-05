@@ -12522,18 +12522,18 @@ def _stamp_lia_launcher(exe_path):
         return False
     try:
         vi = VSVersionInfo(
-            ffi=FixedFileInfo(filevers=(1, 4, 0, 0), prodvers=(1, 4, 0, 0),
+            ffi=FixedFileInfo(filevers=(1, 4, 1, 0), prodvers=(1, 4, 1, 0),
                               mask=0x3f, flags=0x0, OS=0x40004,
                               fileType=0x1, subtype=0x0),
             kids=[
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.4.0.0'),
+                    StringStruct('FileVersion', '1.4.1.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.4.0.0'),
+                    StringStruct('ProductVersion', '1.4.1.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -18021,6 +18021,7 @@ class LiaApp:
                         alt.load_model(callback=lambda msg: log.info(msg))
                     except Exception as alt_e:
                         log.warning("No-GPU: %s primary load failed: %s", alt_label, alt_e)
+                    self.transcriber = alt                        # route dictation here
                     self.config["transcription_backend"] = alt_backend  # route (in-memory)
                     self.model_loaded = True
                     self.status_text = "Ready"
@@ -18044,6 +18045,10 @@ class LiaApp:
                         "No GPU here - open Settings > Transcription server to use a home server.")
                 except Exception:
                     pass
+                # Drop the user straight onto the Transcription-server page so
+                # they connect to a home server (or add a cloud key) without
+                # hunting - the no-GPU first-run path.
+                self._auto_open_settings_on_error(page="server")
                 return
 
             # Local is primary: load it synchronously. Also validate any
@@ -18071,13 +18076,68 @@ class LiaApp:
         except Exception as e:
             self.status_text = f"Error: {e}"
             log.error("Failed to load model: %s", e)
+            # RECOVER onto any configured cloud/remote backend before a dead red
+            # X (a weak/broken GPU or a slow first-run download can fail the local
+            # load; if Groq/OpenAI/a home server is set up, use it instead of
+            # leaving the user stuck). 2026-09-05.
+            alt, alt_be, alt_label = self._first_available_cloud_backend()
+            if alt is not None:
+                try:
+                    if getattr(alt, "model", None) is None:
+                        alt.load_model(callback=lambda m: log.info(m))
+                    self.transcriber = alt
+                    self.config["transcription_backend"] = alt_be  # in-memory route
+                    self.model_loaded = True
+                    self.status_text = "Ready"
+                    log.warning("Local model load failed - recovered onto %s.", alt_label)
+                    if self.tray_icon:
+                        self._refresh_tray(update_menu=True)
+                    try:
+                        self.overlay.show("  ⚠  Local model failed - using %s  " % alt_label,
+                                          bg_color="#d08770", duration=4000)
+                    except Exception:
+                        pass
+                    return
+                except Exception as alt_e:
+                    log.warning("Cloud fallback after local-load failure failed: %s", alt_e)
             if self.tray_icon:
                 # Red X icon — NEVER green on error. Green lies that
                 # the app is ready; user would press hotkey and nothing
                 # would happen with no visible indication of why.
                 self.tray_icon.icon = self._create_icon("error")
                 self.tray_icon.title = f"Lia - Model load failed: {e}"
-            self.overlay.show_error("Model load failed")
+            self.overlay.show_error("Model load failed - opening Settings")
+            # Drop the user straight into Settings so they can pick a backend /
+            # home server, instead of hunting from a mystery red X.
+            self._auto_open_settings_on_error(page="models")
+
+    def _first_available_cloud_backend(self):
+        """The first configured cloud/remote transcriber (built only when its
+        key/URL is set), as (transcriber, backend, label), or (None, None, None).
+        Preference: home server, then Groq, OpenAI, Gemini."""
+        for tr, be, label in (
+            (getattr(self, "_remote_transcriber", None), "remote", "the home server"),
+            (getattr(self, "_groq_transcriber", None), "groq", "Groq"),
+            (getattr(self, "_openai_transcriber", None), "openai", "OpenAI"),
+            (getattr(self, "_gemini_transcriber", None), "gemini", "Gemini"),
+        ):
+            if tr is not None:
+                return tr, be, label
+        return None, None, None
+
+    def _auto_open_settings_on_error(self, page="models"):
+        """Open Settings once after a startup model failure so the user lands
+        where they fix it. Fires at most once per launch, off the loader thread."""
+        if getattr(self, "_auto_opened_settings", False):
+            return
+        self._auto_opened_settings = True
+
+        def _later():
+            try:
+                self._open_settings_window(page=page)
+            except Exception as e:
+                log.debug("auto-open settings failed: %s", e)
+        threading.Timer(1.5, _later).start()
 
     def _register_hotkey(self, hotkey_str, quiet=False):
         """(Re-)register the main press-to-talk hotkey at runtime.
@@ -26616,6 +26676,19 @@ class LiaApp:
         return (v[:4] + "…" + v[-2:]) if len(v) >= 10 else ("set" if v else "")
 
     def _settings_state(self, *, devices=True, ollama=True):
+        # EVERY sub-call here is wrapped: if device enumeration, an Ollama probe,
+        # serve status, etc. throws or a subsystem is broken (a stuck laptop),
+        # Settings must STILL open so the user can change the backend/keys/server
+        # (the payload is built on the caller's thread; a raise here used to
+        # silently abort the whole open - "can't open Settings" 2026-09-05).
+        def _safe(fn, default):
+            try:
+                return fn()
+            except Exception as e:
+                log.debug("settings-state field failed (%s): %s",
+                          getattr(fn, "__name__", "?"), e)
+                return default
+
         c = self.config
         SECRETS = list(_SECRET_CONFIG_KEYS)
         cfg = {}
@@ -26631,17 +26704,17 @@ class LiaApp:
             "config": cfg,
             "secrets": {k: self._settings_mask(c.get(k, "")) for k in SECRETS},
             "has": {k: bool((c.get(k) or "")) for k in SECRETS},
-            "status_line": self._settings_status_line(),
+            "status_line": _safe(self._settings_status_line, "Ready"),
             "model_loaded": bool(getattr(self, "model_loaded", False)),
             "recording": bool(getattr(self, "is_recording", False)),
-            "meeting_active": self._is_meeting_active(),
-            "live_transcript_available": self._live_transcript_available(),
-            "loopback_available": LoopbackRecorder.is_available(),
-            "whisper_device_label": self._whisper_device_label(),
-            "cleanup_model_label": self._cleanup_model_label(),
-            "cleanup_provider": self._effective_cleanup_provider() or "",
-            "vocab_pending": self._vocab_pending_count(),
-            "auto_start": bool(is_auto_start_enabled()),
+            "meeting_active": _safe(self._is_meeting_active, False),
+            "live_transcript_available": _safe(self._live_transcript_available, False),
+            "loopback_available": _safe(LoopbackRecorder.is_available, False),
+            "whisper_device_label": _safe(self._whisper_device_label, "Auto"),
+            "cleanup_model_label": _safe(self._cleanup_model_label, ""),
+            "cleanup_provider": _safe(self._effective_cleanup_provider, "") or "",
+            "vocab_pending": _safe(self._vocab_pending_count, 0),
+            "auto_start": _safe(lambda: bool(is_auto_start_enabled()), False),
             "hotkeys": {
                 "main": c.get("hotkey", "ctrl+space"),
                 "undo": c.get("undo_hotkey", "ctrl+alt+z"),
@@ -26655,15 +26728,54 @@ class LiaApp:
             "paths": {"config": CONFIG_DIR,
                       "log": os.path.join(CONFIG_DIR, "lia.log"),
                       "meetings": MEETINGS_DIR},
-            "tables": self._settings_tables(ollama=ollama),
-            "serve": self._settings_serve_status(),
-            "lexicon": self._lexicon_status(),
+            "tables": _safe(lambda: self._settings_tables(ollama=ollama), {}),
+            "serve": _safe(self._settings_serve_status, {}),
+            "lexicon": _safe(self._lexicon_status, {}),
         }
         if devices:
-            state["mics"] = [{"idx": i, "name": n} for i, n in list_input_devices()]
-            state["loopbacks"] = [{"idx": i, "name": n} for i, n in list_loopback_devices()]
-            state["outputs"] = [{"idx": i, "name": n} for i, n in list_output_devices()]
+            state["mics"] = _safe(lambda: [{"idx": i, "name": n} for i, n in list_input_devices()], [])
+            state["loopbacks"] = _safe(lambda: [{"idx": i, "name": n} for i, n in list_loopback_devices()], [])
+            state["outputs"] = _safe(lambda: [{"idx": i, "name": n} for i, n in list_output_devices()], [])
         return state
+
+    def _settings_state_minimal(self):
+        """A can't-fail Settings state: just enough for the window to render and
+        let the user change the backend / keys / server when the full-state
+        build blew up. Pure config reads, no subsystem calls."""
+        c = self.config
+        SECRETS = list(_SECRET_CONFIG_KEYS)
+        cfg = {}
+        for k, v in c.items():
+            if k in SECRETS:
+                continue
+            try:
+                json.dumps(v)
+                cfg[k] = v
+            except Exception:
+                pass
+        return {
+            "config": cfg,
+            "secrets": {k: self._settings_mask(c.get(k, "")) for k in SECRETS},
+            "has": {k: bool((c.get(k) or "")) for k in SECRETS},
+            "status_line": "Ready", "model_loaded": bool(getattr(self, "model_loaded", False)),
+            "recording": False, "meeting_active": False,
+            "live_transcript_available": False, "loopback_available": False,
+            "whisper_device_label": "Auto", "cleanup_model_label": "",
+            "cleanup_provider": "", "vocab_pending": 0, "auto_start": False,
+            "hotkeys": {"main": c.get("hotkey", "ctrl+space"),
+                        "undo": c.get("undo_hotkey", "ctrl+alt+z"),
+                        "cancel": c.get("cancel_hotkey", "esc"),
+                        "ask": c.get("meetings_ask_hotkey", "ctrl+alt+m"),
+                        "voice_ask": c.get("voice_ask_hotkey", "ctrl+alt+v"),
+                        "actions": c.get("action_items_hotkey", "ctrl+alt+t"),
+                        "email": c.get("email_search_hotkey", "ctrl+alt+f"),
+                        "chat": c.get("chat_hotkey", "ctrl+alt+c")},
+            "paths": {"config": CONFIG_DIR,
+                      "log": os.path.join(CONFIG_DIR, "lia.log"),
+                      "meetings": MEETINGS_DIR},
+            "tables": {}, "serve": {}, "lexicon": {},
+            "mics": [], "loopbacks": [], "outputs": [],
+        }
 
     def _reveal_settings(self, proc, page, focus):
         """Bring an already-running Settings proc forward: focus it, push fresh
@@ -26746,9 +26858,16 @@ class LiaApp:
             return None
         import subprocess
         import tempfile
+        # Building the state must never stop Settings from opening (a stuck
+        # subsystem on a broken laptop). _settings_state is already defensive;
+        # this is the final belt - fall back to a minimal state and still open.
+        try:
+            st = self._settings_state(devices=True, ollama=True)
+        except Exception as e:
+            log.warning("Settings state build failed - opening minimal: %s", e)
+            st = self._settings_state_minimal()
         payload = {"title": "Lia Settings", "page": page, "focus": focus,
-                   "prewarm": prewarm,
-                   "state": self._settings_state(devices=True, ollama=True)}
+                   "prewarm": prewarm, "state": st}
         try:
             fd, ppath = tempfile.mkstemp(suffix=".json", prefix="wt_settings_")
             with os.fdopen(fd, "w", encoding="utf-8") as f:

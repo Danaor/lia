@@ -4718,6 +4718,106 @@ _test("lexicon: sha256-verified install (fail-loud) + Settings UI",
       t_lexicon_download_and_ui)
 
 
+def t_settings_state_never_raises():
+    """Settings must ALWAYS open (2026-09-05): _settings_state is defensive -
+    even if device enumeration, the Ollama probe, serve status, etc. throw (a
+    stuck laptop), it returns a full-shaped dict instead of aborting the open.
+    _settings_state_minimal is a can't-fail fallback."""
+    import lia as w
+    App = w.LiaApp
+    app = App.__new__(App)
+    app.config = {"transcription_backend": "local", "hotkey": "ctrl+space",
+                  "model_size": "ivrit-ai/whisper-large-v3-turbo-ct2"}
+    # Force the fallible sub-calls to blow up.
+    def boom(*a, **k):
+        raise RuntimeError("subsystem down")
+    for name in ("_settings_status_line", "_is_meeting_active",
+                 "_live_transcript_available", "_whisper_device_label",
+                 "_cleanup_model_label", "_effective_cleanup_provider",
+                 "_vocab_pending_count", "_settings_tables",
+                 "_settings_serve_status", "_lexicon_status"):
+        setattr(app, name, boom)
+    saved = {n: getattr(w, n) for n in ("list_input_devices", "list_loopback_devices",
+                                        "list_output_devices", "is_auto_start_enabled")}
+    for n in saved:
+        setattr(w, n, boom)
+    try:
+        st = app._settings_state(devices=True, ollama=True)   # must NOT raise
+    finally:
+        for n, fn in saved.items():
+            setattr(w, n, fn)
+    # full-shaped, with the failed sections safely defaulted
+    for k in ("config", "secrets", "has", "hotkeys", "paths", "tables", "serve",
+              "lexicon", "mics", "loopbacks", "outputs", "status_line"):
+        assert k in st, "missing key: " + k
+    assert st["tables"] == {} and st["serve"] == {} and st["lexicon"] == {}
+    assert st["mics"] == [] and st["loopbacks"] == [] and st["outputs"] == []
+    assert st["config"]["transcription_backend"] == "local"   # config survived
+    # the minimal fallback is itself can't-fail and carries config
+    m = app._settings_state_minimal()
+    assert m["config"]["hotkey"] == "ctrl+space" and m["tables"] == {}
+    # the spawn builds the payload defensively (source check)
+    import inspect
+    src = inspect.getsource(App._spawn_settings_proc_locked)
+    assert "_settings_state_minimal" in src and "opening minimal" in src
+
+
+_test("settings: state build never raises -> Settings always opens",
+      t_settings_state_never_raises)
+
+
+def t_model_load_failure_recovery():
+    """No-GPU / failed local load recovery (2026-09-05): a configured cloud/
+    remote backend is preferred (home server > Groq > OpenAI > Gemini), the
+    local-load except recovers onto it, and a mystery red X auto-opens Settings
+    once."""
+    import inspect
+    import lia as w
+    App = w.LiaApp
+    app = App.__new__(App)
+    # preference order
+    app._remote_transcriber = None
+    app._groq_transcriber = object()
+    app._openai_transcriber = object()
+    app._gemini_transcriber = None
+    tr, be, label = app._first_available_cloud_backend()
+    assert be == "groq" and tr is app._groq_transcriber, (be, label)
+    app._remote_transcriber = object()
+    assert app._first_available_cloud_backend()[1] == "remote"   # home server wins
+    app._groq_transcriber = app._openai_transcriber = app._gemini_transcriber = None
+    app._remote_transcriber = None
+    assert app._first_available_cloud_backend() == (None, None, None)
+    # auto-open fires once (guarded), off a Timer
+    opened = []
+    app._open_settings_window = lambda page=None, focus=None: opened.append(page)
+    fired = []
+
+    class _FakeTimer:
+        def __init__(self, delay, fn):
+            self.fn = fn
+        def start(self):
+            fired.append(1)
+            self.fn()
+    saved_timer = w.threading.Timer
+    w.threading.Timer = _FakeTimer
+    try:
+        app._auto_open_settings_on_error(page="server")
+        app._auto_open_settings_on_error(page="models")   # guard: no second open
+    finally:
+        w.threading.Timer = saved_timer
+    assert opened == ["server"], opened
+    assert app._auto_opened_settings is True
+    # the load-failure except recovers onto a cloud backend + auto-opens Settings
+    src = inspect.getsource(App._load_model)
+    assert "_first_available_cloud_backend" in src
+    assert "_auto_open_settings_on_error" in src
+    assert "self.transcriber = alt" in src
+
+
+_test("startup: model-load failure recovers onto cloud/server + auto-opens Settings",
+      t_model_load_failure_recovery)
+
+
 # ---- Ask your meetings (RAG index) ----------------------------------------
 # Synthetic fixtures reproduce the REAL on-disk format verified 2026-08-15:
 # every line RLM-prefixed (U+200F), title header "Meeting <EM DASH> ...", a
