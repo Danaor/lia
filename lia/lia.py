@@ -329,6 +329,7 @@ for _legacy_name in ("Recap", "WhisperType"):
             pass  # fall through - try the next legacy name / start clean
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_FILE = os.path.join(LOG_DIR, "lia.log")
+SERVE_LOG_FILE = os.path.join(LOG_DIR, "serve.log")
 
 _log_handler = RotatingFileHandler(
     LOG_FILE,
@@ -342,6 +343,31 @@ logging.basicConfig(
     handlers=[_log_handler],
 )
 log = logging.getLogger("Lia")
+
+
+def _switch_logging_to_serve_file():
+    """The `--serve` child runs in its OWN process but imported this module, so
+    it inherited the shared lia.log RotatingFileHandler. Two processes rotating
+    ONE file loses the child's lines (2026-09-06: a whole day of server activity
+    was gone - the tray app rotated lia.log out from under the still-running
+    server child). Point THIS process at its own serve.log and drop the shared
+    handler, so serve activity is preserved and diagnosable. Best-effort: on any
+    failure the process keeps the inherited handler rather than losing logging."""
+    try:
+        h = RotatingFileHandler(SERVE_LOG_FILE, maxBytes=2 * 1024 * 1024,
+                                backupCount=3, encoding="utf-8")
+        h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        root = logging.getLogger()
+        for old in list(root.handlers):
+            root.removeHandler(old)
+            try:
+                old.close()
+            except Exception:
+                pass
+        root.addHandler(h)
+        return SERVE_LOG_FILE
+    except Exception:
+        return None
 
 # Hide console window on Windows
 if sys.platform == "win32":
@@ -7513,6 +7539,11 @@ def run_transcription_server(argv=None):
     built-in WhisperLive server, blocking forever. Its OWN process - a Settings
     toggle spawns it, and a Scheduled Task can run it at logon (independent of
     the tray app). Flags override config.json."""
+    # Log to serve.log, NOT the tray app's shared lia.log (see the helper).
+    _serve_log = _switch_logging_to_serve_file()
+    if _serve_log:
+        log.info("Lia serve: logging to %s (own file, not the tray app's lia.log)",
+                 _serve_log)
     import argparse
     p = argparse.ArgumentParser(prog="lia --serve", add_help=False)
     p.add_argument("--serve", action="store_true")
@@ -10773,6 +10804,11 @@ class MeetingSession:
                 ov.meeting_status_step("summarize", gen=gen)
             md_path = self._write_diarized_markdown(result)
             log.info("Diarized meeting saved: %s", md_path)
+            # The authoritative transcript is on disk - the rolling LIVE file
+            # (fed by the speaker-less peek pass) has served its purpose. Only
+            # the chunked writer used to do this, so every diarized meeting
+            # left a *_meeting_LIVE.txt behind next to its final transcript.
+            self._delete_live_file()
             # Ask-your-meetings: incrementally index this new transcript (background).
             try:
                 self.app._kick_meetings_indexer_bg()
@@ -12575,18 +12611,18 @@ def _stamp_lia_launcher(exe_path):
         return False
     try:
         vi = VSVersionInfo(
-            ffi=FixedFileInfo(filevers=(1, 4, 4, 0), prodvers=(1, 4, 4, 0),
+            ffi=FixedFileInfo(filevers=(1, 4, 5, 0), prodvers=(1, 4, 5, 0),
                               mask=0x3f, flags=0x0, OS=0x40004,
                               fileType=0x1, subtype=0x0),
             kids=[
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.4.4.0'),
+                    StringStruct('FileVersion', '1.4.5.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.4.4.0'),
+                    StringStruct('ProductVersion', '1.4.5.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -17489,12 +17525,6 @@ class LiaApp:
             # default=True → double-clicking the tray icon opens Settings.
             pystray.MenuItem("Settings…", lambda: self._open_settings_window(),
                              default=True),
-            # Native escape hatch (2026-09-05): on a locked-down machine the
-            # Settings window (pywebview/.NET) can be blocked by policy; this
-            # opens the config folder so config.json (backend, API keys, server
-            # URL) can be edited by hand. Always works - no pywebview, no .NET.
-            pystray.MenuItem("Open config folder",
-                             lambda: self._settings_open_config_dir()),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self._quit),
         )
@@ -23619,15 +23649,27 @@ class LiaApp:
         The file is rewritten after every transcribed chunk (~45s)."""
         session = self._active_meeting
         if session is None:
+            log.info("Live transcript: clicked with no active meeting")
             return
         p = getattr(session, "_live_path", None)
         if p and os.path.exists(p):
+            try:
+                size = os.path.getsize(p)
+            except OSError:
+                size = -1
+            # Logged so a "that's not my meeting" report can be matched to the
+            # exact file (and its size at that moment) that was opened.
+            log.info("Live transcript opened: %s (%d bytes, meeting started %s)",
+                     os.path.basename(p), size,
+                     time.strftime("%H:%M:%S", time.localtime(
+                         getattr(session, "start_time", 0) or 0)))
             try:
                 os.startfile(p)
             except Exception as e:
                 log.warning("Open live transcript failed: %s", e)
                 self.overlay.show_error("Could not open live transcript")
         else:
+            log.info("Live transcript: no file yet (path=%s)", p)
             self.overlay.show_error("No transcript yet — first chunk lands in ~45s")
 
     def _recap_meeting(self):
@@ -26539,6 +26581,12 @@ class LiaApp:
                     tp = os.path.join(CONFIG_DIR, name)
                     if os.path.exists(tp):
                         zf.write(tp, name)
+                # serve.log: the transcription-server child logs here (its own
+                # file since the shared-log rotation fix), so a server issue is
+                # in the bundle too. It carries no dictation text.
+                sp = os.path.join(CONFIG_DIR, "serve.log")
+                if os.path.exists(sp):
+                    zf.write(sp, "serve.log")
                 zf.writestr("config.sanitized.json",
                             _json.dumps(cfg, ensure_ascii=False, indent=2,
                                         default=str))

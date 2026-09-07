@@ -3467,6 +3467,16 @@ def t_live_transcript():
     assert "_write_live_file" in inspect.getsource(wt.MeetingSession._submit_chunk)
     assert "_delete_live_file" in inspect.getsource(wt.MeetingSession._write_output_file)
     assert "_delete_live_file" in inspect.getsource(wt.MeetingSession.cancel)
+    # Diarized meetings keep a LIVE file too (the speaker-less peek pass) and
+    # must drop it once the diarized transcript is saved - it used to leak one
+    # *_meeting_LIVE.txt per diarized meeting (2026-09-07).
+    _dj = inspect.getsource(wt.MeetingSession._run_diarize_job)
+    assert _dj.index("Diarized meeting saved") < _dj.index("self._delete_live_file()"), \
+        "diarized job must delete the LIVE file after the final transcript is saved"
+    # Every open is logged with the file it opened (a "wrong meeting" report
+    # must be matchable to the exact file).
+    _op = inspect.getsource(wt.LiaApp._open_live_transcript)
+    assert "Live transcript opened" in _op and "os.startfile" in _op
     # Discard drops the transcript but KEEPS the audio (WAV + Opus archive),
     # honouring keep_meeting_audio — it must not unconditionally delete the WAV.
     _cancel_src = inspect.getsource(wt.MeetingSession.cancel)
@@ -4035,8 +4045,11 @@ def t_tray_lean_layout():
         assert lbl in run_src, "lean tray missing " + lbl
     assert "self._open_settings_window()" in run_src, "Settings… not wired"
     # native escape hatch: opens the config folder (works when pywebview/.NET
-    # Settings is blocked on a locked-down machine)
-    assert '"Open config folder"' in run_src and "self._settings_open_config_dir()" in run_src
+    # "Open config folder" was REMOVED from the tray (2026-09-06): it was a
+    # locked-machine escape hatch; the pywebview Settings block is fixed, and it
+    # still lives in Settings > Advanced. It must NOT be in the tray menu.
+    assert '"Open config folder"' not in run_src, "config-folder item should be gone from the tray"
+    assert hasattr(App, "_settings_open_config_dir"), "the Advanced action must remain"
     # the old deep submenus are gone from the tray
     for gone in ('"Behavior"', '"Input Selection"', '"Model Selection"',
                  '"API Keys"', '"Custom Vocabulary"', '"Beep Output"'):
@@ -5149,6 +5162,57 @@ def t_remote_blank_token_keeps_saved():
 
 _test("remote: blank token keeps the saved one (Test/Save) + clear unauthorized message",
       t_remote_blank_token_keeps_saved)
+
+
+def t_serve_logs_to_own_file():
+    """Naor, 2026-09-06: the serve child shared the tray app's rotating lia.log,
+    so a day of server activity was rotated away and lost. The serve entry must
+    switch THIS process to its own serve.log (dropping the inherited handler),
+    and the Report-a-problem bundle must include serve.log."""
+    import inspect
+    import logging
+    import os
+    import tempfile
+    import lia as w
+    # the helper points the root logger at serve.log and drops the old handlers
+    saved = list(logging.getLogger().handlers)
+    saved_file = w.SERVE_LOG_FILE
+    try:
+        tmp = tempfile.mkdtemp()
+        w.SERVE_LOG_FILE = os.path.join(tmp, "serve.log")
+        got = w._switch_logging_to_serve_file()
+        assert got == w.SERVE_LOG_FILE
+        root = logging.getLogger()
+        assert len(root.handlers) == 1
+        base = root.handlers[0].baseFilename
+        assert os.path.basename(base) == "serve.log", base
+        w.log.info("serve marker line")
+        for h in root.handlers:
+            h.flush()
+        assert os.path.exists(w.SERVE_LOG_FILE)
+        assert "serve marker" in open(w.SERVE_LOG_FILE, encoding="utf-8").read()
+    finally:
+        root = logging.getLogger()
+        for h in list(root.handlers):
+            root.removeHandler(h)
+            try:
+                h.close()
+            except Exception:
+                pass
+        for h in saved:
+            root.addHandler(h)
+        w.SERVE_LOG_FILE = saved_file
+    # run_transcription_server switches logging before anything else
+    src = inspect.getsource(w.run_transcription_server)
+    assert "_switch_logging_to_serve_file()" in src
+    assert src.index("_switch_logging_to_serve_file()") < src.index("argparse")
+    # the report bundle ships serve.log
+    rp = inspect.getsource(w.LiaApp._settings_report_problem)
+    assert 'zf.write(sp, "serve.log")' in rp
+
+
+_test("serve: logs to its own serve.log (not the shared lia.log) + in the report bundle",
+      t_serve_logs_to_own_file)
 
 
 def t_tray_title_cap_and_prewarm_loop_guard():
@@ -6955,6 +7019,30 @@ def t_meeting_attendees():
     isrc = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)),
                              "emailsearch_indexer.py"), encoding="utf-8").read()
     assert "--current-meeting" in isrc and "AllDayEvent" in isrc
+    # The Restrict date literal must be written in the USER'S locale form:
+    # a fixed US "%m/%d/%Y" read as day/month on English (Israel) / Hebrew
+    # Windows, so 2026-09-07 fetched the calendar of 9 July (wrong title +
+    # attendees on every day 1-12 of the month). Round-trip through the same
+    # OLE parser Outlook uses (VarDateFromStr, LOCALE_USER_DEFAULT).
+    assert '"%m/%d/%Y %I:%M %p"' not in isrc, "US date form is back in the Restrict"
+    assert "outlook_date_literal(lo)" in isrc and "outlook_date_literal(hi)" in isrc
+    import datetime as _dt
+    if sys.platform == "win32":
+        import ctypes
+        for t in (_dt.datetime(2026, 9, 7, 10, 15), _dt.datetime(2026, 7, 9, 10, 20),
+                  _dt.datetime(2026, 12, 25, 9, 5), _dt.datetime(2026, 1, 2, 23, 59)):
+            lit = ex.outlook_date_literal(t)
+            d = ctypes.c_double()
+            hr = ctypes.windll.oleaut32.VarDateFromStr(
+                ctypes.c_wchar_p(lit), 0x0400, 0, ctypes.byref(d))
+            assert hr == 0, "Windows could not parse %r" % lit
+            back = _dt.datetime(1899, 12, 30) + _dt.timedelta(days=d.value)
+            back = back.replace(microsecond=0)
+            assert abs((back - t).total_seconds()) < 1, \
+                "literal %r parsed back as %s, not %s" % (lit, back, t)
+    else:
+        lit = ex.outlook_date_literal(_dt.datetime(2026, 9, 7, 10, 15))
+        assert lit == "07 Sep 2026 10:15"
 
 
 _test("meeting: calendar attendees (parse / metadata / wiring)",

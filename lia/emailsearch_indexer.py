@@ -543,6 +543,54 @@ def split_attendee_names(*fields):
     return out
 
 
+def outlook_date_literal(when):
+    """A date-time literal for an Outlook Restrict filter, written the way
+    the USER'S Windows locale writes dates, because that is how Outlook parses
+    it (VarDateFromStr under LOCALE_USER_DEFAULT).
+
+    A fixed US form ("09/07/2026") is NOT safe: on a day/month locale
+    (English (Israel), Hebrew, most of Europe) Outlook reads it as 9 July, so
+    for every day 1-12 of the month the query silently returned the calendar of
+    a different day (a meeting on 2026-09-07 was credited to two appointments
+    from 2026-07-09 - a wrong title and wrong attendees). Verified on Naor's
+    machine: the locale short-date form and "07 Sep 2026" both return today's
+    real meetings; the US form and ISO "2026-09-07" both return the July ones.
+
+    Falls back to an unambiguous day-month-name form when the Win32 call is
+    unavailable (non-Windows tests)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class SYSTEMTIME(ctypes.Structure):
+            _fields_ = [("wYear", wintypes.WORD), ("wMonth", wintypes.WORD),
+                        ("wDayOfWeek", wintypes.WORD), ("wDay", wintypes.WORD),
+                        ("wHour", wintypes.WORD), ("wMinute", wintypes.WORD),
+                        ("wSecond", wintypes.WORD),
+                        ("wMilliseconds", wintypes.WORD)]
+        st = SYSTEMTIME(when.year, when.month, (when.weekday() + 1) % 7,
+                        when.day, when.hour, when.minute, 0, 0)
+        k32 = ctypes.windll.kernel32
+        LOCALE_USER_DEFAULT = 0x0400
+        DATE_SHORTDATE = 0x0001
+        TIME_NOSECONDS = 0x0002
+        dbuf = ctypes.create_unicode_buffer(64)
+        tbuf = ctypes.create_unicode_buffer(64)
+        if (k32.GetDateFormatW(LOCALE_USER_DEFAULT, DATE_SHORTDATE,
+                               ctypes.byref(st), None, dbuf, 64) and
+                k32.GetTimeFormatW(LOCALE_USER_DEFAULT, TIME_NOSECONDS,
+                                   ctypes.byref(st), None, tbuf, 64)):
+            d, t = dbuf.value.strip(), tbuf.value.strip()
+            if d and t:
+                # Strip RTL/LTR marks a Hebrew locale may embed; Outlook's
+                # parser does not want them.
+                return "".join(ch for ch in (d + " " + t)
+                               if ch not in "‎‏‪‫‬")
+    except Exception:
+        pass
+    return when.strftime("%d %b %Y %H:%M")
+
+
 def current_meeting_snapshot(idx, now=None, slack_min=5):
     """The calendar appointment(s) overlapping NOW (+-slack), as
     [{subject, organizer, attendees, start_epoch, end_epoch}] sorted by start
@@ -552,11 +600,10 @@ def current_meeting_snapshot(idx, now=None, slack_min=5):
     now = now or _dt.datetime.now()
     lo = now + _dt.timedelta(minutes=slack_min)     # [Start] <= now+slack
     hi = now - _dt.timedelta(minutes=slack_min)     # [End]   >= now-slack
-    # Outlook Restrict needs locale-tolerant date strings; this US form parses
-    # on Hebrew Windows too (verified pattern used across Outlook automation).
-    fmt = "%m/%d/%Y %I:%M %p"
-    flt = ("[Start] <= '" + lo.strftime(fmt) + "' AND [End] >= '"
-           + hi.strftime(fmt) + "'")
+    # Dates in the user's own locale form - see outlook_date_literal for why
+    # a fixed US form picked the wrong day on day/month locales.
+    flt = ("[Start] <= '" + outlook_date_literal(lo) + "' AND [End] >= '"
+           + outlook_date_literal(hi) + "'")
     out = []
     for _acct, _name, cal in idx.target_calendars():
         try:
