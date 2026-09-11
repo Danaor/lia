@@ -798,6 +798,187 @@ _test("GeminiTranscriber diarization request + utterance parsing (+ fallbacks)",
       t_gemini_diarize_parsing)
 
 
+def t_gemini_diarize_truncation_guard():
+    """Gemini can answer status 'completed' with a PARTIAL diarized transcript
+    and no error (a real 2026-09-09 call recording lost its last ~3.5 min this
+    way). transcribe_diarized must notice a piece whose words stop well before
+    its real last-speech second and retry it once, keeping the fuller result. A
+    piece that legitimately ends in silence must NOT trigger a retry."""
+    import lia as w
+    import numpy as _np
+
+    def _word(text, spk, s0, s1):
+        return {"type": "word_info", "text": text, "speaker": spk,
+                "start_offset": "%.2fs" % s0, "end_offset": "%.2fs" % s1}
+
+    def _resp(words):
+        return {"steps": [{"type": "model_output", "content": [
+            {"type": "text", "text": " ".join(x["text"] for x in words),
+             "annotations": words}]}]}
+
+    class _SeqGemSession:
+        """Returns queued POST bodies in order (one per request)."""
+        def __init__(self, bodies):
+            self._bodies = list(bodies)
+            self.posts = 0
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.posts += 1
+            b = self._bodies.pop(0) if self._bodies else self._bodies_last
+            self._bodies_last = b
+            return _FakeGemResp(200, b)
+        def get(self, url, headers=None, timeout=None):
+            return _FakeGemResp(200, {"name": "models/gemini-3.5-transcribe"})
+
+    # 60 s of loud audio -> last-speech ~60 s; one inline piece.
+    audio = (_np.ones(16000 * 60, dtype=_np.float32) * 0.2)
+    truncated = _resp([_word("start", "spk:0", 0.1, 0.5),
+                       _word("only", "spk:0", 0.6, 1.0)])       # stops at 1 s
+    full = _resp([_word("start", "spk:0", 0.1, 0.5),
+                  _word("middle", "spk:1", 25.0, 25.5),
+                  _word("end", "spk:0", 57.0, 58.0)])            # covers 58 s
+
+    t = w.GeminiTranscriber(api_key="fake")
+    t._session = _SeqGemSession([truncated, full])
+    t.load_model()
+    utts = t.transcribe_diarized(audio, language="he")
+    assert t._session.posts == 2, "guard must retry the truncated piece once"
+    assert max(u["end"] for u in utts) / 1000.0 >= 55.0, \
+        "the fuller retry result must replace the truncated one: %r" % utts
+
+    # A piece that really ends in silence must NOT retry: 60 s buffer, speech
+    # only in the first 5 s, transcript covering those 5 s is complete.
+    quiet = _np.zeros(16000 * 60, dtype=_np.float32)
+    quiet[:16000 * 5] = 0.2
+    short_resp = _resp([_word("hi", "spk:0", 0.2, 0.6),
+                        _word("there", "spk:0", 4.0, 4.6)])
+    t2 = w.GeminiTranscriber(api_key="fake")
+    t2._session = _SeqGemSession([short_resp, short_resp])
+    t2.load_model()
+    utts2 = t2.transcribe_diarized(quiet, language="he")
+    assert t2._session.posts == 1, "a silent tail must not be read as truncation"
+
+    # _last_speech_s: trailing silence trimmed, fail-open on bad input.
+    assert 4.5 <= w.GeminiTranscriber._last_speech_s(quiet) <= 5.6
+    assert w.GeminiTranscriber._last_speech_s(
+        _np.ones(16000 * 3, dtype=_np.float32) * 0.2) >= 2.9
+
+    # Persistent truncation (same audio stays short after the retry): bisect the
+    # piece and diarize each half. 120 s piece, truncated then truncated, then a
+    # full half + full half -> 4 posts, tail recovered.
+    audio2 = (_np.ones(16000 * 120, dtype=_np.float32) * 0.2)
+    half_full = _resp([_word("a", "spk:0", 0.2, 0.6),
+                       _word("b", "spk:0", 57.0, 58.0)])         # covers 58 of 60
+    t3 = w.GeminiTranscriber(api_key="fake")
+    t3._session = _SeqGemSession([truncated, truncated, half_full, half_full])
+    t3.load_model()
+    utts3 = t3.transcribe_diarized(audio2, language="he")
+    assert t3._session.posts == 4, \
+        "persistent shortfall must retry once then split into two halves: %d" % t3._session.posts
+    assert max(u["end"] for u in utts3) / 1000.0 >= 110.0, \
+        "the second half (offset ~60 s) must land in the merged result: %r" % utts3
+
+    # Depth cap: every request truncates. Must terminate (no runaway recursion)
+    # at a bounded post count. 300 s -> 2 (top: call+retry) + 3 (left: call +
+    # 2 leaves) + 3 (right) = 8, with MAX_SPLIT_DEPTH=2.
+    audio3 = (_np.ones(16000 * 300, dtype=_np.float32) * 0.2)
+    t4 = w.GeminiTranscriber(api_key="fake")
+    t4._session = _SeqGemSession([truncated])   # repeats for every request
+    t4.load_model()
+    utts4 = t4.transcribe_diarized(audio3, language="he")
+    assert t4._session.posts == 8, \
+        "depth cap must bound the split fan-out: %d" % t4._session.posts
+    assert utts4, "best-effort result is still returned when all pieces are short"
+
+
+_test("GeminiTranscriber diarize truncation guard (retry + half-split + depth cap)",
+      t_gemini_diarize_truncation_guard)
+
+
+def t_gemini_file_coverage_guard():
+    """Gap 1: a LONG non-diarized file is decoded, split, and each piece runs
+    through the coverage guard (word timestamps -> a silent truncation is caught
+    and retried). A SHORT clip keeps the one-shot inline request WITH vocabulary
+    and no timestamps."""
+    import lia as w
+    import numpy as _np
+    import wave as _wave, tempfile as _tf, os as _os
+
+    def _mkwav(path, secs, amp=0.2):
+        sr = 16000
+        x = (_np.random.RandomState(1).randn(int(sr * secs)) * amp)
+        pcm = (_np.clip(x, -1, 1) * 32767).astype('<i2').tobytes()
+        with _wave.open(path, 'wb') as wv:
+            wv.setnchannels(1); wv.setsampwidth(2); wv.setframerate(sr)
+            wv.writeframes(pcm)
+
+    def _word(t, s0, s1):
+        return {"type": "word_info", "text": t, "speaker": "spk:0",
+                "start_offset": "%.2fs" % s0, "end_offset": "%.2fs" % s1}
+
+    def _resp(words, text=None):
+        return {"steps": [{"type": "model_output", "content": [{
+            "type": "text",
+            "text": text if text is not None else " ".join(x["text"] for x in words),
+            "annotations": words}]}]}
+
+    class _Sess:
+        def __init__(self, bodies):
+            self._b = list(bodies); self.posts = 0; self.last = None; self._blast = None
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.posts += 1; self.last = {"json": json}
+            b = self._b.pop(0) if self._b else self._blast
+            self._blast = b
+            return _FakeGemResp(200, b)
+        def get(self, url, headers=None, timeout=None):
+            return _FakeGemResp(200, {"name": "models/gemini-3.5-transcribe"})
+
+    d = _tf.mkdtemp(prefix="gemfile_")
+
+    # Short clip (3 s) -> inline, vocab kept, NO timestamps, exactly one request.
+    short = _os.path.join(d, "s.wav"); _mkwav(short, 3)
+    t = w.GeminiTranscriber(api_key="fake"); t.custom_vocabulary = "git, push"
+    t._session = _Sess([_resp([], text="זהו משפט בדיקה קצר")])
+    t.load_model()
+    out = t.transcribe_file(short, language="he")
+    assert t._session.posts == 1, "short clip must be one inline request"
+    tc = t._session.last["json"]["generation_config"]["transcription_config"]
+    assert tc.get("custom_vocabulary") == ["git", "push"], tc
+    assert "timestamp_granularities" not in tc.get("mode", {}), tc
+    assert "משפט בדיקה" in out, repr(out)
+
+    # Long clip (40 s) -> split path; truncated then full on retry; the request
+    # carries word timestamps and DROPS vocab (mutually exclusive).
+    lng = _os.path.join(d, "l.wav"); _mkwav(lng, 40)
+    trunc = _resp([_word("a", 0.1, 0.5), _word("b", 0.6, 1.0)])
+    full = _resp([_word("a", 0.1, 0.5), _word("z", 37.0, 38.0)],
+                 text="the full transcript body")
+    t2 = w.GeminiTranscriber(api_key="fake"); t2.custom_vocabulary = "git, push"
+    t2._session = _Sess([trunc, full])
+    t2.load_model()
+    out2 = t2.transcribe_file(lng, language="he")
+    assert t2._session.posts == 2, "long clip must retry the truncated piece: %d" % t2._session.posts
+    tc2 = t2._session.last["json"]["generation_config"]["transcription_config"]
+    assert tc2["mode"].get("timestamp_granularities") == ["word"], tc2
+    assert "custom_vocabulary" not in tc2, "word timestamps drop vocab"
+    assert "the full transcript body" in out2, repr(out2)
+
+    # Files over the inline cap still point at a local model.
+    big = _os.path.join(d, "big.wav")
+    with open(big, "wb") as f:
+        f.write(b"\0" * (19 * 1024 * 1024))
+    t3 = w.GeminiTranscriber(api_key="fake"); t3._session = _Sess([_resp([])])
+    t3.load_model()
+    try:
+        t3.transcribe_file(big, language="he")
+        assert False, "a >18 MB file must raise, not silently truncate"
+    except RuntimeError as e:
+        assert "Local model" in str(e), str(e)
+
+
+_test("GeminiTranscriber file transcription coverage guard (long split, short inline)",
+      t_gemini_file_coverage_guard)
+
+
 def t_gemini_meeting_registered():
     """Gemini meeting models wired: both keys gated behind gemini_api_key, the
     builder returns is_diarized correctly, the diarize dispatch pins the 'gemini'
@@ -981,7 +1162,8 @@ def t_gemini_diarize_request_constraints():
     assert raised, "persistent 429 must surface a rate-limit error"
 
     # the diarized loop uses the retrying POST.
-    dsrc = inspect.getsource(G.transcribe_diarized)
+    dsrc = (inspect.getsource(G.transcribe_diarized)
+            + inspect.getsource(G._diarize_one_piece))
     assert "_post_interaction_retrying" in dsrc, "diarize loop must retry 429s"
 
     # (3) saved transcript credits Gemini, not AssemblyAI.
@@ -2978,6 +3160,103 @@ def t_local_diarization_wiring():
 _test("diarize: local pyannote option + lia wiring", t_local_diarization_wiring)
 
 
+def t_strip_foreign_script():
+    """Dictation script guard: words carrying a non-Hebrew, non-ASCII letter
+    (a derailed multilingual decode) are dropped; Hebrew, English, digits,
+    punctuation, bidi marks and symbols survive untouched; an all-foreign
+    output becomes '' so the no-speech branch fires. Wired at BOTH dictation
+    finalize sites (partial+tail and full)."""
+    import inspect
+    import lia as wt
+    S = wt.strip_foreign_script_words
+    # the 2026-09-07 field salad, byte for byte
+    salad = ("קיים, קיים, קיים, אני חושב, relating 예 öyle reliability,象, "
+             "מייל muchľunder, Git, نہیں, HI! ‏לאיזה")
+    out, n = S(salad)
+    assert n == 5, n
+    for bad in ("예", "öyle", "象", "ľ", "نہیں"):
+        assert bad not in out, (bad, out)
+    for good in ("קיים", "אני חושב", "relating", "reliability", "מייל", "Git", "HI!", "לאיזה"):
+        assert good in out, (good, out)
+    assert ",," not in out and " ," not in out, out
+    # clean Hebrew / English / mixed / numbers / bidi marks: untouched, 0 dropped
+    for clean in ("‏שלום, מה נשמע? git push ל-S3 ב-14:30.",
+                  "Deploy the API Gateway at 09:00 (v1.4.5) - 100% done!",
+                  "‏תגיד ל-Yulia שה-PoC של ה-Entra מוכן ₪ 5,000 €"):
+        assert S(clean) == (clean, 0), S(clean)
+    # all-foreign -> empty
+    assert S("예 象 نہیں") == ("", 3)
+    assert S("") == ("", 0)
+    # wired at both dictation finalize sites
+    src = inspect.getsource(wt.LiaApp)
+    assert src.count("strip_foreign_script_words(text)") == 2, \
+        src.count("strip_foreign_script_words(text)")
+
+
+_test("dictation: foreign-script word guard (salad clip + clean passthrough)",
+      t_strip_foreign_script)
+
+
+def t_foreign_script_capture():
+    """A dictation whose output carried foreign-script words is ALWAYS saved to
+    foreign_script_clips/ (independent of the debug flag) with a diagnostic
+    sidecar (raw/kept text, model, device, route, rms), ring-bounded to 20; both
+    dictation finalize sites call the capture. Root-causing net for the still-
+    unknown source of the 2026-09-07 salad clip."""
+    import lia as w
+    import numpy as _np
+    import os as _os, json as _json, inspect
+    App = w.LiaApp
+    app = App.__new__(App)
+    app.config = {"model_size": "ivrit-ai/whisper-large-v3-turbo-ct2",
+                  "whisper_device": "cuda", "transcription_backend": "local"}
+    audio = (_np.ones(16000, dtype=_np.float32) * 0.2)
+    d = _os.path.join(w.CONFIG_DIR, "foreign_script_clips")
+    if _os.path.isdir(d):
+        for f in _os.listdir(d):
+            _os.remove(_os.path.join(d, f))
+
+    app._capture_foreign_script_clip(
+        audio, "relating 예 מייל", "relating מייל", 1,
+        duration_sec=1.0, pre_gain_peak_rms=0.2, source="both")
+    wavs = [f for f in _os.listdir(d) if f.endswith(".wav")]
+    assert len(wavs) == 1, wavs
+    side = _json.load(open(_os.path.join(d, wavs[0][:-4] + ".json"), encoding="utf-8"))
+    for k in ("raw_text", "kept_text", "dropped_count", "model", "device",
+              "backend", "route", "pre_gain_peak_rms", "duration_sec"):
+        assert k in side, "sidecar missing " + k
+    assert side["raw_text"] == "relating 예 מייל", side["raw_text"]
+    assert side["kept_text"] == "relating מייל", side["kept_text"]
+    assert side["device"] == "cuda", side["device"]
+
+    # Parakeet is labelled as its own engine (the Parakeet-on-Hebrew hypothesis).
+    app.config["model_size"] = "parakeet-tdt-0.6b-v2"
+    app._capture_foreign_script_clip(audio, "x 예", "x", 1, duration_sec=1.0,
+                                     pre_gain_peak_rms=0.1, source="mic")
+    newest = sorted(f for f in _os.listdir(d) if f.endswith(".json"))[-1]
+    assert _json.load(open(_os.path.join(d, newest), encoding="utf-8"))["device"] == "parakeet"
+
+    # Ring bound = 20: preload 25 older pairs, one real capture -> pruned to 20.
+    for f in _os.listdir(d):
+        _os.remove(_os.path.join(d, f))
+    for i in range(25):
+        base = _os.path.join(d, "fs_0000%02d" % i)
+        open(base + ".wav", "wb").close()
+        open(base + ".json", "w").close()
+    app._capture_foreign_script_clip(audio, "y 예", "y", 1, duration_sec=1.0,
+                                     pre_gain_peak_rms=0.1, source="mic")
+    assert len([f for f in _os.listdir(d) if f.endswith(".wav")]) == 20
+
+    # Both dictation finalize sites capture (partial+tail path and full path).
+    src = inspect.getsource(App)
+    assert src.count("self._capture_foreign_script_clip(") == 2, \
+        src.count("self._capture_foreign_script_clip(")
+
+
+_test("dictation: foreign-script clip capture (always-on diagnostic + ring)",
+      t_foreign_script_capture)
+
+
 def t_bilingual_route_decisions():
     """BilingualRouterTranscriber._decide_route: the pure policy table.
     Hebrew-biased by design — a he→en mistake garbles Hebrew badly, an
@@ -3009,6 +3288,13 @@ def t_bilingual_route_decisions():
         (("nl", 0.50, 0.88, 0.00, "he"), "en"),
         # ambiguous first segment: conservative Hebrew default
         (("en", 0.40, 0.40, 0.28, None), "he"),
+        # MIXED-clip veto (2026-09-07 field clip): a soft English win with real
+        # Hebrew probability behind it is a Hebrew sentence full of English
+        # terms - the English model hallucinated over the Hebrew half.
+        (("en", 0.61, 0.61, 0.35, "he"), "he"),
+        (("en", 0.61, 0.61, 0.20, "he"), "he"),   # at the veto edge -> Hebrew
+        (("en", 0.61, 0.61, 0.19, "he"), "en"),   # just under it -> English
+        (("en", 0.90, 0.90, 0.35, "he"), "en"),   # a STRONG win is never vetoed
     ]
     for args, want in cases:
         got = d(*args)
@@ -3027,6 +3313,8 @@ def t_bilingual_route_decisions():
         (("ru", 0.90, 0.03, 0.02, "en"), "ru"),   # confident third language
         (("tr", 0.26, 0.13, 0.00, "he"), "en"),   # garbage detections -> en
         (("en", 0.40, 0.40, 0.28, None), "en"),   # ambiguous -> en default
+        (("he", 0.61, 0.35, 0.61, "en"), "en"),   # mixed-clip veto, mirrored
+        (("he", 0.90, 0.35, 0.90, "en"), "he"),   # strong Hebrew never vetoed
     ]
     for args, want in en_cases:
         got = d(*args, "en")
@@ -6071,6 +6359,22 @@ def t_settings_actions_coverage():
     for a in ("vocab_pending_list", "vocab_learned_list", "vocab_corrections_list",
               "vocab_corrections_scan", "snippets_get"):
         assert a in App._SETTINGS_READONLY_METHODS, "getter must be state-push-exempt: " + a
+    # List mutations reload their own list in the child; a follow-up state push
+    # would full-re-render the page and wipe it, so accepting / fixing /
+    # dismissing ONE suggestion collapsed the whole list (2026-09-11). Each must
+    # be a real, push-exempt action that is NOT a device method (those need the
+    # push), and the child must reload a list right after calling it.
+    sw_src = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)),
+                               "settings_window.py"), encoding="utf-8").read()
+    for a in App._SETTINGS_LIST_MUTATION_METHODS:
+        assert a in actions, "list-mutation method not in allowlist: " + a
+        assert a not in App._SETTINGS_DEVICE_METHODS, a + " needs the state push"
+        assert a in sw_src, "settings UI never calls list-mutation: " + a
+    for a in ("vocab_resolve", "vocab_add_correction", "lexicon_oov_dismiss"):
+        assert a in App._SETTINGS_LIST_MUTATION_METHODS, \
+            "list mutation must be state-push-exempt: " + a
+    # a getter and a list-mutation must never be classed as both.
+    assert not (App._SETTINGS_READONLY_METHODS & App._SETTINGS_LIST_MUTATION_METHODS)
 
 
 _test("settings: SETTINGS_ACTIONS covers every migrated tray surface (N/N)",

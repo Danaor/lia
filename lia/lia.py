@@ -1521,6 +1521,60 @@ def _get_hallucination_regexes():
     return _HALLUCINATION_REGEXES
 
 
+def _is_foreign_script_char(ch):
+    """A LETTER (or combining mark) that is neither Hebrew nor ASCII Latin.
+    Digits, punctuation, symbols and whitespace of any script are fine."""
+    o = ord(ch)
+    if o < 0x80 or 0x0590 <= o <= 0x05FF or 0xFB1D <= o <= 0xFB4F:
+        return False
+    import unicodedata
+    cat = unicodedata.category(ch)
+    return cat[0] in ("L", "M")
+
+
+def strip_foreign_script_words(text):
+    """Drop words written in a script the user never dictates.
+
+    A multilingual Whisper decode that loses its footing (quiet or noisy
+    audio, a repetition loop that triggers the temperature fallback) samples
+    random tokens from other languages - a real 2026-09-07 dictation came out
+    as "קיים, קיים, קיים, אני חושב, relating 예 öyle reliability,象, מייל
+    muchľunder, Git, نہیں, HI!". Hebrew + ASCII Latin are the only scripts
+    dictation is expected to produce (the router already clamps short clips to
+    he/en), so any word carrying a Korean/CJK/Arabic/Cyrillic/accented-Latin
+    letter is noise, never content. Returns (text, dropped_count); an output
+    that was ALL foreign becomes "" so the no-speech branch fires.
+
+    Measured alternative rejected: suppressing those ~9,800 tokens in the
+    decoder (CTranslate2 suppress_tokens) gave byte-identical output on 73 real
+    clips but tripled the median decode time and turned one 11 s decode into
+    149 s - a post-filter costs nothing."""
+    if not text:
+        return text, 0
+    import re as _re
+    # Units are LETTER RUNS (with apostrophes/hyphens), not whitespace tokens:
+    # "reliability,象" keeps "reliability" (the 象 stands alone behind the
+    # comma) while a letter-fused "muchľunder" is one garbage unit and goes.
+    parts = _re.findall(r"[\w'’\-]+|[^\w'’\-]+", text)
+    kept, dropped = [], 0
+    for p in parts:
+        if _re.match(r"[\w'’\-]", p) and any(_is_foreign_script_char(c) for c in p):
+            dropped += 1
+            continue
+        kept.append(p)
+    if not dropped:
+        return text, 0
+    out = "".join(kept)
+    # Tidy the seams left by a removed unit: ", ," / " ," / doubled spaces.
+    out = _re.sub(r"\s+,", ",", out)
+    out = _re.sub(r"(,\s*){2,}", ", ", out)
+    out = _re.sub(r"[ \t]{2,}", " ", out).strip(" ,")
+    bare = out.replace("‏", "").replace("‎", "").strip()
+    if not any(c.isalnum() for c in bare):
+        return "", dropped
+    return out, dropped
+
+
 def strip_hallucinated_tail(text):
     """Remove known trailing hallucinations from a transcription.
 
@@ -4535,6 +4589,15 @@ class BilingualRouterTranscriber(BaseTranscriber):
     SOFT_EN = 0.50          # top guess == "en" and p_en >= this → English
     STRONG_EN = 0.85        # p_en >= this → English regardless of top label
     OTHER_LANG_MIN = 0.85   # a non-he/en label needs THIS much to be trusted
+    # A SOFT win for the secondary language is vetoed when the primary still
+    # holds this much probability: that is a MIXED clip (Hebrew sentence full
+    # of English terms), and the primary model handles it while the other
+    # model hallucinates over the half it cannot hear. Measured 2026-09-07 on
+    # 73 real dictations: the one mis-routed clip had p_en=0.61 / p_he=0.35
+    # (the English model invented "it's already a summit, something that is
+    # suitable for the work of it" for a Hebrew half); every genuinely English
+    # clip had p_he=0.00. A STRONG win (>= STRONG_EN) is never vetoed.
+    MIXED_VETO = 0.20       # secondary soft win needs p_primary < this
     # Segments shorter than this skip detection (too little audio → the
     # detector hallucinates a language) and reuse the previous route. Raised
     # from 1.2s after the 2026-08-03 live failure: 1.2-3s split groups were
@@ -4670,15 +4733,15 @@ class BilingualRouterTranscriber(BaseTranscriber):
         hysteresis — each segment stands on its own evidence (last_route
         kept in the signature for call-site stability; deliberately unused)."""
         if primary == "en":
-            if top_lang == "he" and p_he >= cls.SOFT_EN:
-                return "he"                # Hebrew is the top guess, reasonably sure
+            if top_lang == "he" and p_he >= cls.SOFT_EN and p_en < cls.MIXED_VETO:
+                return "he"                # Hebrew is the top guess, reasonably sure, not mixed
             if p_he >= cls.STRONG_EN:
                 return "he"                # overwhelmingly Hebrew even if labeled oddly
             if top_lang not in ("he", "en") and top_prob >= cls.OTHER_LANG_MIN:
                 return top_lang            # a GENUINELY confident third language
             return "en"                    # English-first safe default
-        if top_lang == "en" and p_en >= cls.SOFT_EN:
-            return "en"                    # English is the top guess, reasonably sure
+        if top_lang == "en" and p_en >= cls.SOFT_EN and p_he < cls.MIXED_VETO:
+            return "en"                    # English is the top guess, reasonably sure, not mixed
         if p_en >= cls.STRONG_EN:
             return "en"                    # overwhelmingly English even if labeled oddly
         if top_lang not in ("he", "en") and top_prob >= cls.OTHER_LANG_MIN:
@@ -5884,19 +5947,48 @@ class GeminiTranscriber(BaseTranscriber):
         return self._rtl_mark(text)
 
     def transcribe_file(self, file_path, language=None, task="transcribe"):
-        """Transcribe an audio file. Small files are sent inline as-is (any format
-        Gemini accepts); large WAVs are decoded + split at silence. Non-WAV files
-        over the inline cap ask the user to use a local model."""
+        """Transcribe an audio file.
+
+        Short clips go inline as-is (any format, vocab kept). A LONG file is
+        decoded, split, and each piece runs through the coverage guard, because
+        a single long request can come back status "completed" but TRUNCATED
+        with no error (the diarized path hit exactly this - 2026-09-09; the
+        plain path had no per-word coverage signal to catch it). Requesting the
+        word timestamps the guard needs drops custom_vocabulary (they are
+        mutually exclusive), an accepted trade on long-form audio - the
+        corrections table still applies downstream. Files over the inline cap
+        ask the user to use a local model."""
         if self.model is None:
             self.load_model()   # lazy-load (cheap, key-check only)
         try:
             size = os.path.getsize(file_path)
         except OSError:
             size = -1
-        tc = self._build_transcription_config(language=language)
-        # Under the inline cap: send the file bytes directly (no decode needed).
-        if 0 <= size <= 18 * 1024 * 1024:
+        if size > 18 * 1024 * 1024:
+            # Over the ~20 MB inline cap. Gemini decodes any format server-side,
+            # but the transcribe model has no Files-API upload here - point big
+            # files at a local model (faster-whisper handles any size).
+            mb = size / (1024 * 1024) if size >= 0 else -1
+            raise RuntimeError(
+                f"File is {mb:.1f} MB - Gemini Transcribe accepts up to ~20 MB "
+                f"per request. Compress the file, or switch to a Local model "
+                f"(faster-whisper handles any size).")
+
+        # Decode to measure duration + (for long files) drive the coverage
+        # guard. A decode failure falls back to the plain inline request.
+        audio = None
+        try:
+            from faster_whisper.audio import decode_audio
+            audio = np.asarray(decode_audio(file_path, sampling_rate=16000),
+                               dtype=np.float32)
+        except Exception as e:
+            log.warning("Gemini file: decode failed (%s) - inline, no coverage "
+                        "guard", e)
+
+        if audio is None or len(audio) / 16000.0 <= self.COVERAGE_CHECK_MIN_S:
+            # Short clip (or undecodable): one inline request, vocab kept, as-is.
             import base64 as _b64
+            tc = self._build_transcription_config(language=language)
             mime = guess_audio_mime(file_path)
             with open(file_path, "rb") as f:
                 data = _b64.b64encode(f.read()).decode("ascii")
@@ -5909,15 +6001,36 @@ class GeminiTranscriber(BaseTranscriber):
             self._raise_for_api_error(r)
             text = self._extract_text(r.json())
             return self._rtl_mark(strip_hallucinated_tail(text)) if text else ""
-        # Over the ~20 MB inline cap. Gemini decodes any format server-side, so
-        # we do not resample here; a split would need a local decoder (no
-        # soundfile dependency) and, for the transcribe model, a Files-API upload
-        # - both are follow-ups. Point the user at a local model for big files.
-        mb = size / (1024 * 1024) if size >= 0 else -1
-        raise RuntimeError(
-            f"File is {mb:.1f} MB - Gemini Transcribe accepts up to ~20 MB per "
-            f"request. Compress the file, or switch to a Local model "
-            f"(faster-whisper handles any size).")
+
+        # Long file: split, transcribe each piece with word timestamps (so the
+        # shared guard can see coverage), retry/bisect a truncated piece, join.
+        pieces = self._split_for_inline(audio, overlap_s=0.0)
+
+        def _do(pc, off):
+            tc = self._build_transcription_config(language=language, word_ts=True)
+            wav = self._audio_to_wav_bytes(pc)
+            d = len(pc) / 16000.0
+            j = self._post_interaction_retrying(
+                wav, tc, (10, max(120, int(d * 6) + 30)))
+            utts = self._utterances_from_response(j, off, "")
+            end = max((u["end"] for u in utts), default=off * 1000.0)
+            return {"text": self._extract_text(j), "end_ms": end}
+
+        def _cov(res, off):
+            return res["end_ms"] / 1000.0 - off
+
+        def _merge(a, b):
+            return {"text": (a["text"] + " " + b["text"]).strip(),
+                    "end_ms": max(a["end_ms"], b["end_ms"])}
+
+        parts, off = [], 0.0
+        for pc in pieces:
+            res = self._guarded_transcribe_piece(pc, off, _do, _cov, _merge)
+            if res.get("text"):
+                parts.append(res["text"])
+            off += len(pc) / 16000.0
+        text = " ".join(parts).strip()
+        return self._rtl_mark(strip_hallucinated_tail(text)) if text else ""
 
     def transcribe_diarized(self, audio_np, language=None, on_progress=None):
         """Whole-file speaker diarization. Splits long audio into inline-sized
@@ -5931,30 +6044,164 @@ class GeminiTranscriber(BaseTranscriber):
         if self.model is None:
             self.load_model()   # lazy-load (cheap, key-check only)
         pieces = self._split_for_inline(audio_np, overlap_s=0.0)
+        npieces = len(pieces)
         utterances = []
         seg_start_s = 0.0
         for idx, piece in enumerate(pieces):
             seg_dur = len(piece) / 16000.0
-            if on_progress:
-                try:
-                    on_progress(idx + 1, len(pieces))
-                except Exception:
-                    pass
-            tc = self._build_transcription_config(
-                language=language, diarize=True, word_ts=True)
-            wav = self._audio_to_wav_bytes(piece)
-            http_timeout = (10, max(120, int(seg_dur * 6) + 30))
-            # A 40-min meeting = ~7 requests; the free tier is ~25/min, so back
-            # off + retry on a 429 instead of aborting the whole diarize job.
-            j = self._post_interaction_retrying(
-                wav, tc, http_timeout,
-                on_wait=(lambda w, i, n: on_progress(idx + 1, len(pieces)))
-                        if on_progress else None)
-            seg_prefix = f"S{idx + 1}-" if len(pieces) > 1 else ""
-            utterances.extend(
-                self._utterances_from_response(j, seg_start_s, seg_prefix))
+            seg_prefix = f"S{idx + 1}-" if npieces > 1 else ""
+
+            def _prog(*_a):
+                if on_progress:
+                    try:
+                        on_progress(idx + 1, npieces)
+                    except Exception:
+                        pass
+
+            _prog()
+
+            # Coverage-guarded: Gemini occasionally returns status "completed"
+            # with a PARTIAL diarized transcript and NO error (a real 2026-09-09
+            # call recording lost its last ~3.5 min - the 383s 2nd piece came
+            # back covering only 171s). The guard retries and, if a piece stays
+            # short, bisects and recurses so a deterministic truncation is not
+            # fatal either.
+            def _do(pc, off, _pref=seg_prefix):
+                return self._diarize_one_piece(
+                    pc, off, _pref, language, len(pc) / 16000.0, _prog)
+
+            def _cov(utts, off):
+                return (max(u["end"] for u in utts) / 1000.0 - off
+                        if utts else 0.0)
+
+            def _merge(a, b):
+                return (a or []) + (b or [])
+
+            piece_utts = self._guarded_transcribe_piece(
+                piece, seg_start_s, _do, _cov, _merge, _prog)
+            utterances.extend(piece_utts)
             seg_start_s += seg_dur
         return utterances
+
+    # ---- coverage guard (shared by the diarized + plain file paths) ----
+    COVERAGE_TOL_FRAC = 0.10        # a piece is "short" past this fraction ...
+    COVERAGE_TOL_MIN_S = 20.0       # ... or this many seconds, whichever larger
+    COVERAGE_CHECK_MIN_S = 30.0     # never second-guess a very short piece
+    MAX_SPLIT_DEPTH = 2             # bisect at most twice on persistent shortfall
+    MIN_SPLIT_S = 60.0              # never bisect below this
+
+    def _coverage_short(self, covered_s, speech_end_s):
+        """True when a piece's transcript stops a truncation-sized gap short of
+        the piece's real last-speech second (so a piece that legitimately ends
+        in silence is NOT flagged)."""
+        if speech_end_s <= self.COVERAGE_CHECK_MIN_S:
+            return False
+        tol = max(self.COVERAGE_TOL_MIN_S, self.COVERAGE_TOL_FRAC * speech_end_s)
+        return covered_s < speech_end_s - tol
+
+    def _quietest_cut(self, piece, sr=16000):
+        """Frame index of the longest silence in the middle 30-70 % of a piece -
+        a natural split point for a piece Gemini keeps truncating. None when the
+        piece has no clear interior silence (the caller then bisects at the exact
+        midpoint)."""
+        n = len(piece)
+        fr = int(0.03 * sr)
+        nf = n // fr
+        if nf < 8:
+            return None
+        frames = np.asarray(piece[:nf * fr], dtype=np.float32).reshape(nf, fr)
+        rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
+        thr = max(0.006, float(np.median(rms)) * 0.5)
+        lo, hi = int(nf * 0.3), int(nf * 0.7)
+        best_run, best_mid = 0, None
+        i = lo
+        while i < hi:
+            if rms[i] < thr:
+                j = i
+                while j < hi and rms[j] < thr:
+                    j += 1
+                if (j - i) > best_run:
+                    best_run, best_mid = j - i, ((i + j) // 2) * fr
+                i = j
+            else:
+                i += 1
+        return best_mid
+
+    def _guarded_transcribe_piece(self, piece, offset_s, do_one, cov_of, merge,
+                                  on_prog=None, depth=0):
+        """Transcribe one audio piece with a truncation guard shared by the
+        diarized and plain file paths.
+
+        do_one(piece, offset_s) -> result ; cov_of(result, offset_s) -> the
+        transcript's covered seconds (LOCAL to the piece) ; merge(a, b) ->
+        combined result. If coverage falls a truncation-sized gap short of the
+        piece's real last speech, retry once on the same audio (a transient cut
+        self-heals - observed), then, bounded by MAX_SPLIT_DEPTH, bisect at the
+        quietest interior point and recurse, merging the halves. Returns the
+        fullest result; never raises on the guard itself."""
+        res = do_one(piece, offset_s)
+        speech_end = self._last_speech_s(piece)
+        if not self._coverage_short(cov_of(res, offset_s), speech_end):
+            return res
+        if depth == 0:
+            log.warning("Gemini: piece truncated (%.0fs of %.0fs speech) - "
+                        "retrying once", cov_of(res, offset_s), speech_end)
+            retry = do_one(piece, offset_s)
+            if cov_of(retry, offset_s) > cov_of(res, offset_s):
+                res = retry
+            if not self._coverage_short(cov_of(res, offset_s), speech_end):
+                return res
+        if depth < self.MAX_SPLIT_DEPTH and len(piece) > self.MIN_SPLIT_S * 16000:
+            cut = self._quietest_cut(piece) or (len(piece) // 2)
+            log.warning("Gemini: piece still short - splitting at %.0fs and "
+                        "recursing (depth %d)", cut / 16000.0, depth + 1)
+            left, right = piece[:cut], piece[cut:]
+            lres = self._guarded_transcribe_piece(
+                left, offset_s, do_one, cov_of, merge, on_prog, depth + 1)
+            rres = self._guarded_transcribe_piece(
+                right, offset_s + len(left) / 16000.0, do_one, cov_of, merge,
+                on_prog, depth + 1)
+            return merge(lres, rres)
+        log.warning("Gemini: piece STILL short (%.0fs of %.0fs) after retry + "
+                    "split - tail may be missing",
+                    cov_of(res, offset_s), speech_end)
+        return res
+
+    def _diarize_one_piece(self, piece, seg_start_s, seg_prefix, language,
+                           seg_dur, on_prog=None):
+        """One diarized Interactions request for a single audio piece -> a list
+        of offset utterances. Split out of transcribe_diarized so the coverage
+        guard can retry it. A 40-min meeting = ~7 requests; the free tier is
+        ~25/min, so _post_interaction_retrying backs off on a 429 rather than
+        aborting the whole job."""
+        tc = self._build_transcription_config(
+            language=language, diarize=True, word_ts=True)
+        wav = self._audio_to_wav_bytes(piece)
+        http_timeout = (10, max(120, int(seg_dur * 6) + 30))
+        j = self._post_interaction_retrying(
+            wav, tc, http_timeout,
+            on_wait=(lambda w, i, n: on_prog()) if on_prog else None)
+        return self._utterances_from_response(j, seg_start_s, seg_prefix)
+
+    @staticmethod
+    def _last_speech_s(piece, sr=16000):
+        """Second of the last voiced 30 ms frame (trailing-silence-trimmed
+        speech extent). Lets the diarize truncation guard tell a genuinely
+        silent tail from a cut-off response. Mirrors the RMS gate in
+        _split_for_inline; any failure returns the full duration (fail open)."""
+        try:
+            fr = int(0.03 * sr)
+            nf = len(piece) // fr
+            if nf == 0:
+                return len(piece) / float(sr)
+            frames = np.asarray(piece[:nf * fr],
+                                dtype=np.float32).reshape(nf, fr)
+            rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
+            thr = max(0.006, float(np.median(rms)) * 0.5)
+            voiced = np.where(rms >= thr)[0]
+            return float((voiced[-1] + 1) * fr) / sr if len(voiced) else 0.0
+        except Exception:
+            return len(piece) / float(sr)
 
     def _utterances_from_response(self, resp_json, offset_s, speaker_prefix):
         """Aggregate word-level annotations into speaker utterances. Words are
@@ -12611,18 +12858,18 @@ def _stamp_lia_launcher(exe_path):
         return False
     try:
         vi = VSVersionInfo(
-            ffi=FixedFileInfo(filevers=(1, 4, 5, 0), prodvers=(1, 4, 5, 0),
+            ffi=FixedFileInfo(filevers=(1, 4, 6, 0), prodvers=(1, 4, 6, 0),
                               mask=0x3f, flags=0x0, OS=0x40004,
                               fileType=0x1, subtype=0x0),
             kids=[
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.4.5.0'),
+                    StringStruct('FileVersion', '1.4.6.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.4.5.0'),
+                    StringStruct('ProductVersion', '1.4.6.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -20005,6 +20252,19 @@ class LiaApp:
                     # transcription was empty so the "no speech" branch fires.
                     if text and self._is_likely_hallucination(text, audio_rms, duration_sec):
                         text = ""
+                    # Script guard: words in a script dictation never produces
+                    # (Korean/CJK/Arabic/... from a derailed multilingual decode).
+                    if text:
+                        _raw_before = text
+                        text, _n_foreign = strip_foreign_script_words(text)
+                        if _n_foreign:
+                            log.warning("Dictation: dropped %d foreign-script word(s) "
+                                        "(backend=%s)", _n_foreign,
+                                        self.config.get("transcription_backend"))
+                            self._capture_foreign_script_clip(
+                                audio, _raw_before, text, _n_foreign,
+                                duration_sec=duration_sec,
+                                pre_gain_peak_rms=audio_rms, source=source)
 
                     # Single paste of complete text
                     if text:
@@ -20074,6 +20334,18 @@ class LiaApp:
                     # Same hallucination guard as the partial path.
                     if text and self._is_likely_hallucination(text, audio_rms, duration_sec):
                         text = ""
+                    # Same script guard as the partial path.
+                    if text:
+                        _raw_before = text
+                        text, _n_foreign = strip_foreign_script_words(text)
+                        if _n_foreign:
+                            log.warning("Dictation: dropped %d foreign-script word(s) "
+                                        "(backend=%s)", _n_foreign,
+                                        self.config.get("transcription_backend"))
+                            self._capture_foreign_script_clip(
+                                audio, _raw_before, text, _n_foreign,
+                                duration_sec=duration_sec,
+                                pre_gain_peak_rms=audio_rms, source=source)
 
                     if text:
                         # Diagnostic capture (WP0), raw model output. No-op unless on.
@@ -22903,6 +23175,73 @@ class LiaApp:
             if not getattr(self, "_debug_capture_warned", False):
                 self._debug_capture_warned = True
                 log.warning("Dictation debug-capture failed (will not re-log): %s", e)
+
+    def _capture_foreign_script_clip(self, audio, raw_text, kept_text,
+                                     dropped_count, *, duration_sec,
+                                     pre_gain_peak_rms, source):
+        """Persist a dictation clip whose output carried foreign-script words
+        that strip_foreign_script_words removed - ALWAYS, independent of the
+        debug-capture flag, because a derailed multilingual decode is a rare,
+        real failure whose SOURCE is still unknown (the 2026-09-07 salad did not
+        come from the desktop). The sidecar records enough to tell WHY next time:
+        the model + device (Parakeet-on-Hebrew vs a low-signal multilingual
+        derail vs a cloud backend), route, and pre-gain RMS. Bounded ring, and
+        fully defensive - never raises into the dictation path."""
+        try:
+            import datetime as _dt
+            import wave as _wave
+            d = os.path.join(CONFIG_DIR, "foreign_script_clips")
+            os.makedirs(d, exist_ok=True)
+            now = _dt.datetime.now()
+            stamp = now.strftime("%Y%m%d_%H%M%S_") + f"{now.microsecond // 1000:03d}"
+            wav_path = os.path.join(d, f"fs_{stamp}.wav")
+            pcm = (np.clip(np.asarray(audio, dtype=np.float32), -1.0, 1.0)
+                   * 32767.0).astype("<i2")
+            with _wave.open(wav_path, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(16000)
+                w.writeframes(pcm.tobytes())
+            route = None
+            lt = getattr(self, "_local_transcriber", None)
+            if isinstance(lt, BilingualRouterTranscriber):
+                route = getattr(lt, "_last_route", None)
+            model = self.config.get("model_size")
+            # device: parakeet is a distinct engine; otherwise the whisper device
+            device = ("parakeet" if model and "parakeet" in str(model).lower()
+                      else self.config.get("whisper_device", "auto"))
+            sidecar = {
+                "wav": os.path.basename(wav_path),
+                "raw_text": raw_text or "",
+                "kept_text": kept_text or "",
+                "dropped_count": int(dropped_count),
+                "duration_sec": round(float(duration_sec), 3),
+                "pre_gain_peak_rms": round(float(pre_gain_peak_rms), 5),
+                "model": model,
+                "device": device,
+                "backend": self.config.get("transcription_backend"),
+                "route": route,
+                "source": source,
+                "ts": stamp,
+            }
+            with open(wav_path[:-4] + ".json", "w", encoding="utf-8") as f:
+                json.dump(sidecar, f, ensure_ascii=False, indent=2)
+            log.info("Foreign-script clip captured: %s (dropped %d, model=%s, "
+                     "device=%s, route=%s, rms=%.4f)", os.path.basename(wav_path),
+                     dropped_count, model, device, route, float(pre_gain_peak_rms))
+            # Bounded ring: keep the newest N pairs (the stamp sorts by time).
+            keep = 20
+            wavs = sorted(f for f in os.listdir(d) if f.endswith(".wav"))
+            for old in wavs[:-keep]:
+                for ext in (".wav", ".json"):
+                    try:
+                        os.remove(os.path.join(d, old[:-4] + ext))
+                    except OSError:
+                        pass
+        except Exception as e:
+            if not getattr(self, "_fs_capture_warned", False):
+                self._fs_capture_warned = True
+                log.warning("Foreign-script capture failed (will not re-log): %s", e)
 
     def _is_likely_hallucination(self, text, audio_rms, duration_sec):
         """Heuristic: post-transcription, decide whether the model invented
@@ -26743,6 +27082,19 @@ class LiaApp:
                                   "vocab_corrections_list", "vocab_corrections_scan",
                                   "snippets_get", "capture_hotkey", "test_remote",
                                   "serve_status", "lexicon_oov_list"}
+    # Mutations that act on a dynamically-loaded list which the child reloads in
+    # place itself (loadOov / loadCorr / loadList right after the call). A
+    # follow-up {"t":"state"} would full-re-render the page and wipe that list,
+    # so accepting / fixing / dismissing ONE suggestion collapsed the whole list
+    # and the user had to press "Load suggestions" again every time
+    # (2026-09-11). Skip the state push for these too; the only field they leave
+    # briefly stale is the cosmetic "Suggestions" badge count, which reconciles
+    # on the next natural render.
+    _SETTINGS_LIST_MUTATION_METHODS = {"vocab_resolve", "vocab_remove_learned",
+                                       "vocab_add_correction",
+                                       "vocab_remove_correction",
+                                       "vocab_remove_corrections",
+                                       "lexicon_oov_dismiss"}
 
     def _settings_status_line(self):
         if self._is_meeting_active():
@@ -27299,8 +27651,12 @@ class LiaApp:
                 self._settings_send({"t": "result", "id": cid, "ok": ok,
                                      "msg": m, "data": data})
                 # Read-only getters change nothing — a state push would re-render
-                # and wipe the list they just loaded into the DOM.
-                if method in self._SETTINGS_READONLY_METHODS:
+                # and wipe the list they just loaded into the DOM. List
+                # mutations reload their own list in place, so they skip the
+                # push for the same reason (else one accept/fix/dismiss wiped
+                # the whole list — 2026-09-11).
+                if method in self._SETTINGS_READONLY_METHODS \
+                        or method in self._SETTINGS_LIST_MUTATION_METHODS:
                     return
                 # push fresh state so controls reconcile after any mutation
                 dev = method in self._SETTINGS_DEVICE_METHODS
