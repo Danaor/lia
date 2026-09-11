@@ -4091,8 +4091,16 @@ def t_serve_secure_defaults():
     assert App._set_serve_host(app, "bogus")[0] is False
     ok, tok = App._gen_serve_token(app)
     assert ok and len(tok) >= 20 and app.config["serve_token"] == tok
-    # ServeController refuses to start a network bind without a token
+    # ServeController refuses to start a network bind without a token. Use a
+    # free ephemeral port so the port-probe is not short-circuited by a real
+    # serve server already listening on the default 9090 (the desktop, and any
+    # build machine running serve mode, has one - it made this assertion see
+    # "already running" instead of the token rejection, 2026-09-11).
+    import socket as _sock
+    _s = _sock.socket(); _s.bind(("127.0.0.1", 0))
+    _free_port = _s.getsockname()[1]; _s.close()
     app.config["serve_host"] = "all"; app.config["serve_token"] = ""
+    app.config["serve_port"] = _free_port
     sc = w.ServeController(app.config)
     ok, msg = sc.start()
     assert ok is False and "token" in msg.lower(), (ok, msg)
