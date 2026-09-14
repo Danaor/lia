@@ -295,9 +295,9 @@ BODY = """
 <div class="shell">
   <nav class="sidebar">
     <div class="brand"><img class="logo" src="__LOGO_SRC__" alt=""><span class="brand-txt"><span class="brand-name">Lia</span><span class="brand-sub">Local Inference Assistant</span></span></div>
-    <button class="nav-item" data-page="general"><span class="ico">&#9881;</span>General</button>
-    <button class="nav-item" data-page="audio"><span class="ico">&#127911;</span>Audio</button>
     <button class="nav-item" data-page="models"><span class="ico">&#129504;</span>Models</button>
+    <button class="nav-item" data-page="audio"><span class="ico">&#127911;</span>Audio</button>
+    <button class="nav-item" data-page="general"><span class="ico">&#9881;</span>General</button>
     <button class="nav-item" data-page="cleanup"><span class="ico">&#10024;</span>AI Cleanup</button>
     <button class="nav-item" data-page="keys"><span class="ico">&#128273;</span>API Keys</button>
     <button class="nav-item" data-page="meetings"><span class="ico">&#128220;</span>Meetings</button>
@@ -499,14 +499,28 @@ APP_JS = r"""
         JSON.stringify([idx])+'\''+(method==="toggle_loopback_device"?' data-slow="1"':'')+'>'+
         '<span class="ic">'+(checked?'&#9679;':'&#9675;')+'</span><span class="grow rtl-auto" dir="auto">'+esc(name)+'</span></div>';
     }
-    var mics = [devRow("toggle_mic_device", null, "System Default", micOn && mid===null)];
-    (S.mics||[]).forEach(function(d){ mics.push(devRow("toggle_mic_device", d.idx, d.name, micOn && mid===d.idx)); });
+    // Selection is matched by NAME when one is stored (indices shift on USB
+    // hot-plug - a headset's slot once became the Cam Link, and this radio
+    // dutifully highlighted the wrong device). Falls back to the index for a
+    // legacy config that has no name yet.
+    var mname = cfg("input_device_name", "") || "";
+    function isSel(storedIdx, storedName, d){ return storedName ? (d.name===storedName) : (storedIdx===d.idx); }
+    function gone(storedName){ return !!storedName && !(S.mics||[]).some(function(d){ return d.name===storedName; }); }
+    function goneRow(storedName){
+      return '<div class="rowbtn disabledrow"><span class="ic">&#9679;</span><span class="grow rtl-auto" dir="auto">'+esc(storedName)+
+        '</span><span class="hk">disconnected</span></div>';
+    }
+    var mics = [devRow("toggle_mic_device", null, "System Default", micOn && mid===null && !mname)];
+    (S.mics||[]).forEach(function(d){ mics.push(devRow("toggle_mic_device", d.idx, d.name, micOn && isSel(mid, mname, d))); });
+    if(gone(mname)) mics.push(goneRow(mname));
     // Dedicated meeting mic (radio semantics; null = follow the dictation mic).
     // Lets a headset own the meeting while a desk mic stays free for dictating
     // mid-meeting. Falls back to the dictation mic if the device is unplugged.
     var mmid = cfg("meeting_input_device_index", null);
-    var mmics = [devRow("set_meeting_mic_device", null, "Same as dictation mic", mmid===null)];
-    (S.mics||[]).forEach(function(d){ mmics.push(devRow("set_meeting_mic_device", d.idx, d.name, mmid===d.idx)); });
+    var mmname = cfg("meeting_input_device_name", "") || "";
+    var mmics = [devRow("set_meeting_mic_device", null, "Same as dictation mic", mmid===null && !mmname)];
+    (S.mics||[]).forEach(function(d){ mmics.push(devRow("set_meeting_mic_device", d.idx, d.name, isSel(mmid, mmname, d))); });
+    if(gone(mmname)) mmics.push(goneRow(mmname));
     var loops = "";
     if(S.loopback_available){
       var L = [devRow("toggle_loopback_device", null, "System Default", sysOn && lid===null)];
@@ -774,7 +788,11 @@ APP_JS = r"""
       : '<div class="rowbtn disabledrow"><span class="ic">&#128196;</span><span class="grow">Live transcript (none active)</span></div>';
     return '<div class="content-head"><h1>Meetings</h1></div>'+
       '<div class="page">'+
-        sw("Auto-detect Zoom / Teams / Meet calls", !!cfg("auto_detect_meetings",false), "toggle_auto_detect_meetings")+
+        sw("Auto-detect Zoom / Teams / Meet calls", !!cfg("auto_detect_meetings",false), "toggle_auto_detect_meetings")+'<br>'+
+        sw("Keep raw per-source tracks (mic / system / backup) next to the mixdown", !!cfg("keep_meeting_tracks",true), "toggle_keep_meeting_tracks")+'<br>'+
+        sw("Backup mic: also record the dictation mic when the meeting mic differs", !!cfg("meeting_backup_mic",true), "toggle_meeting_backup_mic")+'<br>'+
+        sw("Auto-switch to the dictation mic when the meeting mic is silent but the backup hears you", !!cfg("meeting_mic_auto_fallback",true), "toggle_meeting_mic_auto_fallback")+
+        '<div class="hint">Safety net for meeting transcripts: the mixdown is kept as before; the raw tracks let you re-transcribe one side alone and catch a wrong meeting mic. Same retention as the meeting audio.</div>'+
       '</div>'+
       '<div class="page"><div class="section-title">Tools</div>'+
         actrow('&#128269;','Ask your meetings…','open_meetings_ask',hk.ask,true)+
@@ -784,6 +802,7 @@ APP_JS = r"""
           radio("vao","set_voice_ask_output","paste","str","Paste at cursor", cfg("voice_ask_output")==="paste")+
           radio("vao","set_voice_ask_output","both","str","Both", cfg("voice_ask_output")==="both"))+
         actrow('&#128203;','Action items…','open_action_items',hk.actions)+
+        actrow('&#9993;','Search your email…','open_email_search',hk.email)+
         actrow('&#128193;','Open meeting folder','open_meetings_folder','')+
         actrow('&#9998;','Edit a meeting summary…','edit_meeting_summary','')+
         actrow('&#128101;','Rename speakers in a meeting…','rename_speakers_old','')+

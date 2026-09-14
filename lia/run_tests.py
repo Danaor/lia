@@ -3053,6 +3053,75 @@ def t_email_clean_body():
 _test("email index: body cleaner strips quotes + safelinks", t_email_clean_body)
 
 
+def t_email_rag_rerank():
+    """RAG quality upgrade: RRF fusion + MMR diversity (pure), and the retriever
+    surfaces the matched CHUNK (not the message head) so a long email feeds its
+    relevant passage to the LLM."""
+    import email_index as ei
+    import numpy as _np
+
+    # --- pure _rrf: a doc ranked in BOTH lists beats one ranked high in one ---
+    r = ei._rrf([["a", "b", "c"], ["b", "d", "a"]])
+    assert r["a"] > r["c"] and r["b"] > r["d"], r
+    assert max(r, key=lambda k: r[k]) in ("a", "b")
+
+    # --- pure _mmr: two near-identical vectors must not both fill the top-k ---
+    e0 = _np.zeros(8, dtype=_np.float32); e0[0] = 1.0
+    e1 = _np.zeros(8, dtype=_np.float32); e1[1] = 1.0
+    dup = e0.copy()
+    id2v = {"x": e0, "xdup": dup, "y": e1}
+    # query equally relevant to x and y; xdup is a near-duplicate of x. MMR
+    # (default lambda) must keep x + the DIVERSE y, dropping the duplicate.
+    qv = (e0 + e1); qv = qv / _np.linalg.norm(qv)
+    picked = ei._mmr(["x", "xdup", "y"], id2v, qv, k=2)
+    assert "x" in picked and "y" in picked and "xdup" not in picked, picked
+
+    # --- matched-chunk retrieval end to end (embed monkeypatched) ---
+    import tempfile, time as _t
+    base = os.path.join(tempfile.gettempdir(), "wt_ragtest_%d" % os.getpid())
+    mp, vp = base + "_m.db", base + "_v.db"
+    for p in (mp, vp, mp + "-wal", mp + "-shm", vp + "-wal", vp + "-shm"):
+        try: os.remove(p)
+        except OSError: pass
+    conn = ei.connect(mp); ei.init_schema(conn)
+    vconn = ei.connect(vp); ei.init_vectors(vconn)
+    now = int(_t.time())
+    body = ("שלום, פתיח על מזג האוויר וברכות. " * 6
+            + " ההחלטה על אישור התקציב לפרויקט DEEP מופיעה רק כאן בעומק המייל.")
+    bc = ei.clean_body(body)
+    conn.execute(
+        "INSERT INTO messages(entry_id,store_id,account,folder,sender_name,"
+        "sender_email,to_recips,cc_recips,subject,body_clean,received_ts,"
+        "has_attach,content_hash,indexed_ts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("m1", "s", "primary", "Inbox", "Dana", "dana@x.co", "me@x.co", "",
+         "פרויקט DEEP", bc, now, 0, ei.content_hash("פרויקט DEEP", bc), now))
+    conn.commit()
+    mid = conn.execute("SELECT id FROM messages WHERE entry_id='m1'").fetchone()[0]
+    D = ei.EMBED_DIM
+    def unit(i):
+        v = _np.zeros(D, dtype=_np.float32); v[i] = 1.0; return v
+    # ord0/1 = off-topic axis, ord2 (DEEP) = the query axis
+    chunks = ["פתיח מזג אוויר", "עוד פתיח וברכות", "אישור התקציב לפרויקט DEEP"]
+    vecs = [unit(1), unit(1), unit(0)]
+    ei.store_chunks(vconn, mid, chunks, vecs)
+    ei._VEC_CACHE.update(n=-1, ids=None, mat=None, cids=None)   # bust cross-test cache
+    orig_embed = ei.embed_texts
+    ei.embed_texts = lambda texts, *a, **k: [unit(0)]           # query ~ DEEP axis
+    try:
+        hits = ei.hybrid_search(conn, vconn, "אישור התקציב", limit=5)
+    finally:
+        ei.embed_texts = orig_embed
+    assert hits and hits[0]["id"] == mid, hits
+    cid = hits[0].get("chunk_id")
+    assert cid is not None, "hybrid must surface the matched chunk_id"
+    ctx = ei.chunk_context(vconn, cid)
+    assert "DEEP" in ctx, "matched-chunk context must carry the deep passage, got: " + ctx[:80]
+    conn.close(); vconn.close()
+
+
+_test("email RAG: RRF + MMR + matched-chunk retrieval", t_email_rag_rerank)
+
+
 def t_email_query_parser():
     import email_index as ei
     m, where, params = ei.parse_query("acme.co from:dana after:2026/06/01 has:attachment")
@@ -3079,6 +3148,55 @@ def t_email_module_wiring():
 
 
 _test("email search: modules import + lia wiring", t_email_module_wiring)
+
+
+def t_email_archive_and_autorefresh():
+    """The three email-index improvements: (1) archive stores index in full,
+    (2) a background auto-refresh watchdog keeps the index current while the
+    window is closed, (3) a VISIBLE entry point in Settings > Meetings > Tools."""
+    import inspect
+    import emailsearch_indexer as ex
+    # (1) archive-store classification (pure) - the Online Archive / ILTLV Archive
+    #     stores that the DEFAULT_FOLDERS one-level scan used to miss.
+    assert ex.is_archive_store("Online Archive - Naor Daniel")
+    assert ex.is_archive_store("ILTLV Archive")
+    assert ex.is_archive_store("ארכיון")  # Hebrew "ארכיון"
+    assert not ex.is_archive_store("naor@example.com")
+    assert not ex.is_archive_store("Cloud Professional")
+    # noise folders skipped even inside an archive; a real folder kept
+    assert ex.is_noise_folder("Deleted Items") and ex.is_noise_folder("junk email")
+    assert not ex.is_noise_folder("Inbox") and not ex.is_noise_folder("Projects 2025")
+    # target_folders yields a 4th element (watermark key) now; sync/sync_unread
+    # unpack it, and the archive recursion helper + require-running exist.
+    isrc = inspect.getsource(ex)
+    assert "def _collect_archive_folders" in isrc
+    assert "for acct, fname, fld, key in folders" in isrc, "sync must use the wm key"
+    assert "for _acct, fname, fld, _wmkey in folders" in isrc, "sync_unread unpack"
+    assert '"--require-running"' in isrc or "require_running" in isrc
+    assert "raise RuntimeError(\"Outlook is not running\")" in isrc
+    # (2) background refresh watchdog + config + require-running plumbing in lia.py
+    import lia as wt
+    assert hasattr(wt.LiaApp, "_email_reindex_watchdog"), "watchdog missing"
+    assert hasattr(wt.LiaApp, "_kick_email_indexer_bg"), "bg kicker missing"
+    assert "email_reindex_interval_min" in wt.DEFAULT_CONFIG, "config key missing"
+    run_src = inspect.getsource(wt.LiaApp.run)
+    assert "_email_reindex_watchdog" in run_src, "watchdog not started at boot"
+    kick_src = inspect.getsource(wt.LiaApp._kick_email_indexer)
+    assert "--require-running" in kick_src, "require-running not passed through"
+    # the bg kicker must NOT trigger a heavy first-time full build silently
+    bg_src = inspect.getsource(wt.LiaApp._kick_email_indexer_bg)
+    assert "MESSAGES_DB" in bg_src and "require_running=True" in bg_src
+    # (3) visible entry point: allowlisted action + a Settings Meetings row.
+    app = wt.LiaApp.__new__(wt.LiaApp)
+    amap = wt.LiaApp._settings_action_map(app)
+    assert "open_email_search" in amap, "open_email_search not allowlisted"
+    base = os.path.dirname(os.path.abspath(__file__))
+    sw = open(os.path.join(base, "settings_window.py"), encoding="utf-8").read()
+    assert "open_email_search" in sw, "no Settings entry point for email search"
+
+
+_test("email: archive folders + background auto-refresh + visible entry",
+      t_email_archive_and_autorefresh)
 
 
 def t_email_unread_and_selfheal():
@@ -3875,6 +3993,11 @@ def t_meeting_audio_retention():
     opus_400d = mk("2025-06-01_10-00-00_meeting_audio.opus", 400) # Opus under 730 → keep
     opus_800d = mk("2024-05-01_10-00-00_meeting_audio.opus", 800) # Opus past 730 → prune
     transcript = mk("2024-01-01_10-00-00_meeting.txt", 900)       # ancient transcript → keep
+    # per-source safety-net tracks share the tiers (2026-09-14)
+    trk_wav_old = mk("2026-01-01_10-00-00_meeting_mic.wav", 45)      # prune
+    trk_wav_new = mk("2026-07-20_10-00-00_meeting_backup.wav", 10)   # keep
+    trk_opus_ok = mk("2025-06-01_10-00-00_meeting_system.opus", 400) # keep
+    trk_opus_old = mk("2024-05-01_10-00-00_meeting_mic.opus", 800)   # prune
 
     app = wt.LiaApp.__new__(wt.LiaApp)
     app.config = {"meeting_wav_retention_days": 30, "meeting_opus_retention_days": 730}
@@ -3887,6 +4010,10 @@ def t_meeting_audio_retention():
         assert os.path.exists(opus_400d), "400-day Opus must be kept (<730)"
         assert not os.path.exists(opus_800d), "800-day Opus should be pruned (>730)"
         assert os.path.exists(transcript), "transcripts must NEVER be pruned"
+        assert not os.path.exists(trk_wav_old), "45-day track WAV should be pruned"
+        assert os.path.exists(trk_wav_new), "10-day track WAV must be kept"
+        assert os.path.exists(trk_opus_ok), "400-day track Opus must be kept"
+        assert not os.path.exists(trk_opus_old), "800-day track Opus should be pruned"
         # 0 for a format = keep it forever
         app.config["meeting_wav_retention_days"] = 0
         wav_old = mk("2020-01-01_10-00-00_meeting_audio.wav", 999)
@@ -6392,7 +6519,11 @@ _test("settings: SETTINGS_ACTIONS covers every migrated tray surface (N/N)",
 def t_meeting_mic_resolve():
     """The dedicated meeting mic resolves correctly: None follows the dictation
     mic; a present index is used; an unplugged index falls back to the
-    dictation mic (never records silence from a stale handle)."""
+    dictation mic (never records silence from a stale handle). Since the
+    headset -> Cam Link drift (2026-09-13): the persisted NAME is the source of
+    truth - a shifted index resolves by name and self-heals, a stale index whose
+    slot now holds ANOTHER device is not trusted, and a legacy index-only config
+    migrates itself to a name."""
     import lia as w
 
     class FakeApp:
@@ -6401,6 +6532,8 @@ def t_meeting_mic_resolve():
 
     resolve = w.MeetingSession._resolve_meeting_mic
     orig = w.list_input_devices
+    orig_save = w.save_config
+    w.save_config = lambda cfg: None            # the self-heal must not touch disk here
     w.list_input_devices = lambda: [(1, "JOUNIVO"), (3, "Headset Mic")]
     try:
         # None -> same as dictation mic
@@ -6409,22 +6542,353 @@ def t_meeting_mic_resolve():
         # dedicated present -> used (dictation mic untouched)
         assert resolve(FakeApp({"input_device_index": 1,
                                 "meeting_input_device_index": 3})) == 3
-        # dedicated == dictation -> no enumeration needed, same result
+        # dedicated == dictation -> same result
         assert resolve(FakeApp({"input_device_index": 1,
                                 "meeting_input_device_index": 1})) == 1
         # dedicated UNPLUGGED -> falls back to the dictation mic
         assert resolve(FakeApp({"input_device_index": 1,
                                 "meeting_input_device_index": 7})) == 1
+        # ---- name-based (the drift fix) ----
+        # shifted: the name says Headset, but stored slot 2 now holds the Cam Link
+        w.list_input_devices = lambda: [(1, "JOUNIVO"), (2, "Cam Link HDMI"),
+                                        (4, "Headset Mic")]
+        cfg = {"input_device_index": 1, "meeting_input_device_index": 2,
+               "meeting_input_device_name": "Headset Mic"}
+        assert resolve(FakeApp(cfg)) == 4, "must follow the NAME, not the stale index"
+        assert cfg["meeting_input_device_index"] == 4, "the index must self-heal"
+        # name gone -> fall back (the stale index is NOT trusted)
+        cfg = {"input_device_index": 1, "meeting_input_device_index": 2,
+               "meeting_input_device_name": "Jabra Gone"}
+        assert resolve(FakeApp(cfg)) == 1
+        # legacy index-only -> used once AND migrated to a name
+        cfg = {"input_device_index": 1, "meeting_input_device_index": 4}
+        assert resolve(FakeApp(cfg)) == 4
+        assert cfg.get("meeting_input_device_name") == "Headset Mic"
+        # the name resolves to the dictation mic itself -> same as dictation
+        cfg = {"input_device_index": 1, "meeting_input_device_index": 9,
+               "meeting_input_device_name": "JOUNIVO"}
+        assert resolve(FakeApp(cfg)) == 1
         # enumeration failure -> falls back, never raises
         w.list_input_devices = lambda: (_ for _ in ()).throw(RuntimeError("dead"))
         assert resolve(FakeApp({"input_device_index": 1,
                                 "meeting_input_device_index": 3})) == 1
     finally:
         w.list_input_devices = orig
+        w.save_config = orig_save
 
 
-_test("meeting: dedicated meeting mic resolve + unplug fallback",
+_test("meeting: dedicated meeting mic resolve + unplug fallback + by-name heal",
       t_meeting_mic_resolve)
+
+
+def t_device_remap_by_name():
+    """_remap_device_by_name (pure): the persisted name is authoritative; without
+    one the prior index->name mapping is used; 'gone' and 'unknown' are distinct.
+    Plus wiring: the hot-plug watchdog remaps the MEETING mic too (it did not,
+    which is how a headset's slot became the Cam Link), the boot heal runs
+    before the recorder is built, and the Settings radios match by name."""
+    import inspect
+    import lia as w
+    R = w._remap_device_by_name
+    prev = [(1, "JOUNIVO"), (2, "Headset")]
+    new = [(1, "JOUNIVO"), (2, "Cam Link"), (4, "Headset")]
+    assert R("Headset", prev, new, 2) == (4, "shifted")   # slot 2 is now the Cam Link
+    assert R("", prev, new, 2) == (4, "shifted")          # legacy: name taken from prev
+    assert R("JOUNIVO", prev, new, 1) == (1, "same")
+    assert R("Jabra", prev, new, 7) == (None, "gone")
+    assert R("", prev, new, 9) == (None, "unknown")       # no name, no prior mapping
+    assert R("", [], new, None) == (None, "unknown")
+    assert w._device_name_for_index(None) == ""
+    assert w._device_name_for_index(4, new) == "Headset"
+    src = inspect.getsource(w.LiaApp._device_watchdog)
+    assert "meeting_input_device_index" in src and "_remap_device_by_name" in src
+    assert hasattr(w.LiaApp, "_heal_device_indices_by_name")
+    init_src = inspect.getsource(w.LiaApp.__init__)
+    assert "_heal_device_indices_by_name()" in init_src, \
+        "the boot heal must run before the recorder is created"
+    assert "input_device_name" in w.DEFAULT_CONFIG
+    assert "meeting_input_device_name" in w.DEFAULT_CONFIG
+    base = os.path.dirname(os.path.abspath(w.__file__))
+    sw = open(os.path.join(base, "settings_window.py"), encoding="utf-8").read()
+    assert "meeting_input_device_name" in sw and "isSel(" in sw, "Settings must match by name"
+
+
+_test("device: remap by name (watchdog + boot heal + Settings wiring)",
+      t_device_remap_by_name)
+
+
+def t_meeting_mic_silence_check():
+    """Per-channel silent-mic nudge (2026-09-14): the old dead-audio nudge fires
+    only when BOTH channels are empty; a wrong meeting mic (drifted to a silent
+    HDMI input) leaves the loopback alive, so the meeting looked healthy while
+    the user was missing. Now: mic ~silent + loopback live for 3 drains -> ONE
+    loud overlay; a mic with signal resets the counter; never fires twice; both
+    channels empty stays the OLD dead-audio path."""
+    import lia as w
+    import numpy as np
+
+    class FakeRec:
+        def __init__(self, arr):
+            self.arr = arr
+        def drain(self):
+            return self.arr
+
+    class FakeApp:
+        def __init__(self):
+            self.shown = []
+            self.config = {}
+        def _force_show_error_overlay(self, msg):
+            self.shown.append(msg)
+
+    def fresh(mic, loop):
+        s = w.MeetingSession.__new__(w.MeetingSession)
+        s.app = FakeApp()
+        s.diarize_mode = False
+        s._mic_recorder = FakeRec(mic)
+        s._loopback_recorder = FakeRec(loop)
+        return s
+
+    def hits(s):
+        return [m for m in s.app.shown if "NOT being captured" in m]
+
+    silent = np.zeros(16000, dtype=np.float32)
+    live = (np.sin(np.linspace(0, 200, 16000)) * 0.2).astype(np.float32)
+    s = fresh(silent, live)
+    s._drain_audio_inner(); s._drain_audio_inner()
+    assert not hits(s), "must not nudge before 3 silent-mic drains"
+    s._drain_audio_inner()
+    assert len(hits(s)) == 1, "nudge once after 3 drains of silent mic + live loopback"
+    s._drain_audio_inner(); s._drain_audio_inner()
+    assert len(hits(s)) == 1, "never nudge twice"
+    # a mic WITH signal never trips it
+    s2 = fresh(live, live)
+    for _ in range(5):
+        s2._drain_audio_inner()
+    assert not s2.app.shown
+    # both channels empty = the OLD dead-audio path, not this nudge
+    s3 = fresh(np.zeros(0, np.float32), np.zeros(0, np.float32))
+    for _ in range(3):
+        s3._drain_audio_inner()
+    assert not hits(s3)
+    # the mixed audio still comes back for transcription (loop-only when mic is silent)
+    s4 = fresh(silent, live)
+    out = s4._drain_audio_inner()
+    assert out is not None and len(out) == 16000
+
+
+_test("meeting: per-channel silent-mic nudge (wrong meeting mic signature)",
+      t_meeting_mic_silence_check)
+
+
+def t_meeting_tracks_written():
+    """Per-source safety-net tracks (2026-09-14): next to the mixdown, the RAW
+    mic / system / backup tracks are written before the mix, padded to a common
+    length per drain (time-aligned), finalized on stop (kept) or deleted when
+    keep is False; the mixdown itself is unchanged. Plus wiring: config keys,
+    backup recorder in _open_recorders, both start() modes open the writers,
+    stop/cancel/chunk-close finalize them, Settings toggles + action map."""
+    import inspect
+    import tempfile
+    import lia as w
+    import numpy as np
+
+    class FakeRec:
+        def __init__(self, arr):
+            self.arr = arr
+        def drain(self):
+            return self.arr
+        def stop(self):
+            return self.arr
+
+    class FakeApp:
+        def __init__(self):
+            self.config = {"keep_meeting_audio": True, "keep_meeting_tracks": True}
+            self.shown = []
+        def _force_show_error_overlay(self, msg):
+            self.shown.append(msg)
+
+    d = tempfile.mkdtemp(prefix="wt_tracks_")
+    old_dir = w.MEETINGS_DIR
+    w.MEETINGS_DIR = d
+    try:
+        def fresh(mic, loop, backup):
+            s = w.MeetingSession.__new__(w.MeetingSession)
+            s.app = FakeApp()
+            s.diarize_mode = False
+            s._track_writers = {}
+            s._track_lock = __import__("threading").Lock()
+            s._mic_recorder = FakeRec(mic)
+            s._loopback_recorder = FakeRec(loop)
+            s._backup_recorder = FakeRec(backup)
+            return s
+
+        silent = np.zeros(16000, dtype=np.float32)
+        live = (np.sin(np.linspace(0, 200, 16000)) * 0.2).astype(np.float32)
+        short = live[:8000]                     # a shorter drain gets zero-padded
+        s = fresh(silent, live, short)
+        s._open_track_writers("2026-09-14_10-00-00")
+        assert set(s._track_writers) == {"mic", "system", "backup"}
+        mixed = s._drain_audio_inner()
+        assert mixed is not None and len(mixed) == 16000, "mixdown unchanged"
+        s._drain_audio_inner()
+        s._finalize_tracks(keep=True)
+        assert s._track_writers == {}
+        import wave as _wave
+        for name in ("mic", "system", "backup"):
+            p = os.path.join(d, "2026-09-14_10-00-00_meeting_%s.wav" % name)
+            assert os.path.exists(p), name + " track missing"
+            with _wave.open(p, "rb") as wf:
+                assert wf.getnchannels() == 1 and wf.getsampwidth() == 2
+                assert wf.getframerate() == 16000
+                assert wf.getnframes() == 2 * 16000, \
+                    "%s: %d frames (expected 2 drains x 16000, padded)" % (name, wf.getnframes())
+        # keep=False deletes the tracks (keep_meeting_audio off / cancel)
+        s2 = fresh(live, live, live)
+        s2._open_track_writers("2026-09-14_11-00-00")
+        s2._drain_audio_inner()
+        s2._finalize_tracks(keep=False, label="Cancel")
+        assert not os.path.exists(os.path.join(d, "2026-09-14_11-00-00_meeting_mic.wav"))
+        # tracks off -> nothing opened, drains still mix
+        s3 = fresh(live, live, None)
+        s3.app.config["keep_meeting_tracks"] = False
+        s3._open_track_writers("2026-09-14_12-00-00")
+        assert s3._track_writers == {}
+        assert s3._drain_audio_inner() is not None
+        # a second finalize is a harmless no-op
+        s._finalize_tracks(keep=True)
+    finally:
+        w.MEETINGS_DIR = old_dir
+    # wiring
+    assert w.DEFAULT_CONFIG.get("keep_meeting_tracks") is True
+    assert w.DEFAULT_CONFIG.get("meeting_backup_mic") is True
+    src = inspect.getsource(w.MeetingSession)
+    assert "_backup_recorder = AudioRecorder(" in src, "backup mic recorder missing"
+    assert src.count("self._open_track_writers(stamp)") == 2, "both start() modes must open tracks"
+    assert src.count("self._finalize_tracks(") >= 3, "stop (diarize) + chunk-close + cancel"
+    assert "self._write_tracks(mic_audio, loop_audio, backup_audio)" in src
+    prune_src = inspect.getsource(w.LiaApp._prune_meeting_audio)
+    assert "_meeting_backup" in prune_src and "_meeting_system" in prune_src
+    app = w.LiaApp.__new__(w.LiaApp)
+    amap = w.LiaApp._settings_action_map(app)
+    assert "toggle_keep_meeting_tracks" in amap and "toggle_meeting_backup_mic" in amap
+    base = os.path.dirname(os.path.abspath(w.__file__))
+    sw = open(os.path.join(base, "settings_window.py"), encoding="utf-8").read()
+    assert "toggle_keep_meeting_tracks" in sw and "toggle_meeting_backup_mic" in sw
+
+
+_test("meeting: per-source safety-net tracks (mic/system/backup) + wiring",
+      t_meeting_tracks_written)
+
+
+def t_meeting_mic_auto_fallback():
+    """Wrong-device auto-fallback (2026-09-14): a silent meeting mic + a backup
+    (dictation) mic that clearly hears the user -> the backup is promoted to be
+    the meeting mic ONCE (no device reopened), this window's user audio is kept
+    in the mix, an overlay says so; never twice; no backup / user silent on both
+    / config off -> untouched (the 3-drain nudge still covers the no-backup case)."""
+    import inspect
+    import lia as w
+    import numpy as np
+
+    class FakeRec:
+        def __init__(self, arr, tag):
+            self.arr = arr
+            self.tag = tag
+        def drain(self):
+            return self.arr
+
+    class FakeApp:
+        def __init__(self, fallback=True):
+            self.config = {"meeting_mic_auto_fallback": fallback,
+                           "keep_meeting_audio": True, "keep_meeting_tracks": False}
+            self.shown = []
+        def _force_show_error_overlay(self, msg):
+            self.shown.append(msg)
+
+    def fresh(mic, loop, backup, fallback=True):
+        s = w.MeetingSession.__new__(w.MeetingSession)
+        s.app = FakeApp(fallback)
+        s.diarize_mode = False
+        s._track_writers = {}
+        s._track_lock = __import__("threading").Lock()
+        s._input_device_index = 4
+        s._backup_device_index = 1
+        s._mic_recorder = FakeRec(mic, "mic")
+        s._loopback_recorder = FakeRec(loop, "loop")
+        s._backup_recorder = FakeRec(backup, "backup") if backup is not None else None
+        return s
+
+    silent = np.zeros(16000, dtype=np.float32)
+    live = (np.sin(np.linspace(0, 200, 16000)) * 0.2).astype(np.float32)
+    # silent meeting mic + backup hears the user -> promoted, once
+    s = fresh(silent, live, live)
+    out = s._drain_audio_inner()
+    assert s._mic_recorder.tag == "backup" and s._backup_recorder is None
+    assert s._input_device_index == 1, "meeting mic index follows the promoted device"
+    assert any("switched" in m for m in s.app.shown)
+    assert out is not None and float(np.abs(out).max()) > 0.05, \
+        "this window's backup audio must reach the mix (user's side not lost)"
+    n_shown = len(s.app.shown)
+    s._drain_audio_inner()
+    assert len(s.app.shown) == n_shown, "never switches twice"
+    # user silent on BOTH mics -> no evidence, no switch
+    s2 = fresh(silent, live, silent)
+    s2._drain_audio_inner()
+    assert s2._mic_recorder.tag == "mic" and s2._backup_recorder is not None
+    # config off -> no switch (the 3-drain nudge remains)
+    s3 = fresh(silent, live, live, fallback=False)
+    for _ in range(3):
+        s3._drain_audio_inner()
+    assert s3._mic_recorder.tag == "mic"
+    assert any("NOT being captured" in m for m in s3.app.shown)
+    # no backup at all -> untouched
+    s4 = fresh(silent, live, None)
+    s4._drain_audio_inner()
+    assert s4._mic_recorder.tag == "mic"
+    # wiring
+    assert w.DEFAULT_CONFIG.get("meeting_mic_auto_fallback") is True
+    src = inspect.getsource(w.MeetingSession._drain_audio_inner)
+    assert "_maybe_auto_fallback_mic(" in src
+    app = w.LiaApp.__new__(w.LiaApp)
+    assert "toggle_meeting_mic_auto_fallback" in w.LiaApp._settings_action_map(app)
+    base = os.path.dirname(os.path.abspath(w.__file__))
+    sw = open(os.path.join(base, "settings_window.py"), encoding="utf-8").read()
+    assert "toggle_meeting_mic_auto_fallback" in sw
+
+
+_test("meeting: silent-mic auto-fallback to the dictation (backup) mic",
+      t_meeting_mic_auto_fallback)
+
+
+def t_meeting_chunk_foreign_script_strip():
+    """Phase 5 (2026-09-14): meeting chunks get the same foreign-script
+    post-filter as dictation. A real line from a meeting whose mic had drifted
+    to a silent HDMI input: the Arabic-fused unit goes, Hebrew and plain-ASCII
+    text stay (ASCII hallucinations are out of this filter's scope - the mic
+    fix removes their cause). An all-foreign chunk classifies as 'empty', never
+    'failed'."""
+    import inspect
+    import lia as w
+    line = ("זה היה הבעיה. CNC-K- recuerdom, "
+            "IPR-D, boc if you love your hand to the channel for there,iek, rural "
+            "التwich,recipfend coeuro,")
+    out, n = w.strip_foreign_script_words(line)
+    assert n == 1, "exactly the Arabic-fused unit should be dropped, got %d" % n
+    assert "الت" not in out
+    assert "זה היה הבעיה" in out, "Hebrew kept"
+    assert "recuerdom" in out and "coeuro" in out, "plain-ASCII words are kept (out of scope)"
+    heb = "אז, כמה דקות. קוראים לי בפגישה אחרת."
+    assert w.strip_foreign_script_words(heb) == (heb, 0), "a clean Hebrew line is untouched"
+    assert w.strip_foreign_script_words("象 نہیں 예") == ("", 3), \
+        "an all-foreign chunk collapses to empty"
+    src = inspect.getsource(w.MeetingSession._submit_chunk)
+    assert "strip_foreign_script_words(text)" in src, "chunk worker must run the filter"
+    assert "foreign_emptied" in src and 'status = "empty"   # hallucinated salad' in src, \
+        "an all-foreign chunk must classify as empty, not failed"
+
+
+_test("meeting: foreign-script strip on chunks (Phase 5)",
+      t_meeting_chunk_foreign_script_strip)
 
 
 def t_vocab_corrections_analytics():

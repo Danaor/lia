@@ -46,6 +46,34 @@ OL_FOLDER_CALENDAR = 9
 OL_FOLDER_INBOX = 6
 DEFAULT_FOLDERS = ("Inbox", "Sent Items", "Sent", "Archive")
 
+# A top-level store (mailbox) whose name marks it an Exchange Online Archive /
+# secondary archive is indexed in FULL - every mail subfolder, recursed - because
+# that is exactly the mail the user archived and wants searchable. A NORMAL
+# mailbox stays limited to DEFAULT_FOLDERS (one level) so junk/drafts/deleted mail
+# never enter the index.
+_ARCHIVE_STORE_HINTS = ("archive", "ארכיון")  # en + he "ארכיון"
+# Mail folders that are noise even inside an archive store - never indexed, and we
+# never descend into their subtree either.
+_NOISE_FOLDERS = frozenset(n.lower() for n in (
+    "Deleted Items", "Junk Email", "Junk E-mail", "Junk", "Drafts", "Outbox",
+    "Sync Issues", "Conflicts", "Local Failures", "Server Failures",
+    "RSS Feeds", "RSS Subscriptions", "Conversation Action Settings",
+    "Quick Step Settings", "Suggested Contacts",
+))
+
+
+def is_archive_store(name):
+    """True if a top-level store (account) name marks it an Exchange Online
+    Archive / secondary archive mailbox - those we index in full (recursed)."""
+    n = (name or "").lower()
+    return any(h in n for h in _ARCHIVE_STORE_HINTS)
+
+
+def is_noise_folder(name):
+    """True for mail folders never worth indexing (deleted / junk / drafts /
+    sync-issue system folders), even inside an archive store."""
+    return (name or "").strip().lower() in _NOISE_FOLDERS
+
 
 # ---------------------------------------------------------------------------
 def _heartbeat():
@@ -88,37 +116,54 @@ def _save_state(state):
 
 # ---------------------------------------------------------------------------
 class Indexer:
-    def __init__(self, accounts=None, exclude=None):
+    def __init__(self, accounts=None, exclude=None, archives=True):
         self.accounts = [a.lower() for a in accounts] if accounts else None
         self.exclude = set(f.lower() for f in (exclude or []))
+        self.archives = archives     # index Online-Archive stores in full
         self.app = None
         self.ns = None
         self.conn = None
         self.vconn = None
 
     # ---- COM ----
-    def connect_outlook(self):
+    def connect_outlook(self, require_running=False):
+        if self.ns is not None:      # idempotent (main may connect up front)
+            return
         import pythoncom
         import win32com.client
         pythoncom.CoInitialize()
         try:
             self.app = win32com.client.GetActiveObject("Outlook.Application")
         except Exception:
-            # Not running. Last resort: Dispatch (launches it) — caller may prefer
-            # to fail instead; we Dispatch so a scheduled refresh still works.
+            # Not running. A background refresh passes require_running=True so we
+            # DON'T silently launch Outlook (and can exit quietly); the interactive
+            # window refresh Dispatches so an explicit ⟳ still works.
+            if require_running:
+                raise RuntimeError("Outlook is not running")
             self.app = win32com.client.Dispatch("Outlook.Application")
         self.ns = self.app.GetNamespace("MAPI")
 
     def target_folders(self):
-        """[(account, folder_name, folder_obj)] for cached mail folders we index."""
+        """[(account, folder_name, folder_obj, watermark_key)] for the mail
+        folders we index. A NORMAL store contributes only its DEFAULT_FOLDERS
+        (one level, watermark key 'acct/name' - preserves existing state). An
+        ARCHIVE store contributes EVERY mail subfolder (recursed, minus noise),
+        keyed by 'acct/full/path' so same-named subfolders never share a
+        watermark."""
         out = []
         stores = self.ns.Folders
         for i in range(1, stores.Count + 1):
             store = stores.Item(i)
-            acct = store.Name
+            try:
+                acct = store.Name
+            except Exception:
+                continue
             if self.accounts and not any(a in acct.lower() for a in self.accounts):
                 continue
             if "public folders" in acct.lower():
+                continue
+            if self.archives and is_archive_store(acct):
+                self._collect_archive_folders(acct, store, out)
                 continue
             try:
                 subs = store.Folders
@@ -139,8 +184,51 @@ class Indexer:
                         continue
                 except Exception:
                     pass
-                out.append((acct, name, fld))
+                out.append((acct, name, fld, "%s/%s" % (acct, name)))
         return out
+
+    def _collect_archive_folders(self, acct, store, out, max_folders=300):
+        """Recurse an archive store, appending every mail-type subfolder (minus
+        noise / --exclude) to `out` as (acct, leaf, folder, 'acct/full/path').
+        Bounded by folder count + depth so a pathological tree can't wander."""
+        try:
+            subs = store.Folders
+        except Exception:
+            return
+        stack = []
+        for j in range(1, subs.Count + 1):
+            try:
+                stack.append((subs.Item(j), ""))
+            except Exception:
+                pass
+        count = 0
+        while stack and count < max_folders:
+            fld, parent_path = stack.pop()
+            try:
+                name = fld.Name
+            except Exception:
+                continue
+            if is_noise_folder(name) or name.lower() in self.exclude:
+                continue                       # skip the folder AND its subtree
+            path = (parent_path + "/" + name) if parent_path else name
+            try:
+                kids = fld.Folders
+                if path.count("/") < 6:        # depth guard
+                    for j in range(1, kids.Count + 1):
+                        try:
+                            stack.append((kids.Item(j), path))
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            try:
+                is_mail = getattr(fld, "DefaultItemType", 0) == 0
+            except Exception:
+                is_mail = True
+            if not is_mail:
+                continue                       # calendar/contacts subfolder
+            count += 1
+            out.append((acct, name, fld, "%s/%s" % (acct, path)))
 
     def target_calendars(self):
         """[(account, folder_name, calendar_folder)] — the default calendar of
@@ -321,8 +409,7 @@ class Indexer:
         wm = state.setdefault("watermarks", {})
         folders = self.target_folders()
         total_seen = total_new = 0
-        for acct, fname, fld in folders:
-            key = "%s/%s" % (acct, fname)
+        for acct, fname, fld, key in folders:
             store_id = ""
             try:
                 store_id = fld.StoreID
@@ -445,7 +532,7 @@ class Indexer:
         except Exception:
             return 0
         changed = 0
-        for _acct, fname, fld in folders:
+        for _acct, fname, fld, _wmkey in folders:
             store_id = ""
             try:
                 store_id = fld.StoreID
@@ -681,6 +768,11 @@ def main():
     ap.add_argument("--accounts", default="")
     ap.add_argument("--exclude", default="")
     ap.add_argument("--base-url", default=ei.DEFAULT_OLLAMA)
+    ap.add_argument("--no-archives", action="store_true",
+                    help="skip Online-Archive stores (index only normal mailboxes)")
+    ap.add_argument("--require-running", action="store_true",
+                    help="a background refresh: exit quietly if Outlook is not "
+                         "already running (never launch it, never write an error)")
     ap.add_argument("--current-meeting", default="",
                     help="write the now-overlapping appointment(s) JSON here and exit")
     args = ap.parse_args()
@@ -695,18 +787,34 @@ def main():
         return
 
     ei.ensure_dir()
+    idx = Indexer(
+        accounts=[a for a in args.accounts.split(",") if a.strip()] or None,
+        exclude=[f for f in args.exclude.split(",") if f.strip()],
+        archives=not args.no_archives)
+
+    # Connect to Outlook up front. A background refresh (--require-running) that
+    # finds Outlook closed exits 0 WITHOUT touching index_status.json, so a 3am
+    # closed-Outlook never turns into a scary "error" banner next time the window
+    # opens (the last good "done" status stays intact).
+    try:
+        idx.connect_outlook(require_running=args.require_running)
+    except Exception as e:
+        if args.require_running:
+            sys.stdout.write("skip: %s\n" % e)
+            return
+        _write_status(state="error", error="%s: %s" % (type(e).__name__, e))
+        sys.stderr.write("outlook connect failed: %s\n%s\n"
+                         % (e, traceback.format_exc()))
+        sys.exit(1)
+
     _write_status(state="starting")
     _heartbeat()
     t0 = time.time()
     try:
-        idx = Indexer(
-            accounts=[a for a in args.accounts.split(",") if a.strip()] or None,
-            exclude=[f for f in args.exclude.split(",") if f.strip()])
         idx.conn = ei.connect(ei.MESSAGES_DB)
         ei.init_schema(idx.conn)
         idx.vconn = ei.connect(ei.VECTORS_DB)
         ei.init_vectors(idx.vconn)
-        idx.connect_outlook()
 
         seen, new = idx.sync(full=args.full, limit=args.limit)
         try:

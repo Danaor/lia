@@ -428,11 +428,18 @@ DEFAULT_CONFIG = {
     "whisper_device": "auto",
     "cuda_compute_type": "int8_float16",  # fast + low-VRAM on GPU (near-FP16 quality)
     "input_device_index": None,  # None = default system microphone
+    # The device NAME is persisted next to every index (2026-09-14): PortAudio
+    # indices shift on USB hot-plug (a headset went 7 -> 2 -> 4 as other devices
+    # came and went), and an index alone silently follows whatever device now
+    # occupies its slot. The name is the source of truth; the index is healed
+    # from it at boot, on hot-plug (watchdog) and at meeting start.
+    "input_device_name": "",
     "loopback_device_index": None,  # None = default output device, or specific WASAPI loopback index
     "meeting_input_device_index": None,  # None = same as the dictation mic; an index
                                          # = a DEDICATED meeting mic (e.g. a headset the
                                          # user talks into on calls, while a desk mic
                                          # stays free for dictating mid-meeting)
+    "meeting_input_device_name": "",     # its NAME (see input_device_name)
     "recording_mode": "toggle",  # "toggle" = press-to-start/press-to-stop (default since 1.4.4), "hold" = hold-to-record
     # Press-to-talk safety cap (minutes). The recording watchdog force-stops a
     # runaway dictation at this age (stuck key / forgotten toggle). On a FORCED
@@ -541,6 +548,21 @@ DEFAULT_CONFIG = {
     # short-term recovery) and a compact Opus copy (~10x smaller, long-term),
     # each pruned on its own clock below. Set False to keep no audio at all.
     "keep_meeting_audio": True,
+    # Per-source safety-net tracks (2026-09-14): next to the mixdown WAV also
+    # keep the RAW mic / system / backup-mic tracks (same format + retention),
+    # so a wrong meeting mic is diagnosable and each side can be re-transcribed
+    # alone. The mixdown alone could not recover a side the wrong device never
+    # captured. Needs keep_meeting_audio.
+    "keep_meeting_tracks": True,
+    # When the meeting mic is a DIFFERENT device from the dictation mic, also
+    # record the dictation mic (a desk mic usually still hears the user when
+    # the headset was the intended, or wrong, device). One extra 16 kHz mono
+    # stream; negligible CPU.
+    "meeting_backup_mic": True,
+    # When the meeting mic is ~silent while the backup (dictation) mic clearly
+    # hears the user, the meeting mic is the wrong device: promote the backup
+    # to be the meeting mic, once, with an overlay. Needs meeting_backup_mic.
+    "meeting_mic_auto_fallback": True,
     # Retention (days) for each kept format — pruned at startup by file age.
     # WAV: lossless but ~115MB/hour → short window. Opus: ~11MB/hour → long
     # archive (still re-transcribable, quality-equivalent for ASR).
@@ -765,6 +787,14 @@ DEFAULT_CONFIG = {
     # answer model for "ask your email" (blank = use summary_model).
     "email_search_hotkey": "ctrl+alt+f",
     "email_answer_model": "",
+    # Background email-index refresh: keeps the local index current even while the
+    # search window is CLOSED (it otherwise only refreshes when opened). Minutes
+    # between incremental refreshes; 0 disables. Kept short (15 min) so the index is
+    # near-current with incoming mail - an incremental pass is cheap (reads only mail
+    # newer than the per-folder watermark). The background pass never launches Outlook
+    # (it skips quietly when Outlook is closed) and never triggers the heavy first-time
+    # full build - that still happens the first time you open the window.
+    "email_reindex_interval_min": 15,
     # Chat: a free-form assistant window over the user's OWN models (local Ollama
     # by default; cloud gpt-5.5 offered when openai_api_key is set). Global hotkey
     # opens it. chat_model "" = default to summary_model / gemma4:31b-it-qat.
@@ -995,6 +1025,42 @@ def list_loopback_devices():
     _refresh_device_cache()
     with _device_cache_lock:
         return list(_device_cache["loop"])
+
+
+def _device_name_for_index(idx, devices=None):
+    """The current NAME of an input device index ('' when None/unknown).
+    Names are what survive a USB hot-plug; PortAudio indices are not stable
+    (a Jabra headset went 7 -> 2 -> 4 on one machine as other devices came
+    and went), so every device pick is persisted by name as well."""
+    if idx is None:
+        return ""
+    try:
+        devs = devices if devices is not None else list_input_devices()
+        return (dict(devs).get(idx) or "").strip()
+    except Exception:
+        return ""
+
+
+def _remap_device_by_name(stored_name, prev_list, new_list, cur_idx):
+    """Where did a chosen device go after the device list changed?
+
+    Pure + testable. The persisted NAME is the source of truth; without one
+    (legacy config) fall back to the name that cur_idx had in prev_list.
+    Returns (new_idx, kind) with kind in:
+      'same'    - the device is still at cur_idx
+      'shifted' - found under a different index (new_idx)
+      'gone'    - the device is no longer present (new_idx None)
+      'unknown' - nothing to look up (no name, no prior mapping)"""
+    name = (stored_name or "").strip()
+    if not name and cur_idx is not None:
+        name = (dict(prev_list).get(cur_idx) or "").strip()
+    if not name:
+        return None, "unknown"
+    by_name = {n: i for i, n in new_list}
+    if name in by_name:
+        new_idx = by_name[name]
+        return new_idx, ("same" if new_idx == cur_idx else "shifted")
+    return None, "gone"
 
 
 def resample_audio(audio, orig_rate, target_rate):
@@ -9800,6 +9866,12 @@ class MeetingSession:
         self.summarize = summarize
         self.last_summary = ""   # filled by the output writers when summarising
         self.summary_html_path = None  # clean shareable HTML of the summary
+        # Per-source safety-net tracks (2026-09-14): mic / system / backup are
+        # written RAW next to the mixdown. {name: (path, wave_writer)}.
+        self._track_writers = {}
+        self._track_lock = threading.Lock()
+        self._backup_recorder = None       # the dictation mic, when different
+        self._backup_device_index = None
         self.source = source or app.config.get("recording_source", "both")
         if input_device_index is not None:
             self._input_device_index = input_device_index
@@ -9912,17 +9984,59 @@ class MeetingSession:
         check matters - a meeting mic is typically a headset that may be
         unplugged; opening a stale index would record silence, so fall back
         loudly instead."""
-        dedicated = app.config.get("meeting_input_device_index")
-        fallback = app.config.get("input_device_index")
-        if dedicated is None or dedicated == fallback:
+        cfg = app.config
+        dedicated = cfg.get("meeting_input_device_index")
+        dedicated_name = (cfg.get("meeting_input_device_name") or "").strip()
+        fallback = cfg.get("input_device_index")
+        if dedicated is None and not dedicated_name:
             return fallback
         try:
-            present = {i for i, _n in list_input_devices()}
+            devices = list_input_devices()
         except Exception as e:
             log.warning("Meeting mic: device enumeration failed (%s) - "
                         "using the dictation mic", e)
             return fallback
-        if dedicated in present:
+        by_name = {n: i for i, n in devices}
+        by_idx = dict(devices)
+
+        def _persist(idx, name):
+            # Best-effort self-heal of the stored pair; never affects the
+            # resolution result.
+            try:
+                cfg["meeting_input_device_index"] = idx
+                cfg["meeting_input_device_name"] = name
+                save_config(cfg)
+            except Exception:
+                pass
+
+        # The NAME is the source of truth: a bare index silently follows
+        # whatever device now occupies that slot (a headset's slot became the
+        # Cam Link HDMI input after a hot-plug - the user vanished from the
+        # meeting transcript while "the index was still present").
+        if dedicated_name:
+            if dedicated_name in by_name:
+                idx = by_name[dedicated_name]
+                if idx != dedicated:
+                    log.info("Meeting mic '%s' index shifted %s -> %s (healed)",
+                             dedicated_name, dedicated, idx)
+                    _persist(idx, dedicated_name)
+                if idx == fallback:
+                    return fallback
+                log.info("Meeting mic: using dedicated device %s '%s' "
+                         "(dictation mic stays %s)", idx, dedicated_name, fallback)
+                return idx
+            log.warning("Meeting mic '%s' not present - falling back to the "
+                        "dictation mic (%s)", dedicated_name, fallback)
+            return fallback
+        # Legacy config (index, no name): accept it ONCE and persist its
+        # current name so the next resolve is by name.
+        if dedicated in by_idx:
+            name = (by_idx[dedicated] or "").strip()
+            if name:
+                log.info("Meeting mic: migrating index %s -> name '%s'", dedicated, name)
+                _persist(dedicated, name)
+            if dedicated == fallback:
+                return fallback
             log.info("Meeting mic: using dedicated device %s "
                      "(dictation mic stays %s)", dedicated, fallback)
             return dedicated
@@ -9968,6 +10082,7 @@ class MeetingSession:
                 self._wav_writer.setsampwidth(2)
                 self._wav_writer.setframerate(16000)
                 log.info("Diarized meeting started (wav=%s)", self._wav_path)
+                self._open_track_writers(stamp)
                 # Hybrid live transcript: a lightweight speaker-less pass runs in
                 # PARALLEL for mid-meeting peeking (tray → Live Transcript); the
                 # full diarization still runs on this WAV at Stop.
@@ -9997,6 +10112,7 @@ class MeetingSession:
                 log.info("Meeting started (chunk=%ds, live=%s, audio=%s)",
                          self.CHUNK_SECONDS, self._live_path,
                          self._wav_path or "off")
+                self._open_track_writers(stamp)
 
             self._rotation_thread = threading.Thread(
                 target=self._rotation_loop, daemon=True
@@ -10049,6 +10165,10 @@ class MeetingSession:
                 except Exception as e:
                     log.warning("Closing meeting WAV failed: %s", e)
                 self._wav_writer = None
+            # The per-source tracks do not take part in diarization - close +
+            # archive them now, independent of the (long) background job.
+            self._finalize_tracks(
+                keep=bool(self.app.config.get("keep_meeting_audio", True)))
             self._diarize_job_thread = threading.Thread(
                 target=self._run_diarize_job, daemon=True
             )
@@ -10079,6 +10199,8 @@ class MeetingSession:
         except Exception as e:
             log.warning("Closing chunked meeting WAV failed: %s", e)
         self._wav_writer = None
+        self._finalize_tracks(
+            keep=bool(self.app.config.get("keep_meeting_audio", True)))
         if not bool(self.app.config.get("keep_meeting_audio", True)):
             if self._wav_path and os.path.exists(self._wav_path):
                 try:
@@ -10175,6 +10297,9 @@ class MeetingSession:
             except Exception:
                 pass
             self._wav_writer = None
+        self._finalize_tracks(
+            keep=bool(self.app.config.get("keep_meeting_audio", True)),
+            label="Cancel")
         # Discard the TRANSCRIPT but KEEP the audio (WAV + Opus archive, same
         # retention as a saved meeting) so it can be transcribed later. Honour
         # keep_meeting_audio: if the user turned off keeping meeting audio,
@@ -10485,6 +10610,31 @@ class MeetingSession:
             except Exception as e:
                 log.warning("Meeting: loopback start failed (%s) — mic only", e)
                 self._loopback_recorder = None
+        # Backup mic (2026-09-14): when the meeting mic is a DIFFERENT device
+        # from the dictation mic, also capture the dictation mic. A desk mic
+        # usually still hears the user when the headset was the intended (or
+        # the wrong) device - the "even if the wrong mic is selected" insurance.
+        self._backup_recorder = None
+        self._backup_device_index = None
+        try:
+            if (self._mic_recorder is not None
+                    and bool(self.app.config.get("meeting_backup_mic", True))):
+                dict_idx = self.app.config.get("input_device_index")
+                same = dict_idx == self._input_device_index
+                if not same:
+                    a = _device_name_for_index(dict_idx)
+                    b = _device_name_for_index(self._input_device_index)
+                    same = bool(a) and a == b     # same physical device, other slot
+                if not same:
+                    self._backup_recorder = AudioRecorder(input_device_index=dict_idx)
+                    self._backup_recorder.start()
+                    self._backup_device_index = dict_idx
+                    log.info("Meeting backup mic: also recording the dictation mic "
+                             "(device %s)", dict_idx)
+        except Exception as e:
+            log.warning("Meeting backup mic failed to start (%s) - continuing "
+                        "without it", e)
+            self._backup_recorder = None
 
     def _drain_audio(self):
         """Drain accumulated audio from both recorders WITHOUT stopping
@@ -10499,6 +10649,7 @@ class MeetingSession:
     def _drain_audio_inner(self):
         mic_audio = None
         loop_audio = None
+        backup_audio = None
         if self._mic_recorder is not None:
             try:
                 mic_audio = self._mic_recorder.drain()
@@ -10509,6 +10660,14 @@ class MeetingSession:
                 loop_audio = self._loopback_recorder.drain()
             except Exception as e:
                 log.warning("Meeting: loopback drain failed: %s", e)
+        if getattr(self, "_backup_recorder", None) is not None:
+            try:
+                backup_audio = self._backup_recorder.drain()
+            except Exception as e:
+                log.warning("Meeting: backup mic drain failed: %s", e)
+        # Wrong-device auto-fallback (2026-09-14): silent meeting mic + a backup
+        # that clearly hears the user -> the backup becomes the meeting mic.
+        mic_audio, backup_audio = self._maybe_auto_fallback_mic(mic_audio, backup_audio)
 
         # USB-mic death detection (this machine's known failure mode: the
         # monitor-attached mic drops with display power). A dead stream just
@@ -10530,6 +10689,15 @@ class MeetingSession:
                 except Exception:
                     pass
 
+        # Per-CHANNEL silent-mic check (2026-09-14). The dead-audio nudge above
+        # fires only when BOTH channels are empty. When the meeting mic points
+        # at the wrong device (a headset's index drifted to a silent HDMI input)
+        # the loopback still carries the other side, so the meeting "looked
+        # alive" while the user was missing from the transcript.
+        # Raw per-source tracks go to disk BEFORE the mix collapses them.
+        self._write_tracks(mic_audio, loop_audio, backup_audio)
+        self._check_mic_channel_silent(mic_audio, loop_audio)
+
         self._note_channel_energy(mic_audio, loop_audio)
         if mic_audio is not None and loop_audio is not None and len(loop_audio) > 0:
             return mix_audio(mic_audio, loop_audio)
@@ -10538,6 +10706,181 @@ class MeetingSession:
         if loop_audio is not None and len(loop_audio) > 0:
             return loop_audio
         return None
+
+    # ---- per-source safety-net tracks (2026-09-14) ----
+    TRACK_NAMES = ("mic", "system", "backup")
+
+    def _open_track_writers(self, stamp):
+        """Open the per-source WAVs (mic / system / backup) next to the mixdown,
+        same mono 16 kHz int16 format. Skipped when keep_meeting_audio or
+        keep_meeting_tracks is off. Best-effort per track - a track that fails
+        to open never blocks the meeting."""
+        cfg = self.app.config
+        if not (bool(cfg.get("keep_meeting_audio", True))
+                and bool(cfg.get("keep_meeting_tracks", True))):
+            return
+        wanted = []
+        if self._mic_recorder is not None:
+            wanted.append("mic")
+        if self._loopback_recorder is not None:
+            wanted.append("system")
+        if getattr(self, "_backup_recorder", None) is not None:
+            wanted.append("backup")
+        for name in wanted:
+            path = os.path.join(MEETINGS_DIR, f"{stamp}_meeting_{name}.wav")
+            try:
+                w = wave.open(path, "wb")
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(16000)
+                self._track_writers[name] = (path, w)
+            except Exception as e:
+                log.warning("Meeting track '%s' not opened: %s", name, e)
+        if self._track_writers:
+            log.info("Meeting safety-net tracks: %s", ", ".join(
+                os.path.basename(p) for p, _w in self._track_writers.values()))
+
+    def _write_tracks(self, mic_audio, loop_audio, backup_audio):
+        """Append one drain's worth of each source to its track, padded to a
+        common length so the tracks stay time-aligned with the mixdown."""
+        writers = getattr(self, "_track_writers", None)
+        if not writers:
+            return
+        chans = {"mic": mic_audio, "system": loop_audio, "backup": backup_audio}
+        n = 0
+        for a in chans.values():
+            if a is not None and len(a) > n:
+                n = len(a)
+        if n == 0:
+            return
+        for name, audio in chans.items():
+            ent = writers.get(name)
+            if ent is None:
+                continue
+            try:
+                a = np.zeros(0, dtype=np.float32) if audio is None else np.asarray(audio)
+                if a.dtype != np.int16:
+                    a = np.asarray(a, dtype=np.float32)
+                    if len(a) < n:
+                        a = np.pad(a, (0, n - len(a)))
+                    a = (a * 32767).clip(-32768, 32767).astype(np.int16)
+                elif len(a) < n:
+                    a = np.pad(a, (0, n - len(a)))
+                with self._track_lock:
+                    ent[1].writeframes(a.tobytes())
+            except Exception as e:
+                log.debug("Meeting track '%s' write failed: %s", name, e)
+
+    def _finalize_tracks(self, keep=True, label="Meeting"):
+        """Close the per-source track WAVs; keep + Opus-archive them (same
+        tiered retention as the mixdown) or delete them when keep is False.
+        Idempotent - a second call finds nothing to do."""
+        writers = getattr(self, "_track_writers", None) or {}
+        self._track_writers = {}
+        for name, (path, w) in writers.items():
+            try:
+                with self._track_lock:
+                    w.close()
+            except Exception as e:
+                log.warning("%s track '%s' close failed: %s", label, name, e)
+            if not keep:
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+                continue
+
+            def _archive(p=path, n=name):
+                try:
+                    opus = self._transcode_wav_to_opus(p)    # keeps the WAV
+                    if opus:
+                        log.info("%s track '%s' Opus archive written: %s", label, n, opus)
+                except Exception as e:
+                    log.warning("%s track '%s' Opus archive failed: %s", label, n, e)
+            threading.Thread(target=_archive, daemon=True).start()
+        if writers:
+            log.info("%s safety-net tracks %s: %s", label,
+                     "kept" if keep else "deleted", ", ".join(writers))
+
+    MIC_SILENT_RMS = 0.003      # the floor the dictation path treats as "mic silent"
+    MIC_SILENT_DRAINS = 3       # ~2 min of 45 s rotations before nudging
+
+    def _maybe_auto_fallback_mic(self, mic_audio, backup_audio):
+        """Early wrong-device rescue. Evidence = the meeting mic is ~silent while
+        the backup (dictation) mic CLEARLY hears the user in the same window.
+        Then promote the backup recorder to be the meeting mic (no device is
+        reopened), ONCE, and hand this window's backup audio over as the mic
+        audio so nothing the user said is lost. Returns (mic_audio,
+        backup_audio), possibly swapped. Never raises."""
+        try:
+            if (getattr(self, "_mic_fallback_done", False)
+                    or getattr(self, "_backup_recorder", None) is None
+                    or not bool(self.app.config.get("meeting_mic_auto_fallback", True))):
+                return mic_audio, backup_audio
+
+            def _rms(a):
+                if a is None or len(a) == 0:
+                    return 0.0
+                x = np.asarray(a, dtype=np.float64)
+                return float(np.sqrt(np.mean(x * x)))
+            mic_rms = _rms(mic_audio)
+            backup_rms = _rms(backup_audio)
+            # clear margin: the backup must be well above the silence floor
+            if not (mic_rms < self.MIC_SILENT_RMS
+                    and backup_rms >= 2.0 * self.MIC_SILENT_RMS):
+                return mic_audio, backup_audio
+            self._mic_fallback_done = True
+            old_idx = self._input_device_index
+            self._mic_recorder, self._backup_recorder = self._backup_recorder, None
+            self._input_device_index = getattr(self, "_backup_device_index", None)
+            log.error("Meeting: the meeting mic (device %s) is silent (rms=%.5f) while "
+                      "the dictation mic hears you (rms=%.5f) - switched the meeting "
+                      "mic to the dictation mic (device %s)",
+                      old_idx, mic_rms, backup_rms, self._input_device_index)
+            try:
+                self.app._force_show_error_overlay(
+                    "Meeting mic was silent - switched to the dictation mic")
+            except Exception:
+                pass
+            # this window: the backup audio IS the user's side now
+            return backup_audio, None
+        except Exception as e:
+            log.debug("mic auto-fallback check failed: %s", e)
+            return mic_audio, backup_audio
+
+    def _check_mic_channel_silent(self, mic_audio, loop_audio):
+        """Nudge ONCE when the mic channel stays ~silent for several rotations
+        while the loopback channel has signal - the wrong-device signature
+        (the other side is heard, the user is not). Best-effort, never raises."""
+        try:
+            def _rms(a):
+                if a is None or len(a) == 0:
+                    return 0.0
+                x = np.asarray(a, dtype=np.float64)
+                return float(np.sqrt(np.mean(x * x)))
+            mic_rms = _rms(mic_audio)
+            loop_rms = _rms(loop_audio)
+            wrong_device_sig = (self._mic_recorder is not None
+                                and loop_rms >= self.MIC_SILENT_RMS
+                                and mic_rms < self.MIC_SILENT_RMS)
+            if not wrong_device_sig:
+                self._consec_mic_silent = 0
+                return
+            self._consec_mic_silent = getattr(self, "_consec_mic_silent", 0) + 1
+            if (self._consec_mic_silent >= self.MIC_SILENT_DRAINS
+                    and not getattr(self, "_mic_silent_nudged", False)):
+                self._mic_silent_nudged = True
+                log.error("Meeting: mic channel silent for %d rotations while system "
+                          "audio has signal (mic rms=%.5f, loop rms=%.5f) - the meeting "
+                          "mic is probably the WRONG device",
+                          self._consec_mic_silent, mic_rms, loop_rms)
+                try:
+                    self.app._force_show_error_overlay(
+                        "Your mic is NOT being captured - check the Meeting microphone!")
+                except Exception:
+                    pass
+        except Exception as e:
+            log.debug("mic-channel silence check failed: %s", e)
 
     def _note_channel_energy(self, mic_audio, loop_audio, sr=16000):
         """Speaker naming, phase 1b: per-second RMS of the mic vs loopback
@@ -10578,6 +10921,14 @@ class MeetingSession:
             except Exception as e:
                 log.warning("Meeting: loopback stop failed: %s", e)
             self._loopback_recorder = None
+        backup_audio = None
+        if getattr(self, "_backup_recorder", None) is not None:
+            try:
+                backup_audio = self._backup_recorder.stop()
+            except Exception as e:
+                log.warning("Meeting: backup mic stop failed: %s", e)
+            self._backup_recorder = None
+        self._write_tracks(mic_audio, loop_audio, backup_audio)
 
         self._note_channel_energy(mic_audio, loop_audio)
         if mic_audio is not None and loop_audio is not None and len(loop_audio) > 0:
@@ -10723,6 +11074,18 @@ class MeetingSession:
                 log.warning("Meeting chunk #%d transcription failed: %s", idx, e)
                 text = ""
                 errored = True
+            # Foreign-script salad (2026-09-14): a near-silent channel (a wrong
+            # meeting mic) makes Whisper sample Korean/CJK/Arabic/accented
+            # tokens. Same post-filter as dictation; a result that was ALL
+            # foreign is classified as "empty" below, never as "failed".
+            foreign_emptied = False
+            if text:
+                text, _n_foreign = strip_foreign_script_words(text)
+                if _n_foreign:
+                    log.info("Meeting chunk #%d: dropped %d foreign-script word(s)",
+                             idx, _n_foreign)
+                    if not text:
+                        foreign_emptied = True
             if text:
                 # Corrections BEFORE the chunk is stored: the fixed text feeds
                 # the live transcript immediately (the final write's own pass
@@ -10742,6 +11105,8 @@ class MeetingSession:
             # ~0.04 = normal speech; 0.005 sits well between the two.)
             if text:
                 status = "ok"
+            elif foreign_emptied:
+                status = "empty"   # hallucinated salad only - not real speech
             elif errored or _rms_energy(audio_np) >= 0.005:
                 status = "failed"
             else:
@@ -12858,18 +13223,18 @@ def _stamp_lia_launcher(exe_path):
         return False
     try:
         vi = VSVersionInfo(
-            ffi=FixedFileInfo(filevers=(1, 4, 6, 0), prodvers=(1, 4, 6, 0),
+            ffi=FixedFileInfo(filevers=(1, 4, 7, 0), prodvers=(1, 4, 7, 0),
                               mask=0x3f, flags=0x0, OS=0x40004,
                               fileType=0x1, subtype=0x0),
             kids=[
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.4.6.0'),
+                    StringStruct('FileVersion', '1.4.7.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.4.6.0'),
+                    StringStruct('ProductVersion', '1.4.7.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -17414,6 +17779,11 @@ class LiaApp:
             self.config.get("use_subprocess_mic", True)
             and find_python_interpreter() is not None
         )
+        # Re-point stored device indices at the devices that carry the stored
+        # NAMES now (indices shift while the app is closed; the hot-plug
+        # watchdog only sees changes while it runs). Must run BEFORE the
+        # recorder is built from input_device_index.
+        self._heal_device_indices_by_name()
         if use_subproc:
             self.recorder = SubprocessAudioRecorder(
                 input_device_index=self.config.get("input_device_index"),
@@ -17973,6 +18343,14 @@ class LiaApp:
         threading.Thread(target=self._meetings_reindex_watchdog, daemon=True).start()
         log.info("Meetings reindex watchdog started (interval: %s min, 0=off)",
                  self.config.get("meetings_reindex_interval_min", 360))
+
+        # Periodic background refresh of the LOCAL email index so it stays current
+        # even while the search window is closed (it otherwise only refreshes on
+        # open). Config-gated each tick; safe to start unconditionally (it no-ops
+        # with no index yet / when Outlook is closed).
+        threading.Thread(target=self._email_reindex_watchdog, daemon=True).start()
+        log.info("Email reindex watchdog started (interval: %s min, 0=off)",
+                 self.config.get("email_reindex_interval_min", 15))
 
         # Continuous LOCAL correction auto-harvest over new meetings (config-gated
         # each tick; safe to start unconditionally — it no-ops when disabled or
@@ -19532,6 +19910,53 @@ class LiaApp:
                       "restart skipped (will retry on next wedge detection)")
         threading.Thread(target=worker, daemon=True).start()
 
+    def _heal_device_indices_by_name(self):
+        """Boot-time heal: a stored device INDEX may already point at the wrong
+        device - indices shift while the app is closed, and the hot-plug
+        watchdog only sees changes while it runs. The persisted NAME is
+        authoritative: re-point the dictation + meeting mic indices at the
+        device that carries that name now; a legacy index-only config gets its
+        name recorded so it is protected from the next shuffle. Best-effort,
+        never raises (a failed enumeration just leaves the config as is)."""
+        try:
+            devices = list_input_devices()
+        except Exception as e:
+            log.warning("Device heal skipped (enumeration failed): %s", e)
+            return
+        by_name = {n: i for i, n in devices}
+        by_idx = dict(devices)
+        changed = False
+        for idx_key, name_key, label in (
+                ("input_device_index", "input_device_name", "Mic"),
+                ("meeting_input_device_index", "meeting_input_device_name",
+                 "Meeting mic")):
+            idx = self.config.get(idx_key)
+            name = (self.config.get(name_key) or "").strip()
+            if name:
+                if name in by_name:
+                    new_idx = by_name[name]
+                    if new_idx != idx:
+                        log.info("%s '%s' index healed at boot: %s -> %s",
+                                 label, name, idx, new_idx)
+                        self.config[idx_key] = new_idx
+                        changed = True
+                elif idx is not None:
+                    log.info("%s '%s' not present at boot - index cleared "
+                             "(name kept for re-plug)", label, name)
+                    self.config[idx_key] = None
+                    changed = True
+            elif idx is not None and idx in by_idx:
+                # Legacy: index only -> record its current name (self-migrate).
+                self.config[name_key] = (by_idx[idx] or "").strip()
+                changed = True
+                log.info("%s index %s -> name '%s' (migrated)",
+                         label, idx, self.config[name_key])
+        if changed:
+            try:
+                save_config(self.config)
+            except Exception as e:
+                log.warning("Device heal: save failed: %s", e)
+
     def _device_watchdog(self):
         """Background thread that detects audio device hot-plug events.
 
@@ -19582,70 +20007,82 @@ class LiaApp:
                 log.info("  mic before: %s", old_names_mic or "(none)")
                 log.info("  mic after:  %s", new_names_mic or "(none)")
 
-                # ---- mic: handle index shift / disappearance ----
+                # ---- mic: handle index shift / disappearance (by NAME) ----
                 cur_mic_idx = self.config.get("input_device_index")
-                if cur_mic_idx is not None:
-                    prev_mic_by_idx = dict(prev_mic)
-                    cur_name = prev_mic_by_idx.get(cur_mic_idx)
-                    if cur_name is not None:
-                        new_mic_by_name = {n: i for i, n in new_mic}
-                        if cur_name in new_mic_by_name:
-                            new_idx = new_mic_by_name[cur_name]
-                            if new_idx != cur_mic_idx:
-                                log.info(
-                                    "Mic '%s' index shifted: %d → %d",
-                                    cur_name, cur_mic_idx, new_idx,
-                                )
-                                self.config["input_device_index"] = new_idx
-                                save_config(self.config)
-                                try:
-                                    self.recorder.input_device_index = new_idx
-                                except Exception:
-                                    pass
-                        else:
-                            # Selected mic is gone — fall back to default
-                            log.info(
-                                "Mic '%s' disconnected — reverting to System Default",
-                                cur_name,
+                mic_name = self.config.get("input_device_name") or ""
+                if cur_mic_idx is not None or mic_name:
+                    new_idx, kind = _remap_device_by_name(
+                        mic_name, prev_mic, new_mic, cur_mic_idx)
+                    if kind == "shifted":
+                        log.info("Mic '%s' index shifted: %s → %s",
+                                 mic_name or "?", cur_mic_idx, new_idx)
+                        self.config["input_device_index"] = new_idx
+                        if not mic_name:
+                            self.config["input_device_name"] = \
+                                _device_name_for_index(new_idx, new_mic)
+                        save_config(self.config)
+                        try:
+                            self.recorder.input_device_index = new_idx
+                        except Exception:
+                            pass
+                        self._reset_silent_state()
+                    elif kind == "gone" and cur_mic_idx is not None:
+                        # Selected mic is gone - record with the default for
+                        # now, but KEEP the name so a re-plug heals the index.
+                        log.info("Mic '%s' disconnected — reverting to System "
+                                 "Default (name kept)", mic_name or "?")
+                        self.config["input_device_index"] = None
+                        save_config(self.config)
+                        try:
+                            self.recorder.input_device_index = None
+                        except Exception:
+                            pass
+                        self._reset_silent_state()
+                        try:
+                            self.overlay.show(
+                                f"  🎙  Mic disconnected — using default  ",
+                                bg_color="#d08770", duration=2500,
                             )
-                            self.config["input_device_index"] = None
-                            save_config(self.config)
-                            try:
-                                self.recorder.input_device_index = None
-                            except Exception:
-                                pass
-                            self._reset_silent_state()
-                            try:
-                                self.overlay.show(
-                                    f"  🎙  Mic disconnected — using default  ",
-                                    bg_color="#d08770", duration=2500,
-                                )
-                            except Exception:
-                                pass
+                        except Exception:
+                            pass
+
+                # ---- meeting mic: the SAME remap (it was missing here, so a
+                # headset's index silently followed whatever device took its
+                # slot - the user vanished from a meeting transcript) ----
+                cur_mm_idx = self.config.get("meeting_input_device_index")
+                mm_name = self.config.get("meeting_input_device_name") or ""
+                if cur_mm_idx is not None or mm_name:
+                    new_idx, kind = _remap_device_by_name(
+                        mm_name, prev_mic, new_mic, cur_mm_idx)
+                    if kind == "shifted":
+                        log.info("Meeting mic '%s' index shifted: %s → %s",
+                                 mm_name or "?", cur_mm_idx, new_idx)
+                        self.config["meeting_input_device_index"] = new_idx
+                        if not mm_name:
+                            self.config["meeting_input_device_name"] = \
+                                _device_name_for_index(new_idx, new_mic)
+                        save_config(self.config)
+                    elif kind == "gone" and cur_mm_idx is not None:
+                        log.info("Meeting mic '%s' disconnected - meetings "
+                                 "fall back to the dictation mic (name kept)",
+                                 mm_name or "?")
+                        self.config["meeting_input_device_index"] = None
+                        save_config(self.config)
 
                 # ---- loopback: same shift / disappearance handling ----
                 cur_loop_idx = self.config.get("loopback_device_index")
                 if cur_loop_idx is not None:
-                    prev_loop_by_idx = dict(prev_loop)
-                    cur_name = prev_loop_by_idx.get(cur_loop_idx)
-                    if cur_name is not None:
-                        new_loop_by_name = {n: i for i, n in new_loop}
-                        if cur_name in new_loop_by_name:
-                            new_idx = new_loop_by_name[cur_name]
-                            if new_idx != cur_loop_idx:
-                                log.info(
-                                    "Loopback '%s' index shifted: %d → %d",
-                                    cur_name, cur_loop_idx, new_idx,
-                                )
-                                self.config["loopback_device_index"] = new_idx
-                                save_config(self.config)
-                        else:
-                            log.info(
-                                "Loopback '%s' disconnected — reverting",
-                                cur_name,
-                            )
-                            self.config["loopback_device_index"] = None
-                            save_config(self.config)
+                    new_idx, kind = _remap_device_by_name(
+                        "", prev_loop, new_loop, cur_loop_idx)
+                    if kind == "shifted":
+                        log.info("Loopback index shifted: %s → %s",
+                                 cur_loop_idx, new_idx)
+                        self.config["loopback_device_index"] = new_idx
+                        save_config(self.config)
+                    elif kind == "gone":
+                        log.info("Loopback disconnected — reverting")
+                        self.config["loopback_device_index"] = None
+                        save_config(self.config)
 
                 # ---- force pystray to rebuild menus ----
                 try:
@@ -22582,8 +23019,10 @@ class LiaApp:
                 self.overlay.show_error("Must keep at least one audio input")
                 return
         else:
-            # Check this mic (either a new device or re-enabling mic)
+            # Check this mic (either a new device or re-enabling mic).
+            # Persist the NAME too - indices shift on USB hot-plug.
             self.config["input_device_index"] = device_idx
+            self.config["input_device_name"] = _device_name_for_index(device_idx)
             try:
                 self.recorder.input_device_index = device_idx
             except Exception:
@@ -22605,15 +23044,47 @@ class LiaApp:
         # while the user is in the middle of switching mics.
         self._reset_silent_state()
 
+    def _toggle_keep_meeting_tracks(self):
+        """Settings: keep the raw per-source meeting tracks (mic / system /
+        backup) next to the mixdown. Applies from the NEXT meeting."""
+        self.config["keep_meeting_tracks"] = not bool(
+            self.config.get("keep_meeting_tracks", True))
+        save_config(self.config)
+        log.info("Meeting safety-net tracks: %s",
+                 "on" if self.config["keep_meeting_tracks"] else "off")
+
+    def _toggle_meeting_backup_mic(self):
+        """Settings: also record the dictation mic when the meeting mic is a
+        different device. Applies from the NEXT meeting."""
+        self.config["meeting_backup_mic"] = not bool(
+            self.config.get("meeting_backup_mic", True))
+        save_config(self.config)
+        log.info("Meeting backup mic: %s",
+                 "on" if self.config["meeting_backup_mic"] else "off")
+
+    def _toggle_meeting_mic_auto_fallback(self):
+        """Settings: auto-switch the meeting mic to the dictation mic when the
+        meeting mic is silent but the backup hears the user. Applies from the
+        NEXT meeting."""
+        self.config["meeting_mic_auto_fallback"] = not bool(
+            self.config.get("meeting_mic_auto_fallback", True))
+        save_config(self.config)
+        log.info("Meeting mic auto-fallback: %s",
+                 "on" if self.config["meeting_mic_auto_fallback"] else "off")
+
     def _set_meeting_mic_device(self, device_idx):
         """Settings: pick the DEDICATED meeting mic (None = same as the
         dictation mic). Radio semantics - no toggle-off, 'Same as dictation
         mic' is the off row. Applies from the NEXT meeting; a running
         meeting keeps the recorder it opened."""
         self.config["meeting_input_device_index"] = device_idx
+        # Persist the NAME too - the index alone silently followed whatever
+        # device took its slot after a hot-plug (headset -> Cam Link).
+        self.config["meeting_input_device_name"] = _device_name_for_index(device_idx)
         save_config(self.config)
         log.info("Meeting mic set: %s",
-                 "same as dictation" if device_idx is None else device_idx)
+                 "same as dictation" if device_idx is None
+                 else "%s '%s'" % (device_idx, self.config["meeting_input_device_name"]))
 
     def _toggle_loopback_device(self, device_idx):
         """Click handler for a system audio device: toggle if same, switch if different."""
@@ -23935,10 +24406,13 @@ class LiaApp:
         removed = 0
         for name in names:
             low = name.lower()
-            if low.endswith("_meeting_audio.wav"):
+            # The mixdown AND the per-source safety-net tracks share the tiers.
+            stems = ("_meeting_audio", "_meeting_mic", "_meeting_system",
+                     "_meeting_backup")
+            if any(low.endswith(s + ".wav") for s in stems):
                 days = wav_days
-            elif (low.endswith("_meeting_audio.opus")
-                  or low.endswith("_meeting_audio.opus.tmp")):
+            elif any(low.endswith(s + ".opus") or low.endswith(s + ".opus.tmp")
+                     for s in stems):
                 days = opus_days
             elif (low.endswith("_meeting.txt")
                   or low.endswith("_meeting_diarized.txt")
@@ -24582,9 +25056,12 @@ class LiaApp:
             except Exception as e:
                 log.debug("Meetings reindex watchdog tick failed: %s", e)
 
-    def _kick_email_indexer(self, interp, indexer, ollama_url, env, flags):
+    def _kick_email_indexer(self, interp, indexer, ollama_url, env, flags,
+                            require_running=False):
         """Spawn the indexer subprocess (incremental; --full if no index yet),
-        unless one ran in the last ~20s (heartbeat guard against double-runs)."""
+        unless one ran in the last ~20s (heartbeat guard against double-runs).
+        require_running=True (background refresh) makes the child exit quietly if
+        Outlook is closed instead of launching it."""
         import subprocess
         try:
             import email_index as _ei
@@ -24601,10 +25078,63 @@ class LiaApp:
         args = [interp, "-X", "utf8", indexer, "--base-url", ollama_url]
         if not os.path.exists(_ei.MESSAGES_DB):
             args.append("--full")
+        if require_running:
+            args.append("--require-running")
         # De-elevate when elevated so the indexer's Outlook COM works.
         spawn_helper(args, env=env, creationflags=flags)
-        log.info("Email indexer kicked (%s).",
-                 "full" if "--full" in args else "incremental")
+        log.info("Email indexer kicked (%s%s).",
+                 "full" if "--full" in args else "incremental",
+                 ", bg" if require_running else "")
+
+    def _kick_email_indexer_bg(self):
+        """Background incremental refresh of the local email index (no window).
+        Self-gates: needs an interpreter + the indexer script + an EXISTING index
+        (the first heavy full build stays user-initiated, via opening the window),
+        and passes --require-running so it never launches Outlook on its own."""
+        try:
+            import email_index as _ei
+        except Exception:
+            return
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        interp = find_python_interpreter()
+        indexer = os.path.join(base_dir, "emailsearch_indexer.py")
+        if interp is None or not os.path.exists(indexer):
+            return
+        if not os.path.exists(_ei.MESSAGES_DB):
+            return  # no index yet - don't kick a silent full build in the background
+        ollama_url = (self.config.get("summary_base_url")
+                      or "http://localhost:11434/v1/chat/completions")
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        flags = 0x08000000  # CREATE_NO_WINDOW
+        self._kick_email_indexer(interp, indexer, ollama_url, env, flags,
+                                 require_running=True)
+
+    def _email_reindex_watchdog(self):
+        """Keep the local email index current in the background so it never goes
+        weeks-stale between window opens. Config `email_reindex_interval_min`
+        (0 disables); skipped while recording / in a meeting / composing / voice-
+        asking to avoid COM + embedding contention. The refresh itself is quiet
+        (skips when Outlook is closed; incremental + heartbeat-guarded)."""
+        MIN_TICK_SEC = 60
+        while True:
+            try:
+                mins = int(self.config.get("email_reindex_interval_min", 15) or 0)
+            except (ValueError, TypeError):
+                mins = 15
+            if mins <= 0:
+                time.sleep(30 * 60)          # disabled — re-check every 30 min
+                continue
+            time.sleep(max(MIN_TICK_SEC, mins * 60))
+            try:
+                if (self.is_recording or self._is_meeting_active()
+                        or self._compose_active or self._compose_instr_active
+                        or self._voice_ask_active):
+                    continue
+                self._kick_email_indexer_bg()
+            except Exception as e:
+                log.debug("Email reindex watchdog tick failed: %s", e)
 
     # ---- Ask your meetings (local RAG over the meeting archive) -------------
     def _meetings_providers(self):
@@ -27023,6 +27553,9 @@ class LiaApp:
         add("open_tailscale", self._open_tailscale)
         # Meetings
         add("toggle_auto_detect_meetings", self._toggle_auto_detect_meetings)
+        add("toggle_keep_meeting_tracks", self._toggle_keep_meeting_tracks)
+        add("toggle_meeting_backup_mic", self._toggle_meeting_backup_mic)
+        add("toggle_meeting_mic_auto_fallback", self._toggle_meeting_mic_auto_fallback)
         add("open_meetings_ask", self._open_meetings_ask)
         add("voice_ask_now", self._voice_ask_toggle)
         add("set_voice_ask_output", self._set_voice_ask_output)
@@ -27032,6 +27565,7 @@ class LiaApp:
         add("rename_speakers_old", self._rename_speakers_in_old_meeting)
         add("transcribe_file", self._transcribe_file)
         add("summarize_text_dialog", self._summarize_text_dialog)
+        add("open_email_search", self._open_email_search)
         add("open_live_transcript", self._open_live_transcript)
         # Vocabulary
         add("save_vocabulary", self._save_vocabulary_result)

@@ -497,43 +497,56 @@ def store_chunks(vconn, msg_id, chunks, vecs):
 
 
 # In-process cache of the full vector matrix (rebuilt when the row count changes).
-_VEC_CACHE = {"n": -1, "ids": None, "mat": None}
+_VEC_CACHE = {"n": -1, "ids": None, "mat": None, "cids": None}
 
 
 def load_vectors(vconn, force=False):
-    """Return (msg_ids ndarray[int], mat ndarray[N,1024] float32) for all chunks.
-    Cached; rebuilt when the chunk count changes."""
+    """Return (msg_ids ndarray[int], mat ndarray[N,1024] float32, chunk_ids
+    ndarray[int]) for all chunks. `chunk_ids` is parallel to `msg_ids` so a
+    caller can recover WHICH chunk matched (to feed the LLM the matched passage,
+    not the message head). Cached; rebuilt when the chunk count changes."""
     import numpy as np
     n = vconn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-    if not force and _VEC_CACHE["n"] == n and _VEC_CACHE["mat"] is not None:
-        return _VEC_CACHE["ids"], _VEC_CACHE["mat"]
+    if (not force and _VEC_CACHE["n"] == n and _VEC_CACHE["mat"] is not None
+            and _VEC_CACHE["cids"] is not None):
+        return _VEC_CACHE["ids"], _VEC_CACHE["mat"], _VEC_CACHE["cids"]
     ids = np.empty(n, dtype=np.int64)
+    cids = np.empty(n, dtype=np.int64)
     mat = np.empty((n, EMBED_DIM), dtype=np.float32)
-    for k, row in enumerate(vconn.execute("SELECT msg_id, vec FROM chunks")):
-        ids[k] = row[0]
-        mat[k] = _blob_f32(row[1])
-    _VEC_CACHE.update(n=n, ids=ids, mat=mat)
-    return ids, mat
+    for k, row in enumerate(vconn.execute("SELECT id, msg_id, vec FROM chunks")):
+        cids[k] = row[0]
+        ids[k] = row[1]
+        mat[k] = _blob_f32(row[2])
+    _VEC_CACHE.update(n=n, ids=ids, mat=mat, cids=cids)
+    return ids, mat, cids
 
 
-def semantic_search(conn, vconn, query, base_url=DEFAULT_OLLAMA, limit=50):
+def semantic_search(conn, vconn, query, base_url=DEFAULT_OLLAMA, limit=50,
+                    qv=None):
     """Embed the query, cosine vs all chunk vectors, best-chunk-per-message,
-    return ranked result dicts. [] if no vectors / embedder unavailable."""
+    return ranked result dicts (each with `score` and the matched `chunk_id`).
+    [] if no vectors / embedder unavailable. `qv` lets a caller supply the
+    already-embedded query vector so hybrid_search embeds only once."""
     import numpy as np
-    ids, mat = load_vectors(vconn)
+    ids, mat, cids = load_vectors(vconn)
     if mat is None or len(ids) == 0:
         return []
-    qv = embed_texts([query], base_url)[0]
+    if qv is None:
+        qv = embed_texts([query], base_url)[0]
     sims = mat @ qv  # both L2-normalised -> cosine
-    best = {}
+    best = {}          # msg_id -> (score, chunk_id)
     for idx in np.argsort(-sims):
         mid = int(ids[idx])
         if mid not in best:
-            best[mid] = float(sims[idx])
+            best[mid] = (float(sims[idx]), int(cids[idx]))
             if len(best) >= limit:
                 break
-    ranked = sorted(best.items(), key=lambda x: -x[1])
-    return _fetch_results(conn, ranked)
+    ranked = sorted(best.items(), key=lambda x: -x[1][0])
+    results = _fetch_results(conn, [(mid, sc) for mid, (sc, _c) in ranked])
+    chunk_by_msg = {mid: cid for mid, (_sc, cid) in ranked}
+    for r in results:
+        r["chunk_id"] = chunk_by_msg.get(r["id"])
+    return results
 
 
 def _fetch_results(conn, mid_score_pairs):
@@ -551,41 +564,103 @@ def _fetch_results(conn, mid_score_pairs):
     return out
 
 
+def _rrf(rank_lists, k=60):
+    """Reciprocal-rank fusion: a doc's score is sum 1/(k + rank + 1) over each
+    ranking it appears in (rank 0-based). Robust to score scale, unlike the old
+    min-max blend. Returns {id: score}."""
+    scores = {}
+    for lst in rank_lists:
+        for rank, mid in enumerate(lst):
+            scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank + 1)
+    return scores
+
+
+def _mmr(order, id_to_vec, qv, lambda_=0.7, k=20):
+    """Maximal Marginal Relevance over ids already in relevance `order`. Picks k
+    that balance relevance to the query against novelty vs the already-picked, so
+    near-duplicate thread replies don't fill the top-k. Ids with no vector are
+    appended (in relevance order) after the vectored picks."""
+    import numpy as np
+    pool = [mid for mid in order if mid in id_to_vec]
+    novec = [mid for mid in order if mid not in id_to_vec]
+    rel = {mid: float(np.dot(id_to_vec[mid], qv)) for mid in pool}
+    picked, picked_vecs = [], []
+    while pool and len(picked) < k:
+        best_mid, best_val = None, -1e18
+        for mid in pool:
+            sim = max((float(np.dot(id_to_vec[mid], pv)) for pv in picked_vecs),
+                      default=0.0)
+            val = lambda_ * rel[mid] - (1.0 - lambda_) * sim
+            if val > best_val:
+                best_val, best_mid = val, mid
+        picked.append(best_mid)
+        picked_vecs.append(id_to_vec[best_mid])
+        pool.remove(best_mid)
+    for mid in novec + pool:
+        if len(picked) >= k:
+            break
+        picked.append(mid)
+    return picked
+
+
 def hybrid_search(conn, vconn, query, base_url=DEFAULT_OLLAMA, limit=50):
-    """Merge keyword (BM25) + semantic (cosine) results with min-max normalised
-    scores. Falls back to keyword-only if embeddings are unavailable."""
-    kw = keyword_search(conn, query, limit=limit * 2)
+    """Keyword (BM25) + semantic (cosine) retrieval fused with Reciprocal Rank
+    Fusion, then diversified with MMR so the top-k are not near-duplicate thread
+    replies. Each result carries the matched `chunk_id` (for chunk_context).
+    Falls back to keyword-only if embeddings are unavailable."""
+    kw = keyword_search(conn, query, limit=limit * 3)
+    qv = None
     try:
-        sem = semantic_search(conn, vconn, query, base_url, limit=limit * 2)
+        qv = embed_texts([query], base_url)[0]
+        sem = semantic_search(conn, vconn, query, base_url, limit=limit * 3, qv=qv)
     except Exception:
         sem = []
     if not sem:
         return kw[:limit]
-
-    def norm(vals):
-        if not vals:
-            return {}
-        lo, hi = min(vals), max(vals)
-        rng = (hi - lo) or 1.0
-        return lambda v: (v - lo) / rng
-
-    # BM25: lower (more negative) is better -> invert
-    kw_scores = {r["id"]: -r["rank"] for r in kw}
-    sem_scores = {r["id"]: r.get("score", 0.0) for r in sem}
-    nk = norm(list(kw_scores.values())) if kw_scores else (lambda v: 0)
-    ns = norm(list(sem_scores.values())) if sem_scores else (lambda v: 0)
-    merged = {}
-    rowmap = {r["id"]: r for r in kw}
+    rowmap = {}
+    for r in kw:
+        rowmap[r["id"]] = dict(r)
     for r in sem:
-        rowmap.setdefault(r["id"], r)
-    for mid, row in rowmap.items():
-        s = 0.6 * (ns(sem_scores[mid]) if mid in sem_scores else 0.0) \
-            + 0.4 * (nk(kw_scores[mid]) if mid in kw_scores else 0.0)
-        row = dict(row)
-        row["score"] = round(s, 4)
-        merged[mid] = row
-    ranked = sorted(merged.values(), key=lambda r: -r["score"])
-    return ranked[:limit]
+        row = rowmap.setdefault(r["id"], dict(r))
+        if r.get("chunk_id") is not None:
+            row["chunk_id"] = r["chunk_id"]
+    fused = _rrf([[r["id"] for r in kw], [r["id"] for r in sem]])
+    order = sorted(fused, key=lambda mid: -fused[mid])
+    # best-chunk vectors for the messages that have one (for MMR novelty)
+    id_to_vec = {}
+    try:
+        _ids, _mat, _cids = load_vectors(vconn)
+        cidx = {int(c): i for i, c in enumerate(_cids)}
+        for mid in order:
+            cid = rowmap[mid].get("chunk_id")
+            if cid is not None and cid in cidx:
+                id_to_vec[mid] = _mat[cidx[cid]]
+    except Exception:
+        id_to_vec = {}
+    picked = _mmr(order, id_to_vec, qv, k=limit) if id_to_vec else order[:limit]
+    out = []
+    for mid in picked:
+        row = rowmap[mid]
+        row["score"] = round(fused.get(mid, 0.0), 5)
+        out.append(row)
+    return out
+
+
+def chunk_context(vconn, chunk_id, max_chars=1500):
+    """The matched chunk plus its immediate neighbours (ord-1..ord+1) as one
+    passage, so the LLM sees the part of the email that actually matched, not
+    just the message head. '' when the chunk id is unknown."""
+    if chunk_id is None:
+        return ""
+    row = vconn.execute("SELECT msg_id, ord FROM chunks WHERE id=?",
+                        (chunk_id,)).fetchone()
+    if not row:
+        return ""
+    mid, ordv = int(row[0]), int(row[1])
+    parts = vconn.execute(
+        "SELECT text FROM chunks WHERE msg_id=? AND ord BETWEEN ? AND ? ORDER BY ord",
+        (mid, ordv - 1, ordv + 1)).fetchall()
+    return " ".join((p[0] or "") for p in parts).strip()[:max_chars]
 
 
 # ---- "Ask your email" (RAG) ------------------------------------------------
@@ -734,8 +809,12 @@ def ask(conn, vconn, question, base_url=DEFAULT_OLLAMA, model="gemma4:31b-it-qat
         return {"answer": "לא נמצאו אימיילים רלוונטיים לשאלה.", "sources": []}
     blocks = []
     for i, h in enumerate(hits, 1):
-        full = get_message(conn, h["id"]) or {}
-        body = (full.get("body_clean") or h.get("snippet") or "")[:1200]
+        # Prefer the chunk that actually matched (+ its neighbours) so a long
+        # email contributes its RELEVANT passage, not just its first 1200 chars.
+        body = chunk_context(vconn, h.get("chunk_id"))
+        if not body:
+            full = get_message(conn, h["id"]) or {}
+            body = (full.get("body_clean") or h.get("snippet") or "")[:1200]
         dt = datetime.datetime.fromtimestamp(h["received_ts"]).strftime("%Y-%m-%d") \
             if h.get("received_ts") else ""
         blocks.append(
