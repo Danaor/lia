@@ -709,6 +709,27 @@ def logo_data_uri():
     return _LOGO_URI_CACHE
 
 
+_ASSET_URI_CACHE = {}
+
+
+def asset_data_uri(filename):
+    """Return a PNG that sits next to this module as a base64 `data:` URI for
+    inline <img>/CSS use - CSP-safe, no external asset. Cached per filename;
+    returns "" if the file is missing so callers degrade gracefully."""
+    if filename in _ASSET_URI_CACHE:
+        return _ASSET_URI_CACHE[filename]
+    uri = ""
+    try:
+        import base64
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+        with open(p, "rb") as f:
+            uri = "data:image/png;base64," + base64.b64encode(f.read()).decode("ascii")
+    except Exception as e:
+        _warn("asset_data_uri(%s): %s" % (filename, e))
+    _ASSET_URI_CACHE[filename] = uri
+    return uri
+
+
 # --- per-window UI prefs (size/position memory) ---------------------------
 _CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Lia")
 UI_PREFS_FILE = os.path.join(_CONFIG_DIR, "ui_prefs.json")

@@ -235,7 +235,7 @@ def _demo_state():
             "summary": [{"model": "off", "label": "Off - transcript only (no AI summary)", "checked": True, "enabled": True, "note": ""},
                         {"model": "gpt-5.6-sol", "label": "OpenAI ChatGPT 5.6 Sol", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · ~$0.10 per meeting summary", "note": ""},
                         {"model": "gemini-3.7-flash", "label": "Gemini 3.7 Flash", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · free tier available", "note": "set Gemini key"},
-                        {"model": "gemma4:31b-it-qat", "label": "Gemma 4 31B QAT (local · best quality · needs a 24 GB GPU)", "checked": False, "enabled": False, "where": "local", "note": "start Ollama"}],
+                        {"model": "gemma4:31b-it-qat", "label": "Local Gemma 4 31B QAT (best quality · needs a 24 GB GPU)", "checked": False, "enabled": False, "where": "local", "note": "start Ollama"}],
             "cleanup_styles": [{"style": "off", "label": "Off - raw transcription", "checked": False},
                                {"style": "spoken", "label": "Spoken - remove fillers + self-corrections", "checked": True},
                                {"style": "proofread", "label": "Proofread - full polish", "checked": False}],
@@ -329,6 +329,9 @@ EXTRA_CSS = """
 .credcard .bdg{width:38px;height:38px;border-radius:11px;display:flex;align-items:center;
   justify-content:center;font-weight:800;font-size:16px;color:var(--on-accent);flex:0 0 38px;
   box-shadow:0 2px 6px rgba(16,24,40,.16), inset 0 1px 0 rgba(255,255,255,.28);}
+.credcard .bdg.img{background:#fff;padding:6px;box-shadow:0 2px 6px rgba(16,24,40,.16),
+  inset 0 0 0 1px rgba(16,24,40,.08);}
+.credcard .bdg.img img{width:100%;height:100%;object-fit:contain;display:block;}
 .credcard h3{margin:0;font-size:15.5px;font-weight:700;letter-spacing:-.01em;}
 .credcard .sub{color:var(--muted);font-size:var(--fs-hint);margin-top:2px;line-height:1.45;}
 /* current-key value shown as a soft pill (dashed + faint when unset) */
@@ -356,6 +359,9 @@ EXTRA_CSS = """
 .rowbtn .wb{margin-inline-start:auto;}
 .rowbtn .wb ~ .hk{margin-inline-start:0;}
 .disabledrow{opacity:.5;}
+/* Small provider logo before a model label (OpenAI / Gemini rows). */
+.radio .txt .prov-ico{width:15px;height:15px;object-fit:contain;
+  vertical-align:-3px;margin-inline-end:7px;border-radius:3px;}
 """
 
 APP_JS = r"""
@@ -363,6 +369,16 @@ APP_JS = r"""
   var S = window.__LIA_INIT__ || {};
   var PAGE = window.__LIA_PAGE__ || "models";
   var FOCUS = window.__LIA_FOCUS__ || "";
+  // Provider logos (inlined data URIs; "" -> the placeholder stays, guarded below).
+  var PROV_LOGO = {openai:"__OPENAI_LOGO__", gemini:"__GEMINI_LOGO__"};
+  function provIcon(label){
+    var l = (label||"").toLowerCase();
+    var key = l.indexOf("gemini")>=0 ? "gemini"
+            : (l.indexOf("openai")>=0 ? "openai" : "");
+    var src = key && PROV_LOGO[key];
+    if(!src || src.indexOf("data:")!==0) return "";
+    return '<img class="prov-ico" src="'+src+'" alt="">';
+  }
   var DRAFT = {};            // text fields that must survive re-render, by id
   var pending = {};          // call id -> {resolve}
   var nextId = 1;
@@ -407,7 +423,7 @@ APP_JS = r"""
       '<input type="radio" name="'+esc(name)+'" data-radio="'+esc(method)+'" '+
       'data-arg="'+esc(arg)+'" data-argtype="'+(argtype||'str')+'"'+
       (checked?' checked':'')+(dis?' disabled':'')+'>'+
-      '<span class="box"></span><span class="txt">'+esc(label)+
+      '<span class="box"></span><span class="txt">'+provIcon(label)+esc(label)+
       (note?'<small>'+esc(note)+'</small>':'')+'</span>'+badge+'</label>';
   }
   function btn(label, method, args, kind, slow){
@@ -556,12 +572,14 @@ APP_JS = r"""
     return '<div class="content-head"><h1>Models</h1></div>'+
       group("Dictation model", t.dictation, "set_dictation_model", "idx", "int")+
       group("Meeting transcription model", t.meeting, "set_meeting_model", "key", "str")+
-      group("Summary model", t.summary, "set_summary_model", "model", "str")+
+      group("Meeting Summary Model", t.summary, "set_summary_model", "model", "str")+
       '<div class="page">'+
         sw("Local summaries: add a dedicated tasks pass (more complete task list, +15-45s)", !!cfg("summary_local_tasks_pass",false), "toggle_summary_local_tasks_pass")+
         '<div class="hint">Local (Ollama) meeting summaries only. Runs a narrow second pass that extracts every commitment and replaces the task list; strips speaker-label owners.</div>'+
         sw("Local summaries: merge twice-discussed topics (consolidate pass)", !!cfg("summary_consolidate_pass",true), "toggle_summary_consolidate_pass")+
         sw("Local summaries: mark tasks completed during the meeting as [x]", !!cfg("summary_task_done_pass",true), "toggle_summary_task_done_pass")+
+        sw("Local summaries: coverage pass (add topics the summary missed, +30-60s)", !!cfg("summary_coverage_pass",false), "toggle_summary_coverage_pass")+
+        sw("Local summaries: depth pass (numbers, the why, blockers; guarded, +2min)", !!cfg("summary_depth_pass",true), "toggle_summary_depth_pass")+
         sw("Cloud summaries: parity rules + code cleanups (dedup, tone, owners)", !!cfg("summary_cloud_parity",true), "toggle_summary_cloud_parity")+
         '<div class="hint">Quality passes ported from a private upstream project. The two local passes each add a narrow Ollama call; the cloud row only extends the prompt and runs free code cleanups.</div>'+
       '</div>'+
@@ -600,10 +618,10 @@ APP_JS = r"""
   };
 
   var KEYCARDS = [
-    {svc:"openai", key:"openai_api_key", name:"OpenAI", badge:"O", color:"#0aa37f",
+    {svc:"openai", key:"openai_api_key", name:"OpenAI", badge:"O", color:"#0aa37f", img:"__OPENAI_LOGO__",
      sub:"Paid - best dictation, meeting transcription & summaries.",
      save:"Save & Verify", url:"https://platform.openai.com/api-keys", slow:true},
-    {svc:"gemini", key:"gemini_api_key", name:"Gemini", badge:"G", color:"#3b6fd4",
+    {svc:"gemini", key:"gemini_api_key", name:"Gemini", badge:"G", color:"#3b6fd4", img:"__GEMINI_LOGO__",
      sub:"Free meeting summaries + free AI cleanup (Google AI Studio).",
      save:"Save", url:"https://aistudio.google.com/apikey", slow:true},
     {svc:"hf", key:"hf_token", name:"Local Diarization", badge:"H", color:"#b08900",
@@ -623,8 +641,11 @@ APP_JS = r"""
       var cur = has[c.key] ? '<span class="masked">'+esc(secrets[c.key]||"set")+'</span>'
                            : '<span class="masked empty">not set</span>';
       var iid = "in_"+c.svc;
+      var bdg = (c.img && c.img.indexOf("data:")===0)
+        ? '<span class="bdg img"><img src="'+c.img+'" alt="'+esc(c.name)+'"></span>'
+        : '<span class="bdg" style="background:'+c.color+'">'+esc(c.badge)+'</span>';
       return '<div class="credcard">'+
-        '<div class="head"><span class="bdg" style="background:'+c.color+'">'+esc(c.badge)+'</span>'+
+        '<div class="head">'+bdg+
         '<div><h3>'+esc(c.name)+'</h3><div class="sub">'+esc(c.sub)+'</div></div></div>'+
         '<div class="keyline">Current '+esc(noun)+': '+cur+'</div>'+
         '<div class="row-inline" style="margin-top:8px">'+
@@ -892,6 +913,7 @@ APP_JS = r"""
       '<div class="hint">Report a problem builds a diagnostic zip (log + sanitized settings - API keys and personal lists removed), shows it in Explorer, and opens the GitHub issue page. Nothing is sent automatically - you attach the file yourself.</div>'+
       '</div>'+
       '<div class="page"><div class="section-title">About</div>'+
+        '<div class="kv"><span class="k">Version</span><span class="mono">'+esc(S.version||"")+'</span></div>'+
         '<div class="kv"><span class="k">Config</span><span class="rtl-auto" dir="auto">'+esc(p.config||"")+'</span></div>'+
         '<div class="kv"><span class="k">Log</span><span class="rtl-auto" dir="auto">'+esc(p.log||"")+'</span></div>'+
         '<div class="kv"><span class="k">Meetings</span><span class="rtl-auto" dir="auto">'+esc(p.meetings||"")+'</span></div>'+
@@ -1272,6 +1294,11 @@ APP_JS = r"""
   }
 })();
 """
+# Embed provider logos inline (CSP-safe data: URIs; left as the "__..._LOGO__"
+# placeholder if the asset is missing, so the render falls back to the letter badge).
+APP_JS = (APP_JS
+          .replace("__OPENAI_LOGO__", uk.asset_data_uri("provider_openai.png"))
+          .replace("__GEMINI_LOGO__", uk.asset_data_uri("provider_gemini.png")))
 
 
 if __name__ == "__main__":

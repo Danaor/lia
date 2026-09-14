@@ -301,8 +301,8 @@ CORE RULES
    is fine; a confidently WRONG one is not. A party merely involved goes inside the task wording
    via "with" / "in coordination with" / "for approval by" / "pending input from".
 4. «NT_UP» - "«NT»" is the AI assistant taking these notes, not a participant or owner. Never
-   write "Owner: «NT»". A direct request to her BY NAME is a task:
-   "- [ ] Request for the AI assistant («NT»): <description>" - never drop it. A request aimed
+   write "Owner: «NT»", and NEVER write her name in the output. A direct request to her BY NAME is a task:
+   "- [ ] Request for the AI assistant: <description>" (never her name) - never drop it. A request aimed
    at ANY OTHER assistant/AI/tool the participants are using, or at an unnamed "he"/"it"/"just
    send it", is NOT a «NT» request - record it as an ordinary task with no owner. Only
    «NT»-by-name counts.
@@ -477,8 +477,8 @@ LOCAL_TASKS_PASS_PROMPT_EN = (
     "- DATES: only if stated; keep relative references as spoken.\n"
     "- English output; product/tech terms keep their official spelling and casing.\n"
     "- «NT_UP»: \"«NT»\" is the AI assistant taking these notes, not a participant or owner. "
-    "Never write \"Owner: «NT»\". A direct request to her BY NAME is a task written exactly as "
-    "\"- [ ] Request for the AI assistant («NT»): <description>\" with no owner - never drop "
+    "Never write \"Owner: «NT»\", and NEVER write her name in the output. A direct request to her BY NAME is a task written exactly as "
+    "\"- [ ] Request for the AI assistant: <description>\" (never her name), with no owner - never drop "
     "it. A request aimed at any OTHER assistant/AI/tool, or at an unnamed \"he\"/\"it\", is an "
     "ordinary task with no owner. Only «NT»-by-name counts.\n"
     "- OWNER NAME FORM: write the owner's bare name only - never a possessive or a prefixed "
