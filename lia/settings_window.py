@@ -174,6 +174,15 @@ def build_window(webview, payload):
 def _demo_state():
     """A canned state that exercises every page (for --demo / --html QA)."""
     return {
+        # Advanced > cloud summary-prompt addendum editor (placeholder text: the
+        # real default lives in lia.py, which this child module must not import)
+        "summary_addendum_default": ("כללים נוספים מחייבים:\n- (demo) כל עובדה קונקרטית "
+                                     "נכנסת לתוך הבולט הרלוונטי.\n- (demo) 'דגשים מרכזיים' "
+                                     "נשאר 3-6 בולטים."),
+        "summary_base_prompt": ("You are an experienced project manager writing the final "
+                                "Hebrew meeting summary. (demo placeholder for the full base "
+                                "prompt - the real one is ~150 lines and lives in lia.py.)\n\n"
+                                "## כותרת הדיון\n## תקציר\n## דגשים מרכזיים\n## משימות"),
         "config": {
             "hotkey": "ctrl+space", "recording_mode": "toggle",
             "paste_mode": "auto_paste", "clipboard_auto_restore": True,
@@ -359,6 +368,7 @@ EXTRA_CSS = """
 .rowbtn .wb{margin-inline-start:auto;}
 .rowbtn .wb ~ .hk{margin-inline-start:0;}
 .disabledrow{opacity:.5;}
+.subhead{font-size:13px; font-weight:600; margin:14px 0 2px;}
 /* Small provider logo before a model label (OpenAI / Gemini rows). */
 .radio .txt .prov-ico{width:15px;height:15px;object-fit:contain;
   vertical-align:-3px;margin-inline-end:7px;border-radius:3px;}
@@ -912,6 +922,33 @@ APP_JS = r"""
       '</div>'+
       '<div class="hint">Report a problem builds a diagnostic zip (log + sanitized settings - API keys and personal lists removed), shows it in Explorer, and opens the GitHub issue page. Nothing is sent automatically - you attach the file yourself.</div>'+
       '</div>'+
+      '<div class="page"><div class="section-title">Meeting summary prompt (OpenAI / Gemini)</div>'+
+        '<div class="hint"><b>Affects summaries written by OpenAI and Gemini only.</b> The local Gemma 4 '+
+        'summary is <b>not</b> affected: it runs through a pipeline of passes (depth, consolidate, '+
+        'task-done) that is hardcoded at this stage and never reads this field.</div>'+
+        '<div class="subhead">Base prompt</div>'+
+        '<div class="hint">The full instructions the model receives BEFORE your rules below. Shared '+
+        'with the local Gemma summary; editing here changes OpenAI / Gemini summaries only. Locked by '+
+        'default - unlock to edit.</div>'+
+        '<textarea id="summaryBase" class="rtl-auto" dir="auto" style="min-height:220px" disabled>'+
+          esc(draftOr("summaryBase", cfg("summary_base_prompt_override","") || (S.summary_base_prompt||"")))+
+        '</textarea>'+
+        '<div class="btnrow"><button class="btn" data-unlock-base="1">&#128274; Unlock to edit</button>'+
+          '<button class="btn primary" data-save-base="1" style="display:none">Save</button>'+
+          '<button class="btn ghost" data-reset-base="1">Reset to default</button>'+
+          (cfg("summary_base_prompt_override","")?'<span class="note">manual override active</span>':'')+
+        '</div>'+
+        '<div class="subhead">Additional rules (editable)</div>'+
+        '<div class="hint">Appended after the base prompt above. Empty, or unchanged from the default, '+
+        'keeps the built-in text.</div>'+
+        '<textarea id="summaryAddendum" class="rtl-auto" dir="auto" style="min-height:240px">'+
+          esc(draftOr("summaryAddendum", cfg("summary_cloud_addendum","") || (S.summary_addendum_default||"")))+
+        '</textarea>'+
+        '<div class="btnrow"><button class="btn primary" data-save-addendum="1">Save</button>'+
+          '<button class="btn ghost" data-reset-addendum="1">Reset to default</button>'+
+          (cfg("summary_cloud_addendum","")?'<span class="note">manual override active</span>':'')+
+        '</div>'+
+      '</div>'+
       '<div class="page"><div class="section-title">About</div>'+
         '<div class="kv"><span class="k">Version</span><span class="mono">'+esc(S.version||"")+'</span></div>'+
         '<div class="kv"><span class="k">Config</span><span class="rtl-auto" dir="auto">'+esc(p.config||"")+'</span></div>'+
@@ -1113,6 +1150,26 @@ APP_JS = r"""
     var rv = e.target.closest('[data-reset-vocab]');
     if(rv){ if(!confirm("Replace the terms above with the shipped default set?")) return;
       call("reset_vocab_default",[]).then(function(r){ if(r.ok) delete DRAFT["vocabText"]; }); return; }
+    var sa = e.target.closest('[data-save-addendum]');
+    if(sa){ var at=(document.getElementById("summaryAddendum")||{}).value||"";
+      call("save_summary_addendum",[at]).then(function(r){ if(r.ok) delete DRAFT["summaryAddendum"]; }); return; }
+    var ra = e.target.closest('[data-reset-addendum]');
+    if(ra){ if(!confirm("Replace the text above with the built-in default?")) return;
+      call("reset_summary_addendum",[]).then(function(r){ if(r.ok) delete DRAFT["summaryAddendum"]; }); return; }
+    var ulb = e.target.closest('[data-unlock-base]');
+    if(ulb){ if(ulb.dataset.on==="1") return;
+      if(!confirm("Editing the base prompt can cause unexpected changes to your OpenAI / Gemini "+
+        "summaries - wrong headers, a broken format, or lost faithfulness. It does NOT affect the "+
+        "local Gemma summary. Continue?")) return;
+      var bt=document.getElementById("summaryBase"); if(bt){ bt.disabled=false; bt.focus(); }
+      ulb.dataset.on="1"; ulb.textContent="🔓 Editing enabled";
+      var sbb=document.querySelector('[data-save-base]'); if(sbb) sbb.style.display=""; return; }
+    var sb2 = e.target.closest('[data-save-base]');
+    if(sb2){ var bv=(document.getElementById("summaryBase")||{}).value||"";
+      call("save_summary_base_prompt",[bv]).then(function(r){ if(r.ok) delete DRAFT["summaryBase"]; }); return; }
+    var rb2 = e.target.closest('[data-reset-base]');
+    if(rb2){ if(!confirm("Replace the base prompt with the built-in default?")) return;
+      call("reset_summary_base_prompt",[]).then(function(r){ if(r.ok) delete DRAFT["summaryBase"]; }); return; }
     var va = e.target.closest('[data-vocab-apply]');
     if(va){ applyPending(); return; }
     var vr = e.target.closest('[data-vocab-remove]');

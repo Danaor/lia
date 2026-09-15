@@ -295,6 +295,13 @@ def _meetings_dir():
 
 
 def main(argv=None):
+    # Findings carry Hebrew detail; a piped Windows stdout defaults to cp1252 and
+    # raises UnicodeEncodeError the instant we print one - i.e. exactly when there
+    # is something to report. Force UTF-8 so a finding is never masked by a crash.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     ap = argparse.ArgumentParser(description="Check Lia meeting summaries against the prompt's mechanical rules.")
     ap.add_argument("--file", help="one .md/.txt/.html summary")
     ap.add_argument("--meetings", action="store_true",

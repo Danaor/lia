@@ -375,7 +375,7 @@ if sys.platform == "win32":
     ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
 
 # --- Configuration ---
-APP_VERSION = "1.4.8"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
+APP_VERSION = "1.4.9"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Lia")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -687,6 +687,11 @@ DEFAULT_CONFIG = {
     # reflects the same standards the local pass machinery enforces. NO paid
     # LLM passes on cloud - prompt + pure code only.
     "summary_cloud_parity": True,
+    "summary_cloud_addendum": "",           # Settings > Advanced: manual replacement for the
+                                            #   cloud-parity addendum ("" = built-in default)
+    "summary_base_prompt_override": "",     # Settings > Advanced (behind a lock): manual base
+                                            #   meeting prompt for OpenAI/Gemini ONLY ("" = built-in;
+                                            #   the local Gemma flow always keeps the pinned base)
     # Compose Mode (voice → professional written piece, with iterative
     # re-versioning). Tray → "Start Compose": records a spoken draft, transcribes
     # it, then rewrites it into a polished email/message/summary via summary_model
@@ -8820,7 +8825,14 @@ class GroqLLMCleaner:
                             enriched = self._ollama_summary_once(
                                 url, _DEPTH_ENRICH_PROMPT, enrich_user, nc_e, False, read_to,
                                 num_predict=_DEPTH_NUM_PREDICT) or ""
-                            spliced = _splice_depth(out, enriched, lang, source=narratives)
+                            # source = the enrich call's WHOLE input (A)+(B), not just
+                            # the narratives: a Latin term the rewrite legitimately MOVED
+                            # from one current section into the other is in neither the
+                            # target section nor the narratives, so a per-section bound
+                            # false-refuses it. Both sections joined is a strict superset,
+                            # same invention bound. (Upstream WhisperMeet fix.)
+                            spliced = _splice_depth(out, enriched, lang,
+                                                    source=cur + "\n\n" + narratives)
                             log.info("Summary depth pass (%s): %d narrative(s), %d -> %d chars "
                                      "in %.1fs%s", self.model, n_topics, len(out), len(spliced),
                                      time.time() - t1,
@@ -8888,6 +8900,12 @@ class GroqLLMCleaner:
                                         read_to,
                                         num_predict=_TASK_DONE_NUM_PREDICT) or "",
                                     len(tasks_txt))
+                            intent = _intention_votes(tasks_txt, lang)
+                            if votes & intent:
+                                log.info("Summary task-done pass: %d vote(s) dropped as "
+                                         "first-person future intention (started is not "
+                                         "done).", len(votes & intent))
+                                votes -= intent
                             if votes and len(votes) * 2 > len(tasks_txt):
                                 log.warning("Summary task-done pass: %d/%d tasks voted "
                                             "done - runaway vote, ignored.",
@@ -8921,11 +8939,23 @@ class GroqLLMCleaner:
         model_lower = (self.model or "").lower()
         is_gpt5 = model_lower.startswith("gpt-5")
         is_o_series = model_lower.startswith(("o1", "o3", "o4"))
+        if meeting_meta is not None:
+            # Manual BASE-prompt override (Settings > Advanced, behind a lock):
+            # replaces the built-in meeting prompt on this CLOUD branch only. The
+            # local Gemma path returned far above with the pinned base, so an edit
+            # here can never touch it. "" = keep the base the caller passed in.
+            _base_ovr = ((self._log_cfg or {}).get("summary_base_prompt_override") or "").strip()
+            if _base_ovr:
+                system_prompt = _render_nt(_base_ovr)
+                log.info("Summary (%s): MANUAL base-prompt override in use (%d chars).",
+                         self.model, len(_base_ovr))
         if cloud_parity and meeting_meta is not None:
             # Cloud PARITY, prompt side: the behaviors the local flow enforces
             # with passes, as compact instructions a frontier model applies
             # inline. Cloud branch ONLY - the local prompt stays byte-identical.
-            system_prompt = system_prompt + _p_parity_addendum(lang)
+            # A manual override from Settings > Advanced replaces the block.
+            system_prompt = system_prompt + _p_parity_addendum(
+                lang, override=(self._log_cfg or {}).get("summary_cloud_addendum"))
         body = {
             "model": self.model,
             "messages": [
@@ -9284,30 +9314,55 @@ def _is_gemini_url(url):
 _CORRECTIONS_MARKER = "===CORRECTIONS==="
 
 
-def _split_summary_corrections(text):
-    """Split a summary response into (summary, corrections_pairs).
+# gemma sometimes echoes the instruction's OWN heading ('## Transcript corrections',
+# injected by summarize(collect_corrections=True) at the ## Transcript corrections
+# block) instead of the ===CORRECTIONS=== marker; the heading + its JSON array, or a
+# bare dangling heading, then leaks into the delivered summary. Ported from the
+# upstream project, which shipped BOTH shapes to recipients: the array shape
+# (2026-08-31) and the empty-heading shape (2026-09-08/09). Compiled lazily into a
+# module cache - this module keeps `re` local, not a top-level import (see ~12148).
+_CORRECTIONS_HEADING_RES = None
 
-    The model is asked to append `===CORRECTIONS===` + a JSON array of
-    {"wrong","right"} pairs after the summary. Tolerant parsing: no marker →
-    the whole text is the summary; malformed JSON → the block is stripped and
-    pairs are [] (a bad corrections tail must never corrupt the summary)."""
-    if not text or _CORRECTIONS_MARKER not in text:
-        return (text or "").strip(), []
-    head, _, tail = text.rpartition(_CORRECTIONS_MARKER)
+
+def _corrections_heading_res():
+    global _CORRECTIONS_HEADING_RES
+    if _CORRECTIONS_HEADING_RES is None:
+        import re
+        _CORRECTIONS_HEADING_RES = (
+            # heading line + optional ```json fence + one JSON array + nothing after,
+            # anchored to \Z so it can never eat real prose (still harvests the pairs)
+            re.compile(
+                r"(?ims)\n?^[ \t]{0,3}#{0,6}[ \t]*\**[ \t]*"
+                r"(?:transcript[ \t]+corrections|תיקוני[ \t]+תמלול)\b[^\n]*\n"
+                r"(?:[ \t]*```[a-z]*[ \t]*\n)?"
+                r"[ \t]*(\[.*?\])[ \t]*\n?"
+                r"(?:[ \t]*```[ \t]*\n?)?"
+                r"[ \t\r\n]*\Z"),
+            # the same heading echo with NO array after it (a bare dangling heading);
+            # requires a real #{1,6} heading + whitespace-to-\Z, so a heading followed
+            # by real PROSE is left untouched (pinned by the tests)
+            re.compile(
+                r"(?ims)\n?^[ \t]{0,3}#{1,6}[ \t]*\**[ \t]*"
+                r"(?:transcript[ \t]+corrections|תיקוני[ \t]+תמלול)\b[^\n]*[ \t\r\n]*\Z"),
+        )
+    return _CORRECTIONS_HEADING_RES
+
+
+def _parse_correction_pairs(blob):
+    """Validated {wrong,right} pairs from a JSON-array blob ([] on any problem)."""
     pairs = []
     try:
-        start = tail.index("[")
+        start = blob.index("[")
         depth = 0
-        for i in range(start, len(tail)):
-            if tail[i] == "[":
+        parsed = []
+        for i in range(start, len(blob)):
+            if blob[i] == "[":
                 depth += 1
-            elif tail[i] == "]":
+            elif blob[i] == "]":
                 depth -= 1
                 if depth == 0:
-                    parsed = json.loads(tail[start:i + 1])
+                    parsed = json.loads(blob[start:i + 1])
                     break
-        else:
-            parsed = []
         for p in parsed if isinstance(parsed, list) else []:
             if (isinstance(p, dict)
                     and isinstance(p.get("wrong"), str)
@@ -9316,7 +9371,37 @@ def _split_summary_corrections(text):
                               "right": p["right"].strip()})
     except Exception as e:
         log.warning("Summary corrections tail unparseable (%s) — ignored", e)
-    return head.strip(), pairs
+    return pairs
+
+
+def _split_summary_corrections(text):
+    """Split a summary response into (summary, corrections_pairs).
+
+    Tolerant parsing: no marker and no heading echo → the whole text is the
+    summary; malformed JSON → the block is stripped and pairs are [] (a bad
+    corrections tail must never corrupt the summary a recipient receives).
+    Handles BOTH the requested ===CORRECTIONS=== marker AND gemma echoing the
+    instruction's own '## Transcript corrections' heading instead (the array shape
+    or a bare dangling heading), so neither leaks into a delivered summary."""
+    if not text:
+        return "", []
+    if _CORRECTIONS_MARKER in text:
+        head, _, tail = text.rpartition(_CORRECTIONS_MARKER)
+        return head.strip(), _parse_correction_pairs(tail)
+    block_re, empty_re = _corrections_heading_res()
+    m = block_re.search(text)
+    if m:
+        log.info("Summary corrections: heading-echo tail stripped (the "
+                 "===CORRECTIONS=== marker was replaced by a '%s...' heading).",
+                 m.group(0).strip().splitlines()[0][:40])
+        return text[:m.start()].strip(), _parse_correction_pairs(m.group(1))
+    m = empty_re.search(text)
+    if m:
+        log.info("Summary corrections: EMPTY heading-echo tail stripped (a '%s' "
+                 "heading with no JSON array leaked to the tail).",
+                 m.group(0).strip().splitlines()[0][:40])
+        return text[:m.start()].strip(), []
+    return text.strip(), []
 
 
 _SUMMARY_PROMPT_MEETING = """You are an experienced project manager writing the final, distribution-ready Hebrew meeting summary
@@ -9673,7 +9758,13 @@ def _p_task_done(lang):
                       else _TASK_DONE_PROMPT)
 
 
-def _p_parity_addendum(lang):
+def _p_parity_addendum(lang, override=None):
+    """The cloud-parity addendum appended to the meeting prompt on the CLOUD
+    branch. A non-empty manual `override` (Settings > Advanced, config
+    `summary_cloud_addendum`) replaces the built-in block for every language -
+    it is the user's own text; otherwise the built-in per-language block."""
+    if (override or "").strip():
+        return "\n\n" + _render_nt(override.strip())
     return _render_nt(lang_pack.CLOUD_PARITY_ADDENDUM_EN if lang == "en"
                       else _SUMMARY_CLOUD_PARITY_ADDENDUM)
 
@@ -12693,8 +12784,17 @@ _DEPTH_ENRICH_PROMPT = (
     "- a status in (A) that CONTRADICTS its narrative's verbatim status verdict is corrected to the "
     "narrative's wording; when the narrative quotes TWO verdicts, keep both in order, never collapse "
     "them into one;\n"
-    "- nothing from (A) is dropped; bullets may grow or merge, never silently lost. A topic the "
-    "narratives cover but (A) does not list may be ADDED - one concise bullet, same format;\n"
+    "- '## דגשים מרכזיים' stays 3-6 bullets. ENRICH the bullets that are already there in place - "
+    "fold each narrative's facts, numbers and WHY into the highlight bullet it belongs to; do NOT "
+    "add new highlight bullets. A topic the narratives cover that (A) lists under neither section "
+    "is a project/status item: add it as ONE tight line under '## סטטוס פרויקטים' "
+    "('שם: מצב + חסם/צעד הבא'), never as a 7th highlight. Only a clear DECISION, a cross-cutting "
+    "RISK, or a strategic item may join the highlights, and only by REPLACING a weaker existing "
+    "highlight (which moves down to '## סטטוס פרויקטים') so the count never exceeds 6. If (A) has "
+    "no '## סטטוס פרויקטים' section, keep the enrichment inside the existing 3-6 highlight bullets "
+    "and add no new bullet;\n"
+    "- nothing from (A) is dropped or silently lost: a bullet may grow, merge, or move between the "
+    "two sections, but its facts survive somewhere;\n"
     "- style, voice and format stay exactly as (A): '## דגשים מרכזיים' then bullets; "
     "'## סטטוס פרויקטים' then '- <project>: <status>' bullets; 'הוחלט' for decisions; no bold, "
     "no headers beyond the two; Hebrew; product/tech terms stay English;\n"
@@ -12708,6 +12808,14 @@ _DEPTH_SECTIONS = ("דגשים מרכזיים", "סטטוס פרויקטים")
 _NARRATIVE_SPLIT_RE = _re_tasks.compile(r"(?m)^(?=### )")
 # 'Speaker B' / 'דובר 2' / 'S1-spk:0' style labels - never names in a summary.
 _SPEAKER_LABEL_RE = _re_tasks.compile(r"(?i)\bSpeaker\s+[A-Z](?:\d+)?(?:-spk:?\d*)?\b|(?<![א-ת])דובר\s+\d+")
+# '## דגשים מרכזיים' contract: 3-6 bullets (base prompt + summary_check R5). The depth
+# enrich step can inflate it past that; a rewrite that GROWS the section past the cap
+# keeps the base highlights (only growth is refused - a base already over is not the
+# rewrite's fault). A recovered PROJECT lands in status via the enrich prompt, so the
+# cap never has to relocate a highlight-prose bullet under a status header.
+_DEPTH_HIGHLIGHTS_CAP = 6
+# a highlight bullet, not a '- [ ]' task; MULTILINE so findall counts per line
+_DEPTH_BULLET_RE = _re_tasks.compile(r"^\s*-\s+(?!\[)", _re_tasks.MULTILINE)
 
 
 def _section_body(md, name):
@@ -12723,34 +12831,35 @@ def _replace_section(md, name, body):
     return pat.sub(lambda m: m.group(1) + body.strip() + "\n\n", md, count=1)
 
 
-def _depth_guard(cur, new, known, lang="he", source=None):
-    """True = a depth-pass rewrite is safe to take. The pass ADDS detail, so the
-    guard is asymmetric - it forbids only LOSS: a number, a known name or a
-    conditional qualifier present in `cur` must survive in `new`, and `new` may
-    not introduce a completion form `cur` lacked. New numbers AND new named
-    systems/terms from the narratives are welcome (Git, S3, Shield Advanced -
-    that is the point of the pass), so unlike the condense guard this one does
-    NOT reject a new Latin token; it rejects only a character from a script
-    that is neither Hebrew nor ASCII (model noise: Korean/Arabic salad).
-    Measured 2026-09-14 on the IAA-AWS meeting: with the Latin-token check the
-    enrich rewrite was refused every time and the pass contributed nothing."""
+def _depth_guard_reason(cur, new, known, lang="he", source=None):
+    """The first faithfulness rule a depth-pass rewrite breaks - a short reason
+    for the log - or None when the rewrite is safe to take. The pass ADDS detail,
+    so the guard is asymmetric: it forbids only LOSS - a number, a known name or a
+    conditional qualifier present in `cur` must survive in `new`, and `new` may not
+    introduce a completion form `cur` lacked, a diarization speaker label `cur`
+    lacked, a Latin term absent from `source`, or a non-Hebrew/ASCII script
+    character. New numbers AND new named systems/terms from the narratives are
+    welcome (Git, S3, Shield Advanced - the point of the pass). Naming the rule
+    lets a live 'kept original' be diagnosed - a chance number trip vs the source
+    bound - instead of a bare bool (upstream WhisperMeet split)."""
     if _condense_numbers(cur) - _condense_numbers(new):
-        return False
+        return "a number was lost"
     if _condense_completions(new) - _condense_completions(cur):
-        return False
+        return "a new completion form appeared"
     q_cur, q_new = _condense_qualifiers(cur), _condense_qualifiers(new)
     if any(q_new[q] < c for q, c in q_cur.items()):
-        return False
+        return "a conditional qualifier was lost"
     # A speaker label is not a name (the base prompt's rule): the narratives
     # quote "who backed whom" off a transcript that only has 'Speaker B', and
     # the first live run (IAA-AWS, 2026-09-14) shipped "Speaker B יבצע..." into
     # prose. The enrich prompt now asks for a role instead; this is the net.
-    if _SPEAKER_LABEL_RE.findall(new or "") and not _SPEAKER_LABEL_RE.findall(cur or ""):
-        return False
-    # A new Latin term is welcome only when it comes from the SOURCE (the
-    # narratives, i.e. the transcript) - the enrich step may not "correct" an
-    # ASR spelling into a different real product (live: 'נצקופ/Netscope' became
-    # 'Netscout'). Prefix-tolerant like the condense guard (VLANs ~ VLAN).
+    m = _SPEAKER_LABEL_RE.search(new or "")
+    if m and not _SPEAKER_LABEL_RE.search(cur or ""):
+        return "speaker label %r introduced" % m.group(0)
+    # A new Latin term is welcome only when it comes from the SOURCE (the enrich
+    # call's whole input: both current sections + the narratives) - the enrich
+    # step may not "correct" an ASR spelling into a different real product (live:
+    # 'נצקופ/Netscope' became 'Netscout'). Prefix-tolerant (VLANs ~ VLAN).
     # source=None (no narratives handed in) keeps the permissive behaviour.
     if source is not None and lang != "en":
         allowed = {t.lower() for t in _CONDENSE_LATIN_RE.findall((cur or "") + "\n" + source)}
@@ -12758,24 +12867,38 @@ def _depth_guard(cur, new, known, lang="he", source=None):
             lt = t.lower()
             if lt not in allowed and not any(k.startswith(lt) or lt.startswith(k)
                                              for k in allowed):
-                return False
+                return "unsourced Latin term %r introduced" % t
     o_chars = set(cur or "")
     if lang == "en":
-        if any(c not in o_chars and c > "\x7f" for c in new or ""):
-            return False
-    elif any(c not in o_chars and not ("֐" <= c <= "׿") and c > "\x7f"
-             for c in new or ""):
-        return False
+        bad = next((c for c in new or "" if c not in o_chars and c > "\x7f"), None)
+    else:
+        bad = next((c for c in new or "" if c not in o_chars
+                    and not ("֐" <= c <= "׿") and c > "\x7f"), None)
+    if bad is not None:
+        return "a foreign-script character %r appeared" % bad
     for name in known:
         if name and name in cur and name not in new:
-            return False
-    return True
+            return "known name %r was lost" % name
+    return None
+
+
+def _depth_guard(cur, new, known, lang="he", source=None):
+    """Boolean view of _depth_guard_reason - every existing True/False test of
+    this function is unchanged; the reason string drives the 'kept original' log."""
+    return _depth_guard_reason(cur, new, known, lang, source) is None
 
 
 def _splice_depth(summary, enriched, lang="he", source=None):
     """Splice the depth pass's rewritten sections into `summary`; every other
-    section byte-identical. Both guards fail to KEEP-ORIGINAL: a rewrite must
-    be at least as long as the original, and must pass _depth_guard."""
+    section byte-identical. Three guards fail to KEEP-ORIGINAL: a rewrite must be
+    at least as long as the original, must pass _depth_guard, and (for the
+    highlights) must not GROW the section past the 3-6 contract. A base already
+    over the cap is not the rewrite's fault - only growth past it is refused, and
+    the status rewrite is taken independently; a NEW project the narratives
+    surface lands in status via the enrich prompt, which this cap never touches.
+    Deliberately NOT relocated into '## סטטוס פרויקטים' - overflow highlight
+    bullets are highlight-shaped prose, and a decision under a status header is
+    the wart Naor hand-deletes (his call, upstream WhisperMeet F-6, 2026-09-14)."""
     if not summary or not enriched:
         return summary
     out = summary
@@ -12788,11 +12911,17 @@ def _splice_depth(summary, enriched, lang="he", source=None):
             log.info("Summary depth pass: rewritten '%s' shorter than the original "
                      "(%d < %d chars) - kept original.", name, len(new), len(cur))
             continue
-        if not _depth_guard(cur, new, known, lang, source):
+        if name == "דגשים מרכזיים":
+            n_new, n_cur = (len(_DEPTH_BULLET_RE.findall(new)),
+                            len(_DEPTH_BULLET_RE.findall(cur)))
+            if n_new > _DEPTH_HIGHLIGHTS_CAP and n_new > n_cur:
+                log.info("Summary depth pass: rewritten '%s' inflated to %d bullets "
+                         "(contract 3-6, was %d) - kept original.", name, n_new, n_cur)
+                continue
+        reason = _depth_guard_reason(cur, new, known, lang, source)
+        if reason:
             log.info("Summary depth pass: rewritten '%s' tripped a faithfulness guard "
-                     "(a number, name or qualifier was lost; a completion, a speaker "
-                     "label, a foreign script or a Latin term absent from the "
-                     "narratives appeared) - kept original.", name)
+                     "(%s) - kept original.", name, reason)
             continue
         out = _replace_section(out, name, new)
     return out
@@ -12898,22 +13027,43 @@ def _consolidate_pass(out, call, participants=None, lang="he"):
     return result
 
 
-# Cloud PARITY addendum (ported, 2026-08-27): the LOCAL gemma flow
-# enforces these behaviors with dedicated passes and code guards (dedup,
-# consolidate, task-done); a frontier cloud model (SOL here, Opus there)
-# applies them from instruction - so they ride the SYSTEM PROMPT on the cloud
-# branch ONLY. The GOLD meeting prompt does NOT move (sha-gated); this block is
-# deliberately compact (no prompt bloat). verbatim from the upstream project
-# prompts_unified.CLOUD_PARITY_ADDENDUM - keep in sync.
+# Cloud PARITY addendum (ported 2026-08-27; extended 2026-09-15): the LOCAL
+# gemma flow enforces these behaviors with dedicated passes and code guards
+# (dedup, consolidate, task-done, and since 1.4.8 the DEPTH pass: narratives ->
+# facts / WHY / who-backed-whom / verbatim status verdicts folded into the two
+# most-read sections); a frontier cloud model (SOL here, Opus there) applies
+# them from instruction - so they ride the SYSTEM PROMPT on the cloud branch
+# ONLY. The GOLD meeting prompt does NOT move (sha-gated); this block stays
+# compact (no prompt bloat). Rules 1-4 + the last one are the upstream project's
+# prompts_unified.CLOUD_PARITY_ADDENDUM; the depth rules (5-10) are Lia's
+# DELIBERATE extension (Naor's ask, 2026-09-15) - a future upstream re-sync must
+# keep them. A user can replace the whole block from Settings > Advanced
+# (config `summary_cloud_addendum`; see _p_parity_addendum).
 _SUMMARY_CLOUD_PARITY_ADDENDUM = (
     "\n\nכללים נוספים מחייבים:\n"
     "- משימה שנאמרה או נוסחה יותר מפעם אחת מופיעה פעם אחת, עם כל הפרטים משני האזכורים.\n"
     "- נושא שנדון פעמיים בפגישה מתואר פעם אחת, ממוזג; האזכור המאוחר (עדכון או הכרעה) הוא העיקר.\n"
     "- 'אחראי:' נכתב רק כשיש ראיה מפורשת בתמליל מי קיבל על עצמו את המשימה; בלי ראיה - בלי אחראי.\n"
-    "- משימה שבוצעה בשלמותה במהלך הפגישה עצמה נכתבת '- [x] ... - בוצע במהלך הפגישה', "
-    "ורק על אמירה מפורשת שהפעולה הושלמה.\n"
+    "- '- [x] ... - בוצע במהלך הפגישה' רק על אמירה מפורשת שהפעולה הושלמה בפגישה; "
+    "הבטחה, כוונה עתידית או תחילת ביצוע - אינן ביצוע.\n"
+    "- כל עובדה קונקרטית (מספרים, סכומים, תאריכים, שמות, החלטה והנימוק שלה, סיכון או חסם) "
+    "נכנסת לתוך הבולט הרלוונטי עם מספיק הקשר כדי להיקרא לבד - לא 'X: 164/30' עירום.\n"
+    "- תמונת היחסים והארגון כשהיא מפורשת (לקוח מרוצה או לא, דחיפות, חסם כמו היעדר הרשאות, "
+    "החלטה שהתקבלה בלי הגורמים הנכונים) - במשפט קצר ומקצועי אחד.\n"
+    "- דינמיקה: מי העלה מה, מי גיבה מי ומה הוכרע - בניסוח ענייני וחיובי ('לאחר דיון בנושא'), "
+    "לפי תפקיד ('איש התשתיות', 'היועץ'); לעולם לא 'Speaker A' / 'דובר 1'.\n"
+    "- פסק הסטטוס של הדובר מצוטט כלשונו ('לא התקדם', 'תקוע', 'זה שלד'); שני פסקים לאותו נושא - "
+    "שניהם, לפי הסדר, בלי לרכך ובלי לאחד.\n"
+    "- 'דגשים מרכזיים' נשאר 3-6 בולטים; פרויקט שאינו בהם מקבל שורת סטטוס אחת "
+    "('שם: מצב + חסם/צעד הבא'), לא בולט שביעי.\n"
+    "- שמות ומונחים נשארים באיות התמליל; אין 'לתקן' איות של תמלול למוצר אחר.\n"
     "- ניסוח הדוק וענייני; בלי חזרות ובלי הרחבות מיותרות."
 )
+# Manual override cap (Settings > Advanced): a pasted document must not bloat
+# the system prompt. Generous for hand-written rules, tight for accidents.
+_SUMMARY_ADDENDUM_MAX = 6000
+# The base meeting prompt is ~5-6KB; allow room to hand-edit, still cap a paste.
+_SUMMARY_BASE_PROMPT_MAX = 20000
 
 
 # ---- TASK-DONE pass (ported): a task committed early and COMPLETED
@@ -12959,6 +13109,25 @@ def _parse_done_votes(text, n):
         if m and 1 <= int(m.group(1)) <= n:
             votes.add(int(m.group(1)))
     return votes
+
+
+# A task WORDED as a first-person future intention ("אני ארים טלפון למייק",
+# "I will call Mike") is a to-do, never a completed action: the task-done pass
+# must not flip it to '- [x]' even when the model over-votes (live 2026-09-14).
+# The prompt already says intention != done; this is the deterministic net.
+# \b after the Hebrew pronoun keeps a word that merely starts with those letters
+# (e.g. 'אנונימי') from matching.
+_INTENT_HE_RE = _re_tasks.compile(r"^(?:אני|אנחנו|אנו)\b")
+_INTENT_EN_RE = _re_tasks.compile(
+    r"^(?:i|we)\s*['’]ll\b|^(?:i|we)\s+(?:will|shall|going\s+to|(?:am|are)\s+going\s+to)\b",
+    _re_tasks.IGNORECASE)
+
+
+def _intention_votes(tasks_txt, lang="he"):
+    """Indices (1-based) of tasks whose TEXT reads as a first-person future
+    intention - ineligible for a done flip whatever the model voted."""
+    rx = _INTENT_EN_RE if lang == "en" else _INTENT_HE_RE
+    return {i for i, t in enumerate(tasks_txt, 1) if rx.match((t or "").strip())}
 
 
 def _apply_done_marks(out, done, lang="he"):
@@ -13542,18 +13711,18 @@ def _stamp_lia_launcher(exe_path):
         return False
     try:
         vi = VSVersionInfo(
-            ffi=FixedFileInfo(filevers=(1, 4, 8, 0), prodvers=(1, 4, 8, 0),
+            ffi=FixedFileInfo(filevers=(1, 4, 9, 0), prodvers=(1, 4, 9, 0),
                               mask=0x3f, flags=0x0, OS=0x40004,
                               fileType=0x1, subtype=0x0),
             kids=[
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.4.8.0'),
+                    StringStruct('FileVersion', '1.4.9.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.4.8.0'),
+                    StringStruct('ProductVersion', '1.4.9.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -26623,6 +26792,66 @@ class LiaApp:
         save_config(self.config)
         log.info("Summary task-done pass: %s", "ON" if new else "OFF")
 
+    def _summary_effective_lang(self):
+        """The language cloud meeting summaries are written in (drives both the
+        base-prompt preview and the addendum default in Settings > Advanced)."""
+        sl = self.config.get("summary_language") or "primary"
+        return sl if sl in ("he", "en") else (self.config.get("primary_language") or "he")
+
+    def _summary_base_prompt(self):
+        """The FULL base meeting prompt (rendered) the OpenAI/Gemini model receives
+        BEFORE the addendum - shown read-only in the Advanced editor so the whole
+        prompt is visible. Shared byte-identical with the local Gemma flow and
+        sha-gated, so it is not editable from the UI (edit it in code)."""
+        return _p_summary_meeting(self._summary_effective_lang())
+
+    def _summary_addendum_default(self):
+        """The built-in cloud-parity addendum for the language summaries are
+        written in - shown in the Advanced editor when no override is set."""
+        return _p_parity_addendum(self._summary_effective_lang()).strip()
+
+    def _save_summary_addendum(self, text):
+        """Settings > Advanced: manual cloud-summary prompt addendum. Empty, or
+        identical to the built-in default, CLEARS the override so future default
+        updates apply again. Capped so a pasted document cannot bloat the prompt.
+        Applies to the next OpenAI/Gemini summary; the local Gemma flow gets the
+        same behaviors from its code passes and never reads this."""
+        text = (text or "").strip()
+        if len(text) > _SUMMARY_ADDENDUM_MAX:
+            return (False, "Too long: %d chars (max %d)." % (len(text), _SUMMARY_ADDENDUM_MAX))
+        if text == self._summary_addendum_default():
+            text = ""
+        self.config["summary_cloud_addendum"] = text
+        save_config(self.config)
+        log.info("Summary cloud addendum: %s (%d chars)",
+                 "manual override set" if text else "reset to the built-in default", len(text))
+        return (True, "Saved - applies to the next OpenAI / Gemini summary." if text
+                else "Reset to the built-in default.")
+
+    def _reset_summary_addendum(self):
+        return self._save_summary_addendum("")
+
+    def _save_summary_base_prompt(self, text):
+        """Settings > Advanced (behind a lock): a manual REPLACEMENT for the base
+        meeting prompt on the OpenAI/Gemini branch. Empty, or identical to the
+        built-in default, CLEARS the override. Capped so a pasted document cannot
+        bloat the prompt. The local Gemma flow never reads this - it keeps the
+        pinned base - so an edit here can only affect cloud summaries."""
+        text = (text or "").strip()
+        if len(text) > _SUMMARY_BASE_PROMPT_MAX:
+            return (False, "Too long: %d chars (max %d)." % (len(text), _SUMMARY_BASE_PROMPT_MAX))
+        if text == self._summary_base_prompt():
+            text = ""
+        self.config["summary_base_prompt_override"] = text
+        save_config(self.config)
+        log.info("Summary base prompt: %s (%d chars)",
+                 "manual override set" if text else "reset to the built-in default", len(text))
+        return (True, "Saved - applies to the next OpenAI / Gemini meeting summary." if text
+                else "Reset to the built-in default.")
+
+    def _reset_summary_base_prompt(self):
+        return self._save_summary_base_prompt("")
+
     def _toggle_summary_cloud_parity(self):
         new = not bool(self.config.get("summary_cloud_parity", True))
         self.config["summary_cloud_parity"] = new
@@ -27970,6 +28199,10 @@ class LiaApp:
         add("toggle_summary_consolidate_pass", self._toggle_summary_consolidate_pass)
         add("toggle_summary_task_done_pass", self._toggle_summary_task_done_pass)
         add("toggle_summary_cloud_parity", self._toggle_summary_cloud_parity)
+        add("save_summary_addendum", self._save_summary_addendum)
+        add("reset_summary_addendum", self._reset_summary_addendum)
+        add("save_summary_base_prompt", self._save_summary_base_prompt)
+        add("reset_summary_base_prompt", self._reset_summary_base_prompt)
         add("toggle_summary_coverage_pass", self._toggle_summary_coverage_pass)
         add("toggle_summary_depth_pass", self._toggle_summary_depth_pass)
         add("set_summary_language", self._set_summary_language)
@@ -28335,6 +28568,8 @@ class LiaApp:
             "whisper_device_label": _safe(self._whisper_device_label, "Auto"),
             "cleanup_model_label": _safe(self._cleanup_model_label, ""),
             "cleanup_provider": _safe(self._effective_cleanup_provider, "") or "",
+            "summary_addendum_default": _safe(self._summary_addendum_default, ""),
+            "summary_base_prompt": _safe(self._summary_base_prompt, ""),
             "vocab_pending": _safe(self._vocab_pending_count, 0),
             "auto_start": _safe(lambda: bool(is_auto_start_enabled()), False),
             "hotkeys": {
@@ -28385,6 +28620,7 @@ class LiaApp:
             "live_transcript_available": False, "loopback_available": False,
             "whisper_device_label": "Auto", "cleanup_model_label": "",
             "cleanup_provider": "", "vocab_pending": 0, "auto_start": False,
+            "summary_addendum_default": "", "summary_base_prompt": "",
             "hotkeys": {"main": c.get("hotkey", "ctrl+space"),
                         "undo": c.get("undo_hotkey", "ctrl+alt+z"),
                         "cancel": c.get("cancel_hotkey", "esc"),

@@ -4952,6 +4952,23 @@ def t_vocab_corrections():
     assert s == "סיכום בלי בלוק" and p == []
     s, p = w._split_summary_corrections("סיכום\n===CORRECTIONS===\nbroken [")
     assert s == "סיכום" and p == [], (s, p)
+    # heading-echo LEAK (both shapes): gemma writes the instruction's own
+    # '## Transcript corrections' heading instead of the ===CORRECTIONS=== marker.
+    s, p = w._split_summary_corrections(
+        'סיכום מלא\n\n## Transcript corrections\n[{"wrong":"Netscope","right":"Netskope"}]')
+    assert s == "סיכום מלא" and p == [{"wrong": "Netscope", "right": "Netskope"}], (s, p)
+    s, p = w._split_summary_corrections(
+        'סיכום\n\n## Transcript corrections\n```json\n[{"wrong":"a","right":"b"}]\n```')
+    assert s == "סיכום" and p == [{"wrong": "a", "right": "b"}], (s, p)
+    # EMPTY dangling heading (no array) - the shape delivered twice on 09-08/09
+    s, p = w._split_summary_corrections("סיכום שלם\n\n## Transcript corrections\n")
+    assert s == "סיכום שלם" and p == []
+    s, p = w._split_summary_corrections("סיכום\n\n## תיקוני תמלול\n")   # Hebrew heading, empty
+    assert s == "סיכום" and p == []
+    # deliberate non-rule: a corrections heading FOLLOWED BY REAL PROSE is KEPT
+    keep = ("## תקציר\n- שורה\n\n## Transcript corrections\n"
+            "עברנו על התמליל ולא נמצאו טעויות שראוי לתקן.")
+    assert w._split_summary_corrections(keep)[0] == keep.strip()
     # applier: whole-word, case-insensitive, multiword; partial words untouched
     t, c = vl.apply_corrections(
         "על Bedrook ועל bedrook וגם Bedrooks ו-Lending Zone",
@@ -7325,7 +7342,13 @@ def t_summary_prompt_sync():
         "EN meeting prompt drifted: " + sha(LP.SUMMARY_PROMPT_MEETING_EN))
     assert sha(LP.LOCAL_TASKS_PASS_PROMPT_EN) == "e206a6c014a7cf1d", (
         "EN tasks-pass prompt drifted: " + sha(LP.LOCAL_TASKS_PASS_PROMPT_EN))
-    assert sha(LP.CLOUD_PARITY_ADDENDUM_EN) == "717244a6da17ebc1", (
+    # NOTE (2026-09-15): the parity addendum (he + en) was DELIBERATELY extended
+    # beyond upstream's CLOUD_PARITY_ADDENDUM with the depth-pass rules (facts +
+    # WHY inside bullets, relationship/blocker clause, who-backed-whom by role,
+    # verbatim status verdicts, 3-6 highlights, transcript spelling) so a cloud
+    # model matches the local gemma flow - Naor's ask. A future upstream re-sync
+    # must KEEP those rules. The HE block is not pinned (Lia-tuned); EN is.
+    assert sha(LP.CLOUD_PARITY_ADDENDUM_EN) == "b581e6f3eb1cec71", (
         "EN parity addendum drifted: " + sha(LP.CLOUD_PARITY_ADDENDUM_EN))
     # Notetaker templating: every placeholder resolves with the default
     # identity, in every prompt that carries the rule, in both languages.
@@ -7583,6 +7606,12 @@ def t_summary_coverage_depth_helpers():
     assert not w._depth_guard(cur, cur + "\n- ירכשו Netscout", {"דנה"}, source=src)
     assert w._depth_guard(cur, cur + "\n- ירכשו Netscope", {"דנה"}, source=src)
     assert w._depth_guard(cur, cur + "\n- ירכשו Netscout", {"דנה"})              # no source
+    # _depth_guard_reason names the tripped rule (diagnosable 'kept original')
+    assert w._depth_guard_reason(cur, cur + "\n- נוסף עם 42 פריטים", {"דנה"}) is None
+    assert "number" in w._depth_guard_reason(
+        cur, "- הפרויקט תקוע, כפוף לאישור - אחראי: דנה", {"דנה"})
+    assert "Latin" in w._depth_guard_reason(cur, cur + "\n- ירכשו Netscout", {"דנה"}, source=src)
+    assert "speaker label" in w._depth_guard_reason(cur, cur + "\n- Speaker B יבצע", {"דנה"})
 
     # --- splice_depth: shorter -> original kept; good longer -> taken; rest identical ---
     full = ("## כותרת הדיון\nכ\n\n## תקציר\nת\n\n## דגשים מרכזיים\n- דגש אחד עם 7 פריטים\n\n"
@@ -7597,6 +7626,27 @@ def t_summary_coverage_depth_helpers():
     assert w._section_body(got, "משימות") == "- [ ] משימה"          # untouched
     assert got.startswith("## כותרת הדיון\nכ")
     assert w._splice_depth(full, "") == full
+
+    # --- highlights cap: asymmetric + KEEP-BASE (not relocated to status - a decision
+    # under a status header is the wart Naor hand-deletes, upstream F-6). A rewrite that
+    # GROWS '## דגשים מרכזיים' past 6 keeps the base highlights; the status rewrite is
+    # taken independently; a base already over the cap is not the rewrite's fault. ---
+    base_hl = ("## כותרת הדיון\nכ\n\n## דגשים מרכזיים\n- דגש בסיס עם 3 שרתים\n\n"
+               "## סטטוס פרויקטים\n- פרויקט: מתקדם\n\n## משימות\n- [ ] משימה\n")
+    inflate = ("## דגשים מרכזיים\n- דגש בסיס עם 3 שרתים\n"
+               + "".join("- דגש נוסף %d עם הקשר ארוך יותר\n" % i for i in range(1, 8))
+               + "\n## סטטוס פרויקטים\n- פרויקט: מתקדם, הצוות גיבה את ההחלטה\n")
+    capped = w._splice_depth(base_hl, inflate)
+    assert w._section_body(capped, "דגשים מרכזיים") == "- דגש בסיס עם 3 שרתים", capped  # base kept
+    assert "גיבה" in w._section_body(capped, "סטטוס פרויקטים")           # status taken independently
+    assert w._section_body(capped, "משימות") == "- [ ] משימה"            # untouched
+    # a base ALREADY over the cap is not the rewrite's fault: an enrich that does NOT
+    # grow the count past the base is taken normally (only GROWTH past the cap is refused)
+    over_base = ("## דגשים מרכזיים\n" + "".join("- ד%d\n" % i for i in range(1, 9))
+                 + "\n## סטטוס פרויקטים\n- פ: מתקדם\n")
+    over_enr = ("## דגשים מרכזיים\n" + "".join("- ד%d מועשר עם הקשר\n" % i for i in range(1, 9))
+                + "\n## סטטוס פרויקטים\n- פ: מתקדם\n")
+    assert "מועשר" in w._section_body(w._splice_depth(over_base, over_enr), "דגשים מרכזיים")
 
     # --- narrative window merge keeps the longer block of a repeated topic ---
     merged = w._merge_narrative_windows(["### נושא א\nקצר", "### נושא א\nנרטיב ארוך יותר בהרבה"],
@@ -8012,6 +8062,12 @@ def t_task_done_pass():
     assert "- [x] לשלוח מכתב לאורן - אחראי: נאור - בוצע במהלך הפגישה" in out, out
     assert "- [ ] בקשה לעוזרת ה-AI" in out          # bot line immune
     assert "- [ ] להקים שרת" in out and "## הערות\nz" in out
+    # a first-person future intention is never a done action, whatever the vote
+    it = ["לשלוח מכתב לאורן", "אני ארים טלפון למייק", "אנחנו נבדוק את השרת",
+          "אנונימיזציה של הלוגים", "להקים שרת"]
+    assert w._intention_votes(it, "he") == {2, 3}          # not 4 ('אנונימיזציה')
+    assert w._intention_votes(["I will call Mike", "we'll review", "send the letter"],
+                              "en") == {1, 2}
     # summarize() wiring: vote applied; runaway ignored
     votes_reply = ["1: בוצע"]
     calls = []
@@ -8060,6 +8116,16 @@ def t_task_done_pass():
                           task_done_pass=True, mr_overlap_tokens=1536)
         assert len(n_seen) >= 2, n_seen
         assert "- [x] לשלוח מכתב לאורן" in out, out
+        # a voted first-person future-intention task is NOT flipped (started != done)
+        intent_summ = ("## כותרת הדיון\nX\n\n## משימות\n"
+                       "- [ ] אני ארים טלפון למייק\n- [ ] לשלוח מכתב\n")
+
+        def fake_intent(self, url, system_prompt, content, num_ctx, think, read_to,
+                        num_predict=None, options_extra=None):
+            return "1: בוצע" if system_prompt is w._TASK_DONE_PROMPT else intent_summ
+        w.OpenAILLMCleaner._ollama_summary_once = fake_intent
+        out = c.summarize("טקסט", "SYS", meeting_meta="Duration: 1", task_done_pass=True)
+        assert "- [ ] אני ארים טלפון למייק" in out and "- [x]" not in out, out
     finally:
         w.OpenAILLMCleaner._ollama_summary_once = orig
     assert w.DEFAULT_CONFIG.get("summary_task_done_pass") is True
@@ -8076,9 +8142,12 @@ def t_cloud_parity():
     cloud; the local prompt path never reads it."""
     import hashlib
     import lia as w
+    # 2026-09-15: DIVERGED from the upstream project's pinned block (was
+    # 4f97dd32d8417d8c) - the depth-pass rules were added so a cloud model
+    # matches the local gemma flow (Naor's ask). A re-sync must keep them.
     assert hashlib.sha256(
         w._SUMMARY_CLOUD_PARITY_ADDENDUM.encode("utf-8")).hexdigest()[:16] == \
-        "4f97dd32d8417d8c"   # the SAME sha the upstream project pins
+        "3c54e0a21b75a4b7"
     sent = []
 
     class _Resp:
@@ -8115,15 +8184,100 @@ def t_cloud_parity():
         sent.clear()
         c.summarize("טקסט", "SYS", meeting_meta=None, cloud_parity=True)
         assert sent[0]["messages"][0]["content"] == "SYS"
+        # a manual override (Settings > Advanced, config summary_cloud_addendum)
+        # REPLACES the built-in block on the cloud branch; blank = built-in
+        sent.clear()
+        c2 = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-5.6-sol",
+                                log_cfg={"summary_cloud_addendum": "  כלל ידני אחד  "})
+        c2.summarize("טקסט", "SYS", meeting_meta="Duration: 30", cloud_parity=True)
+        sysp = sent[0]["messages"][0]["content"]
+        assert sysp == "SYS\n\nכלל ידני אחד", sysp
+        assert w._SUMMARY_CLOUD_PARITY_ADDENDUM not in sysp
+        sent.clear()
+        c3 = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-5.6-sol",
+                                log_cfg={"summary_cloud_addendum": "   "})
+        c3.summarize("טקסט", "SYS", meeting_meta="Duration: 30", cloud_parity=True)
+        assert sent[0]["messages"][0]["content"].endswith(w._SUMMARY_CLOUD_PARITY_ADDENDUM)
+        # a manual BASE-prompt override REPLACES the passed base on the cloud branch
+        # (the addendum still appends after it); meeting mode only
+        sent.clear()
+        c4 = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-5.6-sol",
+                                log_cfg={"summary_base_prompt_override": "פרומט בסיס ידני חדש"})
+        c4.summarize("טקסט", "SYS", meeting_meta="Duration: 30", cloud_parity=True)
+        sysp = sent[0]["messages"][0]["content"]
+        assert sysp.startswith("פרומט בסיס ידני חדש") and "SYS" not in sysp, sysp
+        assert sysp.endswith(w._SUMMARY_CLOUD_PARITY_ADDENDUM)
+        sent.clear()   # general mode (no meeting) ignores the base override
+        c4.summarize("טקסט", "SYS", meeting_meta=None, cloud_parity=True)
+        assert sent[0]["messages"][0]["content"] == "SYS"
     finally:
         w.OpenAILLMCleaner._ensure_session = orig
     assert w.DEFAULT_CONFIG.get("summary_cloud_parity") is True
+    assert w.DEFAULT_CONFIG.get("summary_cloud_addendum") == ""
+    # the built-in block carries the depth-pass rules the local gemma flow gets from code
+    for marker in ("כלשונו", "3-6", "Speaker A", "164/30"):
+        assert marker in w._SUMMARY_CLOUD_PARITY_ADDENDUM, marker
     src = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)),
                             "lia.py"), encoding="utf-8").read()
     assert 'cloud_parity=bool(self.config.get("summary_cloud_parity", True))' in src
 
 
 _test("summary: cloud PARITY (addendum + free backstops on SOL)", t_cloud_parity)
+
+
+def t_summary_addendum_setting():
+    """Settings > Advanced manual cloud-prompt addendum: save stores an override,
+    text identical to the built-in default (or blank) CLEARS it, an oversized
+    paste is refused, and both actions are allowlisted for dispatch."""
+    import lia as w
+    App = w.LiaApp
+    app = App.__new__(App)
+    app.config = {"primary_language": "he", "summary_language": "primary"}
+    saved = []
+    orig = w.save_config
+    w.save_config = lambda cfg: saved.append(dict(cfg))
+    try:
+        default = app._summary_addendum_default()
+        assert default == w._p_parity_addendum("he").strip() and "כלשונו" in default
+        # the full base prompt is exposed read-only for the editor (not the addendum)
+        base = app._summary_base_prompt()
+        assert base == w._p_summary_meeting("he") and "## כותרת הדיון" in base
+        assert default not in base                        # base and addendum are distinct
+        ok, msg = app._save_summary_addendum("  כלל ידני  ")
+        assert ok and app.config["summary_cloud_addendum"] == "כלל ידני" and saved, msg
+        ok, _ = app._save_summary_addendum(default)          # same as default -> cleared
+        assert ok and app.config["summary_cloud_addendum"] == ""
+        app.config["summary_cloud_addendum"] = "x"
+        ok, _ = app._reset_summary_addendum()
+        assert ok and app.config["summary_cloud_addendum"] == ""
+        ok, msg = app._save_summary_addendum("א" * (w._SUMMARY_ADDENDUM_MAX + 1))
+        assert not ok and "Too long" in msg and app.config["summary_cloud_addendum"] == ""
+        # EN summaries pick the EN default for the editor preview
+        app.config["summary_language"] = "en"
+        assert app._summary_addendum_default() == w._p_parity_addendum("en").strip()
+        app.config["summary_language"] = "primary"
+        # base-prompt override (behind the Advanced lock): save / clear / cap / reset
+        ok, _ = app._save_summary_base_prompt("SYS בסיס ידני")
+        assert ok and app.config["summary_base_prompt_override"] == "SYS בסיס ידני"
+        ok, _ = app._save_summary_base_prompt(app._summary_base_prompt())   # == default -> cleared
+        assert ok and app.config["summary_base_prompt_override"] == ""
+        app.config["summary_base_prompt_override"] = "x"
+        ok, _ = app._reset_summary_base_prompt()
+        assert ok and app.config["summary_base_prompt_override"] == ""
+        ok, msg = app._save_summary_base_prompt("א" * (w._SUMMARY_BASE_PROMPT_MAX + 1))
+        assert not ok and "Too long" in msg and app.config["summary_base_prompt_override"] == ""
+    finally:
+        w.save_config = orig
+    actions = App._settings_action_map(app)
+    for a in ("save_summary_addendum", "reset_summary_addendum",
+              "save_summary_base_prompt", "reset_summary_base_prompt"):
+        assert a in actions, a
+    minimal = App._settings_state_minimal(app)
+    assert "summary_addendum_default" in minimal and "summary_base_prompt" in minimal
+
+
+_test("settings: manual cloud summary-prompt addendum (save / clear / cap / dispatch)",
+      t_summary_addendum_setting)
 
 
 def t_smart_chunk_boundaries():
