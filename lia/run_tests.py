@@ -6517,6 +6517,7 @@ def t_settings_actions_coverage():
         # Models
         "set_dictation_model", "set_meeting_model", "set_summary_model",
         "toggle_summary_local_tasks_pass", "set_summary_language",
+        "set_summary_template",
         "set_file_model", "set_whisper_device",
         # AI Cleanup
         "set_cleanup_style", "set_cleanup_provider_model",
@@ -6526,6 +6527,7 @@ def t_settings_actions_coverage():
         "set_transcription_role", "open_tailscale", "set_serve_model",
         # Meetings
         "toggle_auto_detect_meetings", "open_meetings_ask", "open_action_items",
+        "open_task_note",
         "open_meetings_folder", "edit_meeting_summary", "transcribe_file",
         "voice_ask_now", "set_voice_ask_output",
         "summarize_text_dialog", "open_live_transcript",
@@ -8225,6 +8227,142 @@ def t_cloud_parity():
 _test("summary: cloud PARITY (addendum + free backstops on SOL)", t_cloud_parity)
 
 
+def t_summary_templates():
+    """Cloud-only summary TEMPLATES (2026-09-15): technical (default, unchanged)
+    + general + minutes. Selected by config `summary_template`; applied on the
+    CLOUD branch + meeting mode ONLY (the local Gemma path keeps the technical
+    base - Naor's rule). Built multilingual-ready (English body + TERMS headers +
+    an output-language directive); offered in he+en today. Lia-only, sha-pinned."""
+    import hashlib
+    import lia as w
+    import lang_pack as LP
+    sha = lambda s: hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+
+    # --- registry / default ---
+    assert LP.SUMMARY_TEMPLATE_IDS == ("technical", "general", "minutes")
+    assert [t["id"] for t in LP.SUMMARY_TEMPLATE_META] == list(LP.SUMMARY_TEMPLATE_IDS)
+    assert w.DEFAULT_CONFIG["summary_template"] == "technical"   # Naor: safe default
+
+    # --- dispatch: technical byte-unchanged; general/minutes distinct + localized ---
+    assert w._p_summary_meeting("he") == w._p_summary_meeting("he", "technical")
+    assert w._p_summary_meeting("he", "technical") == w._render_nt(w._SUMMARY_PROMPT_MEETING)
+    gh, mh = w._p_summary_meeting("he", "general"), w._p_summary_meeting("he", "minutes")
+    assert "## תקציר" in gh and "## דגשים מרכזיים" in gh and "## שאלות פתוחות" in gh
+    assert "experienced project manager" not in gh          # NOT the technical base
+    assert "## סטטוס פרויקטים" not in gh                     # general drops project-status
+    assert "## משתתפים" in mh and "## נושאים שנדונו" in mh and "## צעדים הבאים" in mh
+    assert "Hebrew" in gh and "Hebrew" in mh                # output-language directive
+    ge = w._p_summary_meeting("en", "general")
+    assert "## Summary" in ge and "## Open Questions" in ge and "English" in ge
+    assert "«" not in gh and "«" not in mh and "«" not in ge  # NT + tokens fully rendered
+    assert w._render_nt("«NT»").lower() != "«nt»"           # NT actually resolved (sanity)
+
+    # sha pins (raw template, «NT» tokens intact - identity-independent; Lia-only,
+    # so tuning these is a conscious act - retune, re-verify, then update here).
+    assert sha(LP.build_general_base("he")) == "2eb7fa2070924f58", sha(LP.build_general_base("he"))
+    assert sha(LP.build_general_base("en")) == "52d5fcc857f12b32"
+    assert sha(LP.build_minutes_base("he")) == "5ed23b3aed7a4363"
+    assert sha(LP.build_minutes_base("en")) == "8fc75116e72083eb"
+    assert sha(LP.build_general_addendum("he")) == "723be696b040ef2c"
+    assert sha(LP.build_general_addendum("en")) == "7624cea89a12a119"
+    # general + minutes share the generic binding-rules addendum
+    assert LP.build_general_addendum("he") == LP.build_minutes_addendum("he")
+
+    # --- addendum dispatch ---
+    assert w._p_parity_addendum("he", template="general") == w._render_nt(LP.build_general_addendum("he"))
+    assert w._p_parity_addendum("he", template="technical") == w._render_nt(w._SUMMARY_CLOUD_PARITY_ADDENDUM)
+    assert w._p_parity_addendum("he", override=" x ", template="general") == "\n\nx"  # manual wins
+
+    # --- cloud injection precedence (fake session, meeting mode) ---
+    sent = []
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"choices": [{"message": {"content":
+                "## תקציר\nגוף\n\n## משימות\n- [ ] משימה (אחראי: דנה)\n"
+                "- [ ] משימה (אחראי: דנה)\n"}}]}
+
+    class _Sess:
+        def post(self, url, headers=None, json=None, timeout=None):
+            sent.append(json)
+            return _Resp()
+    orig = w.OpenAILLMCleaner._ensure_session
+    w.OpenAILLMCleaner._ensure_session = lambda self: _Sess()
+    try:
+        c = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-5.6-sol")
+        # general -> template base REPLACES the passed technical base, template addendum appends
+        out = c.summarize("טקסט", "TECH-SYS", meeting_meta="Duration: 30",
+                          cloud_parity=True, lang="he", template="general")
+        sysp = sent[0]["messages"][0]["content"]
+        assert "TECH-SYS" not in sysp and "## דגשים מרכזיים" in sysp, sysp
+        assert sysp.endswith(w._render_nt(LP.build_general_addendum("he")))
+        # marker union still works: dedup + paren-owner normalization on general output
+        assert out.count("- [ ] משימה - אחראי: דנה") == 1, out
+        # the vocab suffix survives the template base swap (not lost with the base)
+        sent.clear()
+        c.summarize("טקסט", "TECH-SYS", meeting_meta="Duration: 30", vocab="ACMEWIDGET",
+                    cloud_parity=True, lang="he", template="general")
+        sp2 = sent[0]["messages"][0]["content"]
+        assert "## דגשים מרכזיים" in sp2 and "ACMEWIDGET" in sp2, sp2
+        # minutes -> minutes base
+        sent.clear()
+        c.summarize("טקסט", "TECH-SYS", meeting_meta="Duration: 30",
+                    cloud_parity=True, lang="he", template="minutes")
+        assert "## נושאים שנדונו" in sent[0]["messages"][0]["content"]
+        # a manual BASE override beats the template
+        sent.clear()
+        c2 = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-5.6-sol",
+                                log_cfg={"summary_base_prompt_override": "MY BASE"})
+        c2.summarize("טקסט", "TECH-SYS", meeting_meta="Duration: 30",
+                     cloud_parity=True, lang="he", template="general")
+        sp = sent[0]["messages"][0]["content"]
+        assert sp.startswith("MY BASE") and "דגשים מרכזיים" not in sp.split("\n")[0]
+        # a manual ADDENDUM override beats the template addendum
+        sent.clear()
+        c3 = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-5.6-sol",
+                                log_cfg={"summary_cloud_addendum": "MY RULES"})
+        c3.summarize("טקסט", "TECH-SYS", meeting_meta="Duration: 30",
+                     cloud_parity=True, lang="he", template="general")
+        assert sent[0]["messages"][0]["content"].endswith("MY RULES")
+        # general MODE (no meeting_meta) ignores the template entirely
+        sent.clear()
+        c.summarize("טקסט", "TECH-SYS", meeting_meta=None, cloud_parity=True,
+                    lang="he", template="general")
+        assert sent[0]["messages"][0]["content"] == "TECH-SYS"
+    finally:
+        w.OpenAILLMCleaner._ensure_session = orig
+
+    # --- _set_summary_template validation ---
+    App = w.LiaApp
+    app = App.__new__(App)
+    app.config = dict(w.DEFAULT_CONFIG)
+    assert App._set_summary_template(app, "zzz") == (False, "Unknown summary template: zzz")
+    App._set_summary_template(app, "general")
+    assert app.config["summary_template"] == "general"
+    # the base/addendum previews follow the selected template + language
+    assert app.config.get("summary_language", "primary")  # sanity
+    assert "## דגשים מרכזיים" in App._summary_base_prompt(app)   # general is selected
+
+    # --- add-a-language readiness: a new LANGUAGES + TERMS row yields headers,
+    # no new prompt (the multilingual scaffolding, proven without shipping a lang) ---
+    LP.LANGUAGES["xx"] = {"name_en": "Testish", "native": "Testish", "rtl": False, "cpt": 2.5}
+    LP.TERMS["xx"] = dict(LP.TERMS["en"], summary="ZZSUM", tasks="ZZTASK")
+    try:
+        bx = LP.build_general_base("xx")
+        assert "## ZZSUM" in bx and "## ZZTASK" in bx and "Testish" in bx
+        assert LP.resolve_summary_lang({"summary_language": "xx"}) == "xx"
+        assert "xx" in LP.summary_enabled_langs()
+    finally:
+        del LP.LANGUAGES["xx"]
+        del LP.TERMS["xx"]
+
+
+_test("summary: cloud templates (technical/general/minutes) + multilingual scaffold",
+      t_summary_templates)
+
+
 def t_summary_addendum_setting():
     """Settings > Advanced manual cloud-prompt addendum: save stores an override,
     text identical to the built-in default (or blank) CLEARS it, an oversized
@@ -8610,10 +8748,133 @@ def t_settings_state_shape():
                 "cleanup_styles", "cleanup_models"):
         assert grp in st["tables"], "state tables missing " + grp
     assert st["hotkeys"]["main"] and "config" in st["paths"]
+    # summary-template catalogue is exposed for the Models-page picker
+    tpls = st["summary_templates"]
+    assert [t["id"] for t in tpls] == ["technical", "general", "minutes"]
+    assert all(t.get("name_en") and t.get("desc_en") for t in tpls)
 
 
 _test("settings: _settings_state shape + secret masking (no raw key leaks)",
       t_settings_state_shape)
+
+
+def t_remote_row_disabled_when_server():
+    """When THIS PC is the transcription server (transcription_role=server), the
+    'Remote Transcription server' client rows are disabled with a note - you
+    cannot point your own dictation/meeting at a remote server while being one
+    (Naor, 2026-09-15). A row already selected stays selectable (never
+    nothing-checked); client/unset roles leave the row enabled."""
+    import lia as w
+    App = w.LiaApp
+
+    def remote_rows(role, sel_meet=None):
+        app = App.__new__(App)
+        app.config = dict(w.DEFAULT_CONFIG)
+        app.config["transcription_role"] = role
+        app.config["remote_server_url"] = "ws://host:9090"  # so 'missing' doesn't dim it
+        if sel_meet:
+            app.config["meeting_model"] = sel_meet
+        t = App._settings_tables(app, ollama=False)
+        return ([r for r in t["dictation"] if r["where"] == "remote"],
+                [r for r in t["meeting"] if r["where"] == "remote"])
+
+    for role in ("client", ""):
+        d, m = remote_rows(role)
+        assert d and all(r["enabled"] for r in d), "remote dictation must be selectable: " + role
+        assert m and all(r["enabled"] for r in m), "remote meeting must be selectable: " + role
+    d, m = remote_rows("server")
+    assert d and all(not r["enabled"] for r in d), "remote dictation must dim on server"
+    assert all("server" in r["note"] for r in d), "server row needs an explanatory note"
+    assert m and all(not r["enabled"] for r in m), "remote meeting must dim on server"
+    # an already-selected remote meeting stays selectable even on server
+    _d, m = remote_rows("server", sel_meet="remote_hebrew_turbo")
+    assert m and all(r["enabled"] for r in m), "a selected remote row must stay selectable"
+
+
+_test("settings: remote-server rows dim when this PC is the transcription server",
+      t_remote_row_disabled_when_server)
+
+
+def t_tasks_store():
+    """Personal task-note store: add (newest first, whitespace-collapsed) /
+    toggle / set_done / edit / delete / clear_done / counts / version, with an
+    insertion cap and safe no-ops for a missing id."""
+    import os as _os
+    import shutil
+    import tempfile
+    import tasks_store as st
+    saved_path, saved_cap = st.STORE_PATH, st.MAX_TASKS
+    d = tempfile.mkdtemp(prefix="lia_tasks_")
+    st.STORE_PATH = _os.path.join(d, "tasks.json")
+    try:
+        assert st.all_tasks() == [] and st.version() == 0
+        assert st.counts() == {"open": 0, "done": 0, "total": 0}
+        a = st.add("  call   Mike\ntomorrow  ")            # whitespace collapsed
+        assert a and a["text"] == "call Mike tomorrow" and a["done"] is False
+        b = st.add("buy milk")
+        assert [t["text"] for t in st.all_tasks()] == ["buy milk", "call Mike tomorrow"]  # newest first
+        assert st.add("   ") is None and st.add("") is None  # empty ignored
+        assert st.version() > 0
+        assert st.toggle(a["id"]) is True and st.toggle(a["id"]) is False
+        assert st.set_done(b["id"], True) is True
+        assert st.counts() == {"open": 1, "done": 1, "total": 2}
+        assert [t["id"] for t in st.open_tasks()] == [a["id"]]
+        assert st.edit(a["id"], "call Michelle") is True
+        assert next(t for t in st.all_tasks() if t["id"] == a["id"])["text"] == "call Michelle"
+        assert st.edit(a["id"], "   ") is False             # empty edit ignored
+        assert st.clear_done() == 1                          # removes only the done one
+        assert st.counts() == {"open": 1, "done": 0, "total": 1}
+        assert st.delete(a["id"]) is True and st.delete("nope") is False
+        assert st.all_tasks() == []
+        assert st.set_done("x", True) is None and st.toggle("x") is None  # safe no-ops
+        # insertion cap
+        st.MAX_TASKS = 3
+        for i in range(6):
+            st.add("t%d" % i)
+        assert len(st.all_tasks()) == 3
+        assert [t["text"] for t in st.all_tasks()] == ["t5", "t4", "t3"]  # newest kept
+    finally:
+        st.STORE_PATH, st.MAX_TASKS = saved_path, saved_cap
+        shutil.rmtree(d, ignore_errors=True)
+
+
+_test("task note: personal task store (CRUD, newest-first, cap, safe no-ops)",
+      t_tasks_store)
+
+
+def t_task_note_wiring():
+    """The task-note voice capture reuses the voice-ask machinery via mode='task'
+    (so every existing mic-busy guard already covers it); the parent methods,
+    config defaults, hotkeys, tray/settings wiring and the sticky window/store
+    modules all exist."""
+    import inspect
+    import lia as w
+    App = w.LiaApp
+    assert w.DEFAULT_CONFIG.get("tasks_hotkey") and w.DEFAULT_CONFIG.get("tasks_toggle_hotkey")
+    for m in ("_task_note_voice_toggle", "_task_note_add_from_voice",
+              "_show_task_note", "_toggle_task_note"):
+        assert callable(getattr(App, m, None)), "missing " + m
+    # voice-ask start takes a mode; the stop path branches to the task note
+    assert "mode" in inspect.signature(App._voice_ask_start).parameters
+    stop_src = inspect.getsource(App._voice_ask_stop_and_answer)
+    assert 'mode == "task"' in stop_src and "_task_note_add_from_voice" in stop_src
+    assert 'mode="task"' in inspect.getsource(App._task_note_voice_toggle)
+    add_src = inspect.getsource(App._task_note_add_from_voice)
+    assert "tasks_store" in add_src and "_show_task_note" in add_src
+    # registration + action-map
+    src = inspect.getsource(App)
+    assert "tasks_hotkey" in src and "_task_note_voice_toggle" in src and "_toggle_task_note" in src
+    assert "open_task_note" in App._settings_action_map(App.__new__(App))
+    # the sticky window + store modules import and expose the bridge API
+    import tasknote_window
+    assert hasattr(tasknote_window, "HTML") and hasattr(tasknote_window, "TasksApi")
+    api = tasknote_window.TasksApi({})
+    for meth in ("get", "add", "set_done", "delete", "clear_done", "version"):
+        assert callable(getattr(api, meth, None)), "TasksApi missing " + meth
+
+
+_test("task note: voice capture (mode=task) + window/store wiring",
+      t_task_note_wiring)
 
 
 def t_bundle_secret_scrub():

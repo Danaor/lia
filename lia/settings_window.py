@@ -183,6 +183,14 @@ def _demo_state():
                                 "Hebrew meeting summary. (demo placeholder for the full base "
                                 "prompt - the real one is ~150 lines and lives in lia.py.)\n\n"
                                 "## כותרת הדיון\n## תקציר\n## דגשים מרכזיים\n## משימות"),
+        "summary_templates": [
+            {"id": "technical", "name_en": "Technical / Project",
+             "desc_en": "Project-manager notes: decisions, project status, work done, tasks with owners."},
+            {"id": "general", "name_en": "General meeting",
+             "desc_en": "A clean everyday recap: summary, key points, decisions, tasks, open questions."},
+            {"id": "minutes", "name_en": "Detailed minutes",
+             "desc_en": "Formal minutes: participants, topics, decisions with rationale, action items, next steps."},
+        ],
         "config": {
             "hotkey": "ctrl+space", "recording_mode": "toggle",
             "paste_mode": "auto_paste", "clipboard_auto_restore": True,
@@ -193,7 +201,7 @@ def _demo_state():
             "custom_vocabulary": "git, push, React, GuardDuty, Landing Zone",
             "vocab_autolearn": True, "meeting_model": "local_hebrew_turbo",
             "file_transcribe_model": "", "summary_model": "gpt-5.6-sol",
-            "whisper_device": "auto",
+            "summary_template": "general", "whisper_device": "auto",
         },
         "secrets": {"openai_api_key": "sk-abc…7xQ", "groq_api_key": "",
                     "gemini_api_key": "AQ.xyz…9kk", "assemblyai_api_key": "",
@@ -234,16 +242,16 @@ def _demo_state():
             "dictation": [{"idx": 0, "label": "Hebrew Turbo Local ⭐ (best local Hebrew)", "checked": True, "where": "local", "wnote": "GPU (4 GB+) recommended · slower on CPU"},
                           {"idx": 1, "label": "English Parakeet Local ⭐ (best English)", "checked": False, "where": "local", "wnote": "fast on a plain CPU · no GPU needed"},
                           {"idx": 4, "label": "OpenAI GPT transcribe", "checked": False, "where": "cloud", "wnote": "API key set · ~$0.4 per audio hour"},
-                          {"idx": 6, "label": "Groq Whisper Large v3 Turbo", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · free tier available"},
-                          {"idx": 7, "label": "Gemini 3.5 transcribe", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · free tier available · ~3.6s, slower than Groq · trains on your audio"},
+                          {"idx": 6, "label": "Groq Whisper Large v3 Turbo", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · Free Tier Available"},
+                          {"idx": 7, "label": "Gemini 3.5 transcribe", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · Free Tier Available · ~3.6s, slower than Groq"},
                           {"idx": 8, "label": "Hebrew Turbo Remote", "checked": False, "where": "remote"}],
             "meeting": [{"key": "local_hebrew_turbo", "label": "Hebrew Turbo Local only", "checked": True, "enabled": True, "note": ""},
-                        {"key": "gemini_transcribe", "label": "Gemini 3.5 transcribe", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · free tier available · trains on your audio", "note": "needs gemini_api_key"},
+                        {"key": "gemini_transcribe", "label": "Gemini 3.5 transcribe", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · Free Tier Available", "note": "needs gemini_api_key"},
                         {"key": "openai_gpt_transcribe", "label": "OpenAI GPT transcribe", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · ~$0.4 per meeting hour", "note": "needs openai_api_key"}],
             "file": [{"key": "", "label": "Same as meeting model", "checked": True, "enabled": True, "note": ""}],
             "summary": [{"model": "off", "label": "Off - transcript only (no AI summary)", "checked": True, "enabled": True, "note": ""},
                         {"model": "gpt-5.6-sol", "label": "OpenAI ChatGPT 5.6 Sol", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · ~$0.10 per meeting summary", "note": ""},
-                        {"model": "gemini-3.7-flash", "label": "Gemini 3.7 Flash", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · free tier available", "note": "set Gemini key"},
+                        {"model": "gemini-3.7-flash", "label": "Gemini 3.7 Flash", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · Free Tier Available", "note": "set Gemini key"},
                         {"model": "gemma4:31b-it-qat", "label": "Local Gemma 4 31B QAT (best quality · needs a 24 GB GPU)", "checked": False, "enabled": False, "where": "local", "note": "start Ollama"}],
             "cleanup_styles": [{"style": "off", "label": "Off - raw transcription", "checked": False},
                                {"style": "spoken", "label": "Spoken - remove fillers + self-corrections", "checked": True},
@@ -583,30 +591,14 @@ APP_JS = r"""
       group("Dictation model", t.dictation, "set_dictation_model", "idx", "int")+
       group("Meeting transcription model", t.meeting, "set_meeting_model", "key", "str")+
       group("Meeting Summary Model", t.summary, "set_summary_model", "model", "str")+
-      '<div class="page">'+
-        sw("Local summaries: add a dedicated tasks pass (more complete task list, +15-45s)", !!cfg("summary_local_tasks_pass",false), "toggle_summary_local_tasks_pass")+
-        '<div class="hint">Local (Ollama) meeting summaries only. Runs a narrow second pass that extracts every commitment and replaces the task list; strips speaker-label owners.</div>'+
-        sw("Local summaries: merge twice-discussed topics (consolidate pass)", !!cfg("summary_consolidate_pass",true), "toggle_summary_consolidate_pass")+
-        sw("Local summaries: mark tasks completed during the meeting as [x]", !!cfg("summary_task_done_pass",true), "toggle_summary_task_done_pass")+
-        sw("Local summaries: coverage pass (add topics the summary missed, +30-60s)", !!cfg("summary_coverage_pass",false), "toggle_summary_coverage_pass")+
-        sw("Local summaries: depth pass (numbers, the why, blockers; guarded, +2min)", !!cfg("summary_depth_pass",true), "toggle_summary_depth_pass")+
-        sw("Cloud summaries: parity rules + code cleanups (dedup, tone, owners)", !!cfg("summary_cloud_parity",true), "toggle_summary_cloud_parity")+
-        '<div class="hint">Quality passes ported from a private upstream project. The two local passes each add a narrow Ollama call; the cloud row only extends the prompt and runs free code cleanups.</div>'+
-      '</div>'+
-      '<div class="page"><div class="section-title">Summary language</div>'+
-        '<div class="radio-row">'+
-        radio("slang","set_summary_language","primary","str","Follow primary language", cfg("summary_language","primary")==="primary")+
-        radio("slang","set_summary_language","auto","str","Follow the transcript", cfg("summary_language")==="auto")+
-        radio("slang","set_summary_language","he","str","Always Hebrew", cfg("summary_language")==="he")+
-        radio("slang","set_summary_language","en","str","Always English", cfg("summary_language")==="en")+
-        '</div>'+
-        '<div class="hint">The language meeting and text summaries are written in, regardless of the language spoken.</div>'+
-      '</div>'+
       group("Transcribe-file model", t.file, "set_file_model", "key", "str");
   };
 
   PAGES.cleanup = function(){
     var t = (S.tables||{});
+    // Cleanup Off -> no provider/model is used, so grey out that whole section
+    // (dim the card + disable its radios) until a style is picked (Naor's ask).
+    var isOff = (t.cleanup_styles||[]).some(function(r){ return r.checked && r.style==="off"; });
     var styles = (t.cleanup_styles||[]).map(function(r){
       return radio("cs","set_cleanup_style",r.style,"str",r.label,r.checked,true,"");
     }).join('');
@@ -618,13 +610,16 @@ APP_JS = r"""
         '<button class="btn" data-page-link="keys">Go to Keys</button></div>';
     } else {
       mhtml = models.map(function(r){
-        return radio("cm","set_cleanup_provider_model",JSON.stringify([r.provider,r.model]),"json",r.label,r.checked,true,"");
+        return radio("cm","set_cleanup_provider_model",JSON.stringify([r.provider,r.model]),"json",r.label,r.checked,!isOff,"");
       }).join('');
+      if(isOff){
+        mhtml = '<div class="hint">Cleanup is Off - pick a style above to choose a provider &amp; model.</div>'+mhtml;
+      }
     }
     return '<div class="content-head"><h1>AI Cleanup</h1>'+
       '<span class="status"><span class="dot"></span>'+esc(S.cleanup_model_label||"")+'</span></div>'+
       '<div class="page"><div class="section-title">Style</div>'+styles+'</div>'+
-      '<div class="page"><div class="section-title">Provider &amp; model</div>'+mhtml+'</div>';
+      '<div class="page"'+(isOff?' style="opacity:.55"':'')+'><div class="section-title">Provider &amp; model</div>'+mhtml+'</div>';
   };
 
   var KEYCARDS = [
@@ -825,14 +820,32 @@ APP_JS = r"""
         sw("Auto-switch to the dictation mic when the meeting mic is silent but the backup hears you", !!cfg("meeting_mic_auto_fallback",true), "toggle_meeting_mic_auto_fallback")+
         '<div class="hint">Safety net for meeting transcripts: the mixdown is kept as before; the raw tracks let you re-transcribe one side alone and catch a wrong meeting mic. Same retention as the meeting audio.</div>'+
       '</div>'+
+      '<div class="page"><div class="section-title">Meeting summaries (OpenAI / Gemini)</div>'+
+        '<div class="hint"><b>These affect OpenAI / Gemini meeting summaries only</b> - Lia makes '+
+        '<b>a single cloud call</b> per summary. The local Gemma summary uses the built-in technical '+
+        'pipeline (tune it on the Advanced page).</div>'+
+        '<div class="subhead">Template</div>'+
+        '<div class="radio-row">'+
+        (S.summary_templates||[]).map(function(tpl){
+          return radio("stpl","set_summary_template",tpl.id,"str",tpl.name_en,
+                       cfg("summary_template","technical")===tpl.id, true, tpl.desc_en);
+        }).join('')+
+        '</div>'+
+        '<div style="height:16px"></div>'+
+        sw("Parity rules + free code cleanups (dedup, tone, owners)", !!cfg("summary_cloud_parity",true), "toggle_summary_cloud_parity")+
+        '<div class="hint">Still one cloud call: the parity rules ride the same prompt and the cleanups are local code (no extra request).</div>'+
+        '<div class="subhead">Summary language</div>'+
+        '<div class="radio-row">'+
+        radio("slang","set_summary_language","primary","str","Follow primary language", cfg("summary_language","primary")==="primary")+
+        radio("slang","set_summary_language","auto","str","Follow the transcript", cfg("summary_language")==="auto")+
+        radio("slang","set_summary_language","he","str","Always Hebrew", cfg("summary_language")==="he")+
+        radio("slang","set_summary_language","en","str","Always English", cfg("summary_language")==="en")+
+        '</div>'+
+        '<div class="hint">The language meeting and text summaries are written in, regardless of the language spoken.</div>'+
+      '</div>'+
       '<div class="page"><div class="section-title">Tools</div>'+
-        actrow('&#128269;','Ask your meetings…','open_meetings_ask',hk.ask,true)+
-        actrow('&#127908;','Voice ask (speak a question, press again to answer)','voice_ask_now',hk.voice_ask,true)+
-        field("Voice ask answer goes to",
-          radio("vao","set_voice_ask_output","card","str","Answer card (always visible)", cfg("voice_ask_output","card")==="card")+
-          radio("vao","set_voice_ask_output","paste","str","Paste at cursor", cfg("voice_ask_output")==="paste")+
-          radio("vao","set_voice_ask_output","both","str","Both", cfg("voice_ask_output")==="both"))+
-        actrow('&#128203;','Action items…','open_action_items',hk.actions)+
+        actrow('&#128203;','Action items (from meetings)…','open_action_items',hk.actions)+
+        actrow('&#128221;','Task note (personal to-do)…','open_task_note',cfg("tasks_toggle_hotkey","ctrl+alt+w"))+
         actrow('&#9993;','Search your email…','open_email_search',hk.email)+
         actrow('&#128193;','Open meeting folder','open_meetings_folder','')+
         actrow('&#9998;','Edit a meeting summary…','edit_meeting_summary','')+
@@ -840,6 +853,16 @@ APP_JS = r"""
         actrow('&#127908;','Transcribe a file…','transcribe_file','')+
         actrow('&#128221;','Summarize text / file…','summarize_text_dialog','')+
         live+
+      '</div>'+
+      '<div class="page"><div class="section-title">Experimental (BETA)</div>'+
+        actrow('&#128269;','Ask your meetings…','open_meetings_ask',hk.ask,true)+
+        actrow('&#127908;','Voice ask (speak a question, press again to answer)','voice_ask_now',hk.voice_ask,true)+
+        field("Voice ask answer goes to",
+          '<div class="radio-row">'+
+          radio("vao","set_voice_ask_output","card","str","Answer card (always visible)", cfg("voice_ask_output","card")==="card")+
+          radio("vao","set_voice_ask_output","paste","str","Paste at cursor", cfg("voice_ask_output")==="paste")+
+          radio("vao","set_voice_ask_output","both","str","Both", cfg("voice_ask_output")==="both")+
+          '</div>')+
       '</div>';
   };
 
@@ -921,6 +944,17 @@ APP_JS = r"""
         '<button class="btn danger" data-quit="1">Quit Lia</button>'+
       '</div>'+
       '<div class="hint">Report a problem builds a diagnostic zip (log + sanitized settings - API keys and personal lists removed), shows it in Explorer, and opens the GitHub issue page. Nothing is sent automatically - you attach the file yourself.</div>'+
+      '</div>'+
+      '<div class="page"><div class="section-title">Local summaries (Gemma / Ollama only)</div>'+
+        '<div class="hint"><b>These affect the LOCAL Gemma summary only</b> - they have NO effect on '+
+        'OpenAI / Gemini summaries. The defaults are recommended.</div>'+
+        sw("Add a dedicated tasks pass (more complete task list, +15-45s)", !!cfg("summary_local_tasks_pass",false), "toggle_summary_local_tasks_pass")+
+        '<div class="hint">Runs a narrow second pass that extracts every commitment and replaces the task list; strips speaker-label owners.</div>'+
+        sw("Merge twice-discussed topics (consolidate pass)", !!cfg("summary_consolidate_pass",true), "toggle_summary_consolidate_pass")+
+        sw("Mark tasks completed during the meeting as [x]", !!cfg("summary_task_done_pass",true), "toggle_summary_task_done_pass")+
+        sw("Coverage pass (add topics the summary missed, +30-60s)", !!cfg("summary_coverage_pass",false), "toggle_summary_coverage_pass")+
+        sw("Depth pass (numbers, the why, blockers; guarded, +2min)", !!cfg("summary_depth_pass",true), "toggle_summary_depth_pass")+
+        '<div class="hint">Each enabled pass adds a narrow local Ollama call. None of these ever touch the OpenAI / Gemini summary.</div>'+
       '</div>'+
       '<div class="page"><div class="section-title">Meeting summary prompt (OpenAI / Gemini)</div>'+
         '<div class="hint"><b>Affects summaries written by OpenAI and Gemini only.</b> The local Gemma 4 '+

@@ -375,7 +375,7 @@ if sys.platform == "win32":
     ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
 
 # --- Configuration ---
-APP_VERSION = "1.4.9"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
+APP_VERSION = "1.5.0"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Lia")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -394,6 +394,13 @@ DEFAULT_CONFIG = {
     #   "auto"    = follow the transcript's dominant language
     #   "he"/"en" = forced
     "summary_language": "primary",
+    # Meeting-summary TEMPLATE (2026-09-15). Affects OpenAI / Gemini summaries
+    # ONLY (Naor's rule); the local Gemma path keeps its hardcoded technical base.
+    #   "technical" = the built-in project-manager prompt (default, unchanged)
+    #   "general"   = a clean everyday recap (summary/points/decisions/tasks/open)
+    #   "minutes"   = formal minutes (participants/topics/decisions/actions/next)
+    # See lang_pack.SUMMARY_TEMPLATE_META + _p_summary_meeting / _p_parity_addendum.
+    "summary_template": "technical",
     # Parakeet (local English ASR, 2026-08): "cpu" (int8, default - several-x
     # realtime, zero GPU setup) or "cuda" (opt-in; needs onnxruntime-gpu,
     # falls back to CPU on load failure).
@@ -843,6 +850,13 @@ DEFAULT_CONFIG = {
     # Action-item tracker: one window listing every open task across all meetings
     # (parsed from each summary's "משימות" section; done-state in its own store).
     "action_items_hotkey": "ctrl+alt+t",
+    # Task note: a personal, frictionless to-do pad (tasks_store.py + the sticky
+    # tasknote_window.py) - jotted DIRECTLY by voice or typing, separate from the
+    # meeting-derived action tracker above. tasks_hotkey = speak a task straight
+    # into the note (reuses the voice-ask capture, mode="task"); tasks_toggle_hotkey
+    # = show/hide the sticky. "" disables either.
+    "tasks_hotkey": "ctrl+alt+q",
+    "tasks_toggle_hotkey": "ctrl+alt+w",
     # Auto-gain: boost quiet press-to-talk recordings toward a target
     # loudness before sending to the transcriber. Low-level mics (a
     # gooseneck at a modest Windows input level) produce weak signals
@@ -8503,7 +8517,7 @@ class GroqLLMCleaner:
                   mr_overlap_tokens=0, mr_fuzzy_dedup=False, mr_prefer_tokens=0,
                   consolidate_pass=False, task_done_pass=False, cloud_parity=False,
                   coverage_pass=False, depth_pass=False,
-                  lang="he"):
+                  lang="he", template="technical"):
         """General LLM call for SUMMARISATION (meeting notes + the standalone
         Summarize tool). Deliberately different from clean():
           - NO anti-injection guard and NO length floors/ceilings — a summary
@@ -8559,30 +8573,40 @@ class GroqLLMCleaner:
         prompts, the generated section markers, and the chars-per-token window
         sizing; the caller must pass a system_prompt in the SAME language
         (see _p_summary_meeting/_p_summary_general). "he" = prior behavior.
+        `template` (config `summary_template`, 2026-09-15) — the meeting-summary
+        flavor. CLOUD branch + meeting mode ONLY: when != "technical" and no manual
+        base override is set, the template's base (from _p_summary_meeting) REPLACES
+        the passed system_prompt, and _p_parity_addendum uses the template's addendum.
+        The local Gemma path returned far above with the technical base it was
+        handed, so a template can never touch it (Naor's rule). "technical" = prior.
         Returns the model's text, or "" on any failure (the caller decides how
         to surface that — meetings fall back to transcript-only)."""
         self.last_corrections = []
         if not self.api_key or not text or not text.strip():
             return ""
+        # Vocabulary + corrections instructions are a suffix appended to whatever
+        # base is used. Kept as a separate string so that when the CLOUD branch
+        # swaps the base (a manual override or a non-technical template), these
+        # general-purpose additions are RE-APPLIED rather than lost with the base.
+        _base_suffix = ""
         if vocab and vocab.strip():
-            system_prompt = (
-                system_prompt
-                + "\n\n## Domain vocabulary (authoritative spellings)\n"
+            _base_suffix += (
+                "\n\n## Domain vocabulary (authoritative spellings)\n"
                 + vocab.strip()
                 + "\nThe transcript arrives from speech-to-text and may "
                   "mis-spell these terms; ALWAYS use the correct forms above "
                   "when they are clearly what the speaker meant.")
         if collect_corrections:
-            system_prompt = (
-                system_prompt
-                + "\n\n## Transcript corrections (append AFTER the summary)\n"
-                  "After the complete summary, output a line containing exactly "
-                  "===CORRECTIONS=== followed by a JSON array of clear "
-                  "speech-to-text errors you noticed in the transcript, each as "
-                  '{"wrong": "<exact garbled string from the transcript>", '
-                  '"right": "<the intended term>"}. Only include high-confidence '
-                  "cases (garbled domain terms, product names, people's names). "
-                  "Output [] if none. Nothing after the JSON.")
+            _base_suffix += (
+                "\n\n## Transcript corrections (append AFTER the summary)\n"
+                "After the complete summary, output a line containing exactly "
+                "===CORRECTIONS=== followed by a JSON array of clear "
+                "speech-to-text errors you noticed in the transcript, each as "
+                '{"wrong": "<exact garbled string from the transcript>", '
+                '"right": "<the intended term>"}. Only include high-confidence '
+                "cases (garbled domain terms, product names, people's names). "
+                "Output [] if none. Nothing after the JSON.")
+        system_prompt = system_prompt + _base_suffix
         try:
             import requests  # noqa: F401
         except ImportError:
@@ -8940,22 +8964,29 @@ class GroqLLMCleaner:
         is_gpt5 = model_lower.startswith("gpt-5")
         is_o_series = model_lower.startswith(("o1", "o3", "o4"))
         if meeting_meta is not None:
-            # Manual BASE-prompt override (Settings > Advanced, behind a lock):
-            # replaces the built-in meeting prompt on this CLOUD branch only. The
-            # local Gemma path returned far above with the pinned base, so an edit
-            # here can never touch it. "" = keep the base the caller passed in.
+            # Base-prompt selection on this CLOUD branch only (the local Gemma path
+            # returned far above with the technical base the caller handed it, so
+            # nothing here can touch it - Naor's rule). Precedence:
+            #   1. a manual BASE override (Settings > Advanced, behind a lock);
+            #   2. else the selected TEMPLATE's base (general / minutes), if != technical;
+            #   3. else the base the caller passed in (technical).
             _base_ovr = ((self._log_cfg or {}).get("summary_base_prompt_override") or "").strip()
             if _base_ovr:
-                system_prompt = _render_nt(_base_ovr)
+                system_prompt = _render_nt(_base_ovr) + _base_suffix
                 log.info("Summary (%s): MANUAL base-prompt override in use (%d chars).",
                          self.model, len(_base_ovr))
+            elif template and template != "technical":
+                system_prompt = _p_summary_meeting(lang, template) + _base_suffix
+                log.info("Summary (%s): '%s' template base in use.", self.model, template)
         if cloud_parity and meeting_meta is not None:
             # Cloud PARITY, prompt side: the behaviors the local flow enforces
             # with passes, as compact instructions a frontier model applies
             # inline. Cloud branch ONLY - the local prompt stays byte-identical.
-            # A manual override from Settings > Advanced replaces the block.
+            # A manual override from Settings > Advanced replaces the block; else
+            # the selected template's addendum.
             system_prompt = system_prompt + _p_parity_addendum(
-                lang, override=(self._log_cfg or {}).get("summary_cloud_addendum"))
+                lang, override=(self._log_cfg or {}).get("summary_cloud_addendum"),
+                template=template)
         body = {
             "model": self.model,
             "messages": [
@@ -8992,7 +9023,11 @@ class GroqLLMCleaner:
                 # Cloud PARITY, code side: the free deterministic backstop chain
                 # the local path always gets - pure code, zero extra cloud cost.
                 # The paid LLM passes stay off here by design.
-                out = _fix_title_header(out, lang, cfg=self._log_cfg)
+                # The title backstop assumes a "title" section; the general
+                # template has none by design, so skip it there (technical +
+                # minutes carry a title). Tone / owner / dedup are template-agnostic.
+                if template in _TEMPLATES_WITH_TITLE:
+                    out = _fix_title_header(out, lang, cfg=self._log_cfg)
                 out = _soften_tone(_normalize_paren_owners(
                     _strip_speaker_label_owners(out), lang), lang)
                 out = _dedupe_tasks_section(out, cfg=self._log_cfg)
@@ -9728,7 +9763,21 @@ def _render_nt(text):
     return lang_pack.render_notetaker(text, _NOTETAKER_NAMES)
 
 
-def _p_summary_meeting(lang):
+# Templates whose output carries a "## title" section (so the title backstop may
+# run). The general template has no title by design.
+_TEMPLATES_WITH_TITLE = ("technical", "minutes")
+
+
+def _p_summary_meeting(lang, template="technical"):
+    """The meeting BASE prompt for `lang`. `template` (config `summary_template`)
+    selects the flavor - "technical" (default) is the sha-pinned GOLD prompt,
+    unchanged; "general"/"minutes" are the multilingual-ready Lia templates built
+    from lang_pack. Templates are applied on the CLOUD branch only (see
+    summarize()); the caller keeps passing the technical base for the local path."""
+    if template == "general":
+        return _render_nt(lang_pack.build_general_base(lang))
+    if template == "minutes":
+        return _render_nt(lang_pack.build_minutes_base(lang))
     return _render_nt(lang_pack.SUMMARY_PROMPT_MEETING_EN if lang == "en"
                       else _SUMMARY_PROMPT_MEETING)
 
@@ -9758,13 +9807,19 @@ def _p_task_done(lang):
                       else _TASK_DONE_PROMPT)
 
 
-def _p_parity_addendum(lang, override=None):
+def _p_parity_addendum(lang, override=None, template="technical"):
     """The cloud-parity addendum appended to the meeting prompt on the CLOUD
     branch. A non-empty manual `override` (Settings > Advanced, config
-    `summary_cloud_addendum`) replaces the built-in block for every language -
-    it is the user's own text; otherwise the built-in per-language block."""
+    `summary_cloud_addendum`) replaces the built-in block for every language and
+    template - it is the user's own text. Otherwise the per-`template` built-in
+    block: "technical" gets the depth-parity addendum; "general"/"minutes" get
+    the shared generic binding-rules block (their bases carry their own rules)."""
     if (override or "").strip():
         return "\n\n" + _render_nt(override.strip())
+    if template == "general":
+        return _render_nt(lang_pack.build_general_addendum(lang))
+    if template == "minutes":
+        return _render_nt(lang_pack.build_minutes_addendum(lang))
     return _render_nt(lang_pack.CLOUD_PARITY_ADDENDUM_EN if lang == "en"
                       else _SUMMARY_CLOUD_PARITY_ADDENDUM)
 
@@ -13711,18 +13766,18 @@ def _stamp_lia_launcher(exe_path):
         return False
     try:
         vi = VSVersionInfo(
-            ffi=FixedFileInfo(filevers=(1, 4, 9, 0), prodvers=(1, 4, 9, 0),
+            ffi=FixedFileInfo(filevers=(1, 5, 0, 0), prodvers=(1, 5, 0, 0),
                               mask=0x3f, flags=0x0, OS=0x40004,
                               fileType=0x1, subtype=0x0),
             kids=[
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.4.9.0'),
+                    StringStruct('FileVersion', '1.5.0.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.4.9.0'),
+                    StringStruct('ProductVersion', '1.5.0.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -18580,6 +18635,12 @@ class LiaApp:
         self._voice_ask_active = False
         self._voice_ask_stopping = False
         self._voice_ask_lock = threading.Lock()
+        # The shared voice-capture serves two ends: "ask" (answer via meetings RAG)
+        # and "task" (append the line to the personal task note). The mode is set
+        # at start; the stop path branches on it. Reusing the same active flag +
+        # lock means every existing mic-busy guard already covers both.
+        self._voice_ask_mode = "ask"
+        self._task_note_proc = None        # the sticky task-note child (single instance)
         self._compose_lock = threading.Lock()
         self._compose_started_at = 0.0
         # Last paste state — drives Ctrl+Alt+Z undo. dict with keys:
@@ -18689,6 +18750,14 @@ class LiaApp:
                 lambda: self._toggle_meeting(summarize=True),
                 visible=lambda item: not self._is_meeting_active(),
             ),
+            # Transcribe an existing audio/video file - a daily-use action, so it
+            # sits right under Start Meeting in the tray (Naor's ask, 2026-09-15).
+            # Plain label (no emoji + double space) so its text aligns with the
+            # other rows instead of sitting indented further right.
+            pystray.MenuItem(
+                "Transcribe a file…",
+                lambda: self._transcribe_file(),
+            ),
             # While a meeting runs, the summarize decision moves to STOP time
             # (2026-08-29, Naor's ask): you know at the END whether the
             # meeting deserved a summary.
@@ -18711,6 +18780,11 @@ class LiaApp:
                 "🗑  Cancel Meeting (discard)",
                 lambda: self._cancel_meeting(),
                 visible=lambda item: self._is_meeting_active(),
+            ),
+            # Personal task note (sticky) - show/hide. Separate from meetings.
+            pystray.MenuItem(
+                "Task note",
+                lambda: self._toggle_task_note(),
             ),
             # History lives here (under the Start Meeting group) per user layout.
             pystray.MenuItem("History", lambda: self._show_history()),
@@ -18834,6 +18908,22 @@ class LiaApp:
                 log.info("Action-items hotkey registered: %s", act_hk)
         except Exception as e:
             log.warning("Could not register action-items hotkey: %s", e)
+
+        # Task note: speak a task straight in (tasks_hotkey) + show/hide the
+        # sticky (tasks_toggle_hotkey). Personal to-do pad, separate from the
+        # meeting-derived tracker above.
+        try:
+            import keyboard as kb
+            tk_hk = self.config.get("tasks_hotkey", "ctrl+alt+q")
+            if tk_hk:
+                kb.add_hotkey(tk_hk, self._task_note_voice_toggle, suppress=False)
+                log.info("Task-note voice hotkey registered: %s", tk_hk)
+            tt_hk = self.config.get("tasks_toggle_hotkey", "ctrl+alt+w")
+            if tt_hk:
+                kb.add_hotkey(tt_hk, self._toggle_task_note, suppress=False)
+                log.info("Task-note toggle hotkey registered: %s", tt_hk)
+        except Exception as e:
+            log.warning("Could not register task-note hotkeys: %s", e)
 
         # Hotkey hook watchdog — RE-ENABLED 2026-05-25.
         #
@@ -21932,9 +22022,15 @@ class LiaApp:
         # summary_language in DEFAULT_CONFIG) selects the prompt family, the
         # pass prompts, the generated markers, and the window sizing.
         lang = lang_pack.resolve_summary_lang(self.config, text)
-        if lang != "he":
-            log.info("Summary language: %s (mode=%s)", lang,
-                     self.config.get("summary_language", "primary"))
+        # Meeting-summary template (config `summary_template`). The CALLER always
+        # passes the TECHNICAL base as system_prompt (the local path needs it);
+        # summarize() swaps in the template's base on the CLOUD branch only.
+        template = self.config.get("summary_template", "technical")
+        if template not in lang_pack.SUMMARY_TEMPLATE_IDS:
+            template = "technical"
+        if lang != "he" or template != "technical":
+            log.info("Summary language: %s (mode=%s), template=%s", lang,
+                     self.config.get("summary_language", "primary"), template)
         if mode == "general":
             return cleaner.summarize(text, _p_summary_general(lang), vocab=vocab,
                                      lang=lang)
@@ -21951,10 +22047,14 @@ class LiaApp:
                                 cloud_parity=bool(self.config.get("summary_cloud_parity", True)),
                                 coverage_pass=bool(self.config.get("summary_coverage_pass", False)),
                                 depth_pass=bool(self.config.get("summary_depth_pass", True)),
-                                lang=lang)
+                                lang=lang, template=template)
         # Mechanical quality check (2026-09-14): log any rule violation in the
         # produced summary (no model, no network) so a prompt/model regression
-        # is visible in lia.log. NEVER blocks delivery.
+        # is visible in lia.log. NEVER blocks delivery. Its R-rules are shaped
+        # for the TECHNICAL template's sections/markers; skip it for the
+        # general/minutes templates (different structure -> false findings).
+        if template != "technical":
+            return out
         try:
             import summary_check
             names = [str(n).strip() for n in
@@ -22472,10 +22572,12 @@ class LiaApp:
         else:
             self._voice_ask_start()
 
-    def _voice_ask_start(self):
-        """Start recording a short spoken question on the shared mic. Refuses
-        while dictation / compose / meeting holds the mic or the model is still
-        loading. Shows the listening state and arms the hard-cap auto-stop."""
+    def _voice_ask_start(self, mode="ask"):
+        """Start recording a short spoken clip on the shared mic. `mode`:
+        "ask" (answer it via the meetings RAG) or "task" (append it to the
+        personal task note). Refuses while dictation / compose / meeting holds
+        the mic or the model is still loading. Shows the listening state and arms
+        the hard-cap auto-stop."""
         with self._voice_ask_lock:
             if self._voice_ask_active or self._voice_ask_stopping:
                 return False
@@ -22491,6 +22593,7 @@ class LiaApp:
                 self._force_show_error_overlay("Model still loading")
                 return False
             # Flag BEFORE start() - the hotkey listener reads it lock-free.
+            self._voice_ask_mode = mode if mode in ("ask", "task") else "ask"
             self._voice_ask_active = True
             try:
                 self.recorder.start()
@@ -22506,7 +22609,8 @@ class LiaApp:
         try:
             self._refresh_tray()               # arbiter: _voice_ask_active -> recording icon
             if self.tray_icon:
-                self.tray_icon.title = "Lia - Listening (voice ask)..."
+                self.tray_icon.title = ("Lia - Listening (task)..." if self._voice_ask_mode == "task"
+                                        else "Lia - Listening (voice ask)...")
         except Exception:
             pass
         threading.Thread(target=self._voice_ask_autostop, daemon=True).start()
@@ -22542,10 +22646,12 @@ class LiaApp:
             self.overlay.show_processing()
         except Exception:
             pass
+        mode = self._voice_ask_mode
         try:
             if self.tray_icon:
                 self.tray_icon.icon = self._create_icon("processing")
-                self.tray_icon.title = "Lia - Answering..."
+                self.tray_icon.title = ("Lia - Adding task..." if mode == "task"
+                                        else "Lia - Answering...")
         except Exception:
             pass
 
@@ -22559,16 +22665,27 @@ class LiaApp:
                         question = self._transcribe_with_fallback(
                             audio, language=self._get_language(),
                             beam_size=self.config["beam_size"], task="transcribe") or ""
-                    question = self._vocab_apply_corrections(question, label="voice-ask")
+                    question = self._vocab_apply_corrections(
+                        question, label=("task-note" if mode == "task" else "voice-ask"))
             except Exception as e:
-                log.warning("Voice-ask transcribe failed: %s", e)
+                log.warning("Voice-%s transcribe failed: %s",
+                            "task" if mode == "task" else "ask", e)
             finally:
                 with self._voice_ask_lock:
                     self._voice_ask_active = False
                     self._voice_ask_stopping = False
             question = (question or "").strip()
             if not question:
-                self._force_show_error_overlay("Didn't catch a question")
+                self._force_show_error_overlay(
+                    "Didn't catch a task" if mode == "task" else "Didn't catch a question")
+                try:
+                    self._refresh_tray()
+                except Exception:
+                    pass
+                return
+            # TASK mode: append the spoken line to the personal task note and stop.
+            if mode == "task":
+                self._task_note_add_from_voice(question)
                 try:
                     self._refresh_tray()
                 except Exception:
@@ -22582,6 +22699,36 @@ class LiaApp:
             except Exception:
                 pass
         threading.Thread(target=worker, daemon=True).start()
+
+    # ---- Task note: voice capture (reuses the voice-ask machinery, mode="task") ----
+    def _task_note_voice_toggle(self):
+        """Hotkey (tasks_hotkey): first press starts listening for a task, second
+        press stops + appends the spoken line to the task note. Shares the
+        voice-ask recorder/guards; only the stop action differs (mode='task')."""
+        if self._voice_ask_active:
+            self._voice_ask_stop_and_answer()
+        else:
+            self._voice_ask_start(mode="task")
+
+    def _task_note_add_from_voice(self, text):
+        """Append a spoken line to the personal task note, confirm with a toast,
+        and surface the sticky. Runs on the voice-capture worker thread."""
+        text = (text or "").strip()
+        if not text:
+            return
+        try:
+            import tasks_store
+            task = tasks_store.add(text)
+        except Exception as e:
+            log.warning("Task note add failed: %s", e)
+            self._force_show_error_overlay("Couldn't add the task")
+            return
+        if not task:
+            return
+        log.info("Task note: added %s", _fmt_user_text(self.config, task["text"], 120))
+        # No toast (silent-mode friendly): surfacing the sticky with the new task
+        # at the top IS the confirmation.
+        self._show_task_note()
 
     def _voice_ask_answer(self, question):
         """Run the meetings RAG in-process with the user's default provider
@@ -25606,6 +25753,80 @@ class LiaApp:
                 pass
         threading.Thread(target=_cleanup, daemon=True).start()
 
+    def _show_task_note(self):
+        """Open the sticky task note (tasknote_window.py), or bring the existing
+        one to the front - single instance. Direct Popen (not spawn_helper) so we
+        keep the handle for the single-instance / toggle-close logic; the window
+        needs no Outlook COM, so de-elevation is irrelevant. No-op on a frozen
+        build / missing script."""
+        proc = getattr(self, "_task_note_proc", None)
+        if proc is not None and proc.poll() is None:
+            try:
+                import ctypes
+                ctypes.windll.user32.AllowSetForegroundWindow(proc.pid)
+            except Exception:
+                pass
+            return
+        import subprocess
+        import tempfile
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        interp = find_python_interpreter()
+        script = os.path.join(base_dir, "tasknote_window.py")
+        if interp is None or not os.path.exists(script):
+            log.warning("Task note unavailable (no interpreter / script).")
+            return
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        try:
+            fd, ppath = tempfile.mkstemp(suffix=".json", prefix="wt_tasknote_")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"title": "Tasks - Lia"}, f, ensure_ascii=False)
+        except Exception as e:
+            log.warning("Task note payload write failed: %s", e)
+            return
+        try:
+            proc = subprocess.Popen(
+                [interp, "-X", "utf8", script, ppath],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=env, creationflags=0x08000000)   # CREATE_NO_WINDOW
+        except Exception as e:
+            log.warning("Task note spawn failed: %s", e)
+            _safe_remove(ppath)
+            return
+        self._task_note_proc = proc
+        try:
+            import ctypes
+            ctypes.windll.user32.AllowSetForegroundWindow(proc.pid)
+        except Exception:
+            pass
+        log.info("Task note opened (pid %s).", proc.pid)
+
+        def _cleanup():
+            try:
+                proc.wait()
+            except Exception:
+                pass
+            _safe_remove(ppath)
+            if getattr(self, "_task_note_proc", None) is proc:
+                self._task_note_proc = None
+        threading.Thread(target=_cleanup, daemon=True).start()
+
+    def _toggle_task_note(self):
+        """Hotkey (tasks_toggle_hotkey) / tray: show the sticky task note, or
+        close it if it is already open. All state lives in tasks.json, so closing
+        the window loses nothing."""
+        proc = getattr(self, "_task_note_proc", None)
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            self._task_note_proc = None
+            log.info("Task note closed.")
+            return
+        self._show_task_note()
+
     def _kick_meetings_indexer_bg(self):
         """Fire-and-forget incremental reindex after a meeting is saved, so the
         ask-your-meetings index stays fresh. Daemon thread; heartbeat-guarded
@@ -26796,19 +27017,38 @@ class LiaApp:
         """The language cloud meeting summaries are written in (drives both the
         base-prompt preview and the addendum default in Settings > Advanced)."""
         sl = self.config.get("summary_language") or "primary"
-        return sl if sl in ("he", "en") else (self.config.get("primary_language") or "he")
+        return sl if sl in lang_pack.LANGUAGES else (self.config.get("primary_language") or "he")
+
+    def _summary_template_id(self):
+        """The selected meeting-summary template id (config `summary_template`),
+        clamped to a known id."""
+        t = self.config.get("summary_template", "technical")
+        return t if t in lang_pack.SUMMARY_TEMPLATE_IDS else "technical"
+
+    def _set_summary_template(self, template):
+        """Settings > Models: choose the OpenAI/Gemini meeting-summary template
+        (technical / general / minutes). Cloud only - the local Gemma summary is
+        a hardcoded pipeline and never reads it (Naor's rule)."""
+        if template not in lang_pack.SUMMARY_TEMPLATE_IDS:
+            return (False, "Unknown summary template: %s" % template)
+        self.config["summary_template"] = template
+        save_config(self.config)
+        log.info("Summary template set to: %s (OpenAI / Gemini only)", template)
 
     def _summary_base_prompt(self):
         """The FULL base meeting prompt (rendered) the OpenAI/Gemini model receives
-        BEFORE the addendum - shown read-only in the Advanced editor so the whole
-        prompt is visible. Shared byte-identical with the local Gemma flow and
-        sha-gated, so it is not editable from the UI (edit it in code)."""
-        return _p_summary_meeting(self._summary_effective_lang())
+        BEFORE the addendum, for the SELECTED template - shown read-only in the
+        Advanced editor so the whole prompt is visible. The technical base is
+        shared byte-identical with the local Gemma flow and sha-gated (edit it in
+        code); the general/minutes bases are built from lang_pack."""
+        return _p_summary_meeting(self._summary_effective_lang(), self._summary_template_id())
 
     def _summary_addendum_default(self):
-        """The built-in cloud-parity addendum for the language summaries are
-        written in - shown in the Advanced editor when no override is set."""
-        return _p_parity_addendum(self._summary_effective_lang()).strip()
+        """The built-in cloud addendum for the selected template + the language
+        summaries are written in - shown in the Advanced editor when no override
+        is set."""
+        return _p_parity_addendum(self._summary_effective_lang(),
+                                  template=self._summary_template_id()).strip()
 
     def _save_summary_addendum(self, text):
         """Settings > Advanced: manual cloud-summary prompt addendum. Empty, or
@@ -28206,6 +28446,7 @@ class LiaApp:
         add("toggle_summary_coverage_pass", self._toggle_summary_coverage_pass)
         add("toggle_summary_depth_pass", self._toggle_summary_depth_pass)
         add("set_summary_language", self._set_summary_language)
+        add("set_summary_template", self._set_summary_template)
         add("set_file_model", self._set_file_transcribe_model)
         add("set_whisper_device", self._set_whisper_device, True)
         # AI Cleanup
@@ -28235,6 +28476,7 @@ class LiaApp:
         add("voice_ask_now", self._voice_ask_toggle)
         add("set_voice_ask_output", self._set_voice_ask_output)
         add("open_action_items", self._open_action_items)
+        add("open_task_note", self._toggle_task_note)
         add("open_meetings_folder", self._open_meetings_folder)
         add("edit_meeting_summary", self._edit_meeting_summary)
         add("rename_speakers_old", self._rename_speakers_in_old_meeting)
@@ -28324,6 +28566,11 @@ class LiaApp:
 
     def _settings_tables(self, *, ollama=True):
         c = self.config
+        # When THIS PC is the transcription SERVER (serve mode), pointing its own
+        # dictation/meeting at a "Remote Transcription server" client makes no
+        # sense - disable those rows (Naor, 2026-09-15). A row already selected
+        # stays selectable so the UI never shows nothing-checked.
+        is_server = (c.get("transcription_role", "") or "") == "server"
 
         def missing(reqs):
             return [k for k in reqs if not (c.get(k) or "").strip()]
@@ -28386,23 +28633,25 @@ class LiaApp:
             # picking a cloud model. Deliberately approximate.
             wn = ""
             if backend == "groq":
-                wn = key_note("groq_api_key") + " · free tier available"
+                wn = key_note("groq_api_key") + " · Free Tier Available"
             elif backend == "openai":
                 wn = key_note("openai_api_key") + " · ~$0.4 per audio hour"
             elif backend == "gemini":
-                # Honest, measured hint (Naor's rule): free but slower + less
-                # private than Groq, so it is a clearly non-default option.
+                # Honest, measured hint (Naor's rule): free but slower than Groq,
+                # so it is a clearly non-default option. (The "trains on your
+                # audio" note was dropped - it is covered once at the top.)
                 wn = (key_note("gemini_api_key")
-                      + " · free tier available · ~3.6s, slower than Groq · "
-                        "trains on your audio")
+                      + " · Free Tier Available · ~3.6s, slower than Groq")
             elif backend == "local":
                 # Hardware hint (2026-08-29, Naor's ask): what each local
                 # model needs so nobody is surprised by CPU wait times.
                 wn = _LOCAL_HW_NOTES.get(model_id, "")
+            remote_blocked = (backend == "remote") and is_server and not checked
             dictation.append({"idx": i, "label": unbadge(label), "checked": checked,
-                              "enabled": not pk_missing and not key_missing,
+                              "enabled": not pk_missing and not key_missing and not remote_blocked,
                               "where": where_of(backend), "wnote": wn,
-                              "note": "pip install onnx-asr" if pk_missing else ""})
+                              "note": ("pip install onnx-asr" if pk_missing else
+                                       "This PC is the transcription server" if remote_blocked else "")})
         def _key_reqs(reqs):
             return [r for r in reqs if r.endswith("_api_key") or r == "hf_token"]
 
@@ -28415,10 +28664,9 @@ class LiaApp:
             if not wn:
                 return wn
             # Per-key price: Gemini Transcribe is FREE-tier; every other cloud
-            # row is paid (~$0.4/audio hour). The free tier may use audio to
-            # improve Google's models - an honest privacy note, not marketing.
+            # row is paid (~$0.4/audio hour).
             if key.startswith("gemini_"):
-                wn += " · free tier available · trains on your audio"
+                wn += " · Free Tier Available"
             else:
                 wn += " · ~$0.4 per meeting hour"
             return wn
@@ -28434,11 +28682,14 @@ class LiaApp:
             miss = missing(reqs)
             pk_missing = "parakeet" in key and not has_parakeet
             wn = _meeting_wnote(key, reqs)
+            m_checked = c.get("meeting_model", "local_hebrew_turbo") == key
+            remote_blocked = where_of(key) == "remote" and is_server and not m_checked
             meeting.append({"key": key, "label": unbadge(label),
-                            "checked": c.get("meeting_model", "local_hebrew_turbo") == key,
-                            "enabled": not miss and not pk_missing,
+                            "checked": m_checked,
+                            "enabled": not miss and not pk_missing and not remote_blocked,
                             "where": where_of(key), "wnote": wn,
                             "note": ("pip install onnx-asr" if pk_missing else
+                                     "This PC is the transcription server" if remote_blocked else
                                      ("needs " + ", ".join(miss)) if miss else "")})
         file_rows = [{"key": "", "label": "Same as meeting model",
                       "checked": (c.get("file_transcribe_model", "") or "") == "",
@@ -28450,11 +28701,14 @@ class LiaApp:
             miss = missing(reqs)
             pk_missing = "parakeet" in key and not has_parakeet
             wn = _meeting_wnote(key, reqs)
+            f_checked = c.get("file_transcribe_model", "") == key
+            remote_blocked = where_of(key) == "remote" and is_server and not f_checked
             file_rows.append({"key": key, "label": unbadge(label),
-                              "checked": c.get("file_transcribe_model", "") == key,
-                              "enabled": not miss and not pk_missing,
+                              "checked": f_checked,
+                              "enabled": not miss and not pk_missing and not remote_blocked,
                               "where": where_of(key), "wnote": wn,
                               "note": ("pip install onnx-asr" if pk_missing else
+                                       "This PC is the transcription server" if remote_blocked else
                                        ("needs " + ", ".join(miss)) if miss else "")})
         pulled = self._ollama_pulled() if ollama else "skip"
         cur_sm = c.get("summary_model", "")
@@ -28483,7 +28737,7 @@ class LiaApp:
             s_wn = ""
             if s_where == "cloud":
                 if url == GEMINI_CHAT_URL:
-                    s_wn = key_note("gemini_api_key") + " · free tier available"
+                    s_wn = key_note("gemini_api_key") + " · Free Tier Available"
                 else:
                     # MEASURED per-summary cost (2026-08-03, incl. hidden
                     # reasoning tokens): SOL ~$0.106, Terra ~$0.024.
@@ -28570,6 +28824,7 @@ class LiaApp:
             "cleanup_provider": _safe(self._effective_cleanup_provider, "") or "",
             "summary_addendum_default": _safe(self._summary_addendum_default, ""),
             "summary_base_prompt": _safe(self._summary_base_prompt, ""),
+            "summary_templates": list(lang_pack.SUMMARY_TEMPLATE_META),
             "vocab_pending": _safe(self._vocab_pending_count, 0),
             "auto_start": _safe(lambda: bool(is_auto_start_enabled()), False),
             "hotkeys": {
@@ -28581,6 +28836,8 @@ class LiaApp:
                 "actions": c.get("action_items_hotkey", "ctrl+alt+t"),
                 "email": c.get("email_search_hotkey", "ctrl+alt+f"),
                 "chat": c.get("chat_hotkey", "ctrl+alt+c"),
+                "task_add (voice)": c.get("tasks_hotkey", "ctrl+alt+q"),
+                "task_note (show/hide)": c.get("tasks_toggle_hotkey", "ctrl+alt+w"),
             },
             "paths": {"config": CONFIG_DIR,
                       "log": os.path.join(CONFIG_DIR, "lia.log"),
@@ -28621,6 +28878,7 @@ class LiaApp:
             "whisper_device_label": "Auto", "cleanup_model_label": "",
             "cleanup_provider": "", "vocab_pending": 0, "auto_start": False,
             "summary_addendum_default": "", "summary_base_prompt": "",
+            "summary_templates": list(lang_pack.SUMMARY_TEMPLATE_META),
             "hotkeys": {"main": c.get("hotkey", "ctrl+space"),
                         "undo": c.get("undo_hotkey", "ctrl+alt+z"),
                         "cancel": c.get("cancel_hotkey", "esc"),
