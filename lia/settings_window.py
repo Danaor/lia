@@ -846,7 +846,6 @@ APP_JS = r"""
       '<div class="page"><div class="section-title">Tools</div>'+
         actrow('&#128203;','Action items (from meetings)…','open_action_items',hk.actions)+
         actrow('&#128221;','Task note (personal to-do)…','open_task_note',cfg("tasks_toggle_hotkey","ctrl+alt+w"))+
-        actrow('&#9993;','Search your email…','open_email_search',hk.email)+
         actrow('&#128193;','Open meeting folder','open_meetings_folder','')+
         actrow('&#9998;','Edit a meeting summary…','edit_meeting_summary','')+
         actrow('&#128101;','Rename speakers in a meeting…','rename_speakers_old','')+
@@ -854,7 +853,8 @@ APP_JS = r"""
         actrow('&#128221;','Summarize text / file…','summarize_text_dialog','')+
         live+
       '</div>'+
-      '<div class="page"><div class="section-title">Experimental (BETA)</div>'+
+      '<div class="page"><div class="section-title">Experimental (Beta) - requires a 24 GB VRAM GPU</div>'+
+        '<div class="hint">These run local LLM / embedding models on your GPU (best on a 24 GB card such as an RTX 3090 / 4090) and work without any cloud key.</div>'+
         actrow('&#128269;','Ask your meetings…','open_meetings_ask',hk.ask,true)+
         actrow('&#127908;','Voice ask (speak a question, press again to answer)','voice_ask_now',hk.voice_ask,true)+
         field("Voice ask answer goes to",
@@ -863,6 +863,7 @@ APP_JS = r"""
           radio("vao","set_voice_ask_output","paste","str","Paste at cursor", cfg("voice_ask_output")==="paste")+
           radio("vao","set_voice_ask_output","both","str","Both", cfg("voice_ask_output")==="both")+
           '</div>')+
+        actrow('&#9993;','Search your email…','open_email_search',hk.email,true)+
       '</div>';
   };
 

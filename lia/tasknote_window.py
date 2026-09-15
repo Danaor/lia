@@ -59,8 +59,8 @@ HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  :root{ --bg:#FFFDF3; --panel:#FFFFFF; --line:#ECE7D3; --fg:#232019; --muted:#8A8570;
-         --accent:#C99A2E; --done:#B4AF9C; }
+  :root{ --bg:#FFFFFF; --panel:#FFFFFF; --line:#E5E7EB; --fg:#1B2430; --muted:#6B7280;
+         --accent:#22314F; --done:#9AA0AD; }
   *{ box-sizing:border-box; }
   body{ margin:0; background:var(--bg); color:var(--fg); height:100vh; display:flex; flex-direction:column;
         font-family:"Segoe UI Variable Text","Segoe UI",Heebo,system-ui,Arial,sans-serif; font-size:14px; }
