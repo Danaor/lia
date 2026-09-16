@@ -573,6 +573,79 @@ def t_strip_keeps_question_mark():
 _test("strip: a real '?' survives a following hallucination", t_strip_keeps_question_mark)
 
 
+def t_collapse_leading_duplicate():
+    """A doubled OPENING word/phrase (Whisper VAD/segment-conditioning artifact)
+    is collapsed - Naor's real cases - while natural emphasis and ordinary text
+    are left intact; the local Whisper path + the dictation choke point run it."""
+    import lia as w
+    f = w.collapse_leading_duplicate
+    # multi-word opening double (punctuation-insensitive)
+    assert f("כשאני לוחץ כשאני לוחץ פסיק") == "כשאני לוחץ פסיק"
+    assert f("כשאני לוחץ, כשאני לוחץ, פסיק") == "כשאני לוחץ, פסיק"
+    assert f("by the way by the way I wanted to add") == "by the way I wanted to add"
+    # single-word content double IS collapsed (Naor's "אגב אגב")
+    assert f("אגב אגב רציתי להגיד") == "אגב רציתי להגיד"
+    # longest opening unit wins (not a sub-phrase of it)
+    assert f("a b a b then more text here") == "a b then more text here"
+    # an RLM/space prefix is preserved
+    assert f("‏שלום עולם שלום עולם וזהו") == "‏שלום עולם וזהו"
+    # LEFT ALONE: a naturally-doubled emphasis/interjection word (protect-list)
+    assert f("מאוד מאוד יפה היום") == "מאוד מאוד יפה היום"
+    assert f("לא לא אני לא רוצה") == "לא לא אני לא רוצה"
+    assert f("no no I do not want that") == "no no I do not want that"
+    # LEFT ALONE: no leading repeat, and ordinary text
+    assert f("עוד הפעם יש לי בעיה") == "עוד הפעם יש לי בעיה"
+    assert f("שלום עולם זה טקסט רגיל בלי חזרות") == "שלום עולם זה טקסט רגיל בלי חזרות"
+    assert f("") == "" and f("   ") == "   "
+    # runs at the transcriber AND the dictation choke point (source-level guard)
+    import os as _os
+    src = open(_os.path.join(_os.path.dirname(_os.path.abspath(w.__file__)),
+                             "lia.py"), encoding="utf-8").read()
+    assert src.count("collapse_leading_duplicate(text)") >= 2
+    # the root fix: cross-segment conditioning is off in the Whisper decode
+    assert "condition_on_previous_text=False" in src
+
+
+_test("collapse: a doubled opening word/phrase (first-word duplication) is removed",
+      t_collapse_leading_duplicate)
+
+
+def t_parakeet_long_file_chunks():
+    """Parakeet never runs more than FILE_CHUNK_S in one pass: a 1-hour file is
+    split into <=55s windows with full coverage and no gaps, so a long meeting /
+    file can't hit Parakeet's few-minute single-pass limit (Naor 2026-09-16).
+    Meetings feed it even shorter pieces (meeting_chunk_seconds, default 15s)."""
+    import lia as w
+    import numpy as np, threading
+    import faster_whisper.audio as fwa
+    App = w.ParakeetTranscriber
+    p = App.__new__(App)
+    p.model = object()                 # non-None so the loaded-guard passes
+    p._infer_lock = threading.Lock()
+    seen = []
+    p._recognize = lambda audio: (seen.append(len(audio)) or "x")
+    SR = 16000
+    audio = np.zeros(3600 * SR, dtype=np.float32)   # one hour of audio
+    orig = fwa.decode_audio
+    fwa.decode_audio = lambda path, sampling_rate=16000: audio
+    try:
+        out = p.transcribe_file("dummy.wav")        # must not raise
+    finally:
+        fwa.decode_audio = orig
+    cap = int(App.FILE_CHUNK_S * SR)
+    assert seen, "a 1-hour file produced no chunks"
+    assert max(seen) <= cap, ("a chunk exceeded FILE_CHUNK_S", max(seen), cap)
+    assert len(seen) >= 40, ("a 1-hour file must be split into many windows", len(seen))
+    assert abs(sum(seen) - len(audio)) <= SR, "audio dropped between chunks"
+    assert isinstance(out, str)
+    # the meeting path caps each fed chunk far lower still
+    assert w.DEFAULT_CONFIG.get("meeting_chunk_seconds", 15) <= 120
+
+
+_test("parakeet: a 1-hour file is chunked (<=55s/pass, full coverage, no crash)",
+      t_parakeet_long_file_chunks)
+
+
 def t_strip_preserves_real_text():
     import lia as w
     assert w.strip_hallucinated_tail("Hello, this is a real message.") == "Hello, this is a real message."
@@ -652,6 +725,143 @@ def t_summary_module_wiring():
 
 
 _test("Meeting Summary Module: cloud/local wiring + Ollama match", t_summary_module_wiring)
+
+
+def t_local_summary_tiers():
+    """Low-VRAM local summary tiers (2026-09-15): the two new picker rows, the
+    tier profile table + helper, and _run_summary picking the general recap base
+    + a smaller ctx_cap + the GOLD-shaped passes OFF for the 8 GB (gemma3:4b)
+    tier, while 12B/31B keep the technical GOLD base and a cloud model falls to
+    the safe default. No model, no network."""
+    import lia as w
+    App = w.LiaApp
+    ids = [m for _l, m, _u in App._SUMMARY_MODELS]
+    assert "gemma3:12b" in ids and "gemma3:4b" in ids, ids
+    # tier table + helper
+    assert w.LOCAL_SUMMARY_TIERS["gemma3:4b"]["prompt"] == "general"
+    assert w.LOCAL_SUMMARY_TIERS["gemma3:4b"]["ctx_cap"] == 12288
+    assert w.LOCAL_SUMMARY_TIERS["gemma3:12b"]["prompt"] == "technical"
+    assert w.LOCAL_SUMMARY_TIERS["gemma3:12b"]["ctx_cap"] == 24576
+    assert w.LOCAL_SUMMARY_TIERS["gemma4:31b-it-qat"]["prompt"] == "technical"
+    # cloud / empty / unknown local -> the safe default (technical + full cap)
+    assert w._local_summary_tier("gpt-5.6-sol") is w.DEFAULT_LOCAL_TIER
+    assert w._local_summary_tier("")["prompt"] == "technical"
+    assert w._local_summary_tier("unknown:99b")["ctx_cap"] == w._SUMMARY_CTX_CAP
+    # the general recap base really differs from (and is far shorter than) GOLD
+    he_gold = w._p_summary_meeting("he", "technical")
+    he_gen = w._p_summary_meeting("he", "general")
+    assert he_gold != he_gen and len(he_gold) > len(he_gen), (len(he_gold), len(he_gen))
+
+    # _run_summary wiring: capture the base + flags that reach summarize()
+    captured = {}
+
+    class _FakeCleaner:
+        def summarize(self, text, system_prompt, **kw):
+            captured.clear()
+            captured["base"] = system_prompt
+            captured.update(kw)
+            return "## סיכום\nok"
+
+    def _make(model):
+        app = App.__new__(App)
+        app.config = {"summary_model": model, "summary_language": "he",
+                      "summary_template": "technical"}
+        app._get_summary_cleaner = lambda: _FakeCleaner()
+        app._composed_vocabulary = lambda: ""
+        return app
+
+    txt = "שלום זו פגישה"
+    # 8 GB light tier: general base + guards, GOLD-shaped passes OFF, cap 12288
+    _make("gemma3:4b")._run_summary(txt, mode="meeting")
+    assert captured["base"].startswith(he_gen)
+    assert w._LIGHT_TIER_GUARDS in captured["base"]
+    assert captured["ctx_cap"] == 12288
+    assert captured["depth_pass"] is False and captured["coverage_pass"] is False
+    assert captured["consolidate_pass"] is False and captured["task_done_pass"] is False
+    assert captured["local_tasks_pass"] is False
+    # 16 GB tier: technical GOLD base, NO guards, cap 24576, depth pass ON
+    _make("gemma3:12b")._run_summary(txt, mode="meeting")
+    assert captured["base"] == he_gold
+    assert w._LIGHT_TIER_GUARDS not in captured["base"]
+    assert captured["ctx_cap"] == 24576
+    assert captured["depth_pass"] is True
+    # cloud model: technical GOLD base + full cap (byte-identical intent)
+    app = _make("gpt-5.6-sol")
+    app.config["summary_base_url"] = ""
+    app._run_summary(txt, mode="meeting")
+    assert captured["base"] == he_gold
+    assert captured["ctx_cap"] == w._SUMMARY_CTX_CAP
+
+
+_test("low-VRAM local summary tiers (8/16 GB base + cap + passes)",
+      t_local_summary_tiers)
+
+
+def t_meeting_model_names_match_dictation():
+    """Model display names line up across the pickers (Naor's ask 2026-09-16):
+    no ⭐ markers; shared local models read the same in the dictation and
+    meeting/file pickers; every local ASR model has a "+ Pyannote Diarization"
+    variant (incl. the multilingual Whisper), each grouped right under its plain
+    row; and the new pyannote-multilingual model is fully wired."""
+    import lia as w
+    App = w.LiaApp
+    # only the LOCAL rows own their model_id (cloud rows reuse a local model_id
+    # as their offline fallback), so key the map on backend == "local"
+    dict_label = {model_id: label
+                  for label, model_id, backend, _t, _o in App._MENU_MODELS_ORDERED
+                  if backend == "local"}
+    meet = App._MEETING_MODELS
+    meet_label = {k: label for label, k, _r in meet}
+    meet_keys = [k for _l, k, _r in meet]
+    # NO stars anywhere in either picker
+    assert not any("⭐" in l for l, _k, _r in meet), meet
+    assert not any("⭐" in l for l, *_ in App._MENU_MODELS_ORDERED)
+    # the three plain LOCAL models read identically in both pickers
+    assert meet_label["local_hebrew_turbo"] == \
+        dict_label["ivrit-ai/whisper-large-v3-turbo-ct2"]
+    assert meet_label["local_parakeet_english"] == \
+        dict_label["parakeet-tdt-0.6b-v3"]
+    assert meet_label["local_multilang_turbo"] == dict_label["large-v3-turbo"]
+    # each local model has a pyannote diarize variant named "<model> + Pyannote
+    # Diarization", the plain base name shared with its plain row
+    for plain, diar, base in (
+            ("local_hebrew_turbo", "local_pyannote_hebrew", "Whisper Hebrew Local"),
+            ("local_parakeet_english", "local_pyannote_parakeet",
+             "Parakeet Multi-Language Local"),
+            ("local_multilang_turbo", "local_pyannote_multilang",
+             "Whisper Multi-Language Local")):
+        assert meet_label[diar] == base + " + Pyannote Diarization", meet_label[diar]
+        assert meet_label[plain].startswith(base), meet_label[plain]
+        # grouped: the diarize row sits immediately under its plain row
+        assert meet_keys.index(diar) == meet_keys.index(plain) + 1, meet_keys
+    # the previously-missing pyannote + multilingual Whisper now exists + is wired
+    assert "local_pyannote_multilang" in meet_keys, "pyannote + multilang missing"
+    assert App._MEETING_TRANSCRIBE_NAMES.get("local_pyannote_multilang")
+    assert w._LOCAL_HW_NOTES.get("local_pyannote_multilang")
+    src = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)),
+                            "lia.py"), encoding="utf-8").read()
+    assert 'if key in ("local_multilang_turbo", "local_pyannote_multilang"):' in src
+    # diarize per-turn ASR mapping + backend routing for the new key
+    assert '"local_pyannote_multilang": "local_multilang_turbo"' in src
+    # Naming rule (Naor 2026-09-16): model/brand name FIRST, then the qualifier,
+    # no "Turbo"; "Multi-Language" for the qualifier, and the LOCAL multi-language
+    # models (Parakeet + Whisper) also keep the language count in parentheses.
+    assert dict_label["large-v3-turbo"] == "Whisper Multi-Language Local (99 languages)"
+    assert not any("Turbo" in l for l, *_ in App._MENU_MODELS_ORDERED)
+    assert not any("Turbo" in l for l, _k, _r in meet)
+    dnames = [l for l, *_ in App._MENU_MODELS_ORDERED]
+    assert "Whisper Hebrew Local" in dnames
+    assert "Parakeet Multi-Language Local (25 languages)" in dnames
+    assert "Groq Multi-Language" in dnames
+    assert not any("Whisper Large v3" in l for l in dnames)
+    assert "Gemini 3.5 transcribe Multi-Language" in dnames
+    assert "OpenAI GPT transcribe" in dnames
+    assert meet_label["gemini_transcribe"] == "Gemini 3.5 transcribe Multi-Language"
+    assert meet_label["openai_gpt_transcribe"] == "OpenAI GPT transcribe"
+
+
+_test("model picker names: no stars, consistent, grouped, + pyannote-multilang",
+      t_meeting_model_names_match_dictation)
 
 
 def t_summary_marker_localizer():
@@ -2061,11 +2271,11 @@ def t_parakeet_registration():
     and the class honors the BaseTranscriber contract without loading."""
     import lia as w
     # model tables
-    assert w.MODELS.get("parakeet-tdt-0.6b-v2"), "MODELS entry missing"
-    assert w.MODEL_LANGUAGE.get("parakeet-tdt-0.6b-v2") == "en"
+    assert w.MODELS.get("parakeet-tdt-0.6b-v3"), "MODELS entry missing"
+    assert w.MODEL_LANGUAGE.get("parakeet-tdt-0.6b-v3") == "auto"
     # dictation picker row (local backend, no translate, no openai model)
     row = next((r for r in w.LiaApp._MENU_MODELS_ORDERED
-                if r[1] == "parakeet-tdt-0.6b-v2"), None)
+                if r[1] == "parakeet-tdt-0.6b-v3"), None)
     assert row and row[2] == "local" and row[3] is False and row[4] == ""
     # meeting + file keys (file picker inherits _MEETING_MODELS)
     keys = [k for _, k, _ in w.LiaApp._MEETING_MODELS]
@@ -2086,7 +2296,7 @@ def t_parakeet_registration():
     assert "onnx-asr" in open(os.path.join(base, "requirements.txt"),
                               encoding="utf-8").read()
     import download_models as dm
-    assert "parakeet-tdt-0.6b-v2" in dm.MODELS
+    assert "parakeet-tdt-0.6b-v3" in dm.MODELS
     # contract, without loading anything
     t = w.ParakeetTranscriber()
     assert t.model is None and hasattr(t, "custom_vocabulary")
@@ -2105,8 +2315,16 @@ def t_parakeet_registration():
     # the local factory routes parakeet model ids to the new class
     app = w.LiaApp.__new__(w.LiaApp)
     app.config = {"cpu_threads": 4, "parakeet_device": "cpu"}
-    made = w.LiaApp._make_local_transcriber(app, "parakeet-tdt-0.6b-v2")
+    made = w.LiaApp._make_local_transcriber(app, "parakeet-tdt-0.6b-v3")
     assert isinstance(made, w.ParakeetTranscriber), type(made)
+    # v3 (2026-09-15): 25 European languages, auto-detected. Supports our
+    # es/fr/de/it/pt/ru, NOT he/zh/ja/ko/ar/hi (use Whisper for those).
+    PL = w.ParakeetTranscriber.PARAKEET_LANGS
+    assert len(PL) == 25
+    assert {"en", "es", "fr", "de", "it", "pt", "ru"} <= PL
+    assert not (PL & {"he", "zh", "ja", "ko", "ar", "hi"})
+    assert w.MODELS["parakeet-tdt-0.6b-v3"] == "Parakeet Multi-Language (25 languages)"
+    assert w.MODELS["large-v3-turbo"] == "Whisper Multi-Language (99 languages)"
 
 
 _test("parakeet: registration N/N + BaseTranscriber contract", t_parakeet_registration)
@@ -2138,9 +2356,9 @@ def t_primary_language_cascade():
         "diarized flavor must be preserved"
     assert app.config["groq_he_en_bias"] is False
     assert app.config["bilingual_english_model"] == "parakeet"
-    assert calls == ["parakeet-tdt-0.6b-v2"], calls
+    assert calls == ["parakeet-tdt-0.6b-v3"], calls
     # round-trip back to Hebrew restores the he defaults
-    app.config["model_size"] = "parakeet-tdt-0.6b-v2"   # as _set_model would
+    app.config["model_size"] = "parakeet-tdt-0.6b-v3"   # as _set_model would
     calls.clear()
     ok, _ = w.LiaApp._set_primary_language(app, "he")
     assert ok
@@ -2158,9 +2376,23 @@ def t_primary_language_cascade():
                        "meeting_model": "openai_gpt_transcribe"})
     w.LiaApp._set_primary_language(app, "en")
     assert app.config["meeting_model"] == "openai_gpt_transcribe"
-    # unknown language rejected
-    ok, _ = w.LiaApp._set_primary_language(app, "fr")
+    # an out-of-registry code is rejected
+    ok, _ = w.LiaApp._set_primary_language(app, "zz")
     assert ok is False
+    # a multilingual primary is ACCEPTED (de-gated): enabled includes it, the
+    # local engine goes multilingual (large-v3-turbo), he/en bias off.
+    app.config.update({"primary_language": "he", "enabled_languages": ["he", "en"],
+                       "model_size": "ivrit-ai/whisper-large-v3-turbo-ct2",
+                       "transcription_backend": "local", "groq_he_en_bias": True})
+    calls.clear()
+    ok, msg = w.LiaApp._set_primary_language(app, "ru")
+    assert ok and "Russian" in msg, msg
+    assert "ru" in app.config["enabled_languages"]
+    assert app.config["groq_he_en_bias"] is False
+    assert app.config["model_size"] == "large-v3-turbo" and calls == ["large-v3-turbo"], calls
+    # locking to one language (only the primary enabled) forces it in _get_language
+    app.config.update({"primary_language": "ru", "enabled_languages": ["ru"]})
+    assert w.LiaApp._get_language(app) == "ru"
     # first-run locale derivation + en first-run model defaults (source check)
     src = inspect.getsource(w.load_config)
     assert "GetUserDefaultUILanguage" in src and "0x0D" in src
@@ -2316,6 +2548,90 @@ _test("lang_pack: bilingual marker table + detection + union regexes",
       t_lang_pack)
 
 
+def t_multilang_registry_and_profile():
+    """Multi-language (2026-09-15): the LANGUAGES registry schema, the profile
+    resolver truth table, enabled_languages ordering + the lock, script_of_char,
+    and TERMS completeness for every summary-enabled language."""
+    import re
+    import lang_pack as LP
+    # 1. Every LANGUAGES row carries the full schema.
+    for code, row in LP.LANGUAGES.items():
+        for f in ("name_en", "native", "rtl", "cpt", "scripts", "bcp47"):
+            assert f in row, "%s missing %s" % (code, f)
+        assert isinstance(row["rtl"], bool) and isinstance(row["cpt"], float)
+        assert row["scripts"] and all(s in LP.SCRIPT_RANGES for s in row["scripts"]), code
+        assert re.match(r"^[a-z]{2}-[A-Z]{2}$", row["bcp47"]), row["bcp47"]
+    assert LP.LANGUAGES["he"]["rtl"] and LP.LANGUAGES["ar"]["rtl"]
+    assert not LP.LANGUAGES["en"]["rtl"] and not LP.LANGUAGES["ru"]["rtl"]
+    # 2. Profile truth table (the byte-identity gate for the Hebrew workflow).
+    lp = LP.language_profile
+    assert lp({}) == "hebrew"
+    assert lp({"primary_language": "he", "enabled_languages": ["he", "en"]}) == "hebrew"
+    assert lp({"primary_language": "he", "enabled_languages": ["he"]}) == "hebrew"
+    assert lp({"primary_language": "en", "enabled_languages": ["en"]}) == "hebrew"
+    assert lp({"primary_language": "es"}) == "multilingual"
+    assert lp({"primary_language": "he", "enabled_languages": ["he", "en", "ru"]}) == "multilingual"
+    assert lp({"primary_language": "he", "enabled_languages": "junk"}) == "hebrew"
+    # 3. enabled_languages: primary first, filtered, deduped; single = lock.
+    assert LP.enabled_languages({"primary_language": "he"}) == ["he", "en"]
+    assert LP.enabled_languages({"primary_language": "en"}) == ["en", "he"]
+    assert LP.enabled_languages(
+        {"primary_language": "es", "enabled_languages": ["en", "es", "zz"]}) == ["es", "en"]
+    assert LP.enabled_languages({"primary_language": "ja", "enabled_languages": ["ja"]}) == ["ja"]
+    # 4. script_of_char.
+    assert LP.script_of_char("a") == "Latin" and LP.script_of_char("Z") == "Latin"
+    assert LP.script_of_char("ש") == "Hebrew" and LP.script_of_char("中") == "Han"
+    assert LP.script_of_char("я") == "Cyrillic" and LP.script_of_char("ا") == "Arabic"
+    assert LP.script_of_char("가") == "Hangul" and LP.script_of_char("क") == "Devanagari"
+    assert LP.script_of_char("5") is None and LP.script_of_char("!") is None
+    # 5. TERMS completeness for every summary-enabled language.
+    he_keys = set(LP.TERMS["he"])
+    for code in LP.summary_enabled_langs():
+        assert set(LP.TERMS[code]) == he_keys, "%s TERMS key mismatch" % code
+        for k in he_keys:
+            assert LP.TERMS[code][k], "%s empty term %s" % (code, k)
+    assert {"he", "en", "es", "fr", "de", "pt", "it", "ru"} <= set(LP.summary_enabled_langs())
+
+
+_test("multilang: registry schema + profile + enabled/lock + scripts + TERMS",
+      t_multilang_registry_and_profile)
+
+
+def t_multilang_detect_gemini_migrate():
+    """Multi-language: he/en byte-identity of detection + gemini codes, the
+    multilingual detection path, and _normalize_language_config repair."""
+    import lang_pack as LP
+    import lia as w
+    # he/en gemini codes are byte-identical to the prior behavior.
+    assert LP.gemini_language_codes({"primary_language": "he"}) == ["he-IL", "en-US"]
+    assert LP.gemini_language_codes({"primary_language": "en"}) == ["en-US", "he-IL"]
+    # multilingual whitelist: primary first, en kept as a guard.
+    codes = LP.gemini_language_codes(
+        {"primary_language": "es", "enabled_languages": ["es", "fr"]})
+    assert codes[0] == "es-ES" and "fr-FR" in codes and "en-US" in codes
+    # detection with a multilingual config picks the enabled code by script.
+    cfg = {"primary_language": "ru", "enabled_languages": ["ru", "en"]}
+    assert LP.detect_text_lang("Привет мир", cfg) == "ru"
+    assert LP.detect_text_lang("hello world", cfg) == "en"
+    # config=None reproduces the historical he/en behavior exactly.
+    assert LP.detect_text_lang("שלום") == "he" and LP.detect_text_lang("hi") == "en"
+    # _normalize_language_config repairs bad input; a he/en config is unchanged.
+    n = w._normalize_language_config
+    assert n({"primary_language": "he", "enabled_languages": ["he", "en"]}) == \
+        {"primary_language": "he", "enabled_languages": ["he", "en"]}
+    fixed = n({"primary_language": "zz", "enabled_languages": ["zz", "ru", "he"]})
+    assert fixed["primary_language"] == "he" and fixed["enabled_languages"] == ["ru", "he"]
+    assert n({"primary_language": "es"})["enabled_languages"] == ["es", "en"]  # lang + en fallback
+    assert n({"primary_language": "he", "enabled_languages": []})["enabled_languages"] == ["he", "en"]
+    # a summary-enabled 3rd language's owner marker joins the union alternation.
+    import re
+    assert re.search(LP.OWNER_ALT + ":", "Responsable: Ana")  # es owner
+
+
+_test("multilang: detect/gemini byte-identity + multilingual path + config migrate",
+      t_multilang_detect_gemini_migrate)
+
+
 def t_file_transcribe_model():
     """Transcribe File has its OWN model, decoupled from the meeting model:
     "" follows meeting_model; an explicit key wins; the local-pyannote (meetings
@@ -2336,9 +2652,9 @@ def t_file_transcribe_model():
     assert f._file_model_key() == "openai_gpt4o", "empty must follow meeting_model"
     f.config["file_transcribe_model"] = "local_hebrew_turbo"
     assert f._file_model_key() == "local_hebrew_turbo", "explicit file model must win"
-    assert "Hebrew Turbo Local" in f._file_model_label(), f._file_model_label()
+    assert "Whisper Hebrew Local" in f._file_model_label(), f._file_model_label()
 
-    # the file picker must offer Hebrew Turbo Local and omit meetings-only pyannote
+    # the file picker must offer Whisper Hebrew Local and omit meetings-only pyannote
     offered = [k for (_l, k, _r) in w.LiaApp._MEETING_MODELS
                if k != "local_pyannote_hebrew"]
     assert "local_hebrew_turbo" in offered
@@ -3351,14 +3667,174 @@ def t_strip_foreign_script():
     # all-foreign -> empty
     assert S("예 象 نہیں") == ("", 3)
     assert S("") == ("", 0)
-    # wired at both dictation finalize sites
+    # wired at both dictation finalize sites, each passing the profile allow-set
     src = inspect.getsource(wt.LiaApp)
-    assert src.count("strip_foreign_script_words(text)") == 2, \
-        src.count("strip_foreign_script_words(text)")
+    assert src.count("strip_foreign_script_words(") == 2, \
+        src.count("strip_foreign_script_words(")
+    assert src.count("self._allowed_scripts()") >= 2, "dictation must pass the allow-set"
+    # multilingual profile disables the filter (never deletes correct output)
+    assert S("Привет 你好 مرحبا hello", None) == ("Привет 你好 مرحبا hello", 0)
+    # a wider allow-set keeps that script but still drops out-of-set letters
+    import lang_pack as _LP
+    kept, _ = S("Привет 예", frozenset({"Cyrillic"}))
+    assert "Привет" in kept and "예" not in kept
 
 
 _test("dictation: foreign-script word guard (salad clip + clean passthrough)",
       t_strip_foreign_script)
+
+
+def t_multilingual_app_helpers():
+    """Multi-language (2026-09-15): the LiaApp profile helpers, the script-filter
+    allow-set, the language lock in _get_language, and that the he/en bias +
+    router are gated on the Hebrew profile (byte-identical for a he/en config)."""
+    import inspect
+    import lia as w
+    app = w.LiaApp.__new__(w.LiaApp)
+    app.transcriber = None
+    # Hebrew profile (Naor's default): byte-identical helpers.
+    app.config = {"primary_language": "he", "enabled_languages": ["he", "en"],
+                  "model_size": "ivrit-ai/whisper-large-v3-turbo-ct2"}
+    assert w.LiaApp._language_profile(app) == "hebrew"
+    assert w.LiaApp._allowed_scripts(app) == w._HEBREW_ALLOWED_SCRIPTS
+    assert w.LiaApp._language_locked(app) is False
+    # Multilingual profile: the filter is disabled (None), engine auto-detects.
+    app.config = {"primary_language": "es", "enabled_languages": ["es", "en"],
+                  "model_size": "large-v3-turbo"}
+    assert w.LiaApp._language_profile(app) == "multilingual"
+    assert w.LiaApp._allowed_scripts(app) is None
+    assert w.LiaApp._get_language(app) is None   # 2 enabled -> auto-detect
+    # Hard lock: exactly one enabled language forces it on every backend.
+    app.config = {"primary_language": "ja", "enabled_languages": ["ja"],
+                  "model_size": "large-v3-turbo"}
+    assert w.LiaApp._language_locked(app) is True
+    assert w.LiaApp._get_language(app) == "ja"
+    # A he/en config's _get_language is unchanged (auto model -> None).
+    app.config = {"primary_language": "he", "enabled_languages": ["he", "en"],
+                  "model_size": "large-v3-turbo"}
+    assert w.LiaApp._get_language(app) is None
+    # he/en bias is gated on the Hebrew profile at every wiring site.
+    isrc = inspect.getsource(w.LiaApp)
+    assert 'self._language_profile() == "hebrew"' in isrc
+    assert 'groq_he_en_bias", True)) and self._language_profile() == "hebrew"' in isrc, \
+        "he/en bias must be gated on the Hebrew profile"
+    # the router is only built in the Hebrew profile.
+    msrc = inspect.getsource(w.LiaApp._make_local_transcriber)
+    assert '_language_profile() == "hebrew"' in msrc, "router gated to hebrew profile"
+    # the he/en learned vocab is suppressed in the multilingual profile (else a
+    # local Whisper initial_prompt forces Hebrew for a non-Hebrew speaker).
+    app._vocab_store = None
+    app.config = {"primary_language": "es", "enabled_languages": ["es", "en"],
+                  "custom_vocabulary": "git, React"}
+    assert w.LiaApp._composed_vocabulary(app) == ""
+    app.config = {"primary_language": "he", "enabled_languages": ["he", "en"],
+                  "custom_vocabulary": "git, React"}
+    assert w.LiaApp._composed_vocabulary(app) == "git, React"
+
+
+_test("multilingual: app profile helpers + lock + bias/router gating",
+      t_multilingual_app_helpers)
+
+
+def t_summary_multilingual_selectors():
+    """Multi-language summaries (2026-09-15): he/en keep the sha-pinned GOLD; a
+    3rd language's technical resolves to the multilingual general builder; the
+    intermediate passes fall back to English (not Hebrew); summary_check is gated
+    to he/en technical."""
+    import inspect
+    import lia as w
+    import lang_pack as LP
+    # he/en technical + parity are byte-identical to the GOLD constants.
+    assert w._p_summary_meeting("he", "technical") == w._render_nt(w._SUMMARY_PROMPT_MEETING)
+    assert w._p_summary_meeting("en", "technical") == w._render_nt(LP.SUMMARY_PROMPT_MEETING_EN)
+    assert w._p_parity_addendum("he") == w._render_nt(w._SUMMARY_CLOUD_PARITY_ADDENDUM)
+    assert w._p_parity_addendum("en") == w._render_nt(LP.CLOUD_PARITY_ADDENDUM_EN)
+    # a 3rd language's technical -> the multilingual general builder (in-language).
+    es_tech = w._p_summary_meeting("es", "technical")
+    assert es_tech == w._render_nt(LP.build_general_base("es"))
+    assert "Resumen" in es_tech and "Tareas" in es_tech
+    assert w._p_parity_addendum("es", None, "technical") == \
+        w._render_nt(LP.build_general_addendum("es"))
+    # general/minutes already multilingual.
+    assert "Resumen" in w._p_summary_meeting("es", "general")
+    assert "Participantes" in w._p_summary_meeting("es", "minutes")
+    # intermediate passes: he -> Hebrew, else -> English (byte-identical he/en).
+    assert w._p_summary_map("he") == w._render_nt(w._SUMMARY_PROMPT_MAP)
+    assert w._p_summary_map("es") == w._render_nt(LP.SUMMARY_PROMPT_MAP_EN)
+    assert w._p_consolidate("en") == w._render_nt(LP.CONSOLIDATE_PROMPT_EN)
+    # summary_check gate skips general/minutes AND non-he/en technical.
+    gsrc = inspect.getsource(w.LiaApp._run_summary)
+    assert 'template != "technical" or lang not in ("he", "en")' in gsrc
+
+
+_test("multilingual: summary selectors + 3rd-language builder + check gate",
+      t_summary_multilingual_selectors)
+
+
+def t_multilingual_rtl():
+    """Multi-language RTL (2026-09-15): text_direction / is_rtl handle Arabic, and
+    _is_mostly_hebrew (now a shim over text_direction) is byte-identical for
+    Hebrew/Latin text while newly treating Arabic as RTL."""
+    import lia as w
+    import lang_pack as LP
+    assert LP.is_rtl("he") and LP.is_rtl("ar") and not LP.is_rtl("en") and not LP.is_rtl("ru")
+    assert LP.text_direction("مرحبا بالعالم") == "rtl"
+    assert LP.text_direction("שלום עולם") == "rtl"
+    assert LP.text_direction("hello world") == "ltr"
+    assert LP.has_rtl_chars("مرحبا") and LP.has_rtl_chars("שלום") and not LP.has_rtl_chars("hola")
+    # the shim: Hebrew/Latin byte-identical to the retired hebrew>latin count.
+    assert w._is_mostly_hebrew("שלום, נדבר על ה-VPN") is True
+    assert w._is_mostly_hebrew("We will discuss the VPN") is False
+    assert w._is_mostly_hebrew("") is False
+    # NEW: Arabic text is now RTL (was False under the old Hebrew-only count).
+    assert w._is_mostly_hebrew("مرحبا، سنناقش الشبكة") is True
+
+
+_test("multilingual: RTL direction handles Arabic (shim byte-identical he/en)",
+      t_multilingual_rtl)
+
+
+def t_multilingual_full_language_set():
+    """Multi-language (2026-09-15): the FULL Whisper set (99), lang_meta for any
+    code, and the MODEL-AWARE Languages picker (Parakeet's 25 / Whisper's 99)."""
+    import lia as w
+    import lang_pack as L
+    assert len(L.WHISPER_LANGS) >= 99
+    for c in ("th", "sw", "el", "ka", "fa"):
+        assert L.known_language(c)
+        m = L.lang_meta(c)
+        assert m["name_en"] and m["bcp47"] and m["scripts"]
+    assert L.lang_meta("fa")["rtl"] and not L.lang_meta("th")["rtl"]
+    assert L.lang_meta("ja")["scripts"] == ["Han", "Hiragana", "Katakana"]
+    assert L.lang_meta("he")["native"] == "עברית"   # curated row still wins
+    # enabled_languages accepts arbitrary Whisper codes; he/en byte-identical
+    cfg = {"primary_language": "th", "enabled_languages": ["th", "en"]}
+    assert L.enabled_languages(cfg) == ["th", "en"]
+    assert L.language_profile(cfg) == "multilingual"
+    gc = L.gemini_language_codes(cfg)
+    assert gc[0] == "th" and "en-US" in gc
+    assert L.gemini_language_codes({"primary_language": "he"}) == ["he-IL", "en-US"]
+    # model-aware rows: Whisper -> 99, Parakeet -> 25
+    app = w.LiaApp.__new__(w.LiaApp)
+    app.config = {"model_size": "large-v3-turbo", "transcription_backend": "local",
+                  "primary_language": "he", "enabled_languages": ["he", "en"]}
+    assert len(w.LiaApp._model_supported_langs(app)) >= 99
+    rows = w.LiaApp._settings_language_rows(app)
+    assert rows["model_lang_count"] >= 99 and rows["model_kind"] == "whisper"
+    ids = {r["id"] for r in rows["rows"]}
+    assert {"he", "en", "th", "sw", "zh"} <= ids
+    # switch to Parakeet: the picker shrinks to its 25, and an enabled language
+    # Parakeet cannot do (Hebrew) is shown but flagged unsupported.
+    app.config["model_size"] = "parakeet-tdt-0.6b-v3"
+    assert len(w.LiaApp._model_supported_langs(app)) == 25
+    prows = w.LiaApp._settings_language_rows(app)
+    assert prows["model_kind"] == "parakeet" and prows["model_lang_count"] == 25
+    he = next(r for r in prows["rows"] if r["id"] == "he")
+    assert he["enabled"] is True and he["supported"] is False
+
+
+_test("multilingual: full Whisper set + model-aware picker (99 / 25)",
+      t_multilingual_full_language_set)
 
 
 def t_foreign_script_capture():
@@ -3394,7 +3870,7 @@ def t_foreign_script_capture():
     assert side["device"] == "cuda", side["device"]
 
     # Parakeet is labelled as its own engine (the Parakeet-on-Hebrew hypothesis).
-    app.config["model_size"] = "parakeet-tdt-0.6b-v2"
+    app.config["model_size"] = "parakeet-tdt-0.6b-v3"
     app._capture_foreign_script_clip(audio, "x 예", "x", 1, duration_sec=1.0,
                                      pre_gain_peak_rms=0.1, source="mic")
     newest = sorted(f for f in _os.listdir(d) if f.endswith(".json"))[-1]
@@ -3898,6 +4374,7 @@ def t_live_transcript():
     s = wt.MeetingSession.__new__(wt.MeetingSession)
     s.diarize_mode, s._cancelled = False, False
     s.start_time = _time.time()
+    s.chunk_seconds = 45   # set by __init__ from config; __new__ bypasses it
     s._chunks_lock, s._live_lock = _th.Lock(), _th.Lock()
     s._live_warned = False
     # completion order != chunk order — the file must still be chunk-ordered
@@ -3939,6 +4416,158 @@ def t_live_transcript():
 
 
 _test("meeting: rolling LIVE transcript (order + atomic + cleanup)", t_live_transcript)
+
+
+def t_meeting_chunk_cadence():
+    """Config-driven realtime cadence (2026-09-15): meeting_chunk_seconds sets the
+    rotation interval, clamped to [5,120]; the silent-mic nudge drain count is
+    derived from it so the ~2-min threshold holds at any cadence. Plus the
+    self-refreshing live-transcript window module + its wiring."""
+    import inspect
+    import lia as w
+
+    class FakeApp:
+        def __init__(self, cfg):
+            self.config = dict(cfg)
+
+    def mk(cfg):
+        # input_device_index given so __init__ never touches real audio devices.
+        return w.MeetingSession(FakeApp(cfg), input_device_index=1,
+                                loopback_device_index=None)
+
+    assert w.MeetingSession.DEFAULT_CHUNK_SECONDS == 15
+    assert mk({}).chunk_seconds == 15                       # default when unset
+    assert mk({"meeting_chunk_seconds": 10}).chunk_seconds == 10
+    assert mk({"meeting_chunk_seconds": 1}).chunk_seconds == 5      # clamp low
+    assert mk({"meeting_chunk_seconds": 9999}).chunk_seconds == 120  # clamp high
+    assert mk({"meeting_chunk_seconds": "nope"}).chunk_seconds == 15  # bad -> default
+    # nudge drains scale to keep ~2 min regardless of cadence
+    assert mk({"meeting_chunk_seconds": 15})._mic_silent_drains == 8
+    assert mk({"meeting_chunk_seconds": 45})._mic_silent_drains == 3
+    assert mk({"meeting_chunk_seconds": 120})._mic_silent_drains == 2
+    assert "timeout=self.chunk_seconds" in inspect.getsource(w.MeetingSession._rotation_loop)
+    assert w.DEFAULT_CONFIG.get("meeting_chunk_seconds") == 15
+
+    # Live-transcript auto-refresh window: module + LiveApi lifecycle (no webview
+    # needed - webview/ui_kit are imported lazily inside main()).
+    import importlib, tempfile, os as _os
+    lt = importlib.import_module("live_transcript_window")
+    d = tempfile.mkdtemp(prefix="wt_ltwin_")
+    p = _os.path.join(d, "m_LIVE.txt")
+    api = lt.LiveApi({"live_path": p, "chunk_seconds": 15})   # no status sidecar -> legacy inference
+    assert api.get()["phase"] == "waiting"           # not written yet
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("head line\n\n[00:00] hello world\n")
+    r = api.get()
+    assert r["phase"] == "recording" and "hello world" in r["text"]
+    assert api.version() != ""
+    _os.remove(p)
+    assert api.get()["phase"] == "ended"             # seen then gone = ended
+
+    # Wiring: tray opens the self-refreshing window (single instance) + payload,
+    # with a raw-file fallback.
+    src = inspect.getsource(w.LiaApp._spawn_live_transcript_window)
+    for marker in ("live_transcript_window.py", "_live_transcript_proc",
+                   "chunk_seconds", "live_path"):
+        assert marker in src, "spawn window missing %r" % marker
+    op = inspect.getsource(w.LiaApp._open_live_transcript)
+    assert "_spawn_live_transcript_window" in op and "os.startfile" in op
+
+    # Settings knob: the Meetings page has the interval select + the action is
+    # in the allowlist (the coverage test guards the reverse: no dead actions).
+    base = _os.path.dirname(_os.path.abspath(w.__file__))
+    sw = open(_os.path.join(base, "settings_window.py"), encoding="utf-8").read()
+    assert 'data-select="set_meeting_chunk_seconds"' in sw, "no cadence select in Settings"
+    app = w.LiaApp.__new__(w.LiaApp)
+    assert "set_meeting_chunk_seconds" in w.LiaApp._settings_action_map(app)
+
+
+_test("meeting: config-driven chunk cadence + live-transcript window",
+      t_meeting_chunk_cadence)
+
+
+def t_meeting_status_sidecar():
+    """Reliable recording->result flow (Phase 4): the meeting writes a status
+    sidecar with the authoritative phase + per-artifact readiness; the live window
+    reads it (not filename inference) and opens only that meeting's own files."""
+    import json as _json
+    import os as _os
+    import tempfile
+    import threading as _th
+    import importlib
+    import lia as w
+
+    d = tempfile.mkdtemp(prefix="wt_status_")
+
+    # --- MeetingSession._set_status: atomic, merging, version-bumping ---
+    s = w.MeetingSession.__new__(w.MeetingSession)
+    s._status_path = _os.path.join(d, "x_meeting_LIVE.txt.status.json")
+    s._status = {}
+    s._status_lock = _th.Lock()
+    s._set_status(phase="recording", chunk_seconds=15, summarize=True,
+                  transcript={"ready": False, "path": None})
+    st = _json.load(open(s._status_path, encoding="utf-8"))
+    assert st["phase"] == "recording" and st["version"] == 1 and st["chunk_seconds"] == 15
+    s._set_status(phase="processing")                       # merge, keep chunk_seconds
+    st = _json.load(open(s._status_path, encoding="utf-8"))
+    assert st["phase"] == "processing" and st["version"] == 2 and st["chunk_seconds"] == 15
+    # no status path -> silent no-op (never raises)
+    s0 = w.MeetingSession.__new__(w.MeetingSession)
+    s0._status_path = None; s0._status = {}; s0._status_lock = _th.Lock()
+    s0._set_status(phase="done")
+
+    # --- LiveApi reads the sidecar and reports the real phase + readiness ---
+    lt = importlib.import_module("live_transcript_window")
+    live = _os.path.join(d, "m_LIVE.txt")
+    status = live + ".status.json"
+    tpath = _os.path.join(d, "m_meeting.txt")
+    open(tpath, "w", encoding="utf-8").write("the transcript")
+    _json.dump({"phase": "done", "summarize": False, "version": 5,
+                "transcript": {"ready": True, "path": tpath},
+                "summary": {"ready": False, "path": None}},
+               open(status, "w", encoding="utf-8"))
+    api = lt.LiveApi({"live_path": live, "status_path": status})
+    r = api.get()
+    assert r["phase"] == "done" and r["transcript_ready"] and r["transcript_path"] == tpath
+    assert not r["summary_ready"]
+
+    # open_artifact: opens a file INSIDE the meetings dir, rejects one outside it
+    opened = []
+    had = hasattr(_os, "startfile")
+    real = _os.startfile if had else None
+    _os.startfile = lambda p: opened.append(p)
+    try:
+        assert api.open_artifact("transcript")["ok"] is True
+        assert opened and _os.path.abspath(opened[-1]) == _os.path.abspath(tpath)
+        assert api.open_artifact("summary")["ok"] is False    # no summary path
+        # a path OUTSIDE the meeting folder must be refused (no startfile)
+        outside = tempfile.mkdtemp(prefix="wt_outside_")
+        badf = _os.path.join(outside, "evil.txt"); open(badf, "w").write("x")
+        _json.dump({"phase": "done", "transcript": {"ready": True, "path": badf}},
+                   open(status, "w", encoding="utf-8"))
+        api2 = lt.LiveApi({"live_path": live, "status_path": status})
+        n_before = len(opened)
+        assert api2.open_artifact("transcript")["ok"] is False
+        assert len(opened) == n_before, "must not open a file outside the meetings dir"
+    finally:
+        if had: _os.startfile = real
+        else:
+            try: del _os.startfile
+            except Exception: pass
+
+    # --- wiring: the session writes status at each transition ---
+    import inspect
+    for meth, phrase in (("stop", 'phase="processing"'),
+                         ("cancel", 'phase="cancelled"'),
+                         ("_write_output_file", '_set_status(')):
+        src = inspect.getsource(getattr(w.MeetingSession, meth))
+        assert phrase in src, "%s missing status write %r" % (meth, phrase)
+    # the parent passes status_path to the window
+    assert "status_path" in inspect.getsource(w.LiaApp._spawn_live_transcript_window)
+
+
+_test("meeting: status sidecar + window phases (recording->processing->done)",
+      t_meeting_status_sidecar)
 
 
 def t_chunked_wav_safety_net():
@@ -4685,9 +5314,15 @@ def t_cleanup_provider_and_models():
     assert wt.DEFAULT_CONFIG.get("cleanup_llm_model_openai") == "gpt-5.6-luna"
     # cleanup ships OFF — the default model only matters once turned on.
     assert wt.DEFAULT_CONFIG.get("cleanup_style") == "off"
-    # ⭐ default marker sits on luna, not another row.
-    starred = [m for l, m in App.CLEANUP_OPENAI_MODELS if "⭐" in l]
-    assert starred == ["gpt-5.6-luna"], starred
+    # AI Cleanup labels carry NO decorative emoji/stars (Naor 2026-09-16); the
+    # default is tracked by config (cleanup_llm_model_openai above), not a marker.
+    for l, _m in (App.CLEANUP_OPENAI_MODELS + App.CLEANUP_GEMINI_MODELS
+                  + App.CLEANUP_MENU_STYLES):
+        assert not any(ch in l for ch in "⭐✨⚡"), l
+    import os as _os
+    wt_src = open(_os.path.join(_os.path.dirname(_os.path.abspath(wt.__file__)),
+                                "lia.py"), encoding="utf-8").read()
+    assert '"Groq Llama-3.3-70B (free)"' in wt_src and "⚡  Groq Llama" not in wt_src
 
     app = App.__new__(App)
     # auto + both keys → OpenAI (pay-as-you-go, no daily cap).
@@ -5381,7 +6016,7 @@ def t_no_gpu_needs_setup_state():
     assert 'if backend != "local" and self.transcriber is not None' in sb
     assert "self.model_loaded = True" in sb
     # the no-GPU gate must not skip the CPU-by-design local model (Parakeet)
-    assert "parakeet-tdt-0.6b-v2" in w.CPU_FRIENDLY_MODELS
+    assert "parakeet-tdt-0.6b-v3" in w.CPU_FRIENDLY_MODELS
     assert 'not in CPU_FRIENDLY_MODELS' in src, "no_gpu gate must exempt CPU-friendly models"
 
 
@@ -5532,7 +6167,7 @@ def t_fresh_install_defaults_1_4_4():
     assert "_no_gpu_parakeet_notice" not in app.config and app._pending_notices == []
     # runtime safety net + welcome text + chained-reload flag ownership
     src = inspect.getsource(App._load_model)
-    assert "switching dictation to English Parakeet" in src
+    assert "switching dictation to Parakeet Multi-Language" in src
     assert "_queue_notice(*self._NO_GPU_PARAKEET_NOTICE)" in src
     assert 'getattr(self, "_model_load_t0", None) == my_t0' in src
     ob = inspect.getsource(App._tray_first_run_onboarding)
@@ -6275,7 +6910,8 @@ def t_webview_windows_defer_api():
     here = os.path.dirname(os.path.abspath(__file__))
     for fn in ("meetings_search.py", "action_items.py", "email_search.py",
                "chat_window.py", "compose_editor.py", "settings_window.py",
-               "history_window.py", "summarize_window.py"):
+               "history_window.py", "summarize_window.py",
+               "live_transcript_window.py"):
         src = open(os.path.join(here, fn), encoding="utf-8").read()
         # a COLUMN-0 (non-indented, i.e. top-level) JS line touching the bridge = the bug
         bad = re.search(r"(?m)^\S[^\n]*window\.pywebview\.api", src)
@@ -6302,8 +6938,8 @@ def t_webview_no_inline_handler_injection():
     here = os.path.dirname(os.path.abspath(__file__))
     files = ("meetings_search.py", "action_items.py", "email_search.py",
              "chat_window.py", "compose_editor.py", "settings_window.py",
-             "history_window.py", "summarize_window.py", "ui_kit.py",
-             "ui_kit_gallery.py")
+             "history_window.py", "summarize_window.py", "live_transcript_window.py",
+             "ui_kit.py", "ui_kit_gallery.py")
     # e.g.  onclick="openMeeting(\''+esc(id)+'\')"   or   onclick="f('+i+')"
     # (?<!\w) so words merely CONTAINING "on..." (textContent) don't match
     sink = re.compile(r"""(?<!\w)on\w+\s*=\s*\\?["'][^"'\n]*['"]\s*\+""")
@@ -6443,6 +7079,220 @@ _test("ui_kit: design tokens, page() assembler, bridge-defer discipline",
       t_ui_kit_tokens)
 
 
+def t_ui_kit_icons():
+    """Local SVG icon set (Phase 1): icon() + RK.icon share ONE ICONS map, render
+    inline currentColor SVGs, carry an accessible name when meaningful (decorative
+    ones are aria-hidden), add no network dependency, and replace the settings-nav
+    emoji."""
+    import ui_kit as uk
+    assert isinstance(uk.ICONS, dict) and len(uk.ICONS) >= 20
+    for name in ("models", "audio", "general", "meetings", "home",
+                 "history", "search", "mic", "tasks"):
+        assert name in uk.ICONS, "missing icon " + name
+    s = uk.icon("models", title="Models")
+    assert s.startswith("<svg") and s.endswith("</svg>")
+    assert 'stroke="currentColor"' in s and 'fill="none"' in s
+    assert 'role="img"' in s and 'aria-label="Models"' in s and "<title>Models</title>" in s
+    dec = uk.icon("audio")                       # no title -> decorative
+    assert 'aria-hidden="true"' in dec and "role=" not in dec
+    assert uk.icon("does-not-exist") == "", "unknown icon must render empty"
+    assert "http" not in s, "icon SVG must carry no external URL/namespace"
+    # JS-built HTML shares the SAME icon map via RK.icon
+    assert "RK.ICONS" in uk.JS_BASE and "RK.icon" in uk.JS_BASE
+    for name in ("models", "meetings", "mic"):
+        assert ('"%s"' % name) in uk.JS_BASE, "icon %s missing from the JS map" % name
+    # settings sidebar renders SVG icons, not emoji
+    import settings_window as sw
+    assert "ico-svg" in sw.BODY and 'data-page="advanced"' in sw.BODY
+    for emoji in ("&#129504;", "&#127911;", "&#9881;", "&#128220;", "&#128273;"):
+        assert emoji not in sw.BODY, "settings nav still has emoji " + emoji
+
+
+_test("ui_kit: local SVG icon set (Python + JS) replaces nav emoji",
+      t_ui_kit_icons)
+
+
+def t_settings_search():
+    """Settings search (Phase 2): a static local index with he+en aliases, a
+    jumpTo that navigates + flashes + focuses, an empty state, and NO personal
+    field values or secrets indexed."""
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    src = open(os.path.join(here, "settings_window.py"), encoding="utf-8").read()
+    assert 'id="settingsSearch"' in src, "no settings search input in BODY"
+    for fn in ("SEARCH_INDEX", "function jumpTo(", "function searchRun(",
+               "setting-flash"):
+        assert fn in src, "settings search missing " + fn
+    assert "No settings found" in src, "search has no empty state"
+    # bilingual aliases: both Hebrew and English must resolve common settings
+    assert "מיקרופון" in src and "microphone" in src, "no he/en microphone alias"
+    assert "קיצור" in src and "hotkey" in src, "no he/en hotkey alias"
+    # the index is static labels only - it must never carry secret-shaped material
+    i = src.index("var SEARCH_INDEX = [")
+    idx_block = src[i:src.index("];", i)]
+    for secretish in ("gsk_", "sk-", "AIza", "dpapi:", "_api_key", "serve_token"):
+        assert secretish not in idx_block, "search index leaks secret-shaped text: " + secretish
+
+
+_test("settings: local search (he/en aliases, jump-to-field, no secrets)",
+      t_settings_search)
+
+
+def t_settings_models_active_engines():
+    """Models page (Phase 3): an 'Active engines' summary derived from the
+    existing table data - the SELECTED model's readable name, a place tag
+    (local/cloud/server), and real availability - above the detail groups. No
+    invented metrics."""
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    src = open(os.path.join(here, "settings_window.py"), encoding="utf-8").read()
+    for marker in ("Active engines", "function engCard(", "function placeOf(",
+                   "eng-grid", "engineSummary"):
+        assert marker in src, "models summary missing " + marker
+    # the three roles are summarized
+    for role in ('engCard("Dictation"', 'engCard("Meeting transcription"',
+                 'engCard("Summaries"'):
+        assert role in src, "missing engine card: " + role
+    # availability comes from the row's own enabled/note, not a fabricated status
+    assert "sel.enabled!==false" in src, "status must derive from the row data"
+    # place badges exist for all three environments
+    ui = open(os.path.join(here, "settings_window.py"), encoding="utf-8").read()
+    for cls in (".place.local", ".place.cloud", ".place.server"):
+        assert cls in ui, "missing place badge style " + cls
+
+
+_test("settings: Models 'active engines' summary (name + place + status)",
+      t_settings_models_active_engines)
+
+
+def t_settings_save_feedback():
+    """Phase 5: a successful action shows an in-place confirmation in the settings
+    header (flashStatus with the real message), complementing the corner toast."""
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    src = open(os.path.join(here, "settings_window.py"), encoding="utf-8").read()
+    assert "function flashStatus(" in src, "no in-place save confirmation"
+    assert "flashStatus(msg.msg, msg.ok)" in src, "result handler must flash the confirmation"
+
+
+_test("settings: in-place save/result confirmation (flashStatus)",
+      t_settings_save_feedback)
+
+
+def t_settings_home_page():
+    """Home landing page: a wide-optimized layout (Naor 2026-09-16) - a compact
+    header (Start meeting / Transcribe file + an overflow menu), a compact info
+    line, and a meetings LIST with a side PREVIEW on wide windows. Header actions
+    are allowlisted; the per-meeting preview actions (open / edit / transcript /
+    rename / copy) live in loadHomePreview and are allowlisted too. The old
+    Quick-actions card + single-scroll recent-list are gone; Ask-your-meetings +
+    Action items are not on Home."""
+    import inspect, os
+    import lia as w
+    App = w.LiaApp
+    here = os.path.dirname(os.path.abspath(w.__file__))
+    src = open(os.path.join(here, "settings_window.py"), encoding="utf-8").read()
+    assert "PAGES.home = function" in src, "no Home page"
+    assert '_nav_button("home"' in src, "Home not in the nav"
+    # isolate the Home page body so the presence/absence checks are Home-specific
+    home_src = src[src.index("PAGES.home = function"):src.index("PAGES.general = function")]
+    for tok in ("home_start_meeting", "home_stop_meeting", "transcribe_file",
+                "show_history", "open_meetings_folder", "mtgSearch", "mtg-row",
+                "home-body", "mtg-preview"):
+        assert tok in home_src, "home page missing " + tok
+    # removed: the Quick-actions grid + Ask / Action items are not on Home
+    for gone in ("open_meetings_ask", "open_action_items", "home-acts", "recent-list"):
+        assert gone not in home_src, "home page still has " + gone
+    # the wide-window preview wires the per-meeting actions
+    for tok in ("function loadHomePreview", "open_meeting_path", "open_meeting_transcript",
+                "rename_speakers_for", "copy_meeting_summary", "get_meeting_details"):
+        assert tok in src, "home preview missing " + tok
+    # every home / preview action is on the allowlist
+    amap = App._settings_action_map(App.__new__(App))
+    for act in ("home_start_meeting", "home_stop_meeting", "cancel_meeting",
+                "show_history", "transcribe_file", "open_meetings_folder",
+                "open_meeting_path", "get_meeting_details", "open_meeting_transcript",
+                "rename_speakers_for", "copy_meeting_summary"):
+        assert act in amap, "home action not allowlisted: " + act
+    # reads stay inside the meetings dir; the details payload rides `data`
+    assert "def _recent_meetings" in inspect.getsource(App)
+    assert "commonpath" in inspect.getsource(App._meeting_in_dir), "must validate path"
+    assert 'return (True, "", {' in inspect.getsource(App._get_meeting_details)
+    # the settings state carries the home data, and the tray opens Home
+    assert '"home":' in inspect.getsource(App._settings_state)
+    # get_meeting_details is READ-ONLY (no state push) - else Home re-renders,
+    # re-requests it, and flickers forever (the 2026-09-16 loop).
+    assert "get_meeting_details" in App._SETTINGS_READONLY_METHODS
+    lia_src = open(os.path.join(here, "lia.py"), encoding="utf-8").read()
+    assert "Open Lia" in lia_src and 'page="home"' in lia_src, "tray must open Home"
+
+
+_test("settings: Home wide layout (list + preview) + allowlisted actions",
+      t_settings_home_page)
+
+
+def t_recent_meetings_title_clean():
+    """_recent_meetings strips the leading <date>_<time> stamp from the display
+    name (the date column already shows it) and flags diarized meetings."""
+    import lia as w
+    import os as _os, tempfile
+    App = w.LiaApp
+    d = tempfile.mkdtemp()
+    for n in ("2026-09-16_09-44-13_Dror_Abulof_meeting.txt",
+              "2026-09-14_16-07-02_Cloud_policy_meeting_diarized.txt",
+              "2026-05-28_14-24_meeting.txt",          # older: HH-MM, no seconds
+              "2026-05-27_meeting.txt"):               # date only, no name
+        open(_os.path.join(d, n), "w").close()
+    app = App.__new__(App)
+    import lia
+    _orig = lia.MEETINGS_DIR
+    lia.MEETINGS_DIR = d
+    try:
+        rows = {r["title"]: r for r in app._recent_meetings(10)}
+    finally:
+        lia.MEETINGS_DIR = _orig
+    assert "Dror Abulof" in rows, rows            # no "09-44-13 " prefix
+    assert "Cloud policy" in rows, rows
+    assert rows["Cloud policy"]["diarized"] is True
+    assert rows["Dror Abulof"]["diarized"] is False
+    # a timestamp-only name doesn't leak the raw stamp into the title column
+    assert "2026-05-28 14-24" not in rows and "2026-05-27" not in rows, rows
+    assert "Untitled meeting" in rows, rows
+
+
+_test("home: recent-meeting titles drop the redundant time prefix",
+      t_recent_meetings_title_clean)
+
+
+def t_open_meeting_summary_editor():
+    """Clicking a recent meeting opens its summary in the WYSIWYG editor when one
+    exists (editable, not Notepad); chunked + diarized transcripts pair with the
+    SAME X_meeting_summary.html; None (fall back to the file) when there is no
+    summary or the path isn't a .txt."""
+    import lia as w
+    import os as _os, tempfile
+    App = w.LiaApp
+    d = tempfile.mkdtemp()
+    txt = _os.path.join(d, "2026-09-16_09-00-00_call_meeting.txt")
+    html = _os.path.join(d, "2026-09-16_09-00-00_call_meeting_summary.html")
+    open(txt, "w").close()
+    assert App._meeting_summary_html_for(txt) is None      # no summary yet
+    open(html, "w").close()
+    assert App._meeting_summary_html_for(txt) == html       # chunked -> summary
+    dtxt = _os.path.join(d, "2026-09-16_09-00-00_call_meeting_diarized.txt")
+    open(dtxt, "w").close()
+    assert App._meeting_summary_html_for(dtxt) == html       # diarized shares it
+    assert App._meeting_summary_html_for(html) is None       # not a .txt
+    # the Home action routes through this helper to the editor
+    src = open(_os.path.join(_os.path.dirname(_os.path.abspath(w.__file__)),
+                             "lia.py"), encoding="utf-8").read()
+    assert "_meeting_summary_html_for" in src and "_open_summary_editor(html)" in src
+
+
+_test("home: clicking a meeting opens the summary editor (not Notepad)",
+      t_open_meeting_summary_editor)
+
+
 def t_ui_kit_no_webview_import():
     """Importing ui_kit must NOT drag in the heavy `webview` package (the parent
     app imports ui_kit in-process; webview is only needed inside a child window,
@@ -6507,7 +7357,7 @@ def t_settings_actions_coverage():
     expected = [
         # General
         "capture_hotkey", "set_hotkey", "set_recording_mode", "set_paste_mode",
-        "set_primary_language",
+        "set_primary_language", "set_enabled_languages",
         "toggle_clipboard_auto_restore", "toggle_press_enter_after_paste",
         "toggle_silent_mode", "toggle_auto_start", "set_beep_device",
         "set_history_retention_weeks", "clear_history",
@@ -6527,7 +7377,6 @@ def t_settings_actions_coverage():
         "set_transcription_role", "open_tailscale", "set_serve_model",
         # Meetings
         "toggle_auto_detect_meetings", "open_meetings_ask", "open_action_items",
-        "open_task_note",
         "open_meetings_folder", "edit_meeting_summary", "transcribe_file",
         "voice_ask_now", "set_voice_ask_output",
         "summarize_text_dialog", "open_live_transcript",
@@ -6711,6 +7560,7 @@ def t_meeting_mic_silence_check():
         s = w.MeetingSession.__new__(w.MeetingSession)
         s.app = FakeApp()
         s.diarize_mode = False
+        s._mic_silent_drains = 3   # __init__ derives this from the chunk cadence
         s._mic_recorder = FakeRec(mic)
         s._loopback_recorder = FakeRec(loop)
         return s
@@ -6895,14 +7745,18 @@ def t_meeting_mic_auto_fallback():
         def __init__(self, fallback=True):
             self.config = {"meeting_mic_auto_fallback": fallback,
                            "keep_meeting_audio": True, "keep_meeting_tracks": False}
-            self.shown = []
+            self.shown = []      # ERROR overlays (the wrong-device nudge)
+            self.notices = []    # neutral notice overlays (the successful auto-switch)
         def _force_show_error_overlay(self, msg):
             self.shown.append(msg)
+        def _force_show_notice_overlay(self, msg, bg_color=None, duration=0):
+            self.notices.append(msg)
 
     def fresh(mic, loop, backup, fallback=True):
         s = w.MeetingSession.__new__(w.MeetingSession)
         s.app = FakeApp(fallback)
         s.diarize_mode = False
+        s._mic_silent_drains = 3   # __init__ derives this from the chunk cadence
         s._track_writers = {}
         s._track_lock = __import__("threading").Lock()
         s._input_device_index = 4
@@ -6919,12 +7773,15 @@ def t_meeting_mic_auto_fallback():
     out = s._drain_audio_inner()
     assert s._mic_recorder.tag == "backup" and s._backup_recorder is None
     assert s._input_device_index == 1, "meeting mic index follows the promoted device"
-    assert any("switched" in m for m in s.app.shown)
+    # A SUCCESSFUL auto-switch is a neutral notice (respects silent_mode), NOT a
+    # scary red error - the meeting is transcribing fine on the dictation mic.
+    assert any("dictation mic" in m for m in s.app.notices), "switch must surface a notice"
+    assert not s.app.shown, "a successful auto-switch must not flash the error overlay"
     assert out is not None and float(np.abs(out).max()) > 0.05, \
         "this window's backup audio must reach the mix (user's side not lost)"
-    n_shown = len(s.app.shown)
+    n_notices = len(s.app.notices)
     s._drain_audio_inner()
-    assert len(s.app.shown) == n_shown, "never switches twice"
+    assert len(s.app.notices) == n_notices, "never switches twice"
     # user silent on BOTH mics -> no evidence, no switch
     s2 = fresh(silent, live, silent)
     s2._drain_audio_inner()
@@ -6976,7 +7833,8 @@ def t_meeting_chunk_foreign_script_strip():
     assert w.strip_foreign_script_words("象 نہیں 예") == ("", 3), \
         "an all-foreign chunk collapses to empty"
     src = inspect.getsource(w.MeetingSession._submit_chunk)
-    assert "strip_foreign_script_words(text)" in src, "chunk worker must run the filter"
+    assert "strip_foreign_script_words(" in src, "chunk worker must run the filter"
+    assert "self.app._allowed_scripts()" in src, "chunk worker must pass the profile allow-set"
     assert "foreign_emptied" in src and 'status = "empty"   # hallucinated salad' in src, \
         "an all-foreign chunk must classify as empty, not failed"
 
@@ -7298,7 +8156,8 @@ def t_local_tasks_pass():
     assert "toggle_summary_local_tasks_pass" in actions
     src = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)),
                             "lia.py"), encoding="utf-8").read()
-    assert 'local_tasks_pass=bool(self.config.get("summary_local_tasks_pass", False))' in src
+    # (the light 8 GB tier gates this OFF, so the flag now rides `(not light) and ...`)
+    assert 'local_tasks_pass=(not light) and bool(self.config.get("summary_local_tasks_pass", False))' in src
     sw = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)),
                            "settings_window.py"), encoding="utf-8").read()
     assert "toggle_summary_local_tasks_pass" in sw
@@ -8748,6 +9607,13 @@ def t_settings_state_shape():
                 "cleanup_styles", "cleanup_models"):
         assert grp in st["tables"], "state tables missing " + grp
     assert st["hotkeys"]["main"] and "config" in st["paths"]
+    # multi-language rows are exposed for the General Languages controls
+    assert "languages" in st and st["languages"]["rows"], "language rows exposed"
+    lmap = {r["id"]: r for r in st["languages"]["rows"]}
+    assert {"he", "en", "es", "ru"} <= set(lmap)
+    assert lmap["he"]["enabled"] and lmap["en"]["enabled"] and not lmap["es"]["enabled"]
+    assert lmap["es"]["summary_ok"] and not lmap["zh"]["summary_ok"]  # es shipped, zh not
+    assert st["languages"]["profile"] == "hebrew" and st["languages"]["locked"] is False
     # summary-template catalogue is exposed for the Models-page picker
     tpls = st["summary_templates"]
     assert [t["id"] for t in tpls] == ["technical", "general", "minutes"]
@@ -8793,88 +9659,6 @@ def t_remote_row_disabled_when_server():
 
 _test("settings: remote-server rows dim when this PC is the transcription server",
       t_remote_row_disabled_when_server)
-
-
-def t_tasks_store():
-    """Personal task-note store: add (newest first, whitespace-collapsed) /
-    toggle / set_done / edit / delete / clear_done / counts / version, with an
-    insertion cap and safe no-ops for a missing id."""
-    import os as _os
-    import shutil
-    import tempfile
-    import tasks_store as st
-    saved_path, saved_cap = st.STORE_PATH, st.MAX_TASKS
-    d = tempfile.mkdtemp(prefix="lia_tasks_")
-    st.STORE_PATH = _os.path.join(d, "tasks.json")
-    try:
-        assert st.all_tasks() == [] and st.version() == 0
-        assert st.counts() == {"open": 0, "done": 0, "total": 0}
-        a = st.add("  call   Mike\ntomorrow  ")            # whitespace collapsed
-        assert a and a["text"] == "call Mike tomorrow" and a["done"] is False
-        b = st.add("buy milk")
-        assert [t["text"] for t in st.all_tasks()] == ["buy milk", "call Mike tomorrow"]  # newest first
-        assert st.add("   ") is None and st.add("") is None  # empty ignored
-        assert st.version() > 0
-        assert st.toggle(a["id"]) is True and st.toggle(a["id"]) is False
-        assert st.set_done(b["id"], True) is True
-        assert st.counts() == {"open": 1, "done": 1, "total": 2}
-        assert [t["id"] for t in st.open_tasks()] == [a["id"]]
-        assert st.edit(a["id"], "call Michelle") is True
-        assert next(t for t in st.all_tasks() if t["id"] == a["id"])["text"] == "call Michelle"
-        assert st.edit(a["id"], "   ") is False             # empty edit ignored
-        assert st.clear_done() == 1                          # removes only the done one
-        assert st.counts() == {"open": 1, "done": 0, "total": 1}
-        assert st.delete(a["id"]) is True and st.delete("nope") is False
-        assert st.all_tasks() == []
-        assert st.set_done("x", True) is None and st.toggle("x") is None  # safe no-ops
-        # insertion cap
-        st.MAX_TASKS = 3
-        for i in range(6):
-            st.add("t%d" % i)
-        assert len(st.all_tasks()) == 3
-        assert [t["text"] for t in st.all_tasks()] == ["t5", "t4", "t3"]  # newest kept
-    finally:
-        st.STORE_PATH, st.MAX_TASKS = saved_path, saved_cap
-        shutil.rmtree(d, ignore_errors=True)
-
-
-_test("task note: personal task store (CRUD, newest-first, cap, safe no-ops)",
-      t_tasks_store)
-
-
-def t_task_note_wiring():
-    """The task-note voice capture reuses the voice-ask machinery via mode='task'
-    (so every existing mic-busy guard already covers it); the parent methods,
-    config defaults, hotkeys, tray/settings wiring and the sticky window/store
-    modules all exist."""
-    import inspect
-    import lia as w
-    App = w.LiaApp
-    assert w.DEFAULT_CONFIG.get("tasks_hotkey") and w.DEFAULT_CONFIG.get("tasks_toggle_hotkey")
-    for m in ("_task_note_voice_toggle", "_task_note_add_from_voice",
-              "_show_task_note", "_toggle_task_note"):
-        assert callable(getattr(App, m, None)), "missing " + m
-    # voice-ask start takes a mode; the stop path branches to the task note
-    assert "mode" in inspect.signature(App._voice_ask_start).parameters
-    stop_src = inspect.getsource(App._voice_ask_stop_and_answer)
-    assert 'mode == "task"' in stop_src and "_task_note_add_from_voice" in stop_src
-    assert 'mode="task"' in inspect.getsource(App._task_note_voice_toggle)
-    add_src = inspect.getsource(App._task_note_add_from_voice)
-    assert "tasks_store" in add_src and "_show_task_note" in add_src
-    # registration + action-map
-    src = inspect.getsource(App)
-    assert "tasks_hotkey" in src and "_task_note_voice_toggle" in src and "_toggle_task_note" in src
-    assert "open_task_note" in App._settings_action_map(App.__new__(App))
-    # the sticky window + store modules import and expose the bridge API
-    import tasknote_window
-    assert hasattr(tasknote_window, "HTML") and hasattr(tasknote_window, "TasksApi")
-    api = tasknote_window.TasksApi({})
-    for meth in ("get", "add", "set_done", "delete", "clear_done", "version"):
-        assert callable(getattr(api, meth, None)), "TasksApi missing " + meth
-
-
-_test("task note: voice capture (mode=task) + window/store wiring",
-      t_task_note_wiring)
 
 
 def t_bundle_secret_scrub():
@@ -9055,10 +9839,34 @@ def t_history_window_wiring():
     assert uk.window_geometry("history") == {"width": 900, "height": 700, "x": 40, "y": 20}
     uk.save_ui_pref("win_bad", {"width": 5, "height": 5})   # absurd -> default
     assert uk.window_geometry("bad", {"d": 1}) == {"d": 1}
+    # Phase 5: copy is a dedicated keyboard-accessible button (not click-anywhere),
+    # the transcript text stays freely selectable, and empty-search is distinct.
+    hsrc = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)),
+                             "history_window.py"), encoding="utf-8").read()
+    assert "data-copy" in hsrc and "user-select:text" in hsrc, "copy must be a button, text selectable"
+    assert "No results for" in hsrc, "no distinct no-results message"
 
 
 _test("history: pywebview window + txt fallback + ui_kit prefs/geometry",
       t_history_window_wiring)
+
+
+def t_action_items_undo():
+    """Action items (Phase 5): completing a task shows an Undo snackbar (8s,
+    keyboard-focused) that restores via the SAME id and survives the list
+    refresh (the snackbar is independent of #wrap)."""
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    src = open(os.path.join(here, "action_items.py"), encoding="utf-8").read()
+    assert 'id="snack"' in src and 'id="snackUndo"' in src, "no undo snackbar"
+    assert "function showUndo(" in src and "setTimeout(hideUndo, 8000)" in src, "no 8s undo window"
+    assert "API.set_done(id, false)" in src, "undo must restore via set_done(false)"
+    assert "snackUndo').focus()" in src, "undo must be keyboard-focused"
+    assert "if(done) showUndo(id)" in src, "completing a task must arm undo"
+
+
+_test("action items: complete -> Undo snackbar (restore by id, 8s)",
+      t_action_items_undo)
 
 
 def t_history_retention():
@@ -9568,6 +10376,176 @@ def t_autostart_relaunch_spawn():
 
 _test("startup: logon relaunch spawns the next attempt (detached, flagged, delayed)",
       t_autostart_relaunch_spawn)
+
+
+def t_soften_chunk_boundary():
+    """Transcript flow (2026-09-16): Whisper closes EVERY chunk with a period,
+    so a smart-cut (short pause) boundary drops that artificial period and
+    flows; any real sentence-end signal keeps it (long pause, ? / !, the final
+    chunk, a discourse opener starting the next chunk)."""
+    import lia as w
+    f = w.soften_chunk_boundary
+    # The screenshot case: "עכשיו שיש עוד הצעה." -> next chunk continues mid-thought.
+    assert f("עכשיו שיש עוד הצעה.", "זה סביב ה-60,000 דולר", "smart", 0.3) == \
+        ("עכשיו שיש עוד הצעה", "flow")
+    assert f("גם כן שם...", "זה מה שצריך", "smart", 0.2) == ("גם כן שם", "flow")
+    assert f("גם כן שם…", "זה מה שצריך", "smart", 0.2) == ("גם כן שם", "flow")
+    # No closing punctuation at all: flow, text untouched.
+    assert f("אני חושב ש", "זה נכון", "smart", 0.1) == ("אני חושב ש", "flow")
+    # Real sentence ends keep the period.
+    assert f("הצריכה תלמוד.", "אבל לפי צריכה מוערכת", "smart", 0.3)[1] == "break"
+    assert f("we ship it.", "So the next step", "smart", 0.3)[1] == "break"
+    assert f("שיש עוד הצעה.", "זה סביב", "smart", 1.2) == ("שיש עוד הצעה.", "break")
+    assert f("מה דעתך?", "אני חושב", "smart", 0.1) == ("מה דעתך?", "break")
+    assert f("יאללה!", "נתחיל", "smart", 0.1)[1] == "break"
+    assert f("סוף הפגישה.", "", "final", 0.0) == ("סוף הפגישה.", "break")
+    assert f("סוף הפגישה.", "עוד משהו", "final", 0.1) == ("סוף הפגישה.", "break")
+    # A drain (arbitrary) boundary is just as likely mid-sentence: flows.
+    assert f("ואז הוא אמר.", "שזה בסדר", "drain", 0.0) == ("ואז הוא אמר", "flow")
+    # Never returns an empty previous text.
+    assert f("...", "המשך", "smart", 0.1) == ("...", "break")
+
+
+_test("transcript flow: chunk boundary period stripped / kept by pause + opener",
+      t_soften_chunk_boundary)
+
+
+def t_flow_chunk_paragraphs():
+    """flow_chunk_paragraphs joins consecutive chunks into paragraphs (one
+    timestamp each), splits only at a real sentence end after para_seconds,
+    never mid-sentence; silence / failed / pending close a paragraph;
+    enabled=False = the old one-block-per-chunk layout. The session assemblers
+    (.txt + summary input) render the same items."""
+    import lia as w
+    import threading
+    mk = lambda i, ts, text, status="ok", cut="smart", pause=0.3: dict(
+        index=i, timestamp_rel=ts, text=text, status=status, cut=cut, pause_s=pause)
+    chunks = [
+        mk(0, 0,  "עד עכשיו היה מצב ש."),
+        mk(1, 15, "פורטסה פרייס על 50% מהצריכה."),
+        mk(2, 30, "אבל לפי צריכה מוערכת.", pause=1.0),   # real end (long pause)
+        mk(3, 45, "אז זה יכול להגיע."),                     # before 60s: same paragraph
+        mk(4, 60, "נתי זה היה קרוב ל-100 אלף."),           # mid-sentence at 60s: NO split
+        mk(5, 75, "דולר מימון.", pause=1.0),                # real end after 60s -> split next
+        mk(6, 90, "מבחינת מימונים יש לנו."),
+        mk(7, 105, "", status="empty"),                     # silence closes the paragraph
+        mk(8, 120, "", status="failed"),
+        mk(9, 135, "סיכום."),
+        mk(10, 150, "", status="pending"),
+    ]
+    items = w.flow_chunk_paragraphs(chunks, para_seconds=60)
+    kinds = [it[0] for it in items]
+    assert kinds == ["text", "text", "failed", "text", "pending"], kinds
+    p0 = items[0][2]
+    assert p0 == ("עד עכשיו היה מצב ש פורטסה פרייס על 50% מהצריכה. "
+                  "אבל לפי צריכה מוערכת. אז זה יכול להגיע נתי זה היה קרוב ל-100 אלף "
+                  "דולר מימון."), p0
+    assert items[0][1] == 0
+    assert items[1] == ("text", 90, "מבחינת מימונים יש לנו.")
+    assert items[2] == ("failed", 120)
+    assert items[3] == ("text", 135, "סיכום.")
+    assert items[4] == ("pending", 150)
+    # Legacy layout: every ok chunk is its own block, text untouched.
+    old = w.flow_chunk_paragraphs(chunks, para_seconds=60, enabled=False)
+    assert [it[0] for it in old].count("text") == 8
+    assert old[0][2] == "עד עכשיו היה מצב ש." and old[1][2] == "פורטסה פרייס על 50% מהצריכה."
+    # Session assemblers render the items (no app on the session = defaults).
+    s = w.MeetingSession.__new__(w.MeetingSession)
+    s._chunks_lock = threading.Lock()
+    s.chunks = chunks
+    md = w.MeetingSession._assemble_transcript_markdown(s)
+    assert md.count("[0:00]") == 1 and "[0:15]" not in md and "[1:30]" in md, md
+    assert "[transcription failed]" in md and "audio lost" in md
+    assert "ש פורטסה" in md, "the artificial period is gone from the .txt"
+    plain = w.MeetingSession._assemble_transcript_plain(s)
+    assert "[" not in plain and plain.count("\n") == 2, plain
+    assert plain.startswith("עד עכשיו היה מצב ש פורטסה")
+    # The flag off reproduces the per-chunk .txt.
+    class _App:
+        config = {"meeting_transcript_flow": False}
+    s.app = _App()
+    assert w.MeetingSession._assemble_transcript_markdown(s).count("[0:15]") == 1
+    # Diarized live-peek chunks (no status until done) flow the same way; the
+    # live tail's dangling period is dropped (Naor 2026-09-16).
+    s._live_chunks_lock = threading.Lock()
+    s.app = None
+    s._live_chunks = [mk(0, 0, "שלום לכולם."), mk(1, 15, "היום נדבר על."), mk(2, 30, "")]
+    live = w.MeetingSession._assemble_live_markdown(s)
+    assert live == "[0:00] שלום לכולם היום נדבר על", live
+
+
+def t_flow_live_tail():
+    """live=True: the streaming tail is always mid-thought, so a dangling
+    period/ellipsis is stripped off the LAST paragraph (a ? / ! is kept); a
+    still-pending chunk is hidden (not "audio lost"). The final .txt keeps the
+    genuine end (cut='final')."""
+    import lia as w
+    import threading
+    mk = lambda i, ts, text, status="ok", cut="smart", pause=0.3: dict(
+        index=i, timestamp_rel=ts, text=text, status=status, cut=cut, pause_s=pause)
+    # Live tail dot stripped.
+    items = w.flow_chunk_paragraphs(
+        [mk(0, 0, "אז נתי זה היה קרוב ל-100 אלף דולר מימון.")], live=True)
+    assert items == [("text", 0, "אז נתי זה היה קרוב ל-100 אלף דולר מימון")], items
+    # ? / ! kept even on the live tail.
+    assert w.flow_chunk_paragraphs([mk(0, 0, "מה דעתך?")], live=True) == \
+        [("text", 0, "מה דעתך?")]
+    # Ellipsis stripped.
+    assert w.flow_chunk_paragraphs([mk(0, 0, "אני חושב ש...")], live=True) == \
+        [("text", 0, "אני חושב ש")]
+    # NOT live: the tail dot stays (final file, genuine end).
+    assert w.flow_chunk_paragraphs([mk(0, 0, "סוף.", cut="final")], live=False) == \
+        [("text", 0, "סוף.")]
+    # Live hides a pending chunk (in flight, not lost); final keeps the marker.
+    ch = [mk(0, 0, "שלום עולם."), mk(1, 15, "", status="pending")]
+    assert [it[0] for it in w.flow_chunk_paragraphs(ch, live=True)] == ["text"]
+    assert [it[0] for it in w.flow_chunk_paragraphs(ch, live=False)] == ["text", "pending"]
+    # The live rendering path (_write_live_file -> markdown(live=True)) strips
+    # the tail; the final write (live default False) does not.
+    s = w.MeetingSession.__new__(w.MeetingSession)
+    s._chunks_lock = threading.Lock()
+    s.chunks = [mk(0, 0, "עוד עכשיו היה מצב ש.")]
+    s.app = None
+    assert w.MeetingSession._assemble_transcript_markdown(s, live=True).endswith("מצב ש")
+    assert w.MeetingSession._assemble_transcript_markdown(s).rstrip().endswith("מצב ש.")
+    import inspect
+    assert "live=True" in inspect.getsource(w.MeetingSession._write_live_file)
+
+
+_test("transcript flow: live tail drops a dangling period; pending hidden live",
+      t_flow_live_tail)
+
+
+_test("transcript flow: paragraphs join chunks, split only at a real end after 60s",
+      t_flow_chunk_paragraphs)
+
+
+def t_pause_seconds_at_cut():
+    """pause_seconds_at_cut measures the low-energy run around a smart cut:
+    ~0.5s of silence between speech = ~0.5; a cut inside continuous speech = 0."""
+    import lia as w
+    import numpy as np
+    sr = 16000
+    rng = np.random.RandomState(1)
+    speech = lambda s: (rng.randn(int(s * sr)) * 0.05).astype(np.float32)
+    a = np.concatenate([speech(1.0), np.zeros(int(0.5 * sr), np.float32), speech(1.0)])
+    cut = int(1.25 * sr)
+    p = w.pause_seconds_at_cut(a[:cut], a[cut:])
+    assert 0.4 <= p <= 0.6, p
+    assert w.pause_seconds_at_cut(speech(1.0), speech(1.0)) == 0.0
+    # The rotation loop stores the measurement + cut kind on the chunk record.
+    import inspect
+    src = inspect.getsource(w.MeetingSession._rotation_loop)
+    assert "pause_seconds_at_cut(head, tail)" in src and 'cut = "smart"' in src
+    assert 'cut="final"' in inspect.getsource(w.MeetingSession._finalise_current_chunk)
+    assert '"pause_s": float(pause_s or 0.0)' in inspect.getsource(w.MeetingSession._submit_chunk)
+    # Config defaults present.
+    assert w.DEFAULT_CONFIG["meeting_transcript_flow"] is True
+    assert w.DEFAULT_CONFIG["meeting_transcript_paragraph_seconds"] == 60
+
+
+_test("transcript flow: pause measured at the smart cut + wired into the chunk record",
+      t_pause_seconds_at_cut)
 
 
 # ============================================================

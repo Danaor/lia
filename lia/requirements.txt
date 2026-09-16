@@ -26,7 +26,7 @@ pywin32>=306
 # get_display would double-reverse). Kept only because _to_visual_rtl remains
 # for back-compat; safe to drop once that helper is removed.
 python-bidi>=0.4.2
-# onnx-asr: the LOCAL English backend (NVIDIA Parakeet TDT 0.6B v2, int8 ONNX,
+# onnx-asr: the LOCAL multi-language backend (NVIDIA Parakeet TDT 0.6B v3 (25 European languages), int8 ONNX,
 # CC-BY-4.0). Tiny footprint (numpy + onnxruntime, no torch); the model
 # (~670MB) auto-downloads on first use. CPU is several-x realtime.
 onnx-asr[cpu,hub]>=0.12

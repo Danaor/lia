@@ -128,14 +128,20 @@ EXTRA_CSS = """
 .htop #q{max-width:280px;}
 #list{overflow-y:auto; padding:var(--sp-2) var(--sp-4) var(--sp-5);}
 .h-item{border:1px solid var(--line); border-radius:var(--r-m); padding:11px 14px; margin-top:10px;
-  background:var(--card); cursor:pointer; transition:border-color var(--tr),background var(--tr);}
-.h-item:hover{border-color:var(--accent); background:var(--accent-soft);}
+  background:var(--card); transition:border-color var(--tr);}
+.h-item:hover{border-color:var(--line-2);}
 .h-item .h-head{display:flex; align-items:center; gap:10px; margin-bottom:5px;}
 .h-item .h-ts{font-size:var(--fs-hint); color:var(--muted); font-variant-numeric:tabular-nums;}
 .h-item .h-meta{font-size:var(--fs-small); color:var(--faint); margin-inline-start:auto;}
-.h-item .h-text{white-space:pre-wrap; line-height:1.6; overflow-wrap:anywhere;}
-.h-item .h-copy{font-size:var(--fs-small); color:var(--accent); opacity:0; transition:opacity var(--tr);}
-.h-item:hover .h-copy{opacity:1;}
+/* the text is freely selectable - copy is a dedicated button, not click-anywhere */
+.h-item .h-text{white-space:pre-wrap; line-height:1.6; overflow-wrap:anywhere; user-select:text;}
+.h-item .h-copy{display:inline-flex; align-items:center; gap:5px; font-size:var(--fs-small); font-weight:600;
+  color:var(--accent); background:transparent; border:1px solid var(--line); border-radius:var(--r-s);
+  padding:3px 9px; cursor:pointer; opacity:0; transition:opacity var(--tr); font-family:inherit;}
+.h-item:hover .h-copy, .h-item:focus-within .h-copy, .h-copy:focus-visible{opacity:1;}
+.h-copy:hover{background:var(--accent-soft);}
+.h-copy:focus-visible{outline:none; box-shadow:var(--ring); opacity:1;}
+.h-copy.ok{color:var(--ok); border-color:var(--ok);}
 mark{background:var(--hi, #FFF3BF); border-radius:2px;}
 """
 
@@ -149,14 +155,15 @@ APP_JS = r"""
     var rows = f ? ALL.filter(function(e){ return e.text.toLowerCase().indexOf(f)>=0; }) : ALL;
     if(!ALL.length){ list.innerHTML=""; empty.style.display="flex"; return; }
     empty.style.display="none";
-    if(!rows.length){ list.innerHTML='<div class="empty"><div class="sub">No matches.</div></div>'; return; }
+    if(!rows.length){ list.innerHTML='<div class="empty"><div class="sub">No results for &ldquo;'+esc(filter||"")+'&rdquo;.</div></div>'; return; }
     list.innerHTML = rows.map(function(e){
       var t = esc(e.text);
       if(f){ try{ var re=new RegExp('('+f.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+')','ig');
         t = esc(e.text).replace(re,'<mark>$1</mark>'); }catch(_){ } }
       return '<div class="h-item" data-t="'+esc(e.text)+'">'+
         '<div class="h-head"><span class="h-ts">'+esc(e.ts)+'</span>'+
-        '<span class="h-copy">Copy</span>'+
+        '<button class="h-copy" data-copy type="button" title="Copy this transcription">'+
+          RK.icon('copy',{size:14})+'<span class="h-copy-lbl">Copy</span></button>'+
         '<span class="h-meta">'+esc(e.meta)+'</span></div>'+
         '<div class="h-text rtl-auto" dir="auto">'+t+'</div></div>';
     }).join('');
@@ -176,9 +183,24 @@ APP_JS = r"""
       });
       return;
     }
-    var it = ev.target.closest(".h-item");
-    if(it){ var txt = it.getAttribute("data-t");
-      RK.ready(function(api){ api.copy(txt); }); RK.toast("Copied", "ok"); }
+    var cp = ev.target.closest("[data-copy]");
+    if(cp){
+      var item = cp.closest(".h-item");
+      var txt = item ? item.getAttribute("data-t") : "";
+      RK.ready(function(api){
+        Promise.resolve(api.copy(txt)).then(function(ok){
+          if(ok !== false){
+            RK.toast("Copied", "ok");
+            var lbl = cp.querySelector(".h-copy-lbl"); if(lbl) lbl.textContent = "Copied";
+            cp.classList.add("ok");
+            setTimeout(function(){ cp.classList.remove("ok");
+              var l = cp.querySelector(".h-copy-lbl"); if(l) l.textContent = "Copy"; }, 1600);
+          } else {
+            RK.toast("Copy failed - try again", "err");
+          }
+        });
+      });
+    }
   });
   document.addEventListener("input", function(ev){
     if(ev.target.id==="q") render(ev.target.value);

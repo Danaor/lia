@@ -8,7 +8,7 @@ import os
 MODELS = {
     "ivrit-ai/whisper-large-v3-turbo-ct2": ("Hebrew Turbo ⭐", "~1.5 GB"),
     "ivrit-ai/whisper-large-v3-ct2": ("Hebrew Large", "~3 GB"),
-    "parakeet-tdt-0.6b-v2": ("English Parakeet ⭐ (best English)", "~670 MB"),
+    "parakeet-tdt-0.6b-v3": ("English Parakeet ⭐ (best English)", "~670 MB"),
     "distil-large-v3": ("English Distil (fast + accurate)", "~1.5 GB"),
     "small": ("General Small", "~460 MB"),
     "medium": ("General Medium", "~1.5 GB"),

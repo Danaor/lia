@@ -73,7 +73,7 @@ CSS_TOKENS = """
   /* type */
   --font:"Segoe UI Variable Text","Segoe UI",Heebo,system-ui,Arial,sans-serif;
   --mono:"Cascadia Code",Consolas,"Courier New",monospace;
-  --fs-base:14px; --fs-h1:19px; --fs-section:16px; --fs-label:13px;
+  --fs-base:14px; --fs-title:22px; --fs-h1:19px; --fs-section:16px; --fs-label:13px;
   --fs-hint:12px; --fs-small:11.5px;
   /* effects */
   --shadow:0 1px 2px rgba(16,24,40,.06),0 12px 32px rgba(16,24,40,.05);
@@ -155,7 +155,14 @@ a:hover{text-decoration:underline;}
    fill, too high-contrast). Distinct from hover via the accent text + weight. */
 .nav-item.on{background:var(--accent-soft-h); color:var(--accent); font-weight:600;}
 .nav-item.on .ico{color:var(--accent);}
-.nav-item .ico{font-size:15px; width:18px; text-align:center; flex:0 0 18px;}
+.nav-item .ico{display:inline-flex; align-items:center; justify-content:center;
+  font-size:15px; width:20px; height:20px; flex:0 0 20px; color:var(--muted);}
+.nav-item:hover .ico, .nav-item.on .ico{color:var(--accent);}
+/* Sidebar group label: sentence-case, faint, small - separates the nav into
+   task groups without heavy dividers. */
+.nav-group{font-size:var(--fs-small); font-weight:600; color:var(--faint);
+  padding:14px 16px 3px;}
+.nav-group:first-of-type{padding-top:2px;}
 .sidebar .spacer{flex:1 1 auto;}
 
 .content{flex:1 1 auto; overflow-y:auto; padding:var(--sp-5) var(--sp-6);}
@@ -163,7 +170,7 @@ a:hover{text-decoration:underline;}
   display:flex; align-items:center; gap:var(--sp-3);
   margin-bottom:var(--sp-4);
 }
-.content-head h1{margin:0; font-size:var(--fs-h1); font-weight:700; color:var(--ink);}
+.content-head h1{margin:0; font-size:var(--fs-title); font-weight:700; color:var(--ink);}
 .content-head .sub{color:var(--muted); font-size:var(--fs-hint);}
 
 /* --- page cards --------------------------------------------------------- */
@@ -283,11 +290,12 @@ a:hover{text-decoration:underline;}
 
 /* --- field: label + control + hint ------------------------------------- */
 .field{margin-bottom:var(--sp-5);}
-/* Group header: uppercase muted small-caps so it reads as a SECTION LABEL
-   above its controls, never as one of the choices below it. */
+/* Group header: a normal sentence-case label above its controls (never ALL
+   CAPS - plain labels read easier and are the house style). Weight + ink colour
+   keep it distinct from the choices below it. */
 .field > label,.field-label{
-  display:block; font-size:var(--fs-hint); font-weight:700; letter-spacing:.03em;
-  text-transform:uppercase; color:var(--muted); margin-bottom:10px;
+  display:block; font-size:var(--fs-label); font-weight:600;
+  color:var(--ink-2); margin-bottom:8px;
 }
 .field .hint{margin-top:6px;}
 .row-inline{display:flex; align-items:center; gap:var(--sp-2); flex-wrap:wrap;}
@@ -519,7 +527,87 @@ input:disabled,select:disabled,textarea:disabled{opacity:.55; cursor:default;}
 ::-webkit-scrollbar-thumb{background:var(--sb-thumb); border-radius:8px; border:3px solid var(--bg); min-height:48px;}
 ::-webkit-scrollbar-thumb:hover{background:var(--sb-thumb-h);}
 ::-webkit-scrollbar-track{background:transparent;}
+
+/* --- local SVG icons (inline, currentColor, uniform stroke) -------------- */
+.ico-svg{display:inline-block; vertical-align:middle; flex:0 0 auto; color:inherit;}
+/* icon-only button: MUST carry an accessible name (aria-label or title) */
+.iconbtn{appearance:none; border:0; background:transparent; color:var(--muted);
+  cursor:pointer; padding:6px; border-radius:var(--r-s); display:inline-flex;
+  align-items:center; justify-content:center; transition:background var(--tr),color var(--tr);}
+.iconbtn:hover{background:var(--accent-soft); color:var(--accent);}
+.iconbtn:focus-visible{outline:none; box-shadow:var(--ring);}
+
+/* --- honour the OS 'reduce motion' setting ------------------------------ */
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{animation-duration:.001ms !important; animation-iteration-count:1 !important;
+    transition-duration:.001ms !important; scroll-behavior:auto !important;}
+}
 """
+
+
+# ============================================================
+# Local SVG icon set (offline, MIT-original geometry, currentColor stroke)
+# ============================================================
+# feather/lucide-style: 24x24 viewBox, no fill, 2px round stroke. Authored here
+# (not copied from a licensed set) so the app ships no web font / external icon
+# dependency. Rendered by icon() in Python and RK.icon() in JS from the SAME map.
+ICONS = {
+    "models":     '<rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><path d="M9 3v3M15 3v3M9 18v3M15 18v3M3 9h3M3 15h3M18 9h3M18 15h3"/>',
+    "audio":      '<path d="M4 13v-1a8 8 0 0 1 16 0v1"/><rect x="2.5" y="13" width="4.5" height="7" rx="1.6"/><rect x="17" y="13" width="4.5" height="7" rx="1.6"/>',
+    "general":    '<line x1="4" y1="8" x2="20" y2="8"/><line x1="4" y1="16" x2="20" y2="16"/><circle cx="15" cy="8" r="2.4"/><circle cx="9" cy="16" r="2.4"/>',
+    "cleanup":    '<path d="M5 19L15 9"/><path d="M13 7l4 4"/><path d="M18 3l.7 1.8L20.5 5.5l-1.8.7L18 8l-.7-1.8L15.5 5.5l1.8-.7z"/>',
+    "keys":       '<circle cx="8" cy="8" r="4"/><path d="M11 11l8 8"/><path d="M16 16l2-2"/>',
+    "meetings":   '<circle cx="9" cy="8" r="3.1"/><path d="M3.5 19a5.5 5.5 0 0 1 11 0"/><path d="M15.5 5.6a3 3 0 0 1 0 5.6"/><path d="M17.5 19a5.4 5.4 0 0 0-2.4-4.4"/>',
+    "vocabulary": '<path d="M5 4h11a2 2 0 0 1 2 2v14H7a2 2 0 0 1-2-2z"/><path d="M5 18a2 2 0 0 1 2-2h11"/>',
+    "snippets":   '<path d="M9 8l-4 4 4 4"/><path d="M15 8l4 4-4 4"/>',
+    "server":     '<rect x="4" y="4" width="16" height="6" rx="1.6"/><rect x="4" y="14" width="16" height="6" rx="1.6"/><line x1="7" y1="7" x2="7.01" y2="7"/><line x1="7" y1="17" x2="7.01" y2="17"/>',
+    "advanced":   '<circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16.5"/><line x1="12" y1="7.6" x2="12.01" y2="7.6"/>',
+    "home":       '<path d="M4 11l8-7 8 7"/><path d="M6 10v9h12v-9"/>',
+    "history":    '<circle cx="12" cy="12" r="9"/><path d="M12 7.5V12l3 2"/>',
+    "tasks":      '<path d="M9.5 6h10M9.5 12h10M9.5 18h10"/><path d="M4 5.6l1.3 1.3L7.4 4.7"/><path d="M4 11.6l1.3 1.3L7.4 10.7"/><path d="M4.2 17.4h.01"/>',
+    "search":     '<circle cx="10.5" cy="10.5" r="6"/><line x1="15" y1="15" x2="20" y2="20"/>',
+    "folder":     '<path d="M4 7a2 2 0 0 1 2-2h3l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2z"/>',
+    "file":       '<path d="M7 3h7l4 4v14H7z"/><path d="M14 3v4h4"/><line x1="9.5" y1="12.5" x2="15" y2="12.5"/><line x1="9.5" y1="16" x2="15" y2="16"/>',
+    "edit":       '<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M14 6l4 4"/>',
+    "mic":        '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M6 11a6 6 0 0 0 12 0"/><line x1="12" y1="17" x2="12" y2="21"/><line x1="8.5" y1="21" x2="15.5" y2="21"/>',
+    "ask":        '<circle cx="12" cy="12" r="9"/><path d="M9.4 9.4a2.6 2.6 0 1 1 3.6 2.4c-.9.4-1 .9-1 1.7"/><line x1="12" y1="16.6" x2="12.01" y2="16.6"/>',
+    "email":      '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M4 7l8 6 8-6"/>',
+    "chat":       '<path d="M4 5h16v11H9l-4 3v-3H4z"/>',
+    "copy":       '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/>',
+    "check":      '<path d="M5 12l4 4 10-10"/>',
+    "close":      '<path d="M6 6l12 12M18 6L6 18"/>',
+    "chevron-right": '<path d="M9 6l6 6-6 6"/>',
+    "chevron-down":  '<path d="M6 9l6 6 6-6"/>',
+    "download":   '<path d="M12 4v10"/><path d="M8 11l4 4 4-4"/><path d="M5 19h14"/>',
+    "refresh":    '<path d="M20 11a8 8 0 1 0-1.6 4.5"/><path d="M20 5v6h-6"/>',
+    "external":   '<path d="M14 4h6v6"/><path d="M20 4l-8 8"/><path d="M18 13v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h5"/>',
+    "alert":      '<path d="M12 4l9 16H3z"/><line x1="12" y1="10" x2="12" y2="15"/><line x1="12" y1="17.5" x2="12.01" y2="17.5"/>',
+    "play":       '<path d="M7 5l12 7-12 7z"/>',
+    "stop":       '<rect x="6" y="6" width="12" height="12" rx="2"/>',
+    "summarize":  '<line x1="5" y1="7" x2="19" y2="7"/><line x1="5" y1="12" x2="19" y2="12"/><line x1="5" y1="17" x2="14" y2="17"/>',
+    "settings":   '<line x1="4" y1="8" x2="20" y2="8"/><line x1="4" y1="16" x2="20" y2="16"/><circle cx="15" cy="8" r="2.4"/><circle cx="9" cy="16" r="2.4"/>',
+}
+
+
+def icon(name, *, size=18, cls="", title=None, stroke=2):
+    """Inline SVG for `name` (currentColor). Pass `title` for an accessible name
+    on a standalone/meaningful icon; without it the icon is aria-hidden (decorative,
+    the adjacent text label carries the meaning). Unknown name -> "" (caller may
+    fall back). Never fetches anything."""
+    body = ICONS.get(name)
+    if not body:
+        return ""
+    cls_attr = (' ' + _h(cls)) if cls else ''
+    if title:
+        a11y = 'role="img" aria-label="%s"' % _h(title)
+        inner = '<title>%s</title>%s' % (_h(title), body)
+    else:
+        a11y = 'aria-hidden="true"'
+        inner = body
+    return ('<svg class="ico-svg%s" width="%d" height="%d" viewBox="0 0 24 24" '
+            'fill="none" stroke="currentColor" stroke-width="%s" '
+            'stroke-linecap="round" stroke-linejoin="round" %s>%s</svg>'
+            % (cls_attr, size, size, stroke, a11y, inner))
 
 
 # ============================================================
@@ -585,6 +673,24 @@ window.RK = (function(){
            get api(){ return api; } };
 })();
 """
+
+# Expose the SAME icon set to JS-built HTML (RK.icon), so Python and JS render
+# identical icons from one source of truth. Appended after JS_BASE so RK exists.
+JS_BASE = JS_BASE + (
+    "\nRK.ICONS = " + json.dumps(ICONS, ensure_ascii=True) + ";\n"
+    "RK.icon = function(name, opts){ opts = opts || {};\n"
+    "  var body = RK.ICONS[name]; if(!body) return '';\n"
+    "  var size = opts.size || 18, stroke = opts.stroke || 2;\n"
+    "  var cls = opts.cls ? (' ' + RK.esc(opts.cls)) : '';\n"
+    "  var a11y, inner;\n"
+    "  if(opts.title){ a11y = 'role=\"img\" aria-label=\"' + RK.esc(opts.title) + '\"';\n"
+    "    inner = '<title>' + RK.esc(opts.title) + '</title>' + body; }\n"
+    "  else { a11y = 'aria-hidden=\"true\"'; inner = body; }\n"
+    "  return '<svg class=\"ico-svg' + cls + '\" width=\"' + size + '\" height=\"' + size +\n"
+    "    '\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"' + stroke +\n"
+    "    '\" stroke-linecap=\"round\" stroke-linejoin=\"round\" ' + a11y + '>' + inner + '</svg>';\n"
+    "};\n"
+)
 
 
 # ============================================================

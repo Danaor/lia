@@ -228,6 +228,16 @@ HTML = r"""<!DOCTYPE html>
   .it .t{ font-size:14px; line-height:1.55; }
   .it.done .t{ color:var(--done); text-decoration:line-through; }
   .empty{ color:var(--muted); text-align:center; margin-top:48px; }
+  /* undo snackbar: survives the list refresh so completing a task in the
+     open-only view (where the row vanishes) is still reversible for 8s. */
+  .snack{ position:fixed; inset-inline:0; bottom:18px; margin:0 auto; width:max-content; max-width:92vw;
+    background:var(--fg); color:#fff; border-radius:10px; padding:9px 10px 9px 16px; display:flex; align-items:center;
+    gap:14px; box-shadow:0 6px 22px rgba(0,0,0,.25); font-size:13px; z-index:50; }
+  .snack button{ background:transparent; border:0; color:#8fb0ee; font-weight:700; cursor:pointer; font-size:13px;
+    font-family:inherit; padding:5px 9px; border-radius:6px; }
+  .snack button:hover{ background:rgba(255,255,255,.12); }
+  .snack button:focus-visible{ outline:2px solid #8fb0ee; outline-offset:1px; }
+  .snack[hidden]{ display:none; }
 </style></head>
 <body>
   <header>
@@ -238,6 +248,10 @@ HTML = r"""<!DOCTYPE html>
     <button class="btn" id="copy">Copy open</button>
   </header>
   <div class="wrap" id="wrap"><div class="empty">Loading…</div></div>
+  <div class="snack" id="snack" hidden>
+    <span id="snackMsg">Task completed</span>
+    <button id="snackUndo" type="button">Undo</button>
+  </div>
 <script>
 // window.pywebview is not populated at inline-script parse time; touching .api
 // here throws and kills the whole script. Assign it inside load() (fired by
@@ -276,9 +290,34 @@ async function toggle(id, done, el){
   await API.set_done(id, done);
   var row = el.closest('.it');
   if(done) row.classList.add('done'); else row.classList.remove('done');
-  if(openOnly && done){ setTimeout(load, 250); }   // it leaves the open view
+  if(done) showUndo(id);                            // reversible for 8s
+  if(openOnly && done){ setTimeout(load, 250); }    // it leaves the open view
   refreshCount();
 }
+
+// Undo snackbar: independent of the list, so a reload never cancels it. Undo
+// restores the task via the SAME id (updates the store, the count, the list).
+var undoTaskId = null, undoTimer = null;
+function showUndo(taskId){
+  undoTaskId = taskId;
+  var s = document.getElementById('snack'); if(!s) return;
+  document.getElementById('snackMsg').textContent = 'Task completed';
+  s.hidden = false;
+  if(undoTimer) clearTimeout(undoTimer);
+  undoTimer = setTimeout(hideUndo, 8000);
+  try{ document.getElementById('snackUndo').focus(); }catch(e){}
+}
+function hideUndo(){
+  var s = document.getElementById('snack'); if(s) s.hidden = true;
+  undoTaskId = null;
+  if(undoTimer){ clearTimeout(undoTimer); undoTimer = null; }
+}
+document.getElementById('snackUndo').onclick = async function(){
+  var id = undoTaskId; if(!id) return;
+  hideUndo();
+  await API.set_done(id, false);   // restore
+  await load();
+};
 
 async function refreshCount(){
   var r = await API.get_items(false);

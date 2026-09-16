@@ -20,53 +20,229 @@ byte-synced with a private upstream project; the EN variants are Lia-only.
 """
 
 import re
+import unicodedata
+
+# ---------------------------------------------------------------------------
+# Unicode script primitive (stdlib range-based; unicodedata has NO script prop)
+# ---------------------------------------------------------------------------
+# The shared primitive the transcription script filter (lia.strip_foreign_
+# script_words) and the RTL helpers below consume. A "script tag" -> the Unicode
+# ranges that spell it. ASCII letters are always 'Latin'; ASCII non-letters have
+# no script (None). Multi-language scaffolding, 2026-09-15.
+SCRIPT_RANGES = {
+    "Latin":      [(0x41, 0x5A), (0x61, 0x7A), (0xC0, 0x24F), (0x1E00, 0x1EFF)],
+    "Hebrew":     [(0x0590, 0x05FF), (0xFB1D, 0xFB4F)],
+    "Arabic":     [(0x0600, 0x06FF), (0x0750, 0x077F), (0x08A0, 0x08FF),
+                   (0xFB50, 0xFDFF), (0xFE70, 0xFEFF)],
+    "Cyrillic":   [(0x0400, 0x052F), (0x2DE0, 0x2DFF), (0xA640, 0xA69F)],
+    "Han":        [(0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xF900, 0xFAFF),
+                   (0x20000, 0x2A6DF)],
+    "Hiragana":   [(0x3040, 0x309F)],
+    "Katakana":   [(0x30A0, 0x30FF), (0x31F0, 0x31FF)],
+    "Hangul":     [(0xAC00, 0xD7A3), (0x1100, 0x11FF), (0x3130, 0x318F),
+                   (0xA960, 0xA97F)],
+    "Devanagari": [(0x0900, 0x097F), (0xA8E0, 0xA8FF)],
+}
+
+# RTL detection uses a NARROWER Hebrew range (exactly the retired inline
+# '֐'<=c<='׿' == 0x0590-0x05FF check) so text_direction stays byte-identical to
+# the old _is_mostly_hebrew; the filter keeps SCRIPT_RANGES['Hebrew']'s wider set.
+_RTL_DETECT_RANGES = {
+    "Hebrew": [(0x0590, 0x05FF)],
+    "Arabic": [(0x0600, 0x06FF), (0x0750, 0x077F), (0x08A0, 0x08FF),
+               (0xFB50, 0xFDFF), (0xFE70, 0xFEFF)],
+}
+
+
+def _in_ranges(cp, ranges):
+    for lo, hi in ranges:
+        if lo <= cp <= hi:
+            return True
+    return False
+
+
+def char_in_any_script(codepoint, tags):
+    """True if `codepoint` falls in the union of SCRIPT_RANGES for any tag in
+    `tags` (an iterable of script-tag strings). Thin helper for the filter."""
+    for t in tags:
+        if _in_ranges(codepoint, SCRIPT_RANGES.get(t, ())):
+            return True
+    return False
+
+
+def script_of_char(ch):
+    """The script tag of a single character, or None. ASCII letters -> 'Latin';
+    ASCII non-letters -> None; a non-letter/mark -> None; else the first
+    SCRIPT_RANGES tag containing it, or 'Other'."""
+    o = ord(ch)
+    if o < 0x80:
+        return "Latin" if ("a" <= ch.lower() <= "z") else None
+    if unicodedata.category(ch)[0] not in ("L", "M"):
+        return None
+    for tag, ranges in SCRIPT_RANGES.items():
+        if _in_ranges(o, ranges):
+            return tag
+    return "Other"
+
+
+def has_rtl_chars(text):
+    """True if the text contains any Hebrew or Arabic letter (RTL scripts)."""
+    for ch in text or "":
+        o = ord(ch)
+        if _in_ranges(o, _RTL_DETECT_RANGES["Hebrew"]) or \
+           _in_ranges(o, _RTL_DETECT_RANGES["Arabic"]):
+            return True
+    return False
+
+
+def text_direction(text):
+    """'rtl' when RTL letters (Hebrew/Arabic) outnumber Latin letters, else
+    'ltr'. The RTL count uses _RTL_DETECT_RANGES (Hebrew = 0x0590-0x05FF exactly)
+    so a Hebrew/Latin mix reproduces the retired _is_mostly_hebrew decision
+    byte-for-byte; Arabic (new) also counts as RTL."""
+    rtl = latin = 0
+    for ch in text or "":
+        o = ord(ch)
+        if _in_ranges(o, _RTL_DETECT_RANGES["Hebrew"]) or \
+           _in_ranges(o, _RTL_DETECT_RANGES["Arabic"]):
+            rtl += 1
+        elif "a" <= ch.lower() <= "z":
+            latin += 1
+    return "rtl" if rtl > latin else "ltr"
+
+
+def is_rtl(lang):
+    """Whether a language code is written right-to-left (from LANGUAGES)."""
+    return bool(lang_meta(lang).get("rtl"))
+
 
 # ---------------------------------------------------------------------------
 # Language detection / resolution
 # ---------------------------------------------------------------------------
 
-def detect_text_lang(text):
-    """'he' when Hebrew letters outnumber Latin letters, else 'en'.
-    Mirrors lia._is_mostly_hebrew's counting so the two never
-    disagree about the same text."""
-    hebrew = latin = 0
-    for c in text or "":
-        if "֐" <= c <= "׿":
-            hebrew += 1
-        elif "a" <= c.lower() <= "z":
-            latin += 1
-    return "he" if hebrew > latin else "en"
+def detect_text_lang(text, config=None):
+    """The dominant language of `text`.
+
+    With config=None (or a hebrew-profile config) this reproduces the historical
+    he/en behavior EXACTLY: 'he' when Hebrew letters outnumber Latin letters, else
+    'en' (mirrors lia._is_mostly_hebrew's counting). With a multilingual-profile
+    config it counts letters per Unicode script and returns the enabled language
+    whose script wins (tiebreak among same-script languages: primary if it uses
+    that script, else the first enabled; no letters -> primary)."""
+    if config is None or language_profile(config) == "hebrew":
+        hebrew = latin = 0
+        for c in text or "":
+            if "֐" <= c <= "׿":
+                hebrew += 1
+            elif "a" <= c.lower() <= "z":
+                latin += 1
+        return "he" if hebrew > latin else "en"
+    enabled = enabled_languages(config)
+    prim = primary_language(config)
+    script_to_codes = {}
+    for code in enabled:
+        for s in lang_meta(code)["scripts"]:
+            script_to_codes.setdefault(s, []).append(code)
+    counts = {}
+    for ch in text or "":
+        s = script_of_char(ch)
+        if s and s in script_to_codes:
+            counts[s] = counts.get(s, 0) + 1
+    if not counts:
+        return prim
+    win = max(counts, key=counts.get)
+    codes = script_to_codes[win]
+    return prim if prim in codes else codes[0]
 
 
-def resolve_summary_lang(config, transcript=""):
+def resolve_summary_lang(config, transcript="", asr_lang=None):
     """The language the SUMMARY should be written in.
 
     summary_language = "primary" (default) -> the user's primary_language
     (today's semantics parameterized: the summary is written for the READER,
     'ALWAYS Hebrew' becomes 'always the user's language');
-    "auto" -> follow the transcript; "he"/"en" -> forced."""
+    "auto" -> follow the ASR-detected language when available (it disambiguates
+    same-script languages that letter-counting cannot), else the transcript's
+    dominant script; a forced summary-enabled code -> that code.
+
+    The resolved code is floored to a summary-enabled language ('en' when it has
+    no TERMS row) so a LANGUAGES-only code never leaks foreign-script headers.
+    For a he/en config every branch is byte-identical to the prior behavior."""
     mode = (config or {}).get("summary_language", "primary")
-    # A forced, summary-enabled language wins (he/en today; any LANGUAGES row
-    # once added). "auto" follows the transcript; anything else -> primary.
-    if mode in LANGUAGES:
-        return mode
-    if mode == "auto":
-        return detect_text_lang(transcript)
-    return primary_language(config)
+    enabled = summary_enabled_langs()
+    if mode in enabled:
+        lang = mode
+    elif mode == "auto":
+        if (asr_lang and asr_lang in LANGUAGES
+                and language_profile(config) == "multilingual"):
+            lang = asr_lang
+        else:
+            lang = detect_text_lang(transcript, config)
+    else:
+        lang = primary_language(config)
+    return lang if lang in enabled else "en"
 
 
 def primary_language(config):
     lang = (config or {}).get("primary_language", "he")
-    return lang if lang in LANGUAGES else "he"
+    return lang if known_language(lang) else "he"
+
+
+def enabled_languages(config):
+    """The languages the app is constrained to, PRIMARY FIRST, filtered to known
+    LANGUAGES codes and de-duped. Default ['he','en']. The set SIZE is the
+    anti-roaming control: exactly one code = a hard language lock; two or more =
+    constrained detection within the set only. For a he/en config this returns
+    ['he','en'] (primary he) / ['en','he'] (primary en), preserving the prior
+    primary-first ordering gemini_language_codes relied on."""
+    cfg = config or {}
+    raw = cfg.get("enabled_languages", ["he", "en"])
+    if not isinstance(raw, (list, tuple)):
+        raw = ["he", "en"]
+    prim = primary_language(config)
+    out = []
+    for c in [prim] + list(raw):
+        if known_language(c) and c not in out:
+            out.append(c)
+    return out or ["he", "en"]
+
+
+def language_profile(config):
+    """'hebrew' = the existing he/en bilingual system (primary he or en, every
+    enabled language within {he,en}); 'multilingual' = anything wider. ALL new
+    multi-language behavior is gated on 'multilingual', so a he/en user stays
+    byte-identical to v1.5.1."""
+    prim = primary_language(config)
+    if prim in ("he", "en") and set(enabled_languages(config)) <= {"he", "en"}:
+        return "hebrew"
+    return "multilingual"
+
+
+def allowed_scripts(config):
+    """The non-ASCII script tags the transcription filter should keep for this
+    config = the scripts of every enabled language (ASCII Latin is always kept by
+    the filter's own guard). Consumed by lia._allowed_scripts."""
+    out = set()
+    for c in enabled_languages(config):
+        for s in lang_meta(c)["scripts"]:
+            out.add(s)
+    return out
 
 
 def gemini_language_codes(config):
-    """BCP-47 whitelist for Gemini Transcribe's `language_codes`, ordered by the
-    user's primary language. BOTH he+en are always present - the whitelist is a
-    guard against a mis-detected third language, not a mono pin, since meetings
-    and dictation here are routinely mixed Hebrew + English."""
-    return (["he-IL", "en-US"] if primary_language(config) == "he"
-            else ["en-US", "he-IL"])
+    """BCP-47 whitelist for Gemini Transcribe's `language_codes`, built from
+    enabled_languages (primary first) and de-duped. A guard against a mis-detected
+    out-of-set language, not a mono pin. en-US is always kept as a mixed-speech
+    guard. For enabled=={he,en} this returns ['he-IL','en-US'] (primary he) /
+    ['en-US','he-IL'] (primary en) - byte-identical to the prior behavior."""
+    codes = []
+    for c in enabled_languages(config):
+        bcp = lang_meta(c)["bcp47"]
+        if bcp and bcp not in codes:
+            codes.append(bcp)
+    if "en-US" not in codes:
+        codes.append("en-US")
+    return codes or ["en-US"]
 
 
 # ---------------------------------------------------------------------------
@@ -113,12 +289,107 @@ def render_notetaker(text, names=None):
 # table so extending it later is additive. name_en drives the "write in X"
 # output-language directive frontier cloud models follow reliably.
 LANGUAGES = {
-    "he": {"name_en": "Hebrew",  "native": "עברית",   "rtl": True,  "cpt": 1.9},
-    "en": {"name_en": "English", "native": "English", "rtl": False, "cpt": 3.9},
+    "he": {"name_en": "Hebrew",     "native": "עברית",    "rtl": True,  "cpt": 1.9, "scripts": ["Hebrew"],                       "bcp47": "he-IL"},
+    "en": {"name_en": "English",    "native": "English",   "rtl": False, "cpt": 3.9, "scripts": ["Latin"],                        "bcp47": "en-US"},
+    "es": {"name_en": "Spanish",    "native": "Español",   "rtl": False, "cpt": 3.6, "scripts": ["Latin"],                        "bcp47": "es-ES"},
+    "zh": {"name_en": "Chinese",    "native": "中文",       "rtl": False, "cpt": 1.3, "scripts": ["Han"],                          "bcp47": "zh-CN"},
+    "hi": {"name_en": "Hindi",      "native": "हिन्दी",     "rtl": False, "cpt": 2.2, "scripts": ["Devanagari"],                   "bcp47": "hi-IN"},
+    "ar": {"name_en": "Arabic",     "native": "العربية",   "rtl": True,  "cpt": 2.4, "scripts": ["Arabic"],                       "bcp47": "ar-XA"},
+    "pt": {"name_en": "Portuguese", "native": "Português", "rtl": False, "cpt": 3.6, "scripts": ["Latin"],                        "bcp47": "pt-BR"},
+    "fr": {"name_en": "French",     "native": "Français",  "rtl": False, "cpt": 3.5, "scripts": ["Latin"],                        "bcp47": "fr-FR"},
+    "de": {"name_en": "German",     "native": "Deutsch",   "rtl": False, "cpt": 3.4, "scripts": ["Latin"],                        "bcp47": "de-DE"},
+    "ru": {"name_en": "Russian",    "native": "Русский",   "rtl": False, "cpt": 2.6, "scripts": ["Cyrillic"],                     "bcp47": "ru-RU"},
+    "ja": {"name_en": "Japanese",   "native": "日本語",     "rtl": False, "cpt": 1.5, "scripts": ["Han", "Hiragana", "Katakana"], "bcp47": "ja-JP"},
+    "ko": {"name_en": "Korean",     "native": "한국어",     "rtl": False, "cpt": 1.8, "scripts": ["Hangul"],                      "bcp47": "ko-KR"},
+    "it": {"name_en": "Italian",    "native": "Italiano",  "rtl": False, "cpt": 3.7, "scripts": ["Latin"],                        "bcp47": "it-IT"},
+    # Tier-2 (transcription; summaries fall back to English until a TERMS row is
+    # added). Romanian added 2026-09-15 (Parakeet v3 + Whisper both support it).
+    "ro": {"name_en": "Romanian",   "native": "Română",    "rtl": False, "cpt": 3.4, "scripts": ["Latin"],                        "bcp47": "ro-RO"},
+    "nl": {"name_en": "Dutch",      "native": "Nederlands","rtl": False, "cpt": 3.5, "scripts": ["Latin"],                        "bcp47": "nl-NL"},
+    "pl": {"name_en": "Polish",     "native": "Polski",    "rtl": False, "cpt": 3.0, "scripts": ["Latin"],                        "bcp47": "pl-PL"},
+    "uk": {"name_en": "Ukrainian",  "native": "Українська","rtl": False, "cpt": 2.6, "scripts": ["Cyrillic"],                     "bcp47": "uk-UA"},
+    "tr": {"name_en": "Turkish",    "native": "Türkçe",    "rtl": False, "cpt": 3.2, "scripts": ["Latin"],                        "bcp47": "tr-TR"},
 }
 
 # Back-compat: kept so any caller reading it still works; LANGUAGES is authoritative.
-_CPT = {"he": 1.9, "en": 3.9}
+_CPT = {c: LANGUAGES[c]["cpt"] for c in LANGUAGES}
+
+
+# ---------------------------------------------------------------------------
+# The FULL Whisper language set (multi-language picker, 2026-09-15)
+# ---------------------------------------------------------------------------
+# The 99 languages Whisper (large-v3 family / Groq / OpenAI) transcribes. The
+# model-aware Settings picker offers exactly the languages the chosen model
+# supports: this set for a Whisper model, ParakeetTranscriber.PARAKEET_LANGS for
+# Parakeet. LANGUAGES (above) holds the RICH curated rows (native glyph, TERMS
+# for summaries); every other Whisper code uses lang_meta()'s derived defaults.
+WHISPER_LANGS = {
+    "en": "English", "zh": "Chinese", "de": "German", "es": "Spanish",
+    "ru": "Russian", "ko": "Korean", "fr": "French", "ja": "Japanese",
+    "pt": "Portuguese", "tr": "Turkish", "pl": "Polish", "ca": "Catalan",
+    "nl": "Dutch", "ar": "Arabic", "sv": "Swedish", "it": "Italian",
+    "id": "Indonesian", "hi": "Hindi", "fi": "Finnish", "vi": "Vietnamese",
+    "he": "Hebrew", "uk": "Ukrainian", "el": "Greek", "ms": "Malay",
+    "cs": "Czech", "ro": "Romanian", "da": "Danish", "hu": "Hungarian",
+    "ta": "Tamil", "no": "Norwegian", "th": "Thai", "ur": "Urdu",
+    "hr": "Croatian", "bg": "Bulgarian", "lt": "Lithuanian", "la": "Latin",
+    "mi": "Maori", "ml": "Malayalam", "cy": "Welsh", "sk": "Slovak",
+    "te": "Telugu", "fa": "Persian", "lv": "Latvian", "bn": "Bengali",
+    "sr": "Serbian", "az": "Azerbaijani", "sl": "Slovenian", "kn": "Kannada",
+    "et": "Estonian", "mk": "Macedonian", "br": "Breton", "eu": "Basque",
+    "is": "Icelandic", "hy": "Armenian", "ne": "Nepali", "mn": "Mongolian",
+    "bs": "Bosnian", "kk": "Kazakh", "sq": "Albanian", "sw": "Swahili",
+    "gl": "Galician", "mr": "Marathi", "pa": "Punjabi", "si": "Sinhala",
+    "km": "Khmer", "sn": "Shona", "yo": "Yoruba", "so": "Somali",
+    "af": "Afrikaans", "oc": "Occitan", "ka": "Georgian", "be": "Belarusian",
+    "tg": "Tajik", "sd": "Sindhi", "gu": "Gujarati", "am": "Amharic",
+    "yi": "Yiddish", "lo": "Lao", "uz": "Uzbek", "fo": "Faroese",
+    "ht": "Haitian Creole", "ps": "Pashto", "tk": "Turkmen", "nn": "Nynorsk",
+    "mt": "Maltese", "sa": "Sanskrit", "lb": "Luxembourgish", "my": "Myanmar",
+    "bo": "Tibetan", "tl": "Tagalog", "mg": "Malagasy", "as": "Assamese",
+    "tt": "Tatar", "haw": "Hawaiian", "ln": "Lingala", "ha": "Hausa",
+    "ba": "Bashkir", "jw": "Javanese", "su": "Sundanese", "yue": "Cantonese",
+}
+
+# Right-to-left languages within the Whisper set.
+_RTL_CODES = frozenset({"he", "ar", "fa", "ur", "yi", "ps", "sd"})
+
+# Non-Latin scripts we can range-detect (SCRIPT_RANGES tags), for codes NOT in
+# the rich LANGUAGES table. Anything omitted defaults to Latin (approximate; the
+# script filter is disabled in the multilingual profile, so this only softly
+# affects auto-detection between same-family languages).
+_SCRIPT_BY_CODE = {
+    "Cyrillic": ("ru", "uk", "bg", "sr", "mk", "be", "kk", "tg", "mn", "ba", "tt"),
+    "Arabic":   ("ar", "fa", "ur", "ps", "sd"),
+    "Hebrew":   ("he", "yi"),
+    "Han":      ("zh", "yue"),
+    "Hangul":   ("ko",),
+    "Devanagari": ("hi", "mr", "ne", "sa"),
+}
+_CODE_SCRIPT = {c: s for s, codes in _SCRIPT_BY_CODE.items() for c in codes}
+_CODE_SCRIPT["ja"] = None   # handled specially below (Han+Kana)
+
+
+def lang_meta(code):
+    """Full metadata for ANY Whisper code: the rich LANGUAGES row if curated,
+    else a derived one (name from WHISPER_LANGS, native=name, rtl from _RTL_CODES,
+    script best-effort, bcp47=code). Always returns all six fields."""
+    row = LANGUAGES.get(code)
+    if row:
+        return row
+    name = WHISPER_LANGS.get(code, code)
+    if code == "ja":
+        scripts = ["Han", "Hiragana", "Katakana"]
+    else:
+        s = _CODE_SCRIPT.get(code)
+        scripts = [s] if s else ["Latin"]
+    return {"name_en": name, "native": name, "rtl": code in _RTL_CODES,
+            "cpt": 3.0, "scripts": scripts, "bcp47": code}
+
+
+def known_language(code):
+    """True if `code` is any transcribable Whisper language (curated or not)."""
+    return code in WHISPER_LANGS or code in LANGUAGES
 
 
 def summary_enabled_langs():
@@ -209,12 +480,217 @@ TERMS = {
         "meta_speakers": "Number of detected speakers: %d (the labels Speaker A/B/C are not names)",
         "meta_invitees": "Calendar invitees (context only - some may not have attended): %s",
     },
+    # ---------------------------------------------------------------------
+    # Additional summary languages (multi-language, 2026-09-15).
+    # These rows make the language SUMMARY-enabled (summary_enabled_langs). The
+    # es/fr/de/pt/it/ru strings below are the section headers / field labels the
+    # cloud summary is asked to use. They are drafted for review; confirm with a
+    # native speaker before a PUBLIC release (the summary BODY is written by the
+    # cloud model per the "write in <LANG>" directive - these are only the
+    # headers). zh/ja/ko/ar/hi are intentionally NOT here yet: they have a full
+    # LANGUAGES row (so transcription works) but need native-reviewed TERMS before
+    # summaries are offered in them (Naor's "most popular first, incremental" rule
+    # + the native-review contract). Preserve every %d/%s placeholder exactly.
+    # ---------------------------------------------------------------------
+    "es": {
+        "title_header": "Título de la reunión",
+        "summary": "Resumen",
+        "highlights": "Puntos destacados",
+        "project_status": "Estado de los proyectos",
+        "done_hdr": "Realizado en la reunión",
+        "tasks": "Tareas",
+        "participants": "Participantes",
+        "key_points": "Puntos principales",
+        "decisions_tasks": "Decisiones / Tareas",
+        "decisions_hdr": "Decisiones",
+        "open_questions": "Preguntas abiertas",
+        "topics": "Temas tratados",
+        "next_steps": "Próximos pasos",
+        "owner": "Responsable",
+        "due": "Fecha límite",
+        "status": "Estado",
+        "decided": "Decidido",
+        "done_marker": "realizado durante la reunión",
+        "bot_request": "Solicitud para el asistente de IA",
+        "tasks_intro": "Las tareas:",
+        "chunk_prefix": "### Parte %d",
+        "interim_summary_banner": "======== Resumen provisional ========",
+        "interim_transcript_banner": "======== Transcripción (hasta ahora) ========",
+        "interim_note": ("\nNota: este es un resumen provisional; la reunión "
+                         "aún está en curso; resume solo lo tratado hasta ahora."),
+        "meta_duration": "Duración de la grabación: %s",
+        "meta_source": "Fuente de audio: %s",
+        "meta_speakers": "Número de hablantes detectados: %d (las etiquetas Speaker A/B/C no son nombres)",
+        "meta_invitees": "Invitados del calendario (solo contexto - puede que algunos no hayan asistido): %s",
+    },
+    "fr": {
+        "title_header": "Titre de la réunion",
+        "summary": "Résumé",
+        "highlights": "Points clés",
+        "project_status": "État des projets",
+        "done_hdr": "Réalisé pendant la réunion",
+        "tasks": "Tâches",
+        "participants": "Participants",
+        "key_points": "Points principaux",
+        "decisions_tasks": "Décisions / Tâches",
+        "decisions_hdr": "Décisions",
+        "open_questions": "Questions en suspens",
+        "topics": "Sujets abordés",
+        "next_steps": "Prochaines étapes",
+        "owner": "Responsable",
+        "due": "Échéance",
+        "status": "Statut",
+        "decided": "Décidé",
+        "done_marker": "réalisé pendant la réunion",
+        "bot_request": "Demande à l'assistant IA",
+        "tasks_intro": "Les tâches :",
+        "chunk_prefix": "### Partie %d",
+        "interim_summary_banner": "======== Résumé intermédiaire ========",
+        "interim_transcript_banner": "======== Transcription (jusqu'à présent) ========",
+        "interim_note": ("\nNote : ceci est un résumé intermédiaire ; la réunion "
+                         "est toujours en cours ; ne résumez que ce qui a été "
+                         "abordé jusqu'à présent."),
+        "meta_duration": "Durée de l'enregistrement : %s",
+        "meta_source": "Source audio : %s",
+        "meta_speakers": "Nombre de locuteurs détectés : %d (les étiquettes Speaker A/B/C ne sont pas des noms)",
+        "meta_invitees": "Invités de l'agenda (contexte uniquement - certains n'ont peut-être pas participé) : %s",
+    },
+    "de": {
+        "title_header": "Titel der Besprechung",
+        "summary": "Zusammenfassung",
+        "highlights": "Wichtigste Punkte",
+        "project_status": "Projektstatus",
+        "done_hdr": "In der Besprechung erledigt",
+        "tasks": "Aufgaben",
+        "participants": "Teilnehmer",
+        "key_points": "Kernpunkte",
+        "decisions_tasks": "Entscheidungen / Aufgaben",
+        "decisions_hdr": "Entscheidungen",
+        "open_questions": "Offene Fragen",
+        "topics": "Besprochene Themen",
+        "next_steps": "Nächste Schritte",
+        "owner": "Verantwortlich",
+        "due": "Frist",
+        "status": "Status",
+        "decided": "Entschieden",
+        "done_marker": "während der Besprechung erledigt",
+        "bot_request": "Anfrage an den KI-Assistenten",
+        "tasks_intro": "Die Aufgaben:",
+        "chunk_prefix": "### Teil %d",
+        "interim_summary_banner": "======== Zwischenzusammenfassung ========",
+        "interim_transcript_banner": "======== Transkript (bisher) ========",
+        "interim_note": ("\nHinweis: Dies ist eine Zwischenzusammenfassung; die "
+                         "Besprechung läuft noch; fassen Sie nur das bisher "
+                         "Besprochene zusammen."),
+        "meta_duration": "Aufnahmedauer: %s",
+        "meta_source": "Audioquelle: %s",
+        "meta_speakers": "Anzahl erkannter Sprecher: %d (die Bezeichnungen Speaker A/B/C sind keine Namen)",
+        "meta_invitees": "Kalendereingeladene (nur Kontext - einige haben möglicherweise nicht teilgenommen): %s",
+    },
+    "pt": {
+        "title_header": "Título da reunião",
+        "summary": "Resumo",
+        "highlights": "Destaques",
+        "project_status": "Status dos projetos",
+        "done_hdr": "Realizado na reunião",
+        "tasks": "Tarefas",
+        "participants": "Participantes",
+        "key_points": "Pontos principais",
+        "decisions_tasks": "Decisões / Tarefas",
+        "decisions_hdr": "Decisões",
+        "open_questions": "Questões em aberto",
+        "topics": "Tópicos discutidos",
+        "next_steps": "Próximos passos",
+        "owner": "Responsável",
+        "due": "Prazo",
+        "status": "Status",
+        "decided": "Decidido",
+        "done_marker": "realizado durante a reunião",
+        "bot_request": "Solicitação para o assistente de IA",
+        "tasks_intro": "As tarefas:",
+        "chunk_prefix": "### Parte %d",
+        "interim_summary_banner": "======== Resumo parcial ========",
+        "interim_transcript_banner": "======== Transcrição (até agora) ========",
+        "interim_note": ("\nObservação: este é um resumo parcial; a reunião ainda "
+                         "está em andamento; resuma apenas o que foi discutido "
+                         "até agora."),
+        "meta_duration": "Duração da gravação: %s",
+        "meta_source": "Fonte de áudio: %s",
+        "meta_speakers": "Número de participantes detectados: %d (os rótulos Speaker A/B/C não são nomes)",
+        "meta_invitees": "Convidados da agenda (apenas contexto - alguns podem não ter participado): %s",
+    },
+    "it": {
+        "title_header": "Titolo della riunione",
+        "summary": "Riepilogo",
+        "highlights": "Punti salienti",
+        "project_status": "Stato dei progetti",
+        "done_hdr": "Svolto durante la riunione",
+        "tasks": "Attività",
+        "participants": "Partecipanti",
+        "key_points": "Punti principali",
+        "decisions_tasks": "Decisioni / Attività",
+        "decisions_hdr": "Decisioni",
+        "open_questions": "Domande aperte",
+        "topics": "Argomenti discussi",
+        "next_steps": "Prossimi passi",
+        "owner": "Responsabile",
+        "due": "Scadenza",
+        "status": "Stato",
+        "decided": "Deciso",
+        "done_marker": "svolto durante la riunione",
+        "bot_request": "Richiesta all'assistente IA",
+        "tasks_intro": "Le attività:",
+        "chunk_prefix": "### Parte %d",
+        "interim_summary_banner": "======== Riepilogo provvisorio ========",
+        "interim_transcript_banner": "======== Trascrizione (finora) ========",
+        "interim_note": ("\nNota: questo è un riepilogo provvisorio; la riunione "
+                         "è ancora in corso; riassumi solo ciò che è stato "
+                         "discusso finora."),
+        "meta_duration": "Durata della registrazione: %s",
+        "meta_source": "Sorgente audio: %s",
+        "meta_speakers": "Numero di parlanti rilevati: %d (le etichette Speaker A/B/C non sono nomi)",
+        "meta_invitees": "Invitati del calendario (solo contesto - alcuni potrebbero non aver partecipato): %s",
+    },
+    "ru": {
+        "title_header": "Тема встречи",
+        "summary": "Краткое содержание",
+        "highlights": "Ключевые моменты",
+        "project_status": "Статус проектов",
+        "done_hdr": "Выполнено на встрече",
+        "tasks": "Задачи",
+        "participants": "Участники",
+        "key_points": "Основные моменты",
+        "decisions_tasks": "Решения / Задачи",
+        "decisions_hdr": "Решения",
+        "open_questions": "Открытые вопросы",
+        "topics": "Обсуждённые темы",
+        "next_steps": "Дальнейшие шаги",
+        "owner": "Ответственный",
+        "due": "Срок",
+        "status": "Статус",
+        "decided": "Решено",
+        "done_marker": "выполнено во время встречи",
+        "bot_request": "Запрос к ИИ-ассистенту",
+        "tasks_intro": "Задачи:",
+        "chunk_prefix": "### Часть %d",
+        "interim_summary_banner": "======== Промежуточное резюме ========",
+        "interim_transcript_banner": "======== Стенограмма (на данный момент) ========",
+        "interim_note": ("\nПримечание: это промежуточное резюме; встреча ещё "
+                         "продолжается; резюмируйте только то, что обсуждалось "
+                         "до сих пор."),
+        "meta_duration": "Длительность записи: %s",
+        "meta_source": "Источник аудио: %s",
+        "meta_speakers": "Число распознанных говорящих: %d (метки Speaker A/B/C не являются именами)",
+        "meta_invitees": "Приглашённые из календаря (только для контекста - некоторые могли не присутствовать): %s",
+    },
 }
 
 
 def term(key, lang):
-    """The generated form of a marker in `lang` (falls back to Hebrew)."""
-    return TERMS.get(lang, TERMS["he"]).get(key, TERMS["he"][key])
+    """The generated form of a marker in `lang` (falls back to English so a
+    partially-translated / LANGUAGES-only language never leaks Hebrew RTL
+    headers into an LTR summary; he/en are complete so both are unaffected)."""
+    return TERMS.get(lang, TERMS["en"]).get(key, TERMS["en"][key])
 
 
 # ---------------------------------------------------------------------------
@@ -222,10 +698,36 @@ def term(key, lang):
 # ---------------------------------------------------------------------------
 
 # Building blocks meant to be embedded inside larger regexes in lia.py
-# / action_items.py. Keep them non-capturing.
-OWNER_ALT = r"(?:אחראי|Owner)"
-FIELD_ALT = r"(?:יעד|סטטוס|Due|Status)"
-TASKS_HDR_ALT = r"(?:משימות|Tasks)"
+# / action_items.py. Keep them non-capturing. Built as the UNION of the marker
+# across every summary-enabled language (he+en today), so adding a language's
+# TERMS row extends the parsers additively. For summary_enabled_langs()==[he,en]
+# these produce exactly the same strings as the retired hardcoded literals.
+def _union_alt(*term_keys):
+    seen = []
+    for c in summary_enabled_langs():
+        for k in term_keys:
+            v = TERMS.get(c, {}).get(k)
+            if v and v not in seen:
+                seen.append(v)
+    return "(?:" + "|".join(re.escape(v) for v in seen) + ")"
+
+
+def _titles_across(*term_keys):
+    out = []
+    for c in summary_enabled_langs():
+        for k in term_keys:
+            v = TERMS.get(c, {}).get(k)
+            if v and v not in out:
+                out.append(v)
+    return tuple(out)
+
+
+OWNER_ALT = _union_alt("owner")
+FIELD_ALT = _union_alt("due", "status")
+TASKS_HDR_ALT = _union_alt("tasks")
+# DONE_VOTE_ALT stays curated he/en: it matches the intermediate task-DONE
+# vote-pass output ("N: done" / "N: בוצע"), which is Hebrew-only-gated in lia; a
+# new language's done detection rides its localized done_marker instead.
 DONE_VOTE_ALT = r"(?:בוצע|done)"
 
 # Both forms of a marker, for `in`-style membership checks.
@@ -233,17 +735,14 @@ def both(key):
     return (TERMS["he"][key], TERMS["en"][key])
 
 
-# Section-title sets for the title-header backstop + consolidate gate.
-KNOWN_SECTION_TITLES = (
-    TERMS["he"]["summary"], TERMS["he"]["participants"], TERMS["he"]["highlights"],
-    TERMS["he"]["done_hdr"], TERMS["he"]["tasks"],
-    TERMS["en"]["summary"], TERMS["en"]["participants"], TERMS["en"]["highlights"],
-    TERMS["en"]["done_hdr"], TERMS["en"]["tasks"],
-)
+# Section-title sets for the title-header backstop + consolidate gate (union
+# across summary-enabled languages; membership, not order, is what the parsers
+# and tests rely on - and the he/en order is preserved).
+KNOWN_SECTION_TITLES = _titles_across(
+    "summary", "participants", "highlights", "done_hdr", "tasks")
 STATUS_HDR_PREFIXES = ("סטטוס", "Project Status", "Status")
 TITLE_HDR_PREFIXES = ("כותרת", "Discussion Title")
-PROSE_SECTIONS = (TERMS["he"]["summary"], TERMS["he"]["highlights"],
-                  TERMS["en"]["summary"], TERMS["en"]["highlights"])
+PROSE_SECTIONS = _titles_across("summary", "highlights")
 
 
 # ---------------------------------------------------------------------------
@@ -760,7 +1259,7 @@ def _fill_summary_tokens(body, lang):
     """Substitute the output-language name (LANGUAGES) and every section header /
     field label / bot-request phrase (TERMS[lang]) into a template body. Leaves
     the «NT» family for lia.render_notetaker. Unknown lang -> Hebrew terms."""
-    T = TERMS.get(lang, TERMS["he"])
+    T = TERMS.get(lang, TERMS["en"])
     repl = {
         "«LANG»": language_name(lang),
         "«H_TITLE»": T["title_header"],
@@ -772,9 +1271,15 @@ def _fill_summary_tokens(body, lang):
         "«H_PARTICIPANTS»": T["participants"],
         "«H_TOPICS»": T["topics"],
         "«H_NEXT»": T["next_steps"],
+        "«H_PROJECT_STATUS»": T["project_status"],
+        "«H_DONE»": T["done_hdr"],
+        "«H_KEY_POINTS»": T["key_points"],
         "«OWNER»": T["owner"],
         "«DUE»": T["due"],
         "«STATUS»": T["status"],
+        "«DECIDED»": T["decided"],
+        "«DONE_MARKER»": T["done_marker"],
+        "«TASKS_INTRO»": T["tasks_intro"],
         "«BOT_REQ»": T["bot_request"],
     }
     for k, v in repl.items():

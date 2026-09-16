@@ -179,6 +179,7 @@ if _ARM_CRASH_NET:
     _startup_trace("launch", " ".join(sys.argv[1:]) or "(no args)")
 
 import json
+import re
 import asyncio
 import threading
 
@@ -375,7 +376,7 @@ if sys.platform == "win32":
     ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
 
 # --- Configuration ---
-APP_VERSION = "1.5.1"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
+APP_VERSION = "1.6.0"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Lia")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -387,7 +388,15 @@ DEFAULT_CONFIG = {
     # direction, and (via summary_language="primary") the summary output
     # language. NOTE the legacy "language" key above is a DEAD slot (written
     # by an uncalled setter, never read) - do not reuse it.
-    "primary_language": "he",  # "he" / "en"
+    "primary_language": "he",  # any lang_pack.LANGUAGES code ("he"/"en" = the bilingual profile)
+    # Languages the app is constrained to (multi-language, 2026-09-15). Default
+    # ["he","en"] = today's behavior. The SET SIZE is the anti-roaming control:
+    # exactly one code = a HARD language lock (forced decoding, no detection);
+    # two or more = constrained detection within the set only. A set within
+    # {he,en} keeps the byte-identical "hebrew" profile; anything wider = the
+    # "multilingual" profile (see lang_pack.language_profile / _language_profile).
+    # Managed on Settings > General ("Languages" + "Lock to one language").
+    "enabled_languages": ["he", "en"],
     # Language meeting + standalone summaries are WRITTEN in:
     #   "primary" = the user's primary_language (today's "summary is for the
     #               READER" semantics, parameterized - he keeps ALWAYS-Hebrew)
@@ -396,6 +405,9 @@ DEFAULT_CONFIG = {
     "summary_language": "primary",
     # Meeting-summary TEMPLATE (2026-09-15). Affects OpenAI / Gemini summaries
     # ONLY (Naor's rule); the local Gemma path keeps its hardcoded technical base.
+    # (One SCOPED exception, unrelated to this config key: the 8 GB local tier -
+    # summary_model "gemma3:4b" - runs the GENERAL base because a ~4B model
+    # collapses on the GOLD prompt; see LOCAL_SUMMARY_TIERS / _run_summary.)
     #   "technical" = the built-in project-manager prompt (default, unchanged)
     #   "general"   = a clean everyday recap (summary/points/decisions/tasks/open)
     #   "minutes"   = formal minutes (participants/topics/decisions/actions/next)
@@ -698,7 +710,8 @@ DEFAULT_CONFIG = {
                                             #   cloud-parity addendum ("" = built-in default)
     "summary_base_prompt_override": "",     # Settings > Advanced (behind a lock): manual base
                                             #   meeting prompt for OpenAI/Gemini ONLY ("" = built-in;
-                                            #   the local Gemma flow always keeps the pinned base)
+                                            #   the local Gemma flow keeps the pinned base - except the
+                                            #   8 GB gemma3:4b tier, which uses the general recap base)
     # Compose Mode (voice → professional written piece, with iterative
     # re-versioning). Tray → "Start Compose": records a spoken draft, transcribes
     # it, then rewrites it into a polished email/message/summary via summary_model
@@ -850,13 +863,6 @@ DEFAULT_CONFIG = {
     # Action-item tracker: one window listing every open task across all meetings
     # (parsed from each summary's "משימות" section; done-state in its own store).
     "action_items_hotkey": "ctrl+alt+t",
-    # Task note: a personal, frictionless to-do pad (tasks_store.py + the sticky
-    # tasknote_window.py) - jotted DIRECTLY by voice or typing, separate from the
-    # meeting-derived action tracker above. tasks_hotkey = speak a task straight
-    # into the note (reuses the voice-ask capture, mode="task"); tasks_toggle_hotkey
-    # = show/hide the sticky. "" disables either.
-    "tasks_hotkey": "ctrl+alt+q",
-    "tasks_toggle_hotkey": "ctrl+alt+w",
     # Auto-gain: boost quiet press-to-talk recordings toward a target
     # loudness before sending to the transcriber. Low-level mics (a
     # gooseneck at a modest Windows input level) produce weak signals
@@ -906,10 +912,26 @@ DEFAULT_CONFIG = {
     "auto_detect_meetings": False,
     # Forgotten-meeting safeguards (all in MINUTES; 0 disables that one).
     "meeting_silence_stop_min": 10,    # auto-stop after this many min of CONTINUOUS silence
-    # Smart chunk boundary (Meetily-inspired, 2026-08-27): cut each drained 45s
+    # Smart chunk boundary (Meetily-inspired, 2026-08-27): cut each drained
     # window at its quietest point near the end and carry the tail into the
     # next chunk, so the rotation never clips a word mid-syllable. Kill-switch.
     "meeting_chunk_smart_cut": True,
+    # Realtime cadence: how often the meeting rotation drains + transcribes a
+    # chunk, so the live transcript updates roughly this often. Lower = snappier
+    # live feedback, more transcription calls; higher = fewer calls, more context
+    # per chunk. Clamped to [5, 120] in MeetingSession. (2026-09-15: 45 -> 15 for
+    # a livelier realtime transcript; the smart-cut carry keeps words un-clipped.)
+    "meeting_chunk_seconds": 15,
+    # Transcript flow (2026-09-16): join consecutive chunks into flowing
+    # paragraphs instead of one timestamped block per 15s chunk. Whisper closes
+    # EVERY chunk with a period even mid-sentence, so per-chunk blocks read as a
+    # run of chopped "sentences"; the flow pass drops that artificial period at
+    # a smart-cut (short pause) boundary and keeps a real sentence end (long
+    # pause / ? ! / a discourse opener next). One timestamp per paragraph,
+    # a new paragraph at the first real sentence end after `paragraph_seconds`.
+    # False = the old per-chunk blocks.
+    "meeting_transcript_flow": True,
+    "meeting_transcript_paragraph_seconds": 60,
     # Speaker naming (2026-08-27): auto-label the diarized cluster whose talk
     # intervals correlate with the MIC channel as the local user (mic = me,
     # loopback = everyone else). speaker_self_name "" = Windows display name.
@@ -1303,6 +1325,152 @@ def smart_cut_tail(audio_np, sample_rate=16000, window_s=2.5, frame_s=0.03,
     return audio_np[:cut], audio_np[cut:]
 
 
+def pause_seconds_at_cut(head, tail, sample_rate=16000, frame_s=0.03,
+                         thresh=0.006, span_s=2.0):
+    """How long the pause is AROUND a smart-cut boundary: the contiguous run of
+    low-energy frames ending `head` plus the run starting `tail`, in seconds.
+    Speech frames sit ~0.04 RMS, room noise well under 0.006, so a breath /
+    comma pause measures ~0.2-0.6 s and a real sentence end ~0.8 s+. Drives the
+    transcript flow pass (a short pause = the chunk's closing period is
+    Whisper's artifact, not a sentence end). Pure; never raises on odd input."""
+    try:
+        fr = max(1, int(frame_s * sample_rate))
+        span = int(span_s * sample_rate)
+
+        def _run(seg, from_end):
+            seg = np.asarray(seg if seg is not None else [], dtype=np.float32)
+            n = len(seg) // fr
+            if n <= 0:
+                return 0
+            frames = (seg[len(seg) - n * fr:] if from_end else seg[:n * fr]).reshape(n, fr)
+            rms = np.sqrt(np.mean(frames * frames, axis=1) + 1e-12)
+            order = rms[::-1] if from_end else rms
+            k = 0
+            for v in order:
+                if v >= thresh:
+                    break
+                k += 1
+            return k
+
+        a = head[-span:] if head is not None and len(head) else head
+        b = tail[:span] if tail is not None and len(tail) else tail
+        return (_run(a, True) + _run(b, False)) * fr / float(sample_rate)
+    except Exception:
+        return 0.0
+
+
+# Words that open a NEW sentence/thought when they start a chunk: if the next
+# chunk begins with one, the previous chunk's closing period was probably real
+# and is kept. Anything else after a short pause is treated as mid-sentence.
+_SENTENCE_OPENERS = frozenset("""
+אז אבל אוקיי אוקי או.קיי עכשיו בסדר טוב רגע יאללה בקיצור למשל בנוסף לכן ולכן ואז
+שנית ראשית בעצם אגב תראה תראי תקשיב תקשיבי שאלה נכון סבבה מעולה יופי אחלה בוא בואו
+כן לא בנוגע לגבי מבחינת
+so but okay ok now well right also then anyway first second next alright actually
+basically look listen yes yeah no great cool fine question regarding
+""".split())
+_CHUNK_TERMINAL_RE = re.compile(r"[.…]+\s*$")
+_HARD_TERMINALS = ("?", "!", "؟")
+
+
+def soften_chunk_boundary(prev_text, next_text, cut="drain", pause_s=0.0,
+                          long_pause_s=0.8):
+    """Decide how two consecutive meeting chunks join. Returns
+    (prev_text_adjusted, kind) with kind "flow" (mid-sentence: the previous
+    chunk's artificial closing period / ellipsis is stripped, the texts run on
+    with a space) or "break" (a real sentence end: punctuation kept).
+    Whisper transcribes each chunk alone and closes it with a period no matter
+    where the audio was cut; a smart-cut boundary sits at the quietest frame,
+    usually a breath, so "flow" is the default. A break wins on any real
+    sentence-end signal: the meeting's final chunk, a ? / !, a long pause, or
+    the next chunk opening with a discourse word (אז / אבל / so / but...)."""
+    prev = (prev_text or "").rstrip()
+    nxt = (next_text or "").lstrip()
+    if not prev or not nxt:
+        return prev, "break"
+    if cut == "final":
+        return prev, "break"
+    if prev.endswith(_HARD_TERMINALS):
+        return prev, "break"
+    if pause_s is not None and pause_s >= long_pause_s:
+        return prev, "break"
+    m = re.match(r"[\"'«(‏‎]*([\w'.]+)", nxt)
+    first = (m.group(1) if m else "").strip(".'").lower()
+    if first in _SENTENCE_OPENERS:
+        return prev, "break"
+    stripped = _CHUNK_TERMINAL_RE.sub("", prev).rstrip()
+    if stripped:
+        return stripped, "flow"
+    return prev, "break"
+
+
+def flow_chunk_paragraphs(chunks, para_seconds=60.0, enabled=True, live=False):
+    """Turn the meeting's chunk records into transcript paragraphs.
+    Returns a list of items: ("text", ts_rel, text) | ("failed", ts_rel) |
+    ("pending", ts_rel). Consecutive 'ok' chunks are joined via
+    soften_chunk_boundary; a paragraph (= one timestamp) is closed only at a
+    real sentence end once `para_seconds` have elapsed, so a sentence is never
+    split across timestamps. Silence, a failed and a pending chunk each close
+    the current paragraph. enabled=False reproduces the old one-block-per-chunk
+    layout.
+    live=True is the rolling transcript: (1) the trailing period / ellipsis is
+    stripped off the very last paragraph - that tail is always mid-sentence
+    ("in flight"), so a closing dot there is Whisper's artifact, never a real
+    end (Naor 2026-09-16); (2) a still-pending chunk is a not-yet-arrived
+    chunk, not a lost one, so it closes the paragraph WITHOUT the "audio lost"
+    marker. Pure (works on plain dicts) so it is testable without a session."""
+    items, cur = [], {"ts": None, "parts": []}
+
+    def close():
+        if cur["parts"]:
+            items.append(("text", cur["ts"], " ".join(cur["parts"])))
+        cur["ts"], cur["parts"] = None, []
+
+    prev = None
+    for c in sorted(chunks, key=lambda c: c["index"]):
+        st, ts = c.get("status"), c.get("timestamp_rel", 0)
+        if st == "empty":
+            close(); prev = None
+            continue
+        if st == "pending" and live:
+            # Live: the worker is still transcribing this chunk; it just hasn't
+            # arrived. Close the paragraph but never emit the "lost" marker.
+            close(); prev = None
+            continue
+        if st in ("failed", "pending"):
+            close(); prev = None
+            items.append((st, ts))
+            continue
+        clean = (c.get("text") or "").replace('‏', '').replace('‎', '').strip()
+        clean = collapse_repetition_hallucinations(clean)
+        if not clean:
+            continue
+        if not enabled or prev is None or not cur["parts"]:
+            close()
+            cur["ts"], cur["parts"] = ts, [clean]
+        else:
+            adj, kind = soften_chunk_boundary(
+                cur["parts"][-1], clean, prev.get("cut", "drain"),
+                prev.get("pause_s", 0.0))
+            cur["parts"][-1] = adj
+            if kind == "break" and (ts - cur["ts"]) >= para_seconds:
+                close()
+                cur["ts"], cur["parts"] = ts, [clean]
+            else:
+                cur["parts"].append(clean)
+        prev = c
+    close()
+    # Live tail: drop a dangling period/ellipsis off the last paragraph - the
+    # streaming tail is always mid-thought, so a closing dot reads as noise even
+    # when Whisper genuinely emitted one. ? / ! carry intent, so keep them.
+    if live and enabled and items and items[-1][0] == "text":
+        _ts, _txt = items[-1][1], items[-1][2]
+        _trim = _CHUNK_TERMINAL_RE.sub("", _txt).rstrip()
+        if _trim:
+            items[-1] = ("text", _ts, _trim)
+    return items
+
+
 def scan_speaker_turns(content):
     """Parse a diarized transcript's '[mm:ss] Speaker X:' headers into
     [(label, hint, best_start_s)] in first-appearance order (pure, testable).
@@ -1610,18 +1778,28 @@ def _get_hallucination_regexes():
     return _HALLUCINATION_REGEXES
 
 
-def _is_foreign_script_char(ch):
-    """A LETTER (or combining mark) that is neither Hebrew nor ASCII Latin.
-    Digits, punctuation, symbols and whitespace of any script are fine."""
+# The Hebrew profile's allow-set: Hebrew letters (ASCII Latin is always kept by
+# the o<0x80 guard below). char_in_any_script(o, {"Hebrew"}) checks exactly the
+# old inline 0x0590-0x05FF / 0xFB1D-0xFB4F ranges, so the Hebrew path is
+# byte-identical. A multilingual profile passes a wider set, or None to disable.
+_HEBREW_ALLOWED_SCRIPTS = frozenset({"Hebrew"})
+
+
+def _is_foreign_script_char(ch, allowed_scripts=_HEBREW_ALLOWED_SCRIPTS):
+    """A LETTER (or combining mark) whose script is not in `allowed_scripts`.
+    ASCII (letters, digits, punctuation) is always allowed; digits, punctuation,
+    symbols and whitespace of any script are fine (only letters/marks foreign)."""
     o = ord(ch)
-    if o < 0x80 or 0x0590 <= o <= 0x05FF or 0xFB1D <= o <= 0xFB4F:
+    if o < 0x80:
+        return False
+    if lang_pack.char_in_any_script(o, allowed_scripts):
         return False
     import unicodedata
     cat = unicodedata.category(ch)
     return cat[0] in ("L", "M")
 
 
-def strip_foreign_script_words(text):
+def strip_foreign_script_words(text, allowed_scripts=_HEBREW_ALLOWED_SCRIPTS):
     """Drop words written in a script the user never dictates.
 
     A multilingual Whisper decode that loses its footing (quiet or noisy
@@ -1640,6 +1818,10 @@ def strip_foreign_script_words(text):
     149 s - a post-filter costs nothing."""
     if not text:
         return text, 0
+    # allowed_scripts=None DISABLES the filter (a broad/auto multilingual profile
+    # must never delete correct output). The Hebrew profile passes {"Hebrew"}.
+    if allowed_scripts is None:
+        return text, 0
     import re as _re
     # Units are LETTER RUNS (with apostrophes/hyphens), not whitespace tokens:
     # "reliability,象" keeps "reliability" (the 象 stands alone behind the
@@ -1647,7 +1829,8 @@ def strip_foreign_script_words(text):
     parts = _re.findall(r"[\w'’\-]+|[^\w'’\-]+", text)
     kept, dropped = [], 0
     for p in parts:
-        if _re.match(r"[\w'’\-]", p) and any(_is_foreign_script_char(c) for c in p):
+        if _re.match(r"[\w'’\-]", p) and any(
+                _is_foreign_script_char(c, allowed_scripts) for c in p):
             dropped += 1
             continue
         kept.append(p)
@@ -1801,6 +1984,56 @@ def _collapse_phrase_repetitions(text, max_phrase_words=20):
     return ' '.join(result)
 
 
+# Single words that are naturally SAID twice for emphasis / as interjections at
+# the start of an utterance - a leading double of one of these is real speech,
+# not a transcriber artifact, so it is NOT collapsed. (A doubled multi-word
+# opening phrase is always collapsed; only the k=1 case consults this set.)
+_LEADING_DOUBLE_PROTECT = frozenset("""
+מאוד לא כן עוד די רגע טוב נו שוב אט לאט חכה חכי בוא בואי בואו ביי היי הלו שלום
+יאללה נכון בטח ברור אולי כאילו טוק טוק־טוק הו אה אוקיי אוקי תודה וולה וואלה סבבה
+no yes very so ok okay wait please really now bye hi hey hello come go knock oh
+ah well yeah yep nope ha blah bla stop
+""".split())
+
+
+def collapse_leading_duplicate(text, max_words=8):
+    """Collapse a phrase the transcriber emitted TWICE in a row at the very START
+    of a clip - a common Whisper VAD-boundary / segment-conditioning artifact
+    where the opening words come out doubled ('כשאני לוחץ כשאני לוחץ ...' ->
+    'כשאני לוחץ ...', 'אגב אגב ...' -> 'אגב ...', 'by the way by the way ...' ->
+    'by the way ...').
+
+    Scoped tight so it never eats natural speech:
+      - ONLY the leading run (position 0), ONLY an exact immediate double;
+      - a multi-word opening phrase is always collapsed (a repeated 2+ word
+        opening is never natural); a SINGLE doubled opening word is collapsed
+        too, EXCEPT the emphasis/interjection words in _LEADING_DOUBLE_PROTECT
+        ('מאוד מאוד', 'לא לא', 'no no' stay).
+    Longest matching opening phrase first, so the true repeated unit is removed
+    rather than a sub-phrase of it. Punctuation-insensitive comparison so
+    'כשאני לוחץ, כשאני לוחץ' still collapses; the kept copy is verbatim."""
+    if not text or not text.strip():
+        return text
+    # Peel any leading bidi marks / whitespace so a first-word RLM (ivrit/gpt-4o
+    # output) is re-attached to the KEPT copy, not dropped with the first one.
+    i = 0
+    while i < len(text) and text[i] in "‏‎‪‫‬‭‮ \t":
+        i += 1
+    lead, core = text[:i], text[i:]
+    words = core.split()
+    n = len(words)
+    def _norm(w):
+        return w.strip("‏‎.,!?;:־–— ").lower()
+    for k in range(min(max_words, n // 2), 0, -1):
+        first = [_norm(w) for w in words[:k]]
+        if not any(first) or first != [_norm(w) for w in words[k:2 * k]]:
+            continue
+        if k == 1 and first[0] in _LEADING_DOUBLE_PROTECT:
+            continue   # a naturally-doubled opening word - leave it
+        return lead + " ".join(words[k:])
+    return text
+
+
 def collapse_repetition_hallucinations(text):
     """Strip stuck-loop hallucinations (phrase + character-run) from
     a transcription. Returns the cleaned text. Safe to call on any
@@ -1886,13 +2119,13 @@ def _weighted_mean_logprob(segments):
 # Available models with display names
 MODELS = {
     # Hebrew-optimized (ivrit.ai) - recommended
-    "ivrit-ai/whisper-large-v3-turbo-ct2": "Hebrew Turbo ⭐ (fast + accurate)",
+    "ivrit-ai/whisper-large-v3-turbo-ct2": "Whisper Hebrew",
     "ivrit-ai/whisper-large-v3-ct2": "Hebrew Large (best Hebrew)",
     # English-optimized
-    "parakeet-tdt-0.6b-v2": "English Parakeet ⭐ (best English)",
+    "parakeet-tdt-0.6b-v3": "Parakeet Multi-Language (25 languages)",
     "distil-large-v3": "English Distil (fast + accurate)",
     # General OpenAI models
-    "large-v3-turbo": "General Turbo (fast, all languages)",
+    "large-v3-turbo": "Whisper Multi-Language (99 languages)",
     "large-v3": "General Large (best translation)",
 }
 
@@ -1901,13 +2134,13 @@ MODELS = {
 # GPU-less machine, but must NOT skip these - a user who picks Parakeet on a
 # laptop wants exactly that (2026-09-05: it was skipped, tray green, Settings
 # stuck on "Loading model", no dictation).
-CPU_FRIENDLY_MODELS = {"parakeet-tdt-0.6b-v2"}
+CPU_FRIENDLY_MODELS = {"parakeet-tdt-0.6b-v3"}
 
 # Auto-detect language from model
 MODEL_LANGUAGE = {
     "ivrit-ai/whisper-large-v3-turbo-ct2": "he",
     "ivrit-ai/whisper-large-v3-ct2": "he",
-    "parakeet-tdt-0.6b-v2": "en",
+    "parakeet-tdt-0.6b-v3": "auto",   # v3: multilingual (25 European languages)
     "distil-large-v3": "en",
     "large-v3-turbo": "auto",
     "large-v3": "auto",
@@ -1921,7 +2154,7 @@ MODEL_LANGUAGE = {
 _LOCAL_HW_NOTES = {
     "ivrit-ai/whisper-large-v3-turbo-ct2":
         "GPU (4 GB+) recommended · slower on CPU",
-    "parakeet-tdt-0.6b-v2": "fast on a plain CPU · no GPU needed",
+    "parakeet-tdt-0.6b-v3": "fast on a plain CPU · no GPU needed",
     "distil-large-v3": "works on CPU · GPU faster",
     "large-v3-turbo": "GPU (4 GB+) recommended · slower on CPU",
     # Meeting keys. Chunked mode transcribes DURING the meeting (45s
@@ -1930,9 +2163,13 @@ _LOCAL_HW_NOTES = {
     "local_hebrew_turbo":
         "GPU (4 GB+) recommended · CPU: ready ~5 min after a 1h meeting",
     "local_parakeet_english": "fast on a plain CPU · no GPU needed",
+    "local_multilang_turbo":
+        "GPU (4 GB+) recommended · CPU: ready ~5 min after a 1h meeting",
     "local_pyannote_hebrew":
         "GPU (6 GB+) strongly recommended · CPU: ~90 min per meeting hour",
     "local_pyannote_parakeet":
+        "GPU (6 GB+) strongly recommended · CPU: ~90 min per meeting hour",
+    "local_pyannote_multilang":
         "GPU (6 GB+) strongly recommended · CPU: ~90 min per meeting hour",
 }
 
@@ -1943,7 +2180,7 @@ _LOCAL_HW_NOTES = {
 # Systran / mobiuslabsgmbh repos) — the revision applies to the RESOLVED repo.
 # NOTE: the Parakeet download (onnx-asr) has no revision parameter — gap
 # documented in SECURITY.md; onnx-asr pulls by fixed filename from the
-# istupakov/parakeet-tdt-0.6b-v2-onnx repo.
+# istupakov/parakeet-tdt-0.6b-v3-onnx repo.
 MODEL_REVISIONS = {
     "ivrit-ai/whisper-large-v3-turbo-ct2": "72ad623a37947395efcc3933132353790e5a12f5",
     "ivrit-ai/whisper-large-v3-ct2": "e9ed4a4a98d761b0f617d668303de2c514236c66",
@@ -1992,23 +2229,36 @@ def _has_cuda_gpu():
         return False
 
 
-PARAKEET_MODEL = "parakeet-tdt-0.6b-v2"
+PARAKEET_MODEL = "parakeet-tdt-0.6b-v3"
 
 
 def _default_dictation_model(cfg):
     """Fresh-install dictation model. A machine WITHOUT a compatible (CUDA) GPU
-    boots on English Parakeet - the CPU model (int8 ONNX, several-x realtime) -
+    boots on multi-language Parakeet - the CPU model (int8 ONNX, several-x realtime) -
     instead of a 1.5 GB Whisper model that crawls or is skipped on CPU (Naor,
     2026-09-05: "start with Parakeet by default when there is no GPU, and say
     so"). The notice is queued in the config and shown once by the tray. A GPU
-    machine keeps the language-derived default (Hebrew Turbo / Parakeet for en)."""
+    machine keeps the language-derived default (Hebrew Turbo / Parakeet for en).
+
+    Multilingual profile (2026-09-15): large-v3-turbo (99 languages, auto-detect)
+    on a GPU. WITHOUT a GPU, if every enabled language is one Parakeet v3 supports
+    (its 25 European languages) it boots on Parakeet v3 - CPU-friendly and fast;
+    otherwise it runs large-v3-turbo on CPU (slower, never hard-blocks) and queues
+    the onboarding nudge to add a free cloud key (Gemini/Groq)."""
+    if lang_pack.language_profile(cfg) == "multilingual":
+        if not _has_cuda_gpu():
+            enabled = set(lang_pack.enabled_languages(cfg))
+            if enabled and enabled <= ParakeetTranscriber.PARAKEET_LANGS:
+                return PARAKEET_MODEL   # v3: fast local multilingual (European)
+            cfg["_no_gpu_multilingual_notice"] = True
+        return "large-v3-turbo"
     if not _has_cuda_gpu():
         cfg["_no_gpu_parakeet_notice"] = True
         return PARAKEET_MODEL
     return cfg.get("model_size", DEFAULT_CONFIG["model_size"])
 
 
-def _default_meeting_model():
+def _default_meeting_model(cfg=None):
     """Default for a FRESH install: plain CHUNKED local transcription — even on a
     CUDA GPU. Chunked keeps the live transcript working, is lighter/faster, and
     scales; and for decision/task meetings the summary is ~identical to diarized
@@ -2016,7 +2266,15 @@ def _default_meeting_model():
     prompt ignores the labels). Turn on 'Local diarize (pyannote)' per-meeting
     when 'who said what' genuinely matters (1:1s, interviews, disputes). Only used
     when the user has no saved meeting_model; an explicit menu choice is never
-    overridden."""
+    overridden.
+
+    Multilingual profile (2026-09-15): Gemini Transcribe (free, 85+ langs,
+    diarization) when a Gemini key is present; else plain chunked local, which
+    _build_meeting_transcriber runs on the multilingual large-v3-turbo. cfg=None
+    (a legacy caller) -> the Hebrew-safe local default."""
+    if cfg is not None and lang_pack.language_profile(cfg) == "multilingual":
+        if cfg.get("gemini_api_key"):
+            return "gemini_transcribe"
     return "local_hebrew_turbo"
 
 
@@ -2167,6 +2425,34 @@ def _unprotect_config_secrets(cfg):
     return cfg
 
 
+def _normalize_language_config(cfg):
+    """Repair the multi-language config keys so downstream code never sees an
+    invalid state (2026-09-15). Idempotent; a he/en config passes through
+    unchanged (primary_language stays, enabled_languages stays ["he","en"]).
+    (a) primary_language not a known code -> "he";
+    (b) enabled_languages -> known codes only, de-duped, never empty, and always
+        contains the primary."""
+    prim = cfg.get("primary_language", "he")
+    if not lang_pack.known_language(prim):
+        prim = "he"
+        cfg["primary_language"] = prim
+    raw = cfg.get("enabled_languages")
+    if not isinstance(raw, (list, tuple)) or not raw:
+        # Absent/empty: keep the he/en pair for a he/en primary (byte-identical
+        # bilingual behavior), else the user's language + English fallback.
+        raw = ["he", "en"] if prim in ("he", "en") else [prim, "en"]
+    out = []
+    for c in raw:
+        if lang_pack.known_language(c) and c not in out:
+            out.append(c)
+    if not out:
+        out = ["he", "en"]
+    if prim not in out:
+        out.insert(0, prim)
+    cfg["enabled_languages"] = out
+    return cfg
+
+
 def load_config():
     os.makedirs(CONFIG_DIR, exist_ok=True)
     if os.path.exists(CONFIG_FILE):
@@ -2179,8 +2465,8 @@ def load_config():
         except (json.JSONDecodeError, IOError) as e:
             log.warning("Config file corrupt or unreadable (%s) — using defaults", e)
             cfg = DEFAULT_CONFIG.copy()
-            cfg["meeting_model"] = _default_meeting_model()
-            return cfg
+            cfg["meeting_model"] = _default_meeting_model(cfg)
+            return _normalize_language_config(cfg)
         # Whether the user already has a meeting model saved — decides if the
         # GPU-smart default below applies (fresh installs only).
         had_meeting_model = "meeting_model" in cfg
@@ -2191,10 +2477,17 @@ def load_config():
         # Fresh install: pick the meeting model by GPU presence (see
         # _default_meeting_model). Existing users keep their saved choice.
         if not had_meeting_model:
-            cfg["meeting_model"] = _default_meeting_model()
+            cfg["meeting_model"] = _default_meeting_model(cfg)
         # Migrate old auto_paste boolean to new paste_mode
         if "auto_paste" in cfg and "paste_mode" not in cfg:
             cfg["paste_mode"] = "auto_paste" if cfg["auto_paste"] else "clipboard_only"
+        # Parakeet v2 -> v3 (multi-language, 2026-09-15): the local English-only
+        # Parakeet was upgraded to the 25-language v3; migrate a saved v2 id so
+        # existing configs boot on the new model.
+        for _k in ("model_size", "file_transcribe_model"):
+            if cfg.get(_k) == "parakeet-tdt-0.6b-v2":
+                cfg[_k] = "parakeet-tdt-0.6b-v3"
+                log.info("Migrating %s Parakeet v2 -> v3", _k)
         # The streaming "gemini_live" dictation backend was replaced by the batch
         # "gemini" (gemini-3.5-transcribe) backend - simpler + reliable at any
         # length (live streaming moved to the backlog). Migrate the saved value.
@@ -2229,7 +2522,7 @@ def load_config():
                          cfg.get("hotkey_with_enter"))
                 cfg["hotkey_with_enter"] = ""
             cfg["_enter_hotkey_disabled"] = True
-        return _unprotect_config_secrets(cfg)
+        return _unprotect_config_secrets(_normalize_language_config(cfg))
     # No config file at all (first run ever) — start from defaults + GPU-smart
     # meeting model. A PORTABLE build may ship config.seed.json next to the app
     # (gitignored, like hf_token.local) with opinionated defaults (e.g. cloud
@@ -2245,19 +2538,30 @@ def load_config():
         log.info("Applied bundled config.seed.json (%d keys)", len(seed))
     # Only fall back to the GPU-smart meeting model if the seed didn't set one.
     if "meeting_model" not in seed:
-        cfg["meeting_model"] = _default_meeting_model()
+        cfg["meeting_model"] = _default_meeting_model(cfg)
     # First run only + no seed opinion: derive the primary language from the
-    # Windows UI language (english-support, 2026-08) - an OSS user in the US boots
-    # into English defaults, a he-IL machine keeps Hebrew. Never touches an
-    # existing config (this branch is the no-config-file path).
+    # Windows UI language. he-IL keeps Hebrew; a Tier-1 locale boots into that
+    # language (multilingual profile + an English fallback); anything else ->
+    # English (byte-identical to the prior he-vs-everything-else behavior). Never
+    # touches an existing config (this branch is the no-config-file path).
+    _WIN_LANGID_TO_CODE = {
+        0x0D: "he", 0x09: "en", 0x0A: "es", 0x04: "zh", 0x39: "hi", 0x01: "ar",
+        0x16: "pt", 0x0C: "fr", 0x07: "de", 0x19: "ru", 0x11: "ja", 0x12: "ko",
+        0x10: "it",
+    }
     if "primary_language" not in seed:
         try:
             import ctypes
             langid = ctypes.windll.kernel32.GetUserDefaultUILanguage()
-            if (langid & 0x3FF) != 0x0D:   # primary language part; 0x0D = Hebrew
-                cfg["primary_language"] = "en"
+            code = _WIN_LANGID_TO_CODE.get(langid & 0x3FF, "en")
+            if code != "he":
+                cfg["primary_language"] = code
+                if code != "en" and "enabled_languages" not in seed:
+                    # A non-he/en locale opens the multilingual profile with an
+                    # English fallback so mixed English tech terms still decode.
+                    cfg["enabled_languages"] = [code, "en"]
                 log.info("First run: Windows UI language 0x%04X -> "
-                         "primary_language=en", langid)
+                         "primary_language=%s", langid, code)
         except Exception:
             pass
     # An English-primary first run also boots on the English local models
@@ -2271,15 +2575,21 @@ def load_config():
                 "local_hebrew_turbo": "local_parakeet_english",
                 "local_pyannote_hebrew": "local_pyannote_parakeet",
             }.get(cfg["meeting_model"], cfg["meeting_model"])
+    # A multilingual-locale first run picks the multilingual meeting default now
+    # that primary + enabled are set (Gemini when keyed, else chunked local which
+    # _build_meeting_transcriber runs on large-v3-turbo). The seed still wins.
+    if (lang_pack.language_profile(cfg) == "multilingual"
+            and "meeting_model" not in seed):
+        cfg["meeting_model"] = _default_meeting_model(cfg)
     # No compatible GPU -> Parakeet (CPU) is the dictation default, with a
     # one-time notice (see _default_dictation_model). The seed still wins.
     if "model_size" not in seed:
         cfg["model_size"] = _default_dictation_model(cfg)
         if cfg.get("_no_gpu_parakeet_notice"):
             log.info("First run without a compatible GPU: dictation model -> "
-                     "English Parakeet (CPU)")
+                     "Parakeet Multi-Language (CPU)")
     # A seed config may carry pre-protected secrets; decrypt like a real load.
-    return _unprotect_config_secrets(cfg)
+    return _unprotect_config_secrets(_normalize_language_config(cfg))
 
 
 def is_user_admin():
@@ -4505,12 +4815,31 @@ class FasterWhisperTranscriber(BaseTranscriber):
                     language=lang,
                     task=task,
                     initial_prompt=init_prompt,
+                    # condition_on_previous_text=False (2026-09-16, Naor's
+                    # first-word-duplication bug): with the default True, the
+                    # first VAD segment's decoded text (and the initial_prompt)
+                    # primes the next segment, and Whisper re-emits the opening
+                    # words ("כשאני לוחץ כשאני לוחץ ..."). Disabling cross-segment
+                    # conditioning stops the double at the source; it does NOT
+                    # forbid a genuinely-repeated word inside one segment, so
+                    # natural emphasis ("מאוד מאוד") is untouched. For this app's
+                    # short clips / chunked meetings the lost long-range context
+                    # is immaterial.
+                    condition_on_previous_text=False,
                     vad_filter=True,
                     vad_parameters=dict(
                         min_silence_duration_ms=500,
                     ),
                 )
-                texts = [seg.text.strip() for seg in segments if seg.text.strip()]
+                # Drop an EXACT immediate duplicate segment at the boundary (the
+                # same artifact, seen as two identical whole segments rather than
+                # a within-line repeat). Segment-level so it never touches
+                # natural word repetition.
+                texts = []
+                for seg in segments:
+                    t = seg.text.strip()
+                    if t and not (texts and t == texts[-1]):
+                        texts.append(t)
             return texts, info
 
         try:
@@ -4527,6 +4856,13 @@ class FasterWhisperTranscriber(BaseTranscriber):
 
         # Strip end-of-clip hallucinations ("thank you" / "תודה רבה")
         text = strip_hallucinated_tail(text)
+        # Collapse repetitions (parity with the Parakeet path) + a doubled OPENING
+        # phrase - a Whisper VAD/segment-conditioning artifact where the first
+        # words come out twice ("כשאני לוחץ כשאני לוחץ ..." -> "כשאני לוחץ ...").
+        # The generic collapser's 5x/4x threshold intentionally ignores an exact
+        # double (natural emphasis), so the leading-double needs its own pass.
+        text = collapse_repetition_hallucinations(text)
+        text = collapse_leading_duplicate(text)
         if not text:
             return ""
 
@@ -4536,6 +4872,14 @@ class FasterWhisperTranscriber(BaseTranscriber):
 
         # Detect if the text is primarily RTL (Hebrew/Arabic)
         detected_lang = info.language if info else lang
+        # Transparency (2026-09-15): log the model + the language actually used,
+        # and whether it was forced (a language lock) or auto-detected, so a
+        # "why is it the wrong language?" question is answerable from lia.log.
+        log.info("Dictation: model=%s language=%s (%s)%s -> %d chars",
+                 getattr(self, "model_size", "?"), detected_lang,
+                 "forced" if lang else "auto-detected",
+                 " vocab-prompt-on" if init_prompt else "",
+                 len(text))
         rtl_langs = {"he", "ar", "fa", "ur", "yi"}
         is_rtl = detected_lang in rtl_langs if detected_lang else any(
             '\u0590' <= c <= '\u05FF' or  # Hebrew
@@ -5036,33 +5380,44 @@ class BilingualRouterTranscriber(BaseTranscriber):
 
 
 # ============================================================
-# Parakeet Transcriber — LOCAL English ASR (english-support, 2026-08)
+# Parakeet Transcriber — LOCAL multi-language ASR (25 European langs, v3)
 # ============================================================
 class ParakeetTranscriber(BaseTranscriber):
-    """NVIDIA Parakeet TDT 0.6B v2 via the onnx-asr runtime — the local
-    ENGLISH backend (Open ASR WER 6.05 vs 7.75 for large-v3-turbo, ~15x
-    faster, native punctuation + capitalization). int8 ONNX (~670MB), CPU
-    execution — already several-x realtime on a modern CPU, so no GPU/cuDNN
-    pairing is needed for v1. CC-BY-4.0 (attribution in the README/About).
+    """NVIDIA Parakeet TDT 0.6B v3 via the onnx-asr runtime — the local
+    MULTI-LANGUAGE backend: 25 European languages (auto-detected), ~6.3% avg
+    WER, native punctuation + capitalization, very fast. int8 ONNX (~670MB),
+    CPU execution — several-x realtime on a modern CPU, so no GPU/cuDNN pairing
+    is needed. CC-BY-4.0 (attribution in the README/About). Upgraded from the
+    English-only v2 (2026-09-15): the model auto-detects among its 25 languages.
 
-    HARD CONSTRAINTS the call sites must honor:
-    - ENGLISH ONLY, acoustics-conditioned: there is no language token at all.
-      Any non-English audio comes out as garbled phonetic English (never
-      Hebrew script, not omission) — every route into this class must sit
-      behind an explicit en gate (MODEL_LANGUAGE / the bilingual router's en
-      route / an *_english meeting key). Never in an auto path.
+    CONSTRAINTS the call sites should honor:
+    - SUPPORTED LANGUAGES = the 25 in PARAKEET_LANGS (Latin/Cyrillic European:
+      en, es, fr, de, it, pt, nl, pl, ru, uk, and more). NO Hebrew, Chinese,
+      Japanese, Korean, Arabic, or Hindi — for those use a Whisper model. A
+      language OUTSIDE the set comes out garbled, so a Parakeet route should be
+      gated to a supported language (or auto among European speech).
+    - LANGUAGE IS AUTO-DETECTED: onnx-asr's recognize() takes no language token,
+      so a forced `language=` (e.g. a hard lock) is a HINT the model cannot
+      honor — it always auto-detects among its 25. For a hard single-language
+      lock, use a Whisper model instead.
     - custom_vocabulary is accepted for contract parity but INERT — Parakeet
-      has no prompt biasing. English term fixing rides the LLM cleanup +
-      the corrections store instead.
-    - task="translate" is unsupported (raises; the router already sends
-      translate to the general Whisper child)."""
+      has no prompt biasing. Term fixing rides the LLM cleanup + corrections.
+    - task="translate" is unsupported (raises; the router sends translate to
+      the general Whisper child)."""
+
+    # The 25 European languages Parakeet TDT 0.6B v3 supports (auto-detected).
+    PARAKEET_LANGS = frozenset({
+        "bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el", "hu",
+        "it", "lv", "lt", "mt", "pl", "pt", "ro", "sk", "sl", "es", "sv", "ru",
+        "uk",
+    })
 
     # ~5x realtime measured on the 265K (int8/CPU, 2026-08-28); single-pass
     # inference is fine well past our 45s meeting chunks — long FILES are
     # split below this many seconds at the quietest boundary region.
     FILE_CHUNK_S = 55.0
 
-    def __init__(self, model_size="parakeet-tdt-0.6b-v2", device="cpu"):
+    def __init__(self, model_size="parakeet-tdt-0.6b-v3", device="cpu"):
         super().__init__(model_size=model_size, cpu_threads=0)
         self.device = device
         self.custom_vocabulary = ""   # contract parity; inert (see docstring)
@@ -5075,7 +5430,7 @@ class ParakeetTranscriber(BaseTranscriber):
         self._loading = True
         try:
             if callback:
-                callback("Loading Parakeet (English)...")
+                callback("Loading Parakeet (multilingual)...")
             # HF cache symlinks need admin/dev-mode on Windows — plain copies
             # work everywhere (verified 2026-08-28: symlink mode raises
             # WinError 1314 in a non-elevated dev run).
@@ -5120,20 +5475,20 @@ class ParakeetTranscriber(BaseTranscriber):
                     from huggingface_hub.constants import HF_HUB_CACHE
                     cache_dir = os.path.join(
                         HF_HUB_CACHE,
-                        "models--istupakov--parakeet-tdt-0.6b-v2-onnx")
+                        "models--istupakov--parakeet-tdt-0.6b-v3-onnx")
                     if os.path.isdir(cache_dir):
                         _sh.rmtree(cache_dir, ignore_errors=True)
                         log.info("Wiped Parakeet cache: %s", cache_dir)
                 except Exception as wipe_e:
                     log.warning("Parakeet cache wipe failed: %s", wipe_e)
                 if callback:
-                    callback("Re-downloading Parakeet (English)...")
+                    callback("Re-downloading Parakeet (multilingual)...")
                 self.model = onnx_asr.load_model(name, quantization="int8")
                 log.info("Parakeet recovered after cache wipe (%s)", name)
             log.info("Parakeet model loaded in %.1fs (%s, %s)",
                      time.time() - t0, name, self.device)
             if callback:
-                callback("Parakeet ready (English)")
+                callback("Parakeet ready")
         except Exception:
             self.model = None
             raise
@@ -5157,10 +5512,12 @@ class ParakeetTranscriber(BaseTranscriber):
             raise RuntimeError("Parakeet model not loaded")
         if len(audio_np) == 0:
             return ""
-        if language not in (None, "en") and not self._lang_warned:
+        if (language and language not in self.PARAKEET_LANGS
+                and not self._lang_warned):
             self._lang_warned = True
-            log.warning("Parakeet asked for language=%r — it is English-only; "
-                        "output for non-English audio will be garbled", language)
+            log.warning("Parakeet asked for language=%r — outside its 25 European "
+                        "languages; output will be garbled (use a Whisper model "
+                        "for %r)", language, language)
         return self._recognize(audio_np)
 
     def transcribe_file(self, file_path, language=None, task="transcribe"):
@@ -5794,8 +6151,10 @@ class GeminiTranscriber(BaseTranscriber):
 
     @staticmethod
     def _bcp47(lang):
-        """Map Lia's short language codes to the BCP-47 tags the API expects."""
-        return {"he": "he-IL", "en": "en-US"}.get(lang, lang)
+        """Map Lia's short language codes to the BCP-47 tags the API expects
+        (from lang_pack.LANGUAGES; he->he-IL / en->en-US unchanged; an unknown
+        code passes through)."""
+        return lang_pack.lang_meta(lang)["bcp47"]
 
     def _vocab_terms(self):
         """Split the composed vocabulary string into a term list (cap 1,000;
@@ -8517,6 +8876,7 @@ class GroqLLMCleaner:
                   mr_overlap_tokens=0, mr_fuzzy_dedup=False, mr_prefer_tokens=0,
                   consolidate_pass=False, task_done_pass=False, cloud_parity=False,
                   coverage_pass=False, depth_pass=False,
+                  ctx_cap=None,
                   lang="he", template="technical"):
         """General LLM call for SUMMARISATION (meeting notes + the standalone
         Summarize tool). Deliberately different from clean():
@@ -8579,6 +8939,11 @@ class GroqLLMCleaner:
         the passed system_prompt, and _p_parity_addendum uses the template's addendum.
         The local Gemma path returned far above with the technical base it was
         handed, so a template can never touch it (Naor's rule). "technical" = prior.
+        `ctx_cap` (low-VRAM tiers, 2026-09-15) - the LOCAL num_ctx ceiling for this
+        call (from the selected model's tier profile). None -> _SUMMARY_CTX_CAP
+        (the 24 GB default, back-compat). A smaller cap sends more/longer meetings
+        through map-reduce so the KV cache stays GPU-resident on a small card;
+        ignored on the cloud branch (cloud sizes nothing by num_ctx).
         Returns the model's text, or "" on any failure (the caller decides how
         to surface that — meetings fall back to transcript-only)."""
         self.last_corrections = []
@@ -8641,6 +9006,11 @@ class GroqLLMCleaner:
         done_prompt = _p_task_done(lang)
 
         if is_local:
+            # num_ctx ceiling for THIS local model's tier (low-VRAM tiers): a
+            # smaller card caps smaller so its KV cache stays GPU-resident, and
+            # longer meetings then fall through to map-reduce rather than being
+            # silently truncated. None -> the 24 GB default (prior behavior).
+            cap = ctx_cap if ctx_cap is not None else _SUMMARY_CTX_CAP
             # Ollama NATIVE /api/chat (lets us disable thinking + set num_ctx).
             url = _re.sub(r"/v1/chat/completions/?$", "/api/chat", self.chat_url)
             try:
@@ -8648,7 +9018,7 @@ class GroqLLMCleaner:
                 # Does the whole transcript + its summary fit one context window?
                 # (Hebrew ~1.9 chars/token; a too-small num_ctx makes Ollama
                 # silently drop the START — the model then summarises the tail.)
-                fits = int(len(content) / cpt) + _SUMMARY_RESERVE <= _SUMMARY_CTX_CAP
+                fits = int(len(content) / cpt) + _SUMMARY_RESERVE <= cap
                 overlap_chars = max(0, int(mr_overlap_tokens * cpt))
                 force_mr, forced_chunk_chars = False, None
                 # Single-pass unified summary is the METHOD (the 3-phase ensemble
@@ -8676,7 +9046,8 @@ class GroqLLMCleaner:
                                  "staying one-shot.")
                 if fits and not force_mr:
                     num_ctx = _summary_size_ctx(int(len(content) / cpt),
-                                                num_predict=max_completion)
+                                                num_predict=max_completion,
+                                                ceiling=cap)
                     log.info("Summary (%s · local): %d chars, one-shot num_ctx=%d",
                              self.model, len(content), num_ctx)
                     out = self._ollama_summary_once(
@@ -8692,7 +9063,7 @@ class GroqLLMCleaner:
                         url, system_prompt, text, think, read_to,
                         meeting_meta=meeting_meta, overlap_chars=overlap_chars,
                         chunk_chars=forced_chunk_chars if force_mr else None,
-                        lang=lang)
+                        lang=lang, ctx_cap=cap)
                 out = _re.sub(r"(?is)<think(?:ing)?>.*?</think(?:ing)?>\s*",
                               "", out or "").strip()
                 out, self.last_corrections = _split_summary_corrections(out)
@@ -8712,11 +9083,11 @@ class GroqLLMCleaner:
                             # Map-reduce-sized meeting: the pass runs per transcript
                             # WINDOW and merges in code (upstream parity). The old
                             # single-call path sent the FULL content with num_ctx
-                            # capped at _SUMMARY_CTX_CAP - Ollama silently dropped
+                            # capped at the tier ceiling - Ollama silently dropped
                             # the START, so long meetings lost their early tasks.
                             reserve_t = (int(len(tasks_prompt) / cpt)
                                          + 4000 + 1024)
-                            win_chars = int((_SUMMARY_CTX_CAP - reserve_t) / 1.2
+                            win_chars = int((cap - reserve_t) / 1.2
                                             * cpt)
                             wins = self._split_for_summary(
                                 text, win_chars, overlap_chars=overlap_chars)
@@ -8724,7 +9095,8 @@ class GroqLLMCleaner:
                             for w_chunk in wins:
                                 wc = _wrap_meeting_input(w_chunk, meeting_meta)
                                 nc_w = _summary_size_ctx(int(len(wc) / cpt),
-                                                         num_predict=4000)
+                                                         num_predict=4000,
+                                                         ceiling=cap)
                                 parts.append(self._ollama_summary_once(
                                     url, tasks_prompt, wc, nc_w, False,
                                     read_to, num_predict=4000) or "")
@@ -8734,7 +9106,8 @@ class GroqLLMCleaner:
                                      "(map-reduce parity).", len(wins))
                         else:
                             num_ctx_t = _summary_size_ctx(int(len(content) / cpt),
-                                                          num_predict=4000)
+                                                          num_predict=4000,
+                                                          ceiling=cap)
                             tasks_md = self._ollama_summary_once(
                                 url, tasks_prompt, content, num_ctx_t, False,
                                 read_to, num_predict=4000) or ""
@@ -8762,14 +9135,15 @@ class GroqLLMCleaner:
                         if windowed:
                             reserve_c = (int(len(_COVERAGE_PASS_PROMPT + tail) / cpt)
                                          + _COVERAGE_NUM_PREDICT + 1024)
-                            win_chars = int((_SUMMARY_CTX_CAP - reserve_c) / 1.2 * cpt)
+                            win_chars = int((cap - reserve_c) / 1.2 * cpt)
                             wins = self._split_for_summary(
                                 text, win_chars, overlap_chars=overlap_chars)
                             additions, seen_add = [], set()
                             for w_chunk in wins:
                                 cmsg = _wrap_meeting_input(w_chunk, meeting_meta) + tail
                                 nc_c = _summary_size_ctx(int(len(cmsg) / cpt),
-                                                         num_predict=_COVERAGE_NUM_PREDICT)
+                                                         num_predict=_COVERAGE_NUM_PREDICT,
+                                                         ceiling=cap)
                                 for kind_a, line_a in _parse_coverage(
                                         self._ollama_summary_once(
                                             url, _COVERAGE_PASS_PROMPT, cmsg, nc_c, False,
@@ -8787,13 +9161,14 @@ class GroqLLMCleaner:
                         else:
                             cmsg = content + tail
                             need = int(len(cmsg) / cpt) + _COVERAGE_NUM_PREDICT + 256
-                            if need > _SUMMARY_CTX_CAP:
+                            if need > cap:
                                 additions = []
                                 log.info("Summary coverage pass skipped: %d tokens needed > "
-                                         "ceiling %d.", need, _SUMMARY_CTX_CAP)
+                                         "ceiling %d.", need, cap)
                             else:
                                 nc_c = _summary_size_ctx(int(len(cmsg) / cpt),
-                                                         num_predict=_COVERAGE_NUM_PREDICT)
+                                                         num_predict=_COVERAGE_NUM_PREDICT,
+                                                         ceiling=cap)
                                 additions = _parse_coverage(self._ollama_summary_once(
                                     url, _COVERAGE_PASS_PROMPT, cmsg, nc_c, False, read_to,
                                     num_predict=_COVERAGE_NUM_PREDICT,
@@ -8814,14 +9189,15 @@ class GroqLLMCleaner:
                         if windowed:
                             reserve_d = (int(len(_DEPTH_EXTRACT_PROMPT) / cpt)
                                          + _DEPTH_NUM_PREDICT + 1024)
-                            win_chars = int((_SUMMARY_CTX_CAP - reserve_d) / 1.2 * cpt)
+                            win_chars = int((cap - reserve_d) / 1.2 * cpt)
                             wins = self._split_for_summary(
                                 text, win_chars, overlap_chars=overlap_chars)
                             parts = []
                             for w_chunk in wins:
                                 wc = _wrap_meeting_input(w_chunk, meeting_meta)
                                 nc_d = _summary_size_ctx(int(len(wc) / cpt),
-                                                         num_predict=_DEPTH_NUM_PREDICT)
+                                                         num_predict=_DEPTH_NUM_PREDICT,
+                                                         ceiling=cap)
                                 parts.append(self._ollama_summary_once(
                                     url, _DEPTH_EXTRACT_PROMPT, wc, nc_d, False, read_to,
                                     num_predict=_DEPTH_NUM_PREDICT) or "")
@@ -8830,7 +9206,8 @@ class GroqLLMCleaner:
                                      len(wins))
                         else:
                             nc_d = _summary_size_ctx(int(len(content) / cpt),
-                                                     num_predict=_DEPTH_NUM_PREDICT)
+                                                     num_predict=_DEPTH_NUM_PREDICT,
+                                                     ceiling=cap)
                             narratives = self._ollama_summary_once(
                                 url, _DEPTH_EXTRACT_PROMPT, content, nc_d, False, read_to,
                                 num_predict=_DEPTH_NUM_PREDICT) or ""
@@ -8845,7 +9222,7 @@ class GroqLLMCleaner:
                                            + "\n\n(B) NARRATIVES\n\n" + narratives)
                             nc_e = _summary_size_ctx(
                                 int(len(_DEPTH_ENRICH_PROMPT + enrich_user) / cpt),
-                                num_predict=_DEPTH_NUM_PREDICT)
+                                num_predict=_DEPTH_NUM_PREDICT, ceiling=cap)
                             enriched = self._ollama_summary_once(
                                 url, _DEPTH_ENRICH_PROMPT, enrich_user, nc_e, False, read_to,
                                 num_predict=_DEPTH_NUM_PREDICT) or ""
@@ -8895,7 +9272,7 @@ class GroqLLMCleaner:
                                 reserve_d = (int((len(done_prompt)
                                                   + len(task_block)) / cpt)
                                              + _TASK_DONE_NUM_PREDICT + 1024)
-                                win_chars = int((_SUMMARY_CTX_CAP - reserve_d) / 1.2
+                                win_chars = int((cap - reserve_d) / 1.2
                                                 * cpt)
                                 wins = self._split_for_summary(
                                     text, win_chars, overlap_chars=overlap_chars)
@@ -8904,7 +9281,8 @@ class GroqLLMCleaner:
                                             + dtail)
                                     nc_d = _summary_size_ctx(
                                         int(len(dmsg) / cpt),
-                                        num_predict=_TASK_DONE_NUM_PREDICT)
+                                        num_predict=_TASK_DONE_NUM_PREDICT,
+                                        ceiling=cap)
                                     votes |= _parse_done_votes(
                                         self._ollama_summary_once(
                                             url, done_prompt, dmsg, nc_d, False,
@@ -8917,7 +9295,8 @@ class GroqLLMCleaner:
                                 dmsg = content + dtail
                                 nc_d = _summary_size_ctx(
                                     int(len(dmsg) / cpt),
-                                    num_predict=_TASK_DONE_NUM_PREDICT)
+                                    num_predict=_TASK_DONE_NUM_PREDICT,
+                                    ceiling=cap)
                                 votes = _parse_done_votes(
                                     self._ollama_summary_once(
                                         url, done_prompt, dmsg, nc_d, False,
@@ -9053,7 +9432,12 @@ class GroqLLMCleaner:
         generation hit num_predict (done_reason='length') or when the prompt
         overflowed num_ctx (prompt_eval_count >= num_ctx)."""
         import re as _re
-        options = {"num_ctx": num_ctx, "temperature": 0.3}
+        # repeat_penalty (low-VRAM tiers, 2026-09-15): a small (~4B) model on the
+        # recap base could otherwise fall into a degenerate repetition loop
+        # (measured: one task line repeated ~150x, unusable). 1.1 eliminated it and
+        # is mild + harmless for the large models, so it applies to every local
+        # summary call. options_extra can still override it per caller.
+        options = {"num_ctx": num_ctx, "temperature": 0.3, "repeat_penalty": 1.1}
         if num_predict is not None:
             options["num_predict"] = num_predict
         if options_extra:
@@ -9126,7 +9510,7 @@ class GroqLLMCleaner:
 
     def _summarize_local_mapreduce(self, url, system_prompt, text, think, read_to,
                                    depth=0, meeting_meta=None, overlap_chars=0,
-                                   chunk_chars=None, lang="he"):
+                                   chunk_chars=None, lang="he", ctx_cap=None):
         """Chunk → per-chunk notes (map) → merge into the final summary (reduce),
         so a transcript too big for one context window still summarises without
         dropping its start. Recurses (bounded) if the merged notes are themselves
@@ -9136,7 +9520,8 @@ class GroqLLMCleaner:
         <transcript> delimiters (it IS transcript). The REDUCE input is NOTES, not a
         transcript, so it is never wrapped — _SUMMARY_REDUCE_PREAMBLE reframes it —
         and recursion (which re-maps notes) drops the wrapper for the same reason."""
-        CAP, CPT = _SUMMARY_CTX_CAP, lang_pack.chars_per_token(lang)
+        CAP = ctx_cap if ctx_cap is not None else _SUMMARY_CTX_CAP
+        CPT = lang_pack.chars_per_token(lang)
         if chunk_chars is None:
             chunk_chars = int((CAP - 2600) * CPT)   # leave room for map sys + notes
         # Overlap only at depth 0 (raw transcript). The recursion re-maps NOTES:
@@ -9167,7 +9552,7 @@ class GroqLLMCleaner:
             log.info("Summary map-reduce: merged notes still large — recursing")
             return self._summarize_local_mapreduce(
                 url, system_prompt, combined, think, read_to, depth + 1,
-                meeting_meta=None, lang=lang)
+                meeting_meta=None, lang=lang, ctx_cap=ctx_cap)
         reduce_sys = _SUMMARY_REDUCE_PREAMBLE + system_prompt
         nc = max(8192, min(CAP, int(len(combined) / CPT) + _SUMMARY_RESERVE))
         return self._ollama_summary_once(url, reduce_sys, combined, nc, think, read_to)
@@ -9641,6 +10026,26 @@ _SUMMARY_CTX_BUCKET = 4096
 _SUMMARY_CTX_PAD = 512          # chat-template / role markers / special tokens
 _SUMMARY_CTX_HEADROOM_PCT = 120  # multiply estimated prompt tokens by 1.20
 
+# Local-summary tier profiles (2026-09-15): which base prompt + num_ctx cap a
+# given LOCAL Ollama summary model runs with, so users on a smaller GPU get a
+# fully-local option that stays GPU-resident. A small card needs a smaller cap
+# (the KV cache must fit) and a lighter prompt (a ~4B model collapses on the
+# heavy GOLD prompt - measured). Every CLOUD model and any unknown local tag
+# falls back to DEFAULT_LOCAL_TIER (technical base + full cap) and is therefore
+# byte-identical to before. Keep the ids in sync with LiaApp._SUMMARY_MODELS.
+LOCAL_SUMMARY_TIERS = {
+    "gemma4:31b-it-qat": {"vram_gb": 24, "prompt": "technical", "ctx_cap": 32768},
+    "gemma3:12b":        {"vram_gb": 16, "prompt": "technical", "ctx_cap": 24576},
+    "gemma3:4b":         {"vram_gb": 8,  "prompt": "general",   "ctx_cap": 12288},
+}
+DEFAULT_LOCAL_TIER = {"prompt": "technical", "ctx_cap": _SUMMARY_CTX_CAP}
+
+
+def _local_summary_tier(model_id):
+    """Tier profile for a LOCAL summary model id, or DEFAULT_LOCAL_TIER for a
+    cloud model / unknown local tag (safe default: technical base + full cap)."""
+    return LOCAL_SUMMARY_TIERS.get((model_id or "").strip(), DEFAULT_LOCAL_TIER)
+
 
 def _bucket_up(n, bucket=_SUMMARY_CTX_BUCKET):
     """Round n up to the next multiple of `bucket` (<=0 -> floor handles it)."""
@@ -9768,6 +10173,25 @@ def _render_nt(text):
 _TEMPLATES_WITH_TITLE = ("technical", "minutes")
 
 
+# Two guards appended to the GENERAL base ONLY on the local light (8 GB) tier
+# (see _run_summary). They target the exact failures a ~4B model showed in the
+# measured A/B: inventing a plausible-sounding known product name for a garbled
+# one, and hallucinating a full summary from thin content. Appended at call time
+# so build_general_base / the cloud templates (and their sha-pins) are untouched.
+# Instructions are in English (a safe instruction language; the base already sets
+# the OUTPUT language); kept short so they don't re-inflate the light prompt.
+_LIGHT_TIER_GUARDS = (
+    "\n\nADDITIONAL RULES:\n"
+    "- If a name (person, product, company, or tool) is too garbled in the "
+    "transcript to identify, keep your best transcription of it and append "
+    "\"(?)\"; NEVER 'correct' it into a similar-sounding known product name.\n"
+    "- If the transcript has no substantive discussion (only greetings, filler, "
+    "small talk, or a recording check), output a single factual sentence, in the "
+    "same language as the rest of the summary, saying what was captured, and stop. "
+    "Do not invent sections, points, decisions, or tasks."
+)
+
+
 def _p_summary_meeting(lang, template="technical"):
     """The meeting BASE prompt for `lang`. `template` (config `summary_template`)
     selects the flavor - "technical" (default) is the sha-pinned GOLD prompt,
@@ -9778,33 +10202,47 @@ def _p_summary_meeting(lang, template="technical"):
         return _render_nt(lang_pack.build_general_base(lang))
     if template == "minutes":
         return _render_nt(lang_pack.build_minutes_base(lang))
-    return _render_nt(lang_pack.SUMMARY_PROMPT_MEETING_EN if lang == "en"
-                      else _SUMMARY_PROMPT_MEETING)
+    # technical: he/en keep the hand-tuned GOLD; a 3rd language reuses the
+    # multilingual general builder (writes in `lang`). A bespoke per-language
+    # technical prompt is a follow-up - the English GOLD is not machine-portable.
+    if lang == "en":
+        return _render_nt(lang_pack.SUMMARY_PROMPT_MEETING_EN)
+    if lang == "he":
+        return _render_nt(_SUMMARY_PROMPT_MEETING)
+    return _render_nt(lang_pack.build_general_base(lang))
 
 
 def _p_summary_general(lang):
-    return _render_nt(lang_pack.SUMMARY_PROMPT_GENERAL_EN if lang == "en"
-                      else _SUMMARY_PROMPT_GENERAL)
+    if lang == "en":
+        return _render_nt(lang_pack.SUMMARY_PROMPT_GENERAL_EN)
+    if lang == "he":
+        return _render_nt(_SUMMARY_PROMPT_GENERAL)
+    return _render_nt(lang_pack.build_general_base(lang))
 
 
+# The intermediate LOCAL passes (map notes / tasks / consolidate / task-done
+# vote) only run on the local map-reduce/depth path (Hebrew-only quality tier).
+# he -> the Hebrew prompt; every other language -> the English variant (a safe
+# instruction language; the final BASE still selects the output language). he/en
+# are byte-identical to the prior behavior.
 def _p_summary_map(lang):
-    return _render_nt(lang_pack.SUMMARY_PROMPT_MAP_EN if lang == "en"
-                      else _SUMMARY_PROMPT_MAP)
+    return _render_nt(_SUMMARY_PROMPT_MAP if lang == "he"
+                      else lang_pack.SUMMARY_PROMPT_MAP_EN)
 
 
 def _p_tasks_pass(lang):
-    return _render_nt(lang_pack.LOCAL_TASKS_PASS_PROMPT_EN if lang == "en"
-                      else _LOCAL_TASKS_PASS_PROMPT)
+    return _render_nt(_LOCAL_TASKS_PASS_PROMPT if lang == "he"
+                      else lang_pack.LOCAL_TASKS_PASS_PROMPT_EN)
 
 
 def _p_consolidate(lang):
-    return _render_nt(lang_pack.CONSOLIDATE_PROMPT_EN if lang == "en"
-                      else _CONSOLIDATE_PROMPT)
+    return _render_nt(_CONSOLIDATE_PROMPT if lang == "he"
+                      else lang_pack.CONSOLIDATE_PROMPT_EN)
 
 
 def _p_task_done(lang):
-    return _render_nt(lang_pack.TASK_DONE_PROMPT_EN if lang == "en"
-                      else _TASK_DONE_PROMPT)
+    return _render_nt(_TASK_DONE_PROMPT if lang == "he"
+                      else lang_pack.TASK_DONE_PROMPT_EN)
 
 
 def _p_parity_addendum(lang, override=None, template="technical"):
@@ -9820,8 +10258,13 @@ def _p_parity_addendum(lang, override=None, template="technical"):
         return _render_nt(lang_pack.build_general_addendum(lang))
     if template == "minutes":
         return _render_nt(lang_pack.build_minutes_addendum(lang))
-    return _render_nt(lang_pack.CLOUD_PARITY_ADDENDUM_EN if lang == "en"
-                      else _SUMMARY_CLOUD_PARITY_ADDENDUM)
+    # technical: he/en keep the hand-tuned parity block; a 3rd language reuses
+    # the generic binding-rules addendum (no Hebrew-example leakage).
+    if lang == "en":
+        return _render_nt(lang_pack.CLOUD_PARITY_ADDENDUM_EN)
+    if lang == "he":
+        return _render_nt(_SUMMARY_CLOUD_PARITY_ADDENDUM)
+    return _render_nt(lang_pack.build_general_addendum(lang))
 
 
 # Compose prompts — used by LiaApp._do_compose_generate (voice → polished
@@ -9912,9 +10355,13 @@ class MeetingSession:
       - On app quit mid-meeting: best-effort save of whatever chunks
         have completed, skip summary.
     """
-    # Chunk length — long enough to minimise Groq round-trip overhead,
-    # short enough to bound memory and give responsive transcript updates.
-    CHUNK_SECONDS = 45
+    # Chunk length — long enough to minimise round-trip overhead + give the model
+    # context, short enough to bound memory and give a responsive live transcript.
+    # This is the default; the actual value is read from config `meeting_chunk_seconds`
+    # per session (self.chunk_seconds), clamped to [CHUNK_SECONDS_MIN, CHUNK_SECONDS_MAX].
+    DEFAULT_CHUNK_SECONDS = 15
+    CHUNK_SECONDS_MIN = 5
+    CHUNK_SECONDS_MAX = 120
 
     def __init__(self, app, source=None, input_device_index=None,
                  loopback_device_index=None, diarize_mode=False,
@@ -9922,6 +10369,18 @@ class MeetingSession:
                  summarize=False, diarize_enhance_model=None,
                  diarize_backend="assemblyai", transcribe_label=""):
         self.app = app
+        # Realtime cadence for THIS session: how often we drain + transcribe a
+        # chunk (and rewrite the live transcript). Config-driven, clamped so a
+        # bad value can never stall or hammer the pipeline.
+        try:
+            cs = int(app.config.get("meeting_chunk_seconds", self.DEFAULT_CHUNK_SECONDS))
+        except (TypeError, ValueError):
+            cs = self.DEFAULT_CHUNK_SECONDS
+        self.chunk_seconds = max(self.CHUNK_SECONDS_MIN,
+                                 min(self.CHUNK_SECONDS_MAX, cs))
+        # Nudge "your mic is silent" only after ~2 min of a silent mic channel,
+        # regardless of the chunk cadence (was a fixed 3 drains @ 45s).
+        self._mic_silent_drains = max(2, round(120.0 / self.chunk_seconds))
         # Friendly name of the transcription engine (e.g. "gpt-transcribe"),
         # decided at meeting start from the meeting_model and shown as the
         # status-card subtitle so the user knows which tool is transcribing.
@@ -10039,6 +10498,14 @@ class MeetingSession:
         # the final file is written (or on cancel).
         self._live_path = None
         self._live_lock = threading.Lock()
+        # Status sidecar (Phase 4, 2026-09-15): a small JSON next to the LIVE file
+        # that reports the AUTHORITATIVE meeting phase + per-artifact readiness, so
+        # the live-transcript window shows the real state instead of inferring
+        # "ended" from the LIVE file disappearing. {phase, transcript{ready,path},
+        # summary{ready,path}, error, started, chunk_seconds, meeting_id, version}.
+        self._status_path = None
+        self._status = {}
+        self._status_lock = threading.Lock()
         # Diarized meetings ALSO keep this live file, fed by a PARALLEL speaker-less
         # "peek" pass (_submit_live_peek). Its chunks live in their own buffer so
         # they never pollute self.chunks / the chunked output — the authoritative
@@ -10186,9 +10653,27 @@ class MeetingSession:
                     self._wav_writer.setsampwidth(2)
                     self._wav_writer.setframerate(16000)
                 log.info("Meeting started (chunk=%ds, live=%s, audio=%s)",
-                         self.CHUNK_SECONDS, self._live_path,
+                         self.chunk_seconds, self._live_path,
                          self._wav_path or "off")
                 self._open_track_writers(stamp)
+
+            # Status sidecar next to the LIVE file: the window reads the real
+            # phase from here rather than guessing from the LIVE file's presence.
+            if self._live_path:
+                import datetime as _dts
+                self._status_path = self._live_path + ".status.json"
+                self._prune_stale_status_files()
+                self._set_status(
+                    phase="recording",
+                    meeting_id=str(int(self.start_time or 0)),
+                    started=_dts.datetime.fromtimestamp(
+                        self.start_time or time.time()).strftime("%H:%M"),
+                    chunk_seconds=self.chunk_seconds,
+                    summarize=bool(self.summarize),
+                    transcript={"ready": False, "path": None},
+                    summary={"ready": False, "path": None},
+                    error=None,
+                )
 
             self._rotation_thread = threading.Thread(
                 target=self._rotation_loop, daemon=True
@@ -10219,6 +10704,9 @@ class MeetingSession:
         self._active = False
         self._stop_event.set()
         self.stop_time = time.time()
+        # Recording is over; the pipeline (transcribe leftover audio, maybe
+        # summarise, write files) is now running.
+        self._set_status(phase="processing")
 
         # Let the rotation loop finalise the last chunk
         if self._rotation_thread and self._rotation_thread.is_alive():
@@ -10355,6 +10843,7 @@ class MeetingSession:
         self._active = False
         self._stop_event.set()
         self.stop_time = time.time()
+        self._set_status(phase="cancelled")
         # Let the rotation loop see the stop event and exit. Deliberately do
         # NOT call _finalise_current_chunk() — that would transcribe the last
         # chunk (and cost tokens), which is the whole point of cancelling.
@@ -10422,9 +10911,9 @@ class MeetingSession:
             head = ("Meeting LIVE transcript — %s\n"
                     "Updates as chunks are transcribed (~every %ds). The final "
                     "file (with the summary) replaces this at Stop.\n\n"
-                    % (start_dt.strftime("%Y-%m-%d %H:%M"), self.CHUNK_SECONDS))
+                    % (start_dt.strftime("%Y-%m-%d %H:%M"), self.chunk_seconds))
             body = (self._assemble_live_markdown() if self.diarize_mode
-                    else self._assemble_transcript_markdown())
+                    else self._assemble_transcript_markdown(live=True))
             tmp = self._live_path + ".tmp"
             with self._live_lock:
                 with open(tmp, "w", encoding="utf-8") as f:
@@ -10435,7 +10924,7 @@ class MeetingSession:
                 self._live_warned = True
                 log.warning("Live transcript write failed (will not re-log): %s", e)
 
-    def _submit_live_peek(self, audio_np):
+    def _submit_live_peek(self, audio_np, cut="drain", pause_s=0.0):
         """Diarized meetings only: transcribe this ~45s chunk with a FAST,
         speaker-less pass purely to keep the rolling live transcript current for
         mid-meeting peeking. Runs in a daemon thread; NEVER touches self.chunks,
@@ -10454,7 +10943,8 @@ class MeetingSession:
             except Exception:
                 pass
             self._live_chunks.append({"index": idx, "timestamp_rel": rel_ts,
-                                      "text": "", "status": "pending"})
+                                      "text": "", "status": "pending",
+                                      "cut": cut, "pause_s": float(pause_s or 0.0)})
 
         def worker():
             if self._cancelled:
@@ -10487,18 +10977,20 @@ class MeetingSession:
         Speaker labels are intentionally absent here — they arrive with the full
         diarized transcript at Stop."""
         with self._live_chunks_lock:
-            items = sorted(self._live_chunks, key=lambda c: c["index"])
-            lines = []
-            for c in items:
-                t = (c.get("text") or "").strip()
-                if t:
-                    lines.append("[%s] %s" % (_fmt_relative_ts(c["timestamp_rel"]), t))
+            # A peek chunk still in flight has no text yet: treat it as a gap,
+            # never as the "[chunk not transcribed]" marker of the final file.
+            items = [dict(c, status=("ok" if (c.get("text") or "").strip() else "empty"))
+                     for c in self._live_chunks]
+        lines = ["[%s] %s" % (_fmt_relative_ts(ts), t)
+                 for kind, ts, t in self._flow_items(items, live=True) if kind == "text"]
         return ("\n".join(lines) if lines
-                else "(עדיין אין תמלול — ה-chunk הראשון בעוד ~%ds)" % self.CHUNK_SECONDS)
+                else "(עדיין אין תמלול - ה-chunk הראשון בעוד ~%ds)" % self.chunk_seconds)
 
     def _delete_live_file(self):
         """Remove the LIVE file — called once the final transcript is safely
-        on disk (or the meeting is cancelled). Best-effort."""
+        on disk (or the meeting is cancelled). Best-effort. The status sidecar is
+        KEPT so a still-open live window can show the final state + open-artifact
+        buttons; it is pruned at the next meeting start."""
         p, self._live_path = self._live_path, None
         if p:
             try:
@@ -10506,6 +10998,47 @@ class MeetingSession:
                     os.remove(p)
             except Exception as e:
                 log.debug("Live transcript delete failed: %s", e)
+
+    def _set_status(self, phase=None, **fields):
+        """Update + persist the meeting status sidecar (atomic tmp+replace).
+        Best-effort; never raises. `phase` sets the lifecycle phase; other fields
+        merge into the current status; `version` increments so the window polls
+        cheaply. Writes nothing until start() has set _status_path."""
+        if not self._status_path:
+            return
+        try:
+            with self._status_lock:
+                st = self._status
+                if phase is not None:
+                    st["phase"] = phase
+                for k, v in fields.items():
+                    st[k] = v
+                st["version"] = int(st.get("version", 0)) + 1
+                tmp = self._status_path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(st, f, ensure_ascii=False)
+                os.replace(tmp, self._status_path)
+        except Exception as e:
+            log.debug("Meeting status write failed: %s", e)
+
+    def _prune_stale_status_files(self):
+        """Delete leftover status sidecars from past meetings (kept so a window
+        could show the final state, but they must not accumulate). Best-effort;
+        removes only files older than a day, never the current one."""
+        try:
+            now = time.time()
+            for fn in os.listdir(MEETINGS_DIR):
+                if fn.endswith("_meeting_LIVE.txt.status.json"):
+                    p = os.path.join(MEETINGS_DIR, fn)
+                    if p == self._status_path:
+                        continue
+                    try:
+                        if now - os.path.getmtime(p) > 86400:
+                            os.remove(p)
+                    except OSError:
+                        pass
+        except Exception as e:
+            log.debug("Prune stale status files failed: %s", e)
 
     def recap(self):
         """Recap & Continue: a MID-MEETING checkpoint. Writes a transcript +
@@ -10879,7 +11412,8 @@ class MeetingSession:
                      "kept" if keep else "deleted", ", ".join(writers))
 
     MIC_SILENT_RMS = 0.003      # the floor the dictation path treats as "mic silent"
-    MIC_SILENT_DRAINS = 3       # ~2 min of 45 s rotations before nudging
+    # Nudge after ~2 min of a silent mic channel; the actual drain count is
+    # derived per session from the chunk cadence (self._mic_silent_drains).
 
     def _maybe_auto_fallback_mic(self, mic_audio, backup_audio):
         """Early wrong-device rescue. Evidence = the meeting mic is ~silent while
@@ -10909,13 +11443,19 @@ class MeetingSession:
             old_idx = self._input_device_index
             self._mic_recorder, self._backup_recorder = self._backup_recorder, None
             self._input_device_index = getattr(self, "_backup_device_index", None)
-            log.error("Meeting: the meeting mic (device %s) is silent (rms=%.5f) while "
-                      "the dictation mic hears you (rms=%.5f) - switched the meeting "
-                      "mic to the dictation mic (device %s)",
-                      old_idx, mic_rms, backup_rms, self._input_device_index)
+            # A HANDLED recovery, not an error: the meeting keeps transcribing on
+            # the dictation mic. Log at WARNING (useful diagnostic; the user may
+            # want to fix the meeting-mic choice) and show a calm, NON-error GREEN
+            # notice - once per meeting (guarded by _mic_fallback_done above). It
+            # bypasses silent_mode on purpose: a mic switch changes WHAT is being
+            # recorded, so the user should get one heads-up even in silent mode.
+            log.warning("Meeting: the meeting mic (device %s) is silent (rms=%.5f) while "
+                        "the dictation mic hears you (rms=%.5f) - switched the meeting "
+                        "mic to the dictation mic (device %s)",
+                        old_idx, mic_rms, backup_rms, self._input_device_index)
             try:
-                self.app._force_show_error_overlay(
-                    "Meeting mic was silent - switched to the dictation mic")
+                self.app._force_show_notice_overlay(
+                    "🎤  Using your dictation mic for this meeting")
             except Exception:
                 pass
             # this window: the backup audio IS the user's side now
@@ -10968,7 +11508,7 @@ class MeetingSession:
                     self._mic_silent_quiet_logged = False   # new streak may log again
                 return
             self._consec_mic_silent = getattr(self, "_consec_mic_silent", 0) + 1
-            if (self._consec_mic_silent >= self.MIC_SILENT_DRAINS
+            if (self._consec_mic_silent >= self._mic_silent_drains
                     and not getattr(self, "_mic_silent_nudged", False)):
                 self._mic_silent_nudged = True
                 log.error("Meeting: mic channel silent for %d rotations while system "
@@ -11042,10 +11582,10 @@ class MeetingSession:
 
     # ---- main rotation loop ----
     def _rotation_loop(self):
-        """Every CHUNK_SECONDS: DRAIN current audio from the continuously-
+        """Every self.chunk_seconds: DRAIN current audio from the continuously-
         running recorders and submit it as a chunk. No close+reopen, so
         no audio is lost between chunks. Exits when stop_event is set."""
-        while not self._stop_event.wait(timeout=self.CHUNK_SECONDS):
+        while not self._stop_event.wait(timeout=self.chunk_seconds):
             if not self._active:
                 break
             try:
@@ -11068,14 +11608,19 @@ class MeetingSession:
                     # never clips a word mid-syllable. Kill-switch
                     # `meeting_chunk_smart_cut`; any error falls back to the
                     # raw drain boundary.
+                    cut, pause_s = "drain", 0.0
                     if bool(self.app.config.get("meeting_chunk_smart_cut", True)):
                         try:
                             head, tail = smart_cut_tail(audio)
                             if tail is not None and len(head) >= 8000:
+                                # The pause length at the cut tells the flow
+                                # pass whether the chunk's closing period is real.
+                                pause_s = pause_seconds_at_cut(head, tail)
                                 audio, self._carry_tail = head, tail
+                                cut = "smart"
                         except Exception as e:
                             log.warning("Meeting smart cut failed (raw cut): %s", e)
-                    self._submit_chunk(audio)
+                    self._submit_chunk(audio, cut=cut, pause_s=pause_s)
             except Exception as e:
                 log.error("Meeting rotation loop error: %s", e)
 
@@ -11097,7 +11642,7 @@ class MeetingSession:
         try:
             audio = self._with_carry(self._drain_audio())
             if audio is not None and len(audio) >= 8000:
-                self._submit_chunk(audio, blocking=True)
+                self._submit_chunk(audio, blocking=True, cut="final")
         except Exception as e:
             log.error("Meeting final chunk drain failed: %s", e)
         # Now actually close — the meeting is over.
@@ -11107,15 +11652,18 @@ class MeetingSession:
             # and stop. If that tail is non-trivial (>=0.5s), submit it
             # too so no end-of-meeting audio is lost.
             if tail is not None and len(tail) >= 8000:
-                self._submit_chunk(tail, blocking=True)
+                self._submit_chunk(tail, blocking=True, cut="final")
         except Exception as e:
             log.error("Meeting recorder close failed: %s", e)
 
     # ---- chunk transcription ----
-    def _submit_chunk(self, audio_np, blocking=False):
+    def _submit_chunk(self, audio_np, blocking=False, cut="drain", pause_s=0.0):
         """In normal mode: reserve an index and transcribe in a thread.
         In diarize mode: append the chunk's audio to the meeting WAV file
-        — AssemblyAI will process the whole thing on stop()."""
+        — AssemblyAI will process the whole thing on stop().
+        `cut` ("smart" / "drain" / "final") + `pause_s` describe how this
+        chunk's END was chosen; the transcript flow pass uses them to decide
+        whether the chunk's closing period is a real sentence end."""
         if self._cancelled:
             return
         # Safety-net WAV: append raw audio whenever a writer is open. Diarized
@@ -11126,7 +11674,7 @@ class MeetingSession:
         if self.diarize_mode:
             # Hybrid: keep a rolling live transcript via a fast speaker-less pass,
             # in parallel with the WAV that feeds the final diarization at Stop.
-            self._submit_live_peek(audio_np)
+            self._submit_live_peek(audio_np, cut=cut, pause_s=pause_s)
             return
         with self._chunks_lock:
             idx = self._next_chunk_index
@@ -11145,6 +11693,8 @@ class MeetingSession:
                 "timestamp_rel": rel_ts,
                 "text": "",
                 "status": "pending",
+                "cut": cut,
+                "pause_s": float(pause_s or 0.0),
             })
 
         def worker():
@@ -11181,7 +11731,8 @@ class MeetingSession:
             # foreign is classified as "empty" below, never as "failed".
             foreign_emptied = False
             if text:
-                text, _n_foreign = strip_foreign_script_words(text)
+                text, _n_foreign = strip_foreign_script_words(
+                    text, self.app._allowed_scripts())
                 if _n_foreign:
                     log.info("Meeting chunk #%d: dropped %d foreign-script word(s)",
                              idx, _n_foreign)
@@ -11536,6 +12087,15 @@ class MeetingSession:
                 ov.meeting_status_step("summarize", gen=gen)
             md_path = self._write_diarized_markdown(result)
             log.info("Diarized meeting saved: %s", md_path)
+            # Final state for the live window (Phase 4): the diarized transcript
+            # (and its summary, if any) are on disk.
+            _has_sum = bool(self.summarize and self.last_summary)
+            self._set_status(
+                phase=("done" if _has_sum else "ended_no_summary"),
+                transcript={"ready": True, "path": md_path},
+                summary={"ready": _has_sum,
+                         "path": (self.summary_html_path or md_path) if _has_sum else None},
+            )
             # The authoritative transcript is on disk - the rolling LIVE file
             # (fed by the speaker-less peek pass) has served its purpose. Only
             # the chunked writer used to do this, so every diarized meeting
@@ -11603,6 +12163,7 @@ class MeetingSession:
             # file is a partial artifact of a run we threw away, so drop it.
             log.info("Diarized meeting discarded by user; recording kept: %s",
                      self._wav_path)
+            self._set_status(phase="cancelled")
             try:
                 self._delete_live_file()
             except Exception:
@@ -11643,6 +12204,7 @@ class MeetingSession:
                 friendly = "AssemblyAI rate-limited — try again later"
             else:
                 friendly = f"AssemblyAI failed: {str(e)[:80]}"
+            self._set_status(phase="failed", error=friendly)
             ov.meeting_status_error(stage, friendly, on_folder=folder_cb, gen=gen)
             # Keep the WAV on failure so the user can retry manually.
 
@@ -11936,57 +12498,57 @@ class MeetingSession:
                 t.join(timeout=remain)
 
     # ---- output ----
-    def _assemble_transcript_markdown(self, max_index=None):
+    def _assemble_transcript_markdown(self, max_index=None, live=False):
         """Return the chunk-by-chunk transcript as a plain-text block
         with timestamps. Method name kept for caller stability \u2014 the
         format is now plain `.txt` with bracket timestamps, not
         markdown headings.
-        max_index: only chunks with index < max_index (Recap snapshots)."""
+        max_index: only chunks with index < max_index (Recap snapshots).
+        live=True: rolling-transcript rendering (strip the dangling tail dot,
+        hide not-yet-arrived pending chunks) - see flow_chunk_paragraphs."""
         with self._chunks_lock:
-            sorted_chunks = sorted(self.chunks, key=lambda c: c["index"])
+            chunks = list(self.chunks)
         if max_index is not None:
-            sorted_chunks = [c for c in sorted_chunks if c["index"] < max_index]
+            chunks = [c for c in chunks if c["index"] < max_index]
         lines = []
-        for c in sorted_chunks:
-            if c["status"] == "empty":
-                continue   # near-silent chunk — nothing was said; omit it
-            if c["status"] == "failed":
-                lines.append(f"[{_fmt_relative_ts(c['timestamp_rel'])}]")
+        for kind, ts, *rest in self._flow_items(chunks, live=live):
+            lines.append(f"[{_fmt_relative_ts(ts)}]")
+            if kind == "failed":
                 lines.append("[transcription failed]")
-                lines.append("")
-                continue
-            if c["status"] == "pending":
+            elif kind == "pending":
                 # Worker still in flight when the 60s stop-timeout expired.
-                # These used to VANISH silently — typically the last minutes
-                # of the meeting (action items / wrap-up) when the API was
-                # slow at meeting end. Leave an explicit hole marker.
-                lines.append(f"[{_fmt_relative_ts(c['timestamp_rel'])}]")
-                lines.append("[chunk not transcribed in time — audio lost]")
-                lines.append("")
-                continue
-            if not c["text"]:
-                continue
-            clean = c["text"].replace('\u200F', '').replace('\u200E', '').strip()
-            clean = collapse_repetition_hallucinations(clean)
-            if not clean:
-                continue
-            lines.append(f"[{_fmt_relative_ts(c['timestamp_rel'])}]")
-            lines.append(_txt_rlm_if_hebrew(clean))
+                # These used to VANISH silently (typically the last minutes of
+                # the meeting, action items / wrap-up, when the API was slow at
+                # meeting end). Leave an explicit hole marker.
+                lines.append("[chunk not transcribed in time - audio lost]")
+            else:
+                lines.append(_txt_rlm_if_hebrew(rest[0]))
             lines.append("")
         return "\n".join(lines).strip()
 
+    def _flow_items(self, chunks, live=False):
+        """Chunk records -> transcript paragraphs (see flow_chunk_paragraphs),
+        honouring config `meeting_transcript_flow` / `_paragraph_seconds`.
+        Tolerates a session built without an app (tests)."""
+        cfg = getattr(getattr(self, "app", None), "config", None) or {}
+        enabled = bool(cfg.get("meeting_transcript_flow", True))
+        try:
+            para_s = float(cfg.get("meeting_transcript_paragraph_seconds", 60))
+        except Exception:
+            para_s = 60.0
+        return flow_chunk_paragraphs(chunks, para_seconds=para_s,
+                                     enabled=enabled, live=live)
+
     def _assemble_transcript_plain(self, max_index=None):
-        """Flat transcript text (for the LLM summarisation prompt).
+        """Flat transcript text (for the LLM summarisation prompt): the same
+        flowing paragraphs as the .txt, one per line, no timestamps / markers.
         max_index: only chunks with index < max_index (Recap snapshots)."""
         with self._chunks_lock:
-            sorted_chunks = sorted(self.chunks, key=lambda c: c["index"])
+            chunks = list(self.chunks)
         if max_index is not None:
-            sorted_chunks = [c for c in sorted_chunks if c["index"] < max_index]
-        texts = []
-        for c in sorted_chunks:
-            if c["status"] == "ok" and c["text"]:
-                texts.append(c["text"].replace('\u200F', '').replace('\u200E', '').strip())
-        return "\n".join(texts).strip()
+            chunks = [c for c in chunks if c["index"] < max_index]
+        return "\n".join(t for kind, _ts, *rest in self._flow_items(chunks)
+                         for t in rest if kind == "text").strip()
 
     def _write_output_file(self, duration_sec):
         """Assemble and save the meeting transcript as a plain-text
@@ -12087,6 +12649,16 @@ class MeetingSession:
             except Exception as e:
                 log.warning("Could not write meeting summary HTML: %s", e)
 
+        # Final state for the live window: transcript is on disk; summary too if
+        # this was a "& Summarize" meeting that produced one.
+        has_summary = bool(self.summarize and summary_md)
+        self._set_status(
+            phase=("done" if has_summary else "ended_no_summary"),
+            transcript={"ready": True, "path": path},
+            summary={"ready": has_summary,
+                     "path": (self.summary_html_path or path) if has_summary else None},
+        )
+
         # Self-learning vocabulary: mine THIS meeting's transcript for new
         # term suggestions (incremental, background, badge-only — no popups).
         if self.app.config.get("vocab_autolearn", True):
@@ -12148,19 +12720,13 @@ def _to_visual_rtl(text, base_dir=None):
 
 
 def _is_mostly_hebrew(text):
-    """True if the text contains more Hebrew letters than Latin letters.
-
-    Used to decide whether a meeting markdown file should be wrapped in
-    a <div dir="rtl"> so HTML-aware markdown viewers (GitHub, Obsidian,
-    VS Code preview, Typora, Word) right-align the whole document
-    instead of left-aligning headings and bold speaker labels that
-    happen to start with LTR characters like `**[` or `###`.
-    """
-    if not text:
-        return False
-    hebrew = sum(1 for c in text if '֐' <= c <= '׿')
-    latin = sum(1 for c in text if 'a' <= c.lower() <= 'z')
-    return hebrew > latin
+    """True if the text is right-to-left (more Hebrew OR Arabic letters than
+    Latin). A thin shim over lang_pack.text_direction (multi-language, 2026-09-15)
+    so every RTL consumer - the meeting <div dir="rtl"> wrapper, the .txt RLM
+    writer, the editor justify - handles Arabic too, not just Hebrew. Hebrew/Latin
+    text is byte-identical to the retired hebrew>latin count (text_direction's
+    Hebrew range is exactly 0x0590-0x05FF)."""
+    return lang_pack.text_direction(text) == "rtl"
 
 
 # Plain-text transcript helpers — meetings are written as .txt with
@@ -13766,18 +14332,18 @@ def _stamp_lia_launcher(exe_path):
         return False
     try:
         vi = VSVersionInfo(
-            ffi=FixedFileInfo(filevers=(1, 5, 1, 0), prodvers=(1, 5, 1, 0),
+            ffi=FixedFileInfo(filevers=(1, 6, 0, 0), prodvers=(1, 6, 0, 0),
                               mask=0x3f, flags=0x0, OS=0x40004,
                               fileType=0x1, subtype=0x0),
             kids=[
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.5.1.0'),
+                    StringStruct('FileVersion', '1.6.0.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.5.1.0'),
+                    StringStruct('ProductVersion', '1.6.0.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -18484,7 +19050,7 @@ class LiaApp:
                 model_size=self.config.get("groq_model", "whisper-large-v3-turbo"),
                 api_key=self.config["groq_api_key"],
             )
-            self._groq_transcriber.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
+            self._groq_transcriber.he_en_bias = (bool(self.config.get("groq_he_en_bias", True)) and self._language_profile() == "hebrew")
             self._groq_transcriber.custom_vocabulary = self._composed_vocabulary()
 
         # Initialize OpenAI transcriber if an OpenAI API key is set.
@@ -18495,7 +19061,7 @@ class LiaApp:
                 api_key=self.config["openai_api_key"],
             )
             # OpenAI shares the bias toggle with Groq — same intent.
-            self._openai_transcriber.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
+            self._openai_transcriber.he_en_bias = (bool(self.config.get("groq_he_en_bias", True)) and self._language_profile() == "hebrew")
             self._openai_transcriber.preferred_language = lang_pack.primary_language(self.config)
             self._openai_transcriber.custom_vocabulary = self._composed_vocabulary()
 
@@ -18635,12 +19201,6 @@ class LiaApp:
         self._voice_ask_active = False
         self._voice_ask_stopping = False
         self._voice_ask_lock = threading.Lock()
-        # The shared voice-capture serves two ends: "ask" (answer via meetings RAG)
-        # and "task" (append the line to the personal task note). The mode is set
-        # at start; the stop path branches on it. Reusing the same active flag +
-        # lock means every existing mic-busy guard already covers both.
-        self._voice_ask_mode = "ask"
-        self._task_note_proc = None        # the sticky task-note child (single instance)
         self._compose_lock = threading.Lock()
         self._compose_started_at = 0.0
         # Last paste state — drives Ctrl+Alt+Z undo. dict with keys:
@@ -18781,17 +19341,18 @@ class LiaApp:
                 lambda: self._cancel_meeting(),
                 visible=lambda item: self._is_meeting_active(),
             ),
-            # Personal task note (sticky) - show/hide. Separate from meetings.
-            pystray.MenuItem(
-                "Task note",
-                lambda: self._toggle_task_note(),
-            ),
             # History lives here (under the Start Meeting group) per user layout.
             pystray.MenuItem("History", lambda: self._show_history()),
-            # Everything configurable now lives in the Settings window.
-            # default=True → double-clicking the tray icon opens Settings.
-            pystray.MenuItem("Settings…", lambda: self._open_settings_window(),
-                             default=True),
+            pystray.Menu.SEPARATOR,
+            # Open Lia -> the Home landing page (status + Start Meeting + recent
+            # meetings). default=True => double-clicking the tray icon opens Home;
+            # visible=False keeps that double-click handler WITHOUT showing a
+            # redundant row in the right-click menu (Naor's ask 2026-09-16 -
+            # "Settings…" below is the visible entry point).
+            pystray.MenuItem("Open Lia", lambda: self._open_settings_window(page="home"),
+                             default=True, visible=False),
+            # Everything configurable lives in the same window under the nav.
+            pystray.MenuItem("Settings…", lambda: self._open_settings_window()),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", self._quit),
         )
@@ -18908,22 +19469,6 @@ class LiaApp:
                 log.info("Action-items hotkey registered: %s", act_hk)
         except Exception as e:
             log.warning("Could not register action-items hotkey: %s", e)
-
-        # Task note: speak a task straight in (tasks_hotkey) + show/hide the
-        # sticky (tasks_toggle_hotkey). Personal to-do pad, separate from the
-        # meeting-derived tracker above.
-        try:
-            import keyboard as kb
-            tk_hk = self.config.get("tasks_hotkey", "ctrl+alt+q")
-            if tk_hk:
-                kb.add_hotkey(tk_hk, self._task_note_voice_toggle, suppress=False)
-                log.info("Task-note voice hotkey registered: %s", tk_hk)
-            tt_hk = self.config.get("tasks_toggle_hotkey", "ctrl+alt+w")
-            if tt_hk:
-                kb.add_hotkey(tt_hk, self._toggle_task_note, suppress=False)
-                log.info("Task-note toggle hotkey registered: %s", tt_hk)
-        except Exception as e:
-            log.warning("Could not register task-note hotkeys: %s", e)
 
         # Hotkey hook watchdog — RE-ENABLED 2026-05-25.
         #
@@ -19300,13 +19845,17 @@ class LiaApp:
                 compute_type=self.config.get("cuda_compute_type"),
             )
         if model_size.startswith("parakeet"):
-            # English Parakeet (2026-08): its own runtime (onnx-asr), no router —
+            # Parakeet (multi-language, v3): its own runtime (onnx-asr), no router —
             # the model is English-only by contract (MODEL_LANGUAGE = "en").
             return ParakeetTranscriber(
                 model_size=model_size,
                 device=self.config.get("parakeet_device", "cpu"))
         if (MODEL_LANGUAGE.get(model_size) == "he"
-                and bool(self.config.get("dictation_bilingual_auto", True))):
+                and bool(self.config.get("dictation_bilingual_auto", True))
+                and self._language_profile() == "hebrew"):
+            # The he/en router is the Hebrew profile's optimization. A
+            # multilingual user gets the plain model (+ language lock/auto via
+            # _get_language) instead of he/en routing.
             return BilingualRouterTranscriber(
                 he_transcriber=_fw(model_size),
                 general_transcriber=_fw(BilingualRouterTranscriber.GENERAL_MODEL),
@@ -19435,7 +19984,7 @@ class LiaApp:
                 if (self._parakeet_available()
                         and self.config.get("model_size") not in CPU_FRIENDLY_MODELS):
                     log.warning("No dedicated GPU and no server/cloud configured - "
-                                "switching dictation to English Parakeet (CPU).")
+                                "switching dictation to Parakeet Multi-Language (CPU).")
                     self.config["model_size"] = PARAKEET_MODEL
                     save_config(self.config)
                     self._local_transcriber = self._make_local_transcriber(PARAKEET_MODEL)
@@ -19541,7 +20090,7 @@ class LiaApp:
 
     _NO_GPU_PARAKEET_NOTICE = (
         "No compatible GPU",
-        "No NVIDIA GPU found, so dictation uses English Parakeet on the CPU. "
+        "No NVIDIA GPU found, so dictation uses Parakeet Multi-Language (25 European languages) on the CPU. "
         "For Hebrew, add a free Groq key or a Transcription server in Settings.")
 
     def _queue_notice(self, title, msg):
@@ -21359,7 +21908,8 @@ class LiaApp:
                     # (Korean/CJK/Arabic/... from a derailed multilingual decode).
                     if text:
                         _raw_before = text
-                        text, _n_foreign = strip_foreign_script_words(text)
+                        text, _n_foreign = strip_foreign_script_words(
+                            text, self._allowed_scripts())
                         if _n_foreign:
                             log.warning("Dictation: dropped %d foreign-script word(s) "
                                         "(backend=%s)", _n_foreign,
@@ -21440,7 +21990,8 @@ class LiaApp:
                     # Same script guard as the partial path.
                     if text:
                         _raw_before = text
-                        text, _n_foreign = strip_foreign_script_words(text)
+                        text, _n_foreign = strip_foreign_script_words(
+                            text, self._allowed_scripts())
                         if _n_foreign:
                             log.warning("Dictation: dropped %d foreign-script word(s) "
                                         "(backend=%s)", _n_foreign,
@@ -21568,7 +22119,8 @@ class LiaApp:
 
             try:
                 if is_diarized and model_key in ("local_pyannote_hebrew",
-                                                 "local_pyannote_parakeet"):
+                                                 "local_pyannote_parakeet",
+                                                 "local_pyannote_multilang"):
                     # 100% LOCAL diarization on the picked file: decode → pyannote
                     # speaker turns → re-transcribe each with the local model
                     # (ivrit.ai / Parakeet) → diarized .txt next to the source.
@@ -21773,7 +22325,7 @@ class LiaApp:
                         for u in utts if (u.get("text") or "").strip())
         out_path = self._write_diarized_file_markdown(
             file_path, {"utterances": utts, "text": text},
-            engine="pyannote (local) + Hebrew Turbo — 100% local")
+            engine="pyannote (local) + Whisper Hebrew - 100% local")
         log.info("Local-diarized file saved: %s (%d turns, %d chars)",
                  out_path, len(utts), len(text))
         return out_path, text
@@ -21823,8 +22375,42 @@ class LiaApp:
             f.write(content)
         return out_path
 
+    def _language_profile(self):
+        """'hebrew' (the byte-identical he/en bilingual system) or 'multilingual'.
+        Every multi-language branch is gated on this so a he/en config is
+        unchanged from v1.5.1."""
+        try:
+            return lang_pack.language_profile(self.config)
+        except Exception:
+            return "hebrew"
+
+    def _language_locked(self):
+        """True when exactly one language is enabled -> force it, no detection,
+        no roaming (the hard-lock mode)."""
+        try:
+            return len(lang_pack.enabled_languages(self.config)) == 1
+        except Exception:
+            return False
+
+    def _allowed_scripts(self):
+        """The transcription script-filter allow-set for the current profile:
+        {"Hebrew"} for the Hebrew profile (byte-identical to today), None for any
+        multilingual profile (disable the filter so correct non-Latin output is
+        never deleted)."""
+        try:
+            if self._language_profile() == "hebrew":
+                return _HEBREW_ALLOWED_SCRIPTS
+            return None
+        except Exception:
+            return _HEBREW_ALLOWED_SCRIPTS
+
     def _get_language(self):
-        """Get language based on selected model."""
+        """Get language based on selected model / profile."""
+        # Language lock: exactly one enabled language forces it on every backend
+        # (no detection, no roaming) - incl. a Hebrew-only or English-only lock.
+        # Naor's default (enabled=[he,en], 2 langs) is NOT locked -> unchanged.
+        if self._language_locked():
+            return lang_pack.enabled_languages(self.config)[0]
         model = self.config.get("model_size", "")
         lang = MODEL_LANGUAGE.get(model, "auto")
         # Dictation bilingual auto: the active transcriber is the router and
@@ -21878,7 +22464,11 @@ class LiaApp:
                 self.overlay.show("  ⚠  Cloud failed, using local  ", bg_color="#d08770")
                 self._wait_for_local_ready()
                 text = self._local_transcriber.transcribe(audio_np, **kwargs)
-        text = collapse_repetition_hallucinations(text) if text else text
+        if text:
+            text = collapse_repetition_hallucinations(text)
+            # Also drop a doubled OPENING word/phrase (the first-word-duplication
+            # artifact) here so EVERY backend is covered, not just local Whisper.
+            text = collapse_leading_duplicate(text)
         # Known mis-transcription fixes (seed + learned) — the same table
         # meeting transcripts get, applied to dictation/file output too, right
         # before cleanup/paste. Whole-word only, every hit logged, kill-switch
@@ -22034,26 +22624,46 @@ class LiaApp:
         if mode == "general":
             return cleaner.summarize(text, _p_summary_general(lang), vocab=vocab,
                                      lang=lang)
-        out = cleaner.summarize(text, _p_summary_meeting(lang),
+        # Low-VRAM local tier (2026-09-15): the selected LOCAL summary model
+        # decides the base prompt + num_ctx cap. A cloud model (or an unknown
+        # local tag) resolves to DEFAULT_LOCAL_TIER -> the technical base + full
+        # cap, i.e. byte-identical to before; summarize()'s cloud branch then
+        # still applies its own `template` logic. The 8 GB "general" tier is a
+        # deliberate, honestly-labelled exception to "local always keeps the
+        # GOLD base" (Naor approved), scoped to the light tier only.
+        tier = _local_summary_tier(self.config.get("summary_model", ""))
+        base = _p_summary_meeting(lang, tier["prompt"])
+        light = tier["prompt"] == "general"
+        if light:
+            # A ~4B model on the general recap base: the GOLD-shaped enrich passes
+            # (depth/coverage/tasks/consolidate/task-done) expect the technical
+            # sections and would both slow it down and mis-shape the recap, so
+            # they are OFF here. Two small guards catch the measured small-model
+            # failures (invented product names, summarising thin content).
+            base = base + _LIGHT_TIER_GUARDS
+        out = cleaner.summarize(text, base,
                                 meeting_meta=(metadata or ""),
                                 vocab=vocab,
                                 collect_corrections=collect_corrections,
-                                local_tasks_pass=bool(self.config.get("summary_local_tasks_pass", False)),
+                                local_tasks_pass=(not light) and bool(self.config.get("summary_local_tasks_pass", False)),
                                 mr_overlap_tokens=int(self.config.get("summary_mr_overlap_tokens", 1536)),
                                 mr_fuzzy_dedup=bool(self.config.get("summary_mr_fuzzy_dedup", True)),
                                 mr_prefer_tokens=int(self.config.get("summary_mr_prefer_tokens", 16000)),
-                                consolidate_pass=bool(self.config.get("summary_consolidate_pass", True)),
-                                task_done_pass=bool(self.config.get("summary_task_done_pass", True)),
+                                consolidate_pass=(not light) and bool(self.config.get("summary_consolidate_pass", True)),
+                                task_done_pass=(not light) and bool(self.config.get("summary_task_done_pass", True)),
                                 cloud_parity=bool(self.config.get("summary_cloud_parity", True)),
-                                coverage_pass=bool(self.config.get("summary_coverage_pass", False)),
-                                depth_pass=bool(self.config.get("summary_depth_pass", True)),
+                                coverage_pass=(not light) and bool(self.config.get("summary_coverage_pass", False)),
+                                depth_pass=(not light) and bool(self.config.get("summary_depth_pass", True)),
+                                ctx_cap=tier["ctx_cap"],
                                 lang=lang, template=template)
         # Mechanical quality check (2026-09-14): log any rule violation in the
         # produced summary (no model, no network) so a prompt/model regression
         # is visible in lia.log. NEVER blocks delivery. Its R-rules are shaped
         # for the TECHNICAL template's sections/markers; skip it for the
-        # general/minutes templates (different structure -> false findings).
-        if template != "technical":
+        # general/minutes templates (different structure -> false findings), and
+        # for a non-he/en language (summary_check.detect_lang only knows he/en, so
+        # a 3rd-language summary would false-flag as "unknown").
+        if template != "technical" or lang not in ("he", "en") or light:
             return out
         try:
             import summary_check
@@ -22572,10 +23182,9 @@ class LiaApp:
         else:
             self._voice_ask_start()
 
-    def _voice_ask_start(self, mode="ask"):
-        """Start recording a short spoken clip on the shared mic. `mode`:
-        "ask" (answer it via the meetings RAG) or "task" (append it to the
-        personal task note). Refuses while dictation / compose / meeting holds
+    def _voice_ask_start(self):
+        """Start recording a short spoken clip on the shared mic, to be answered
+        via the meetings RAG. Refuses while dictation / compose / meeting holds
         the mic or the model is still loading. Shows the listening state and arms
         the hard-cap auto-stop."""
         with self._voice_ask_lock:
@@ -22593,7 +23202,6 @@ class LiaApp:
                 self._force_show_error_overlay("Model still loading")
                 return False
             # Flag BEFORE start() - the hotkey listener reads it lock-free.
-            self._voice_ask_mode = mode if mode in ("ask", "task") else "ask"
             self._voice_ask_active = True
             try:
                 self.recorder.start()
@@ -22609,8 +23217,7 @@ class LiaApp:
         try:
             self._refresh_tray()               # arbiter: _voice_ask_active -> recording icon
             if self.tray_icon:
-                self.tray_icon.title = ("Lia - Listening (task)..." if self._voice_ask_mode == "task"
-                                        else "Lia - Listening (voice ask)...")
+                self.tray_icon.title = "Lia - Listening (voice ask)..."
         except Exception:
             pass
         threading.Thread(target=self._voice_ask_autostop, daemon=True).start()
@@ -22646,12 +23253,10 @@ class LiaApp:
             self.overlay.show_processing()
         except Exception:
             pass
-        mode = self._voice_ask_mode
         try:
             if self.tray_icon:
                 self.tray_icon.icon = self._create_icon("processing")
-                self.tray_icon.title = ("Lia - Adding task..." if mode == "task"
-                                        else "Lia - Answering...")
+                self.tray_icon.title = "Lia - Answering..."
         except Exception:
             pass
 
@@ -22665,27 +23270,16 @@ class LiaApp:
                         question = self._transcribe_with_fallback(
                             audio, language=self._get_language(),
                             beam_size=self.config["beam_size"], task="transcribe") or ""
-                    question = self._vocab_apply_corrections(
-                        question, label=("task-note" if mode == "task" else "voice-ask"))
+                    question = self._vocab_apply_corrections(question, label="voice-ask")
             except Exception as e:
-                log.warning("Voice-%s transcribe failed: %s",
-                            "task" if mode == "task" else "ask", e)
+                log.warning("Voice-ask transcribe failed: %s", e)
             finally:
                 with self._voice_ask_lock:
                     self._voice_ask_active = False
                     self._voice_ask_stopping = False
             question = (question or "").strip()
             if not question:
-                self._force_show_error_overlay(
-                    "Didn't catch a task" if mode == "task" else "Didn't catch a question")
-                try:
-                    self._refresh_tray()
-                except Exception:
-                    pass
-                return
-            # TASK mode: append the spoken line to the personal task note and stop.
-            if mode == "task":
-                self._task_note_add_from_voice(question)
+                self._force_show_error_overlay("Didn't catch a question")
                 try:
                     self._refresh_tray()
                 except Exception:
@@ -22699,36 +23293,6 @@ class LiaApp:
             except Exception:
                 pass
         threading.Thread(target=worker, daemon=True).start()
-
-    # ---- Task note: voice capture (reuses the voice-ask machinery, mode="task") ----
-    def _task_note_voice_toggle(self):
-        """Hotkey (tasks_hotkey): first press starts listening for a task, second
-        press stops + appends the spoken line to the task note. Shares the
-        voice-ask recorder/guards; only the stop action differs (mode='task')."""
-        if self._voice_ask_active:
-            self._voice_ask_stop_and_answer()
-        else:
-            self._voice_ask_start(mode="task")
-
-    def _task_note_add_from_voice(self, text):
-        """Append a spoken line to the personal task note, confirm with a toast,
-        and surface the sticky. Runs on the voice-capture worker thread."""
-        text = (text or "").strip()
-        if not text:
-            return
-        try:
-            import tasks_store
-            task = tasks_store.add(text)
-        except Exception as e:
-            log.warning("Task note add failed: %s", e)
-            self._force_show_error_overlay("Couldn't add the task")
-            return
-        if not task:
-            return
-        log.info("Task note: added %s", _fmt_user_text(self.config, task["text"], 120))
-        # No toast (silent-mode friendly): surfacing the sticky with the new task
-        # at the top IS the confirmation.
-        self._show_task_note()
 
     def _voice_ask_answer(self, question):
         """Run the meetings RAG in-process with the user's default provider
@@ -23014,14 +23578,22 @@ class LiaApp:
     # non-empty for the row to be selectable; empty = always available.
     # LOCAL first (2026-08-29, Naor's ordering): plain local, then local
     # diarized (speaker names), then cloud, remote last.
+    # Model display names are kept IDENTICAL to the dictation picker
+    # (_MENU_MODELS_ORDERED) so the same model reads the same everywhere, with no
+    # ⭐ markers (Naor's ask 2026-09-16). Rows that run on the SAME underlying
+    # model are grouped one under the other: each local ASR model, its pyannote
+    # diarization variant right below it. A diarize variant is named
+    # "<model> + Pyannote Diarization".
     _MEETING_MODELS = [
-        ("Hebrew Turbo Local only", "local_hebrew_turbo", []),
-        ("English Parakeet Local only", "local_parakeet_english", []),
-        ("🖥  Local diarize (pyannote + Hebrew Turbo)", "local_pyannote_hebrew", []),
-        ("🖥  Local diarize (pyannote + English Parakeet)", "local_pyannote_parakeet", []),
-        ("Gemini 3.5 transcribe", "gemini_transcribe", ["gemini_api_key"]),
-        ("Gemini 3.5 transcribe · speakers", "gemini_diarize", ["gemini_api_key"]),
-        ("AssemblyAI + Hebrew Turbo Local", "assemblyai_local_hebrew", ["assemblyai_api_key"]),
+        ("Whisper Hebrew Local", "local_hebrew_turbo", []),
+        ("Whisper Hebrew Local + Pyannote Diarization", "local_pyannote_hebrew", []),
+        ("Parakeet Multi-Language Local (25 languages)", "local_parakeet_english", []),
+        ("Parakeet Multi-Language Local + Pyannote Diarization", "local_pyannote_parakeet", []),
+        ("Whisper Multi-Language Local (99 languages)", "local_multilang_turbo", []),
+        ("Whisper Multi-Language Local + Pyannote Diarization", "local_pyannote_multilang", []),
+        ("Gemini 3.5 transcribe Multi-Language", "gemini_transcribe", ["gemini_api_key"]),
+        ("Gemini 3.5 transcribe Multi-Language · speakers", "gemini_diarize", ["gemini_api_key"]),
+        ("AssemblyAI + Whisper Hebrew Local", "assemblyai_local_hebrew", ["assemblyai_api_key"]),
         ("AssemblyAI + OpenAI GPT-4o", "assemblyai_universal_2", ["assemblyai_api_key"]),
         ("AssemblyAI", "assemblyai_diarize_only", ["assemblyai_api_key"]),
         ("OpenAI GPT transcribe", "openai_gpt_transcribe", ["openai_api_key"]),
@@ -23055,7 +23627,14 @@ class LiaApp:
         # 2026-06-05, newer than the plain 31b tag). Trained with 4-bit
         # simulated, so Q4_0 lands far closer to BF16 quality than an ordinary
         # post-training quant — at a SMALLER footprint (18.9 vs 19.9 GB).
-        ("🖥  Local Gemma 4 31B QAT (best quality · needs a 24 GB GPU)", "gemma4:31b-it-qat", _OLLAMA_CHAT_URL),
+        ("🖥  Gemma 4 31B QAT (best quality · needs a 24 GB GPU)", "gemma4:31b-it-qat", _OLLAMA_CHAT_URL),
+        # Low-VRAM local tiers (2026-09-15) for users who want to stay 100% local
+        # on a smaller GPU. 12B runs the technical GOLD acceptably at 16 GB; 4B is
+        # too weak for GOLD (measured: it collapses into a repetition loop) so its
+        # tier runs the lighter GENERAL recap base + repeat_penalty (see
+        # LOCAL_SUMMARY_TIERS / _run_summary). Order: best -> balanced -> recap.
+        ("🖥  Gemma 3 12B (balanced · needs a 16 GB GPU)", "gemma3:12b", _OLLAMA_CHAT_URL),
+        ("🖥  Gemma 3 4B (quick recap · needs an 8 GB GPU)", "gemma3:4b", _OLLAMA_CHAT_URL),
     ]
 
     # Human-friendly name of the tool that actually produces the transcript
@@ -23065,17 +23644,19 @@ class LiaApp:
         "openai_gpt_transcribe": "OpenAI GPT transcribe",
         "openai_gpt4o": "OpenAI GPT-4o transcribe",
         "openai_gpt4o_mini": "OpenAI GPT-4o-mini transcribe",
-        "groq_turbo": "Groq Whisper Large v3 Turbo",
-        "local_hebrew_turbo": "Hebrew Turbo (local)",
+        "groq_turbo": "Groq Multi-Language",
+        "local_hebrew_turbo": "Whisper Hebrew (local)",
         "remote_hebrew_turbo": "Remote Transcription server",
         "local_english_distil": "English Distil (local)",
-        "local_parakeet_english": "English Parakeet (local)",
-        "local_pyannote_hebrew": "Hebrew Turbo (local) · pyannote speakers",
-        "local_pyannote_parakeet": "English Parakeet (local) · pyannote speakers",
-        "gemini_transcribe": "Gemini 3.5 transcribe",
-        "gemini_diarize": "Gemini 3.5 transcribe · speakers",
+        "local_parakeet_english": "Parakeet Multi-Language (local)",
+        "local_multilang_turbo": "Whisper Multi-Language (local)",
+        "local_pyannote_hebrew": "Whisper Hebrew (local) · pyannote speakers",
+        "local_pyannote_parakeet": "Parakeet Multi-Language (local) · pyannote speakers",
+        "local_pyannote_multilang": "Whisper Multi-Language (local) · pyannote speakers",
+        "gemini_transcribe": "Gemini 3.5 transcribe Multi-Language",
+        "gemini_diarize": "Gemini 3.5 transcribe Multi-Language · speakers",
         "assemblyai_universal_2": "AssemblyAI → OpenAI GPT-4o transcribe",
-        "assemblyai_local_hebrew": "AssemblyAI → Hebrew Turbo (local)",
+        "assemblyai_local_hebrew": "AssemblyAI → Whisper Hebrew (local)",
         "assemblyai_diarize_only": "AssemblyAI",
     }
 
@@ -23407,7 +23988,7 @@ class LiaApp:
                 "openai_gpt4o_mini": "gpt-4o-mini-transcribe",
             }[key]
             t = OpenAITranscriber(model_size=model_size, api_key=api_key)
-            t.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
+            t.he_en_bias = (bool(self.config.get("groq_he_en_bias", True)) and self._language_profile() == "hebrew")
             t.preferred_language = lang_pack.primary_language(self.config)
             t.custom_vocabulary = self._composed_vocabulary()
             try:
@@ -23430,7 +24011,7 @@ class LiaApp:
                 log.warning("Meeting model groq_turbo requires Groq API key")
                 return (None, None, False)
             t = GroqTranscriber(model_size="whisper-large-v3-turbo", api_key=api_key)
-            t.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
+            t.he_en_bias = (bool(self.config.get("groq_he_en_bias", True)) and self._language_profile() == "hebrew")
             t.custom_vocabulary = self._composed_vocabulary()
             try:
                 t.load_model(callback=cb)
@@ -23440,7 +24021,7 @@ class LiaApp:
             return (t, None, False)
 
         if key in ("local_parakeet_english", "local_pyannote_parakeet"):
-            # English Parakeet (2026-08). local_pyannote_parakeet = the SAME model,
+            # Parakeet (multi-language, v3). local_pyannote_parakeet = the SAME model,
             # but the meeting is DIARIZED locally (pyannote is language-agnostic;
             # per-turn ASR = Parakeet). Reuse the dictation-side instance when
             # it is the same model and already loaded.
@@ -23448,7 +24029,7 @@ class LiaApp:
             main = self._local_transcriber
             if (isinstance(main, ParakeetTranscriber)
                     and main.model is not None):
-                return (main, "en", diarized)
+                return (main, None, diarized)   # v3: auto-detect (25 European langs)
             t = ParakeetTranscriber(
                 device=self.config.get("parakeet_device", "cpu"))
             try:
@@ -23456,9 +24037,55 @@ class LiaApp:
             except Exception as e:
                 log.error("Meeting model %s load failed: %s", key, e)
                 return (None, None, False)
-            return (t, "en", diarized)
+            return (t, None, diarized)   # v3: auto-detect (25 European languages)
+
+        if key in ("local_multilang_turbo", "local_pyannote_multilang"):
+            # Plain multilingual Whisper (large-v3-turbo, 99 languages,
+            # auto-detect) - the meeting/file counterpart of the dictation
+            # "Whisper Multi-Language Local (99 languages)" row. NOT the ivrit
+            # Hebrew model or the he/en router. Honors a single-language lock if
+            # the user set one (else full auto-detect). local_pyannote_multilang =
+            # the SAME model, but the meeting is DIARIZED locally (pyannote finds
+            # the turns, this model transcribes each - see _run_diarize_job).
+            diarized = (key == "local_pyannote_multilang")
+            mt = FasterWhisperTranscriber(
+                model_size="large-v3-turbo",
+                cpu_threads=self.config.get("cpu_threads", 16),
+                device=self.config.get("whisper_device", "auto"),
+                compute_type=self.config.get("cuda_compute_type"),
+            )
+            mt.custom_vocabulary = self._composed_vocabulary()
+            try:
+                mt.load_model(callback=cb)
+            except Exception as e:
+                log.error("Meeting model %s load failed: %s", key, e)
+                return (None, None, False)
+            mlock = (lang_pack.enabled_languages(self.config)[0]
+                     if self._language_locked() else None)
+            return (mt, mlock, diarized)
 
         if key in ("local_hebrew_turbo", "local_english_distil", "local_pyannote_hebrew"):
+            # Multilingual profile (2026-09-15): a local meeting uses the
+            # 99-language large-v3-turbo (auto-detect, or the locked language) -
+            # NOT the ivrit Hebrew model or the he/en router. Keeps the Hebrew
+            # profile below byte-identical.
+            if self._language_profile() == "multilingual":
+                mt = FasterWhisperTranscriber(
+                    model_size="large-v3-turbo",
+                    cpu_threads=self.config.get("cpu_threads", 16),
+                    device=self.config.get("whisper_device", "auto"),
+                    compute_type=self.config.get("cuda_compute_type"),
+                )
+                mt.custom_vocabulary = self._composed_vocabulary()
+                try:
+                    mt.load_model(callback=cb)
+                except Exception as e:
+                    log.error("Meeting model %s (multilingual) load failed: %s",
+                              key, e)
+                    return (None, None, False)
+                mlock = (lang_pack.enabled_languages(self.config)[0]
+                         if self._language_locked() else None)
+                return (mt, mlock, key == "local_pyannote_hebrew")
             # local_pyannote_hebrew = the SAME ivrit.ai Hebrew Whisper, but the
             # meeting is DIARIZED locally (pyannote finds the speaker turns, then
             # this model transcribes each turn — see _run_diarize_job's local path).
@@ -23901,9 +24528,9 @@ class LiaApp:
     # applies (chunked/diarized flavor preserved; cloud + AssemblyAI choices
     # are language-capable and left alone). remote is a Hebrew-only server.
     _LANG_DICTATION = {
-        "en": {"ivrit-ai/whisper-large-v3-turbo-ct2": "parakeet-tdt-0.6b-v2",
-               "ivrit-ai/whisper-large-v3-ct2": "parakeet-tdt-0.6b-v2"},
-        "he": {"parakeet-tdt-0.6b-v2": "ivrit-ai/whisper-large-v3-turbo-ct2",
+        "en": {"ivrit-ai/whisper-large-v3-turbo-ct2": "parakeet-tdt-0.6b-v3",
+               "ivrit-ai/whisper-large-v3-ct2": "parakeet-tdt-0.6b-v3"},
+        "he": {"parakeet-tdt-0.6b-v3": "ivrit-ai/whisper-large-v3-turbo-ct2",
                "distil-large-v3": "ivrit-ai/whisper-large-v3-turbo-ct2"},
     }
     _LANG_MEETING = {
@@ -23924,9 +24551,18 @@ class LiaApp:
         - the Groq/OpenAI he/en bias prompt (off for an English-primary user)
         - the router's English child -> Parakeet when switching to en
         Summary language follows automatically via summary_language="primary"."""
-        if lang not in ("he", "en"):
+        if not lang_pack.known_language(lang):
             return (False, "Unknown language: %s" % lang)
         self.config["primary_language"] = lang
+        # Ensure the new primary is enabled (append; never wipe the set) so the
+        # profile + lock resolve correctly.
+        enabled = [c for c in self.config.get("enabled_languages", ["he", "en"])
+                   if lang_pack.known_language(c)]
+        if lang not in enabled:
+            enabled.append(lang)
+        self.config["enabled_languages"] = enabled or [lang]
+        if lang not in ("he", "en"):
+            return self._apply_multilingual_primary(lang)
         changed = []
         pk_ok = (lang != "en") or self._parakeet_available()
         # dictation (local backend only)
@@ -23945,7 +24581,7 @@ class LiaApp:
         # cloud he/en bias: targeted at a Hebrew-primary user; plain
         # auto-detect serves an English-primary one better.
         want_bias = (lang == "he")
-        if bool(self.config.get("groq_he_en_bias", True)) != want_bias:
+        if (bool(self.config.get("groq_he_en_bias", True)) and self._language_profile() == "hebrew") != want_bias:
             self.config["groq_he_en_bias"] = want_bias
             for t in (self._groq_transcriber, self._openai_transcriber):
                 if t is not None:
@@ -23968,9 +24604,109 @@ class LiaApp:
                 + ("Applied: " + "; ".join(changed) if changed
                    else "Models unchanged."))
 
+    def _apply_multilingual_primary(self, lang):
+        """Switch to a non-he/en primary (multi-language, 2026-09-15): multilingual
+        engine defaults + he/en bias off. Models change only on the LOCAL dictation
+        backend (cloud serves every language); the meeting model's multilingual
+        override runs at build time. Called by _set_primary_language."""
+        changed = []
+        if (self.config.get("transcription_backend", "local") == "local"
+                and self.config.get("model_size") != "large-v3-turbo"):
+            self.config["model_size"] = "large-v3-turbo"
+            changed.append("dictation -> multilingual Whisper (large-v3-turbo)")
+            self._set_model("large-v3-turbo")
+        # Prefer Gemini for meetings when a key exists (free, 85+ langs, diarize);
+        # only swap AWAY from a language-specific LOCAL/remote key, never a cloud choice.
+        if (self.config.get("gemini_api_key") and self.config.get("meeting_model") in (
+                "local_hebrew_turbo", "local_pyannote_hebrew",
+                "local_parakeet_english", "local_pyannote_parakeet",
+                "remote_hebrew_turbo")):
+            self.config["meeting_model"] = "gemini_transcribe"
+            changed.append("meetings -> Gemini Transcribe")
+        if self.config.get("groq_he_en_bias", True):
+            self.config["groq_he_en_bias"] = False
+            for t in (self._groq_transcriber, self._openai_transcriber):
+                if t is not None:
+                    t.he_en_bias = False
+            changed.append("he/en bias off")
+        if self._openai_transcriber is not None:
+            self._openai_transcriber.preferred_language = lang
+        save_config(self.config)
+        locked = len(lang_pack.enabled_languages(self.config)) == 1
+        note = "; ".join(changed) if changed else "no other changes"
+        log.info("Primary language set to %s [%s]", lang, note)
+        return (True, "Primary language: %s%s. %s"
+                % (lang_pack.language_name(lang),
+                   " (locked to one language)" if locked else "", note))
+
+    def _set_enabled_languages(self, codes):
+        """Set the enabled-language SET (the anti-roaming control): known codes
+        only, de-duped, never empty, always including the primary. Exactly one
+        code = a hard language lock. Multi-language, 2026-09-15."""
+        if isinstance(codes, str):
+            codes = [codes]
+        prim = lang_pack.primary_language(self.config)
+        out = []
+        for c in (codes or []):
+            if lang_pack.known_language(c) and c not in out:
+                out.append(c)
+        if not out:
+            out = [prim]
+        if prim not in out:
+            out.insert(0, prim)
+        self.config["enabled_languages"] = out
+        save_config(self.config)
+        locked = len(out) == 1
+        log.info("Enabled languages: %s (profile=%s%s)", out,
+                 self._language_profile(), ", locked" if locked else "")
+        names = ", ".join(lang_pack.language_name(c) for c in out)
+        return (True, ("Locked to %s." % names) if locked
+                else ("Languages: %s." % names))
+
+    def _model_supported_langs(self):
+        """The language codes the CURRENT dictation model/backend can transcribe,
+        for the MODEL-AWARE Languages picker: Parakeet's 25, else the full 99
+        Whisper set (local Whisper models, Groq / OpenAI, Gemini)."""
+        try:
+            model = self.config.get("model_size", "")
+            if (self.config.get("transcription_backend", "local") == "local"
+                    and model.startswith("parakeet")):
+                return set(ParakeetTranscriber.PARAKEET_LANGS)
+            return set(lang_pack.WHISPER_LANGS)
+        except Exception:
+            return set(lang_pack.WHISPER_LANGS)
+
+    def _settings_language_rows(self):
+        """Rows for the Settings 'Languages' controls (multi-language): every
+        language the CURRENT model supports (Parakeet's 25 / Whisper's 99) plus
+        any already-enabled code, each with its enabled / summary-capable /
+        primary / model-supported flags, and the resolved primary/lock/profile."""
+        try:
+            enabled = set(lang_pack.enabled_languages(self.config))
+            prim = lang_pack.primary_language(self.config)
+            summ = set(lang_pack.summary_enabled_langs())
+            supported = self._model_supported_langs()
+            rows = []
+            for code in (supported | enabled | {prim}):
+                m = lang_pack.lang_meta(code)
+                rows.append({"id": code, "name_en": m["name_en"],
+                             "native": m["native"], "rtl": bool(m.get("rtl")),
+                             "enabled": code in enabled, "summary_ok": code in summ,
+                             "primary": code == prim, "supported": code in supported})
+            # primary first, then enabled, then alphabetical (a 99-item list).
+            rows.sort(key=lambda r: (not r["primary"], not r["enabled"], r["name_en"]))
+            return {"rows": rows, "primary": prim, "locked": len(enabled) == 1,
+                    "profile": self._language_profile(),
+                    "model_lang_count": len(supported),
+                    "model_kind": "parakeet" if len(supported) < 50 else "whisper"}
+        except Exception:
+            return {"rows": [], "primary": "he", "locked": False,
+                    "profile": "hebrew"}
+
     def _set_summary_language(self, mode):
-        """summary_language: primary / auto / he / en (see DEFAULT_CONFIG)."""
-        if mode not in ("primary", "auto", "he", "en"):
+        """summary_language: primary / auto / or any summary-enabled code."""
+        if (mode not in ("primary", "auto")
+                and mode not in lang_pack.summary_enabled_langs()):
             return (False, "Unknown summary language: %s" % mode)
         self.config["summary_language"] = mode
         save_config(self.config)
@@ -24026,14 +24762,14 @@ class LiaApp:
     # LOCAL first (2026-08-29, Naor's ordering): the local models are the
     # product's identity and the app default; cloud follows, remote last.
     _MENU_MODELS_ORDERED = [
-        ("Hebrew Turbo Local ⭐ (best local Hebrew)", "ivrit-ai/whisper-large-v3-turbo-ct2", "local", False, ""),
-        ("English Parakeet Local ⭐ (best English)", "parakeet-tdt-0.6b-v2", "local", False, ""),
+        ("Whisper Hebrew Local", "ivrit-ai/whisper-large-v3-turbo-ct2", "local", False, ""),
+        ("Parakeet Multi-Language Local (25 languages)", "parakeet-tdt-0.6b-v3", "local", False, ""),
         ("English Distil Local", "distil-large-v3", "local", False, ""),
-        ("General Turbo Local (multilingual · 99 languages)", "large-v3-turbo", "local", False, ""),
+        ("Whisper Multi-Language Local (99 languages)", "large-v3-turbo", "local", False, ""),
         ("OpenAI GPT transcribe", "ivrit-ai/whisper-large-v3-turbo-ct2", "openai", False, "gpt-transcribe"),
         ("OpenAI GPT-4o transcribe", "ivrit-ai/whisper-large-v3-turbo-ct2", "openai", False, "gpt-4o-transcribe"),
-        ("Groq Whisper Large v3 Turbo", "large-v3-turbo", "groq", False, ""),
-        ("Gemini 3.5 transcribe", "ivrit-ai/whisper-large-v3-turbo-ct2", "gemini", False, ""),
+        ("Groq Multi-Language", "large-v3-turbo", "groq", False, ""),
+        ("Gemini 3.5 transcribe Multi-Language", "ivrit-ai/whisper-large-v3-turbo-ct2", "gemini", False, ""),
         ("Remote Transcription server", "ivrit-ai/whisper-large-v3-turbo-ct2", "remote", False, ""),
     ]
 
@@ -24557,6 +25293,24 @@ class LiaApp:
                 daemon=True,
             ).start()
 
+    def _force_show_notice_overlay(self, msg, bg_color="#0f5132", duration=3500):
+        """Show a NON-error informational overlay bypassing silent_mode.
+
+        Same silent-flip dance as _force_show_error_overlay, but a calm color
+        and no ⚠ - for a one-time heads-up the user should see even in silent
+        mode (e.g. 'I switched the meeting mic'), without the alarm of an error.
+        """
+        try:
+            self.overlay.silent = False
+            self.overlay.show(f"  {msg}  ", bg_color=bg_color, duration=duration)
+        except Exception:
+            pass
+        finally:
+            def _restore():
+                time.sleep(4.0)
+                self.overlay.silent = bool(self.config.get("silent_mode", False))
+            threading.Thread(target=_restore, daemon=True).start()
+
     def _force_show_error_overlay(self, msg):
         """Show an error overlay bypassing silent_mode.
 
@@ -24623,7 +25377,7 @@ class LiaApp:
         """Toggle the Hebrew/English bias prompt sent to Groq.
         ON  = Whisper sees a bilingual hint, less likely to detect French/Spanish/etc.
         OFF = no prompt, fastest possible response, full auto-detect over all languages."""
-        new_value = not bool(self.config.get("groq_he_en_bias", True))
+        new_value = not (bool(self.config.get("groq_he_en_bias", True)) and self._language_profile() == "hebrew")
         self.config["groq_he_en_bias"] = new_value
         save_config(self.config)
         if self._groq_transcriber is not None:
@@ -24635,7 +25389,7 @@ class LiaApp:
     # ----- AI Cleanup menu -----
     CLEANUP_MENU_STYLES = [
         ("Off — raw transcription", "off"),
-        ("Spoken ⭐ — remove fillers + self-corrections, keep wording", "spoken"),
+        ("Spoken — remove fillers + self-corrections, keep wording", "spoken"),
         ("Casual — typos + basic grammar (keeps fillers)", "casual"),
         ("Proofread — full spelling + grammar polish", "proofread"),
         ("Email polish — email-ready prose", "email"),
@@ -24711,7 +25465,7 @@ class LiaApp:
     # earlier. gpt-5.x shaping (max_completion_tokens, no temperature) is in
     # OpenAILLMCleaner.clean().
     CLEANUP_OPENAI_MODELS = [
-        ("OpenAI ChatGPT 5.6 Luna - light, fast ⭐", "gpt-5.6-luna"),
+        ("OpenAI ChatGPT 5.6 Luna - light, fast", "gpt-5.6-luna"),
         ("OpenAI ChatGPT 5.6 Sol - strongest", "gpt-5.6-sol"),
         ("OpenAI ChatGPT 5.6 Terra - strongest (alt)", "gpt-5.6-terra"),
     ]
@@ -24727,7 +25481,7 @@ class LiaApp:
     # exists (verified 2026-08-15). Free tier RATE LIMIT ~15 req/min → a burst of
     # dictations can 429; clean() backs off and falls back to raw text.
     CLEANUP_GEMINI_MODELS = [
-        ("✨  Gemini 3.5 Flash-Lite (free, fastest)", "gemini-3.5-flash-lite"),
+        ("Gemini 3.5 Flash-Lite (free, fastest)", "gemini-3.5-flash-lite"),
     ]
 
     def _set_cleanup_provider_model(self, provider, model=None):
@@ -24810,6 +25564,24 @@ class LiaApp:
             w, "" if w == 1 else "s",
             (" - removed %d older entr%s" % (removed, "y" if removed == 1 else "ies"))
             if removed else ""))
+
+    def _set_meeting_chunk_seconds(self, seconds):
+        """Settings -> Meetings: how often a meeting drains + transcribes a chunk,
+        so the live transcript updates roughly this often. Clamped to the same
+        [MIN, MAX] MeetingSession enforces. A meeting already running keeps the
+        cadence it started with; the new value applies to the next one."""
+        lo, hi = MeetingSession.CHUNK_SECONDS_MIN, MeetingSession.CHUNK_SECONDS_MAX
+        try:
+            s = int(seconds)
+        except (TypeError, ValueError):
+            return (False, "Interval must be a number %d-%d seconds" % (lo, hi))
+        s = max(lo, min(hi, s))
+        self.config["meeting_chunk_seconds"] = s
+        save_config(self.config)
+        log.info("Meeting chunk cadence set to %ds", s)
+        if self._is_meeting_active():
+            return (True, "Live transcript updates every ~%ds (takes effect next meeting)" % s)
+        return (True, "Live transcript updates every ~%ds" % s)
 
     def _clear_history(self):
         """Settings / History window -> Delete all history."""
@@ -24902,8 +25674,10 @@ class LiaApp:
             # The pass prompt follows the TRANSCRIPT's language (evidence
             # examples must match what the speakers actually said).
             ev_lang = lang_pack.detect_text_lang(evidence)
-            prompt = (lang_pack.SPEAKER_NAME_PASS_PROMPT_EN if ev_lang == "en"
-                      else _SPEAKER_NAME_PASS_PROMPT)
+            # he -> the Hebrew prompt; any other language -> English (a safe
+            # instruction language; the excerpts carry the real transcript).
+            prompt = (_SPEAKER_NAME_PASS_PROMPT if ev_lang == "he"
+                      else lang_pack.SPEAKER_NAME_PASS_PROMPT_EN)
             num_ctx = max(8192, min(_SUMMARY_CTX_CAP,
                                     int(len(content)
                                         / lang_pack.chars_per_token(ev_lang))
@@ -25016,13 +25790,17 @@ class LiaApp:
             "local_pyannote_hebrew": "local_hebrew_turbo",
             # English variant (2026-08): same pyannote turns, Parakeet per turn.
             "local_pyannote_parakeet": "local_parakeet_english",
+            # Multilingual variant (2026-09-16): pyannote turns, large-v3-turbo
+            # (99 languages) per turn.
+            "local_pyannote_multilang": "local_multilang_turbo",
         }.get(model_key)
         # Which engine finds the speaker turns. gemini_diarize returns text +
         # word timestamps directly (no separate enhance pass, so it is not in
         # diarize_enhance_model above); pyannote gives turns only; else AssemblyAI.
         if model_key == "gemini_diarize":
             diarize_backend = "gemini"
-        elif model_key in ("local_pyannote_hebrew", "local_pyannote_parakeet"):
+        elif model_key in ("local_pyannote_hebrew", "local_pyannote_parakeet",
+                            "local_pyannote_multilang"):
             diarize_backend = "local_pyannote"
         else:
             diarize_backend = "assemblyai"
@@ -25201,33 +25979,123 @@ class LiaApp:
             return False
 
     def _open_live_transcript(self):
-        """Tray → '📄 Live Transcript'. Opens the rolling LIVE transcript of
-        the meeting in progress — read-only peeking, no LLM, no pipeline.
-        The file is rewritten after every transcribed chunk (~45s)."""
+        """Tray → '📄 Live Transcript'. Opens a self-refreshing window on the
+        rolling LIVE transcript of the meeting in progress — read-only peeking,
+        no LLM, no pipeline. The window polls the LIVE file (rewritten after every
+        transcribed chunk) and follows the tail, so new text appears within ~1s
+        without reopening anything. Falls back to opening the raw .txt if the
+        window can't spawn (frozen build / missing script)."""
         session = self._active_meeting
         if session is None:
             log.info("Live transcript: clicked with no active meeting")
             return
         p = getattr(session, "_live_path", None)
-        if p and os.path.exists(p):
+        if not p:
+            log.info("Live transcript: no live path yet")
+            self.overlay.show_error("No transcript yet — starting up")
+            return
+        # Single instance: if a window is already open for THIS meeting, bring
+        # it forward. A window left over from a previous meeting (different live
+        # path) is stale - close it and open a fresh one on the current file.
+        proc = getattr(self, "_live_transcript_proc", None)
+        if proc is not None and proc.poll() is None:
+            if getattr(self, "_live_transcript_path", None) == p:
+                try:
+                    import ctypes
+                    ctypes.windll.user32.AllowSetForegroundWindow(proc.pid)
+                except Exception:
+                    pass
+                return
             try:
-                size = os.path.getsize(p)
-            except OSError:
-                size = -1
-            # Logged so a "that's not my meeting" report can be matched to the
-            # exact file (and its size at that moment) that was opened.
-            log.info("Live transcript opened: %s (%d bytes, meeting started %s)",
-                     os.path.basename(p), size,
-                     time.strftime("%H:%M:%S", time.localtime(
-                         getattr(session, "start_time", 0) or 0)))
+                proc.terminate()
+            except Exception:
+                pass
+            self._live_transcript_proc = None
+        if self._spawn_live_transcript_window(session, p):
+            return
+        # Fallback: open the raw file in the default editor (static; user must
+        # reopen to see new chunks).
+        if os.path.exists(p):
             try:
                 os.startfile(p)
+                log.info("Live transcript opened (raw file fallback): %s",
+                         os.path.basename(p))
             except Exception as e:
                 log.warning("Open live transcript failed: %s", e)
                 self.overlay.show_error("Could not open live transcript")
         else:
+            cs = getattr(session, "chunk_seconds", 15)
             log.info("Live transcript: no file yet (path=%s)", p)
-            self.overlay.show_error("No transcript yet — first chunk lands in ~45s")
+            self.overlay.show_error("No transcript yet — first chunk lands in ~%ds" % cs)
+
+    def _spawn_live_transcript_window(self, session, live_path):
+        """Spawn live_transcript_window.py on this meeting's LIVE file. Returns
+        True if launched (or already launching), False so the caller can fall
+        back to os.startfile. Direct Popen (single-instance handle kept for the
+        bring-to-front / auto-close on meeting end). No-op on a frozen build."""
+        import subprocess
+        import tempfile
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        interp = find_python_interpreter()
+        script = os.path.join(base_dir, "live_transcript_window.py")
+        if interp is None or not os.path.exists(script):
+            log.info("Live transcript window unavailable (no interpreter / script).")
+            return False
+        started = ""
+        try:
+            started = time.strftime("%H:%M", time.localtime(
+                getattr(session, "start_time", 0) or 0))
+        except Exception:
+            pass
+        title = (getattr(session, "title_guess", None)
+                 or getattr(session, "event_subject", "")
+                 or "Live transcript")
+        payload = {
+            "live_path": live_path,
+            "status_path": getattr(session, "_status_path", None) or (live_path + ".status.json"),
+            "title": title,
+            "started": started,
+            "chunk_seconds": int(getattr(session, "chunk_seconds", 15)),
+        }
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        try:
+            fd, ppath = tempfile.mkstemp(suffix=".json", prefix="wt_live_")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+        except Exception as e:
+            log.warning("Live transcript payload write failed: %s", e)
+            return False
+        try:
+            proc = subprocess.Popen(
+                [interp, "-X", "utf8", script, ppath],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=env, creationflags=0x08000000)   # CREATE_NO_WINDOW
+        except Exception as e:
+            log.warning("Live transcript window spawn failed: %s", e)
+            _safe_remove(ppath)
+            return False
+        self._live_transcript_proc = proc
+        self._live_transcript_path = live_path
+        try:
+            import ctypes
+            ctypes.windll.user32.AllowSetForegroundWindow(proc.pid)
+        except Exception:
+            pass
+        log.info("Live transcript window opened (pid %s) on %s",
+                 proc.pid, os.path.basename(live_path))
+
+        def _cleanup():
+            try:
+                proc.wait()
+            except Exception:
+                pass
+            _safe_remove(ppath)
+            if getattr(self, "_live_transcript_proc", None) is proc:
+                self._live_transcript_proc = None
+        threading.Thread(target=_cleanup, daemon=True).start()
+        return True
 
     def _recap_meeting(self):
         """Tray → '📋 Recap & Continue'. Mid-meeting checkpoint: transcript +
@@ -25752,80 +26620,6 @@ class LiaApp:
             except Exception:
                 pass
         threading.Thread(target=_cleanup, daemon=True).start()
-
-    def _show_task_note(self):
-        """Open the sticky task note (tasknote_window.py), or bring the existing
-        one to the front - single instance. Direct Popen (not spawn_helper) so we
-        keep the handle for the single-instance / toggle-close logic; the window
-        needs no Outlook COM, so de-elevation is irrelevant. No-op on a frozen
-        build / missing script."""
-        proc = getattr(self, "_task_note_proc", None)
-        if proc is not None and proc.poll() is None:
-            try:
-                import ctypes
-                ctypes.windll.user32.AllowSetForegroundWindow(proc.pid)
-            except Exception:
-                pass
-            return
-        import subprocess
-        import tempfile
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        interp = find_python_interpreter()
-        script = os.path.join(base_dir, "tasknote_window.py")
-        if interp is None or not os.path.exists(script):
-            log.warning("Task note unavailable (no interpreter / script).")
-            return
-        env = os.environ.copy()
-        env["PYTHONIOENCODING"] = "utf-8"
-        env["PYTHONUTF8"] = "1"
-        try:
-            fd, ppath = tempfile.mkstemp(suffix=".json", prefix="wt_tasknote_")
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump({"title": "Tasks - Lia"}, f, ensure_ascii=False)
-        except Exception as e:
-            log.warning("Task note payload write failed: %s", e)
-            return
-        try:
-            proc = subprocess.Popen(
-                [interp, "-X", "utf8", script, ppath],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                env=env, creationflags=0x08000000)   # CREATE_NO_WINDOW
-        except Exception as e:
-            log.warning("Task note spawn failed: %s", e)
-            _safe_remove(ppath)
-            return
-        self._task_note_proc = proc
-        try:
-            import ctypes
-            ctypes.windll.user32.AllowSetForegroundWindow(proc.pid)
-        except Exception:
-            pass
-        log.info("Task note opened (pid %s).", proc.pid)
-
-        def _cleanup():
-            try:
-                proc.wait()
-            except Exception:
-                pass
-            _safe_remove(ppath)
-            if getattr(self, "_task_note_proc", None) is proc:
-                self._task_note_proc = None
-        threading.Thread(target=_cleanup, daemon=True).start()
-
-    def _toggle_task_note(self):
-        """Hotkey (tasks_toggle_hotkey) / tray: show the sticky task note, or
-        close it if it is already open. All state lives in tasks.json, so closing
-        the window loses nothing."""
-        proc = getattr(self, "_task_note_proc", None)
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-            self._task_note_proc = None
-            log.info("Task note closed.")
-            return
-        self._show_task_note()
 
     def _kick_meetings_indexer_bg(self):
         """Fire-and-forget incremental reindex after a meeting is saved, so the
@@ -26609,7 +27403,18 @@ class LiaApp:
         """Effective vocabulary string for Whisper prompts / LLM cleanup: the
         ranked, budgeted composition from the self-learning store — falling
         back to the raw manual list when the store is unavailable. This is the
-        SINGLE choke point every transcriber push-site reads."""
+        SINGLE choke point every transcriber push-site reads.
+
+        Multi-language (2026-09-15): the learned vocabulary is a Hebrew/English
+        term store; feeding it as a local Whisper initial_prompt FORCES that
+        language, so in the multilingual profile (any non-he/en language enabled)
+        it is suppressed entirely - else a Spanish speaker gets Hebrew output.
+        A he/en config (the Hebrew profile) is byte-identical to before."""
+        try:
+            if self._language_profile() != "hebrew":
+                return ""
+        except Exception:
+            pass
         store = getattr(self, "_vocab_store", None)
         if store is not None:
             try:
@@ -27017,7 +27822,7 @@ class LiaApp:
         """The language cloud meeting summaries are written in (drives both the
         base-prompt preview and the addendum default in Settings > Advanced)."""
         sl = self.config.get("summary_language") or "primary"
-        return sl if sl in lang_pack.LANGUAGES else (self.config.get("primary_language") or "he")
+        return sl if sl in lang_pack.summary_enabled_langs() else (self.config.get("primary_language") or "he")
 
     def _summary_template_id(self):
         """The selected meeting-summary template id (config `summary_template`),
@@ -27341,7 +28146,7 @@ class LiaApp:
                     model_size=self.config.get("groq_model", "whisper-large-v3-turbo"),
                     api_key=api_key,
                 )
-                self._groq_transcriber.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
+                self._groq_transcriber.he_en_bias = (bool(self.config.get("groq_he_en_bias", True)) and self._language_profile() == "hebrew")
                 self._groq_transcriber.custom_vocabulary = self._composed_vocabulary()
             # Idempotently ensure load_model() has been called. The
             # instance can exist with model=None when:
@@ -27374,7 +28179,7 @@ class LiaApp:
                     model_size=self.config.get("openai_model", "gpt-4o-transcribe"),
                     api_key=api_key,
                 )
-                self._openai_transcriber.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
+                self._openai_transcriber.he_en_bias = (bool(self.config.get("groq_he_en_bias", True)) and self._language_profile() == "hebrew")
                 self._openai_transcriber.preferred_language = lang_pack.primary_language(self.config)
                 self._openai_transcriber.custom_vocabulary = self._composed_vocabulary()
             # Same idempotent load_model guard as the Groq branch above —
@@ -27512,7 +28317,7 @@ class LiaApp:
             o.load_model(callback=lambda m: log.info(m))
         except Exception as e:
             log.error("OpenAI load_model failed: %s", e)
-        o.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
+        o.he_en_bias = (bool(self.config.get("groq_he_en_bias", True)) and self._language_profile() == "hebrew")
         o.custom_vocabulary = self._composed_vocabulary()
         self.config["openai_api_key"] = key
         self._openai_transcriber = o
@@ -27555,7 +28360,7 @@ class LiaApp:
             g.load_model(callback=lambda m: log.info(m))
         except Exception as e:
             log.error("Groq load_model failed: %s", e)
-        g.he_en_bias = bool(self.config.get("groq_he_en_bias", True))
+        g.he_en_bias = (bool(self.config.get("groq_he_en_bias", True)) and self._language_profile() == "hebrew")
         self.config["groq_api_key"] = key
         self._groq_transcriber = g
         self.transcriber = g
@@ -28405,6 +29210,206 @@ class LiaApp:
         except Exception as e:
             return (False, str(e)[:120])
 
+    # --- Home page (a landing page in the Settings shell) helpers -----------
+    def _recent_meetings(self, limit=30):
+        """The most recent saved meetings for the Home page: newest first, from
+        the meetings archive only (a listdir + stat, NO model / index run). Each:
+        {title, date, path, has_summary, diarized}. Best-effort; [] on any error."""
+        import re as _re
+        out = []
+        try:
+            names = [n for n in os.listdir(MEETINGS_DIR)
+                     if (n.endswith("_meeting.txt") or n.endswith("_meeting_diarized.txt"))]
+        except Exception:
+            return out
+        rows = []
+        for n in names:
+            try:
+                rows.append((os.path.getmtime(os.path.join(MEETINGS_DIR, n)), n))
+            except OSError:
+                pass
+        rows.sort(reverse=True)
+        import datetime as _dt
+        for mtime, n in rows[:limit]:
+            path = os.path.join(MEETINGS_DIR, n)
+            diarized = n.endswith("_meeting_diarized.txt")
+            # filename: <YYYY-MM-DD_HH-MM-SS>[_<slug>]_meeting[_diarized].txt
+            base = n[:-4]
+            for suf in ("_meeting_diarized", "_meeting"):
+                if base.endswith(suf):
+                    base = base[:-len(suf)]
+                    break
+            # Strip the leading <date>[_<time>] stamp - the date column shows it,
+            # so the display name is just the slug (2026-09-16_09-44-13_Dror_Abulof
+            # -> "Dror Abulof"), not "09-44-13 Dror Abulof" or "2026-05-28 14-24".
+            # The time is optional (older files carry only HH-MM, some only a date).
+            m = _re.match(r"^\d{4}-\d\d-\d\d(?:_\d\d-\d\d(?:-\d\d)?)?_?(.*)$", base)
+            slug = (m.group(1) if m else base).strip("_")
+            title = slug.replace("_", " ").strip() or "Untitled meeting"
+            out.append({
+                "title": title,
+                "date": _dt.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M"),
+                "path": path,
+                "has_summary": self._meeting_summary_html_for(path) is not None,
+                "diarized": diarized,
+            })
+        return out
+
+    def _meeting_in_dir(self, path):
+        """A meetings-dir-scoped absolute path, or None (never an arbitrary path)."""
+        try:
+            full = os.path.abspath(path or "")
+            base = os.path.abspath(MEETINGS_DIR)
+            if os.path.exists(full) and os.path.commonpath([base, full]) == base:
+                return full
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _summary_html_to_text(html_str):
+        """Flatten a Lia summary HTML into readable plain text for the Home
+        preview (headings/bullets become lines). Best-effort; '' on trouble."""
+        import re as _re
+        import html as _htmllib
+        s = html_str or ""
+        m = _re.search(r'<div class="card">(.*?)</div>\s*</(?:body|html)>',
+                       s, _re.S | _re.I)
+        inner = m.group(1) if m else s
+        inner = _re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", "", inner)
+        inner = _re.sub(r"(?i)<li[^>]*>", "\n- ", inner)
+        inner = _re.sub(r"(?i)<(br|/p|/div|/li|/tr|/h[1-6])\s*/?>", "\n", inner)
+        inner = _re.sub(r"<[^>]+>", "", inner)
+        text = _htmllib.unescape(inner)
+        return _re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    def _get_meeting_details(self, path):
+        """Home preview: the selected meeting's summary text + open targets.
+        Reads only files inside the meetings dir; no model/index run."""
+        full = self._meeting_in_dir(path)
+        if not full:
+            return (False, "That meeting is gone")
+        html = self._meeting_summary_html_for(full)
+        summary_text = ""
+        if html:
+            try:
+                with open(html, encoding="utf-8") as f:
+                    summary_text = self._summary_html_to_text(f.read())
+            except Exception as e:
+                log.debug("meeting preview read failed: %s", e)
+        import datetime as _dt
+        try:
+            date = _dt.datetime.fromtimestamp(os.path.getmtime(full)).strftime("%Y-%m-%d %H:%M")
+        except OSError:
+            date = ""
+        # 3-tuple (ok, "", data) so the payload rides `data`, not the toast slot.
+        return (True, "", {
+            "has_summary": bool(html),
+            "summary_text": summary_text,
+            "summary_path": html or "",
+            "transcript_path": full,
+            "diarized": full.endswith("_meeting_diarized.txt"),
+            "date": date,
+        })
+
+    def _open_meeting_transcript(self, path):
+        """Home preview: open the raw transcript .txt of a saved meeting."""
+        full = self._meeting_in_dir(path)
+        if not full:
+            return (False, "That meeting is gone")
+        try:
+            os.startfile(full)
+            return (True, "")
+        except Exception as e:
+            return (False, str(e)[:120])
+
+    def _rename_speakers_for(self, path):
+        """Home preview: open the speaker-rename dialog for THIS meeting (no
+        picker). Only a file inside the meetings dir."""
+        full = self._meeting_in_dir(path)
+        if not full:
+            return (False, "That meeting is gone")
+        threading.Thread(target=lambda: self._rename_speakers_dialog(full),
+                         daemon=True).start()
+        return (True, "Opening speaker rename…")
+
+    def _copy_meeting_summary(self, path):
+        """Home preview: copy the meeting's summary text to the clipboard."""
+        full = self._meeting_in_dir(path)
+        if not full:
+            return (False, "That meeting is gone")
+        html = self._meeting_summary_html_for(full)
+        if not html:
+            return (False, "No summary to copy")
+        try:
+            with open(html, encoding="utf-8") as f:
+                text = self._summary_html_to_text(f.read())
+            import pyperclip
+            pyperclip.copy(text)
+            return (True, "Summary copied")
+        except Exception as e:
+            return (False, str(e)[:120])
+
+    @staticmethod
+    def _meeting_summary_html_for(txt_full):
+        """The shareable summary HTML that pairs with a meeting transcript .txt,
+        or None if there isn't one on disk. Both the chunked (`X_meeting.txt`) and
+        diarized (`X_meeting_diarized.txt`) transcripts pair with the SAME
+        `X_meeting_summary.html` (see MeetingSession._write_*), so strip a trailing
+        `_diarized` before appending `_summary.html`."""
+        low = (txt_full or "").lower()
+        if not low.endswith(".txt"):
+            return None
+        stem = txt_full[:-4]
+        if stem.endswith("_diarized"):
+            stem = stem[:-len("_diarized")]
+        html = stem + "_summary.html"
+        return html if os.path.exists(html) else None
+
+    def _open_meeting_path(self, path):
+        """Home: open a saved meeting. When the meeting has a summary, open it in
+        the WYSIWYG editor (editable, our own UI - not Notepad); otherwise open
+        the transcript file. Only opens a file inside the meetings dir (no
+        arbitrary path)."""
+        try:
+            full = os.path.abspath(path or "")
+            base = os.path.abspath(MEETINGS_DIR)
+            if not os.path.exists(full) or os.path.commonpath([base, full]) != base:
+                return (False, "That meeting file is gone")
+            html = self._meeting_summary_html_for(full)
+            if html:
+                # _open_summary_editor blocks for the window's life -> worker thread.
+                threading.Thread(target=lambda: self._open_summary_editor(html),
+                                 daemon=True).start()
+                return (True, "Opening summary editor…")
+            os.startfile(full)
+            return (True, "")
+        except Exception as e:
+            return (False, str(e)[:120])
+
+    def _home_start_meeting(self):
+        """Home primary action: start a meeting (summarize at stop, like the tray)."""
+        if self._is_meeting_active():
+            return (True, "Meeting already running")
+        self._toggle_meeting(summarize=True)
+        return (True, "Meeting started")
+
+    def _home_stop_meeting(self, summarize=True):
+        if not self._is_meeting_active():
+            return (True, "No meeting running")
+        self._stop_meeting(summarize=bool(summarize))
+        return (True, "Meeting ended - processing…")
+
+    def _home_action_items_open_count(self):
+        """Cheap-ish open action-item count for the Home badge; None if it can't
+        be determined without heavy work."""
+        try:
+            import action_items
+            groups = action_items.collect_items()
+            return sum(1 for g in groups for it in g.get("items", []) if not it.get("done"))
+        except Exception:
+            return None
+
     # --- the action allowlist (name -> (bound callable, is_slow)) ---
     def _settings_action_map(self):
         A = {}
@@ -28417,6 +29422,7 @@ class LiaApp:
         add("set_recording_mode", self._set_recording_mode)
         add("set_paste_mode", self._set_paste_mode)
         add("set_primary_language", self._set_primary_language)
+        add("set_enabled_languages", self._set_enabled_languages)
         add("toggle_clipboard_auto_restore", self._toggle_clipboard_auto_restore)
         add("toggle_press_enter_after_paste", self._toggle_press_enter_after_paste)
         add("toggle_silent_mode", self._toggle_silent_mode)
@@ -28469,6 +29475,7 @@ class LiaApp:
         add("open_tailscale", self._open_tailscale)
         # Meetings
         add("toggle_auto_detect_meetings", self._toggle_auto_detect_meetings)
+        add("set_meeting_chunk_seconds", self._set_meeting_chunk_seconds)
         add("toggle_keep_meeting_tracks", self._toggle_keep_meeting_tracks)
         add("toggle_meeting_backup_mic", self._toggle_meeting_backup_mic)
         add("toggle_meeting_mic_auto_fallback", self._toggle_meeting_mic_auto_fallback)
@@ -28476,7 +29483,6 @@ class LiaApp:
         add("voice_ask_now", self._voice_ask_toggle)
         add("set_voice_ask_output", self._set_voice_ask_output)
         add("open_action_items", self._open_action_items)
-        add("open_task_note", self._toggle_task_note)
         add("open_meetings_folder", self._open_meetings_folder)
         add("edit_meeting_summary", self._edit_meeting_summary)
         add("rename_speakers_old", self._rename_speakers_in_old_meeting)
@@ -28518,6 +29524,16 @@ class LiaApp:
         add("open_debug_clips_dir", self._open_debug_clips_dir)
         add("quit_app", self._quit)
         add("delete_all_data", self._settings_delete_all_data, True)
+        # Home page (landing) actions - most reuse existing behaviour.
+        add("home_start_meeting", self._home_start_meeting)
+        add("home_stop_meeting", self._home_stop_meeting)
+        add("cancel_meeting", self._cancel_meeting)
+        add("show_history", self._show_history)
+        add("open_meeting_path", self._open_meeting_path)
+        add("get_meeting_details", self._get_meeting_details)
+        add("open_meeting_transcript", self._open_meeting_transcript)
+        add("rename_speakers_for", self._rename_speakers_for)
+        add("copy_meeting_summary", self._copy_meeting_summary)
         return A
 
     # Methods whose result should refresh the Ollama probe / device lists.
@@ -28532,7 +29548,15 @@ class LiaApp:
     _SETTINGS_READONLY_METHODS = {"vocab_pending_list", "vocab_learned_list",
                                   "vocab_corrections_list", "vocab_corrections_scan",
                                   "snippets_get", "capture_hotkey", "test_remote",
-                                  "serve_status", "lexicon_oov_list"}
+                                  "serve_status", "lexicon_oov_list",
+                                  # Home preview: pure reads the child loads into
+                                  # the DOM. A state push would re-render Home,
+                                  # which re-requests get_meeting_details -> an
+                                  # infinite flicker loop (2026-09-16). The other
+                                  # two change no settings state, so skip the push
+                                  # (it would only reset the preview).
+                                  "get_meeting_details", "copy_meeting_summary",
+                                  "open_meeting_transcript"}
     # Mutations that act on a dynamically-loaded list which the child reloads in
     # place itself (loadOov / loadCorr / loadList right after the call). A
     # follow-up {"t":"state"} would full-re-render the page and wipe that list,
@@ -28757,7 +29781,7 @@ class LiaApp:
         if (c.get("groq_api_key") or "").strip():
             cleanup_models.append({
                 "provider": "groq", "model": "llama-3.3-70b-versatile",
-                "label": "⚡  Groq Llama-3.3-70B (free)", "checked": prov == "groq"})
+                "label": "Groq Llama-3.3-70B (free)", "checked": prov == "groq"})
         if (c.get("gemini_api_key") or "").strip():
             for l, m in self.CLEANUP_GEMINI_MODELS:
                 cleanup_models.append({
@@ -28825,8 +29849,18 @@ class LiaApp:
             "summary_addendum_default": _safe(self._summary_addendum_default, ""),
             "summary_base_prompt": _safe(self._summary_base_prompt, ""),
             "summary_templates": list(lang_pack.SUMMARY_TEMPLATE_META),
+            "languages": _safe(self._settings_language_rows, {"rows": []}),
             "vocab_pending": _safe(self._vocab_pending_count, 0),
             "auto_start": _safe(lambda: bool(is_auto_start_enabled()), False),
+            "home": {
+                "recent_meetings": _safe(lambda: self._recent_meetings(30), []),
+                "action_items_open": _safe(self._home_action_items_open_count, None),
+                "recording_source": c.get("recording_source", "microphone"),
+                "mic_name": (c.get("input_device_name")
+                             or ("Default mic" if c.get("input_device_index") is None
+                                 else "Mic #%s" % c.get("input_device_index"))),
+                "meeting_mic_name": c.get("meeting_input_device_name") or "",
+            },
             "hotkeys": {
                 "main": c.get("hotkey", "ctrl+space"),
                 "undo": c.get("undo_hotkey", "ctrl+alt+z"),
@@ -28836,8 +29870,6 @@ class LiaApp:
                 "actions": c.get("action_items_hotkey", "ctrl+alt+t"),
                 "email": c.get("email_search_hotkey", "ctrl+alt+f"),
                 "chat": c.get("chat_hotkey", "ctrl+alt+c"),
-                "task_add (voice)": c.get("tasks_hotkey", "ctrl+alt+q"),
-                "task_note (show/hide)": c.get("tasks_toggle_hotkey", "ctrl+alt+w"),
             },
             "paths": {"config": CONFIG_DIR,
                       "log": os.path.join(CONFIG_DIR, "lia.log"),
@@ -28879,6 +29911,7 @@ class LiaApp:
             "cleanup_provider": "", "vocab_pending": 0, "auto_start": False,
             "summary_addendum_default": "", "summary_base_prompt": "",
             "summary_templates": list(lang_pack.SUMMARY_TEMPLATE_META),
+            "languages": self._settings_language_rows(),
             "hotkeys": {"main": c.get("hotkey", "ctrl+space"),
                         "undo": c.get("undo_hotkey", "ctrl+alt+z"),
                         "cancel": c.get("cancel_hotkey", "esc"),
@@ -28919,9 +29952,11 @@ class LiaApp:
         A pre-warmed window (spawned hidden by _prewarm_settings_window) is
         already booted, so this just reveals + refreshes it => the click feels
         instant. If none is alive, spawn a fresh VISIBLE one (the old path)."""
-        # Models is the landing page (2026-08-29, Naor's call): the model
-        # choice is the decision new users actually come to make.
-        page = page or "models"
+        # Home is the landing page (2026-09-16, Naor's call): opening via the
+        # tray "Settings…" item or a tray double-click lands on Home first
+        # (status + Start meeting + recent meetings); every settings page is one
+        # nav click away. A caller may still request a specific page.
+        page = page or "home"
         proc = getattr(self, "_settings_proc", None)
         if proc is not None and proc.poll() is None:
             self._reveal_settings(proc, page, focus)
@@ -28938,7 +29973,7 @@ class LiaApp:
         proc = getattr(self, "_settings_proc", None)
         if proc is not None and proc.poll() is None:
             return
-        self._spawn_settings_proc(page="models", focus=None, prewarm=True)
+        self._spawn_settings_proc(page="home", focus=None, prewarm=True)
 
     def _spawn_settings_proc(self, *, page, focus, prewarm):
         """Spawn the Settings child process. prewarm=True => the child creates
