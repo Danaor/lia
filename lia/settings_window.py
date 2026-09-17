@@ -213,6 +213,9 @@ def _demo_state():
         "meeting_active": False, "live_transcript_available": False,
         "home": {"recording_source": "both", "mic_name": "JOUNIVO Mic",
                  "meeting_mic_name": "Jabra Headset", "action_items_open": 3,
+                 "speaker_profiles": [
+                     {"name": "דנה", "count": 3, "updated": "2026-09-14"},
+                     {"name": "Avi Bar-Yuda", "count": 1, "updated": "2026-09-17"}],
                  "recent_meetings": [
                      {"title": "Meeting %d" % i,
                       "date": "2026-09-%02d %02d:%02d" % (16 - i // 3, 9 + i % 8, (i * 7) % 60),
@@ -1224,6 +1227,17 @@ APP_JS = r"""
         '</div>'+
         '<div class="hint">The language meeting and text summaries are written in, regardless of the language spoken.</div>'+
       '</div>'+
+      ((((S.home||{}).speaker_profiles)||[]).length ?
+      '<div class="page"><div class="section-title">Known voices</div>'+
+        '<div class="hint">Voices Lia learned when you named speakers (local speaker detection only). A wrong entry makes matching hesitate - forget it here.</div>'+
+        (((S.home||{}).speaker_profiles)||[]).map(function(p){
+          return '<div class="row" style="display:flex;align-items:center;gap:10px;padding:6px 0">'+
+            '<span dir="auto" style="flex:1">'+esc(p.name)+'</span>'+
+            '<span class="hint" style="margin:0">'+esc(String(p.count))+' sample'+(p.count===1?'':'s')+(p.updated?' · '+esc(p.updated):'')+'</span>'+
+            '<button class="btn" data-call="delete_speaker_profile" data-args=\''+esc(JSON.stringify([p.name]))+'\'>Forget</button>'+
+          '</div>';
+        }).join('')+
+      '</div>' : '')+
       '<div class="page"><div class="section-title">Tools</div>'+
         actrow('tasks','Action items (from meetings)…','open_action_items',hk.actions)+
         actrow('folder','Open meeting folder','open_meetings_folder','')+

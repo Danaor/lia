@@ -180,6 +180,8 @@ if _ARM_CRASH_NET:
 
 import json
 import re
+import contextlib
+import contextvars
 import asyncio
 import threading
 
@@ -376,7 +378,7 @@ if sys.platform == "win32":
     ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
 
 # --- Configuration ---
-APP_VERSION = "1.6.0"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
+APP_VERSION = "1.6.1"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Lia")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -417,6 +419,10 @@ DEFAULT_CONFIG = {
     # realtime, zero GPU setup) or "cuda" (opt-in; needs onnxruntime-gpu,
     # falls back to CPU on load failure).
     "parakeet_device": "cpu",
+    # ORT intra-op threads for Parakeet: 0 = auto (min(8, cores // 2), the
+    # measured optimum on 2026-09-16; the uncapped default was the slowest).
+    # A support-only override, no Settings UI.
+    "parakeet_threads": 0,
     # Which model owns the bilingual router's confident-ENGLISH segments:
     # "whisper" (default - the general large-v3-turbo, conservative: a rare
     # he->en misroute still comes out as decent Whisper output) or
@@ -941,6 +947,13 @@ DEFAULT_CONFIG = {
     # (and the self cluster automatically); auto-name matching clusters in
     # future meetings. Fully local (speaker_profiles.json). Kill-switch.
     "speaker_profiles_enabled": True,
+    # WP6 (2026-09-17): after the mic-correlated self cluster is found, fix
+    # turns the diarizer misfiled relative to the local user by the per-second
+    # channel ratio (measured self-cluster purity 70-77% -> higher).
+    "speaker_self_sharpen": True,
+    # One-time tip when a cloud diarize model is chosen while local pyannote
+    # speaker detection is installed (it learns voices; the cloud paths cannot).
+    "local_diarize_tip_shown": False,
     # Phase 2: one narrow LOCAL gemma call matches still-unnamed labels to
     # calendar candidates from conversational evidence (self-intros, being
     # addressed by name and answering). Evidence-or-nothing, code-enforced.
@@ -1471,6 +1484,82 @@ def flow_chunk_paragraphs(chunks, para_seconds=60.0, enabled=True, live=False):
     return items
 
 
+# Words that carry no identity in a meeting title / calendar subject, so they
+# must not create a spurious title<->calendar match.
+_MEETING_STOPWORDS = frozenset("""
+meeting call sync standup catchup catch chat weekly daily monthly quarterly
+review demo interview zoom teams meet webex hangout online session invite invited
+new the and with for about re fwd
+פגישה שיחה שיחת סנכרון ישיבה מפגש פגישת זום טימס שבועי יומי חודשי דיון עדכון סבב
+של עם על את אצל
+""".split())
+
+
+def _meeting_name_tokens(text):
+    """Meaningful lowercase word tokens from a title / subject / attendee name
+    (drops digits, punctuation and meeting stopwords). Unicode-aware so Hebrew
+    names tokenize too."""
+    toks = re.findall(r"[^\W\d_]+", (text or "").lower(), re.UNICODE)
+    return {t for t in toks if len(t) >= 2 and t not in _MEETING_STOPWORDS}
+
+
+def meeting_calendar_matches(title, subject, attendees):
+    """Does a calendar appointment (its subject + attendee names) plausibly
+    belong to a recording titled `title`? Rejects the attendees of an unrelated
+    calendar meeting that merely OVERLAPS a manual recording in time (Naor
+    2026-09-16: a manual call with Sergey picked up the invitees of an earlier
+    Tali meeting still on the calendar at that hour).
+    Keep (return True) when: there is no title (ambiguous - preserve the old
+    behaviour), or nothing to compare against, or the title shares a meaningful
+    word with the subject OR any attendee name, or one of title/subject contains
+    the other. Only a title that matches NEITHER the subject NOR any attendee
+    drops the calendar metadata. Pure + testable."""
+    t = (title or "").strip().lower()
+    subj = (subject or "").strip().lower()
+    names = [str(a) for a in (attendees or [])]
+    if not t:
+        return True                      # no title -> can't judge -> keep
+    if not subj and not names:
+        return True                      # nothing to compare -> keep
+    if subj and (t in subj or subj in t):
+        return True                      # substring either way
+    ttok = _meeting_name_tokens(t)
+    if not ttok:
+        return True                      # title was only stopwords -> keep
+    pool = _meeting_name_tokens(subj)
+    for nm in names:
+        pool |= _meeting_name_tokens(nm)
+    return bool(ttok & pool)
+
+
+def speaker_sidecar_path(transcript_path):
+    """`X_meeting_diarized.txt` -> `X_meeting_speakers.json` (WP5 status/lock
+    sidecar). '' for a non-.txt path."""
+    p = transcript_path or ""
+    if not p.lower().endswith(".txt"):
+        return ""
+    stem = p[:-4]
+    if stem.endswith("_diarized"):
+        stem = stem[:-len("_diarized")]
+    return stem + "_speakers.json"
+
+
+def load_speaker_sidecar(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_speaker_sidecar(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
 def scan_speaker_turns(content):
     """Parse a diarized transcript's '[mm:ss] Speaker X:' headers into
     [(label, hint, best_start_s)] in first-appearance order (pure, testable).
@@ -1620,14 +1709,21 @@ def _parse_speaker_name_votes(text, unnamed, candidates, taken=()):
     out = {}
     cand_by_fold = {c.casefold(): c for c in candidates}
     used = {t.casefold() for t in taken}
+    # Match the label by EXACT prefix (longest first) instead of a `\w+` group:
+    # Gemini labels ("S11-spk:0", "S4-Speaker 1") carry '-', ':' and spaces, and
+    # the old regex captured "S11" -> not in `unnamed` -> every vote dropped
+    # (verified 2026-09-17: 0/38 labels named across three real meetings).
+    labels = sorted((str(l) for l in unnamed if l), key=len, reverse=True)
     for line in (text or "").splitlines():
-        m = _re_tasks.match(r"^\s*(?:Speaker\s+)?(\w+)\s*[:.]\s*(.+?)\s*$",
-                            line.strip())
-        if not m:
+        s = line.strip()
+        if s[:8].casefold() == "speaker ":
+            s = s[8:].lstrip()
+        lab = next((l for l in labels
+                    if s.startswith(l)
+                    and _re_tasks.match(r"\s*[:.]\s*\S", s[len(l):])), None)
+        if lab is None or lab in out:
             continue
-        lab, name = m.group(1), m.group(2).strip().strip(".").strip('"')
-        if lab not in unnamed or lab in out:
-            continue
+        name = _re_tasks.sub(r"^\s*[:.]\s*", "", s[len(lab):]).strip().strip(".").strip('"')
         c = cand_by_fold.get(name.casefold())
         if c is None or c.casefold() in used:
             continue
@@ -1680,6 +1776,52 @@ def pick_self_speaker(utterances, mic_rms, loop_rms,
     if top >= min_ratio and margin >= min_margin:
         return top_lab, margin
     return None, 0.0
+
+
+def sharpen_self_turns(utterances, self_lab, mic_rms, loop_rms,
+                       min_s=2, decisive=0.7):
+    """Speaker naming, phase 1c (pure, WP6 of the 2026-09-17 plan): use the
+    per-second CHANNEL signal to fix turns the diarizer put in the wrong
+    cluster relative to the local user. MEASURED on real meetings the self
+    cluster was only 70-77% "me" by channel (mic bleed + boundary drift).
+    For every turn >= `min_s` seconds whose mean log(mic/loop) ratio is
+    DECISIVE (> `decisive` = clearly me, < -decisive = clearly not me):
+      - a clearly-me turn labelled as another speaker -> relabelled self_lab;
+      - a clearly-not-me turn labelled self_lab -> relabelled to the ONLY other
+        speaker when the meeting has exactly one (a 2-party call); with several
+        remote speakers we cannot tell which one, so it is left alone.
+    Non-decisive turns are never touched. The original label is kept in
+    `speaker_orig`. Returns (n_to_self, n_from_self)."""
+    import math
+    if not utterances or not self_lab or not mic_rms or not loop_rms:
+        return 0, 0
+    n = min(len(mic_rms), len(loop_rms))
+    others = sorted({u.get("speaker") for u in utterances
+                     if u.get("speaker") and u.get("speaker") != self_lab})
+    sole_other = others[0] if len(others) == 1 else None
+    to_self = from_self = 0
+    for u in utterances:
+        lab = u.get("speaker")
+        if not lab:
+            continue
+        s = max(0, int(float(u.get("start") or 0) / 1000.0))
+        e = min(n, int(math.ceil(float(u.get("end") or 0) / 1000.0)))
+        if e - s < min_s:
+            continue
+        m = sum(mic_rms[s:e]) / (e - s)
+        l = sum(loop_rms[s:e]) / (e - s)
+        if max(m, l) < 0.003:
+            continue                      # near-silent bins carry no side
+        r = math.log((m + 1e-9) / (l + 1e-9))
+        if r > decisive and lab != self_lab:
+            u["speaker_orig"] = lab
+            u["speaker"] = self_lab
+            to_self += 1
+        elif r < -decisive and lab == self_lab and sole_other:
+            u["speaker_orig"] = lab
+            u["speaker"] = sole_other
+            from_self += 1
+    return to_self, from_self
 
 
 def trim_trailing_silence(audio_np, sample_rate=16000, threshold_db=-45, tail_ms=500):
@@ -4670,6 +4812,93 @@ class BaseTranscriber:
 # ============================================================
 # Faster-Whisper Transcriber (CPU, default)
 # ============================================================
+# ---- Decoder profiles (2026-09-16, plans/DECODER_THRESHOLDS_PLAN_2026-09-16.md) ----
+# faster-whisper re-decodes a 30s window at up to SIX temperatures
+# ([0,0.2,...,1.0]) whenever a quality check trips (compression ratio, avg
+# logprob). The plan's hypothesis was that this ladder is a silent 2-6x cost on
+# a continuous load (meeting chunks, the serve host). MEASURED on the real
+# corpus (2026-09-16): dictation trips it on ~1% of clips; a real 8-min meeting
+# tripped it on 5/127 windows for an 8% time cost - and on one 15s chunk the
+# ladder was the ONLY thing that recovered a repetition loop ("אהההה..." at
+# temperature 0; clean text at 0.6). So every profile keeps the library ladder:
+# it is cheap insurance, not waste. The profile plumbing + per-call telemetry
+# stay so a future change is a one-line, measurable switch per call shape.
+# NO Settings knob (Naor's minimal-UI rule). `no_speech_threshold` stays at its
+# default everywhere so a silent window is still skipped at the decoder.
+DECODER_PROFILES = {
+    "dictation": {},   # library defaults (full ladder)
+    "chunk": {},       # meetings + serve: full ladder too (measured, see above)
+    "file": {},        # offline file: full ladder
+}
+_decoder_profile_var = contextvars.ContextVar("lia_decoder_profile",
+                                              default="dictation")
+
+
+@contextlib.contextmanager
+def decoder_profile(name):
+    """Select the decoder profile for every FasterWhisperTranscriber.transcribe
+    call made inside the block (thread/context-local, so a meeting chunk worker
+    never affects a concurrent dictation). Other backends ignore it."""
+    if name not in DECODER_PROFILES:
+        raise ValueError("unknown decoder profile %r" % (name,))
+    token = _decoder_profile_var.set(name)
+    try:
+        yield
+    finally:
+        _decoder_profile_var.reset(token)
+
+
+def decoder_kwargs(profile=None):
+    """Extra `model.transcribe` kwargs for `profile` (default: the active
+    context profile). A fresh dict each call so callers may mutate it."""
+    return dict(DECODER_PROFILES[profile or _decoder_profile_var.get()])
+
+
+def decoder_stats(segments):
+    """Phase-0 telemetry over faster-whisper Segment objects: how many 30s
+    windows there were, how many needed the temperature ladder (temperature >
+    0), the hottest temperature reached, the lowest avg logprob and the highest
+    no-speech / compression-ratio seen. Segments lacking the fields (mocks,
+    other backends) are simply not counted. Pure; never raises."""
+    st = {"windows": 0, "fallback": 0, "max_temp": 0.0, "min_logprob": None,
+          "max_no_speech": None, "max_cr": None}
+    try:
+        for s in segments or []:
+            t = getattr(s, "temperature", None)
+            if t is None:
+                continue
+            st["windows"] += 1
+            if t > 0:
+                st["fallback"] += 1
+            st["max_temp"] = max(st["max_temp"], float(t))
+            lp = getattr(s, "avg_logprob", None)
+            if lp is not None:
+                st["min_logprob"] = lp if st["min_logprob"] is None else min(st["min_logprob"], lp)
+            ns = getattr(s, "no_speech_prob", None)
+            if ns is not None:
+                st["max_no_speech"] = ns if st["max_no_speech"] is None else max(st["max_no_speech"], ns)
+            cr = getattr(s, "compression_ratio", None)
+            if cr is not None:
+                st["max_cr"] = cr if st["max_cr"] is None else max(st["max_cr"], cr)
+    except Exception:
+        pass
+    return st
+
+
+def fmt_decoder_stats(st, profile="dictation"):
+    """One log line: `decoder[chunk] windows=3 fallback=1 max_temp=0.4
+    min_logprob=-1.21 max_no_speech=0.12 max_cr=1.6`. Empty when nothing was
+    measured (mock models)."""
+    if not st or not st.get("windows"):
+        return ""
+    f = lambda v, d: ("%.2f" % v) if v is not None else "-"
+    return ("decoder[%s] windows=%d fallback=%d max_temp=%.1f min_logprob=%s "
+            "max_no_speech=%s max_cr=%s"
+            % (profile, st["windows"], st["fallback"], st["max_temp"],
+               f(st["min_logprob"], "-"), f(st["max_no_speech"], "-"),
+               f(st["max_cr"], "-")))
+
+
 class FasterWhisperTranscriber(BaseTranscriber):
     def __init__(self, model_size="medium", cpu_threads=8, device="auto",
                  compute_type=None):
@@ -4805,6 +5034,8 @@ class FasterWhisperTranscriber(BaseTranscriber):
         elif self.custom_vocabulary and self.custom_vocabulary.strip():
             log.debug("Vocab prompt suppressed for a low-signal clip (%.1fs) "
                       "to avoid English-letter hallucination", len(audio_np) / 16000)
+        profile = _decoder_profile_var.get()
+
         def _run():
             # Hold the model lock across BOTH the call and the (lazy) segment
             # iteration — the real GPU work happens while consuming `segments`.
@@ -4815,6 +5046,9 @@ class FasterWhisperTranscriber(BaseTranscriber):
                     language=lang,
                     task=task,
                     initial_prompt=init_prompt,
+                    # Per-call-shape decoder settings (temperature ladder etc.),
+                    # see DECODER_PROFILES; dictation = library defaults.
+                    **decoder_kwargs(profile),
                     # condition_on_previous_text=False (2026-09-16, Naor's
                     # first-word-duplication bug): with the default True, the
                     # first VAD segment's decoded text (and the initial_prompt)
@@ -4835,20 +5069,26 @@ class FasterWhisperTranscriber(BaseTranscriber):
                 # same artifact, seen as two identical whole segments rather than
                 # a within-line repeat). Segment-level so it never touches
                 # natural word repetition.
-                texts = []
+                texts, seen = [], []
                 for seg in segments:
+                    seen.append(seg)
                     t = seg.text.strip()
                     if t and not (texts and t == texts[-1]):
                         texts.append(t)
-            return texts, info
+            return texts, info, decoder_stats(seen)
 
         try:
-            seg_list, info = _run()
+            seg_list, info, dstats = _run()
         except Exception as e:
             if self._demote_to_cpu("transcribe", e):
-                seg_list, info = _run()   # retry once on CPU
+                seg_list, info, dstats = _run()   # retry once on CPU
             else:
                 raise
+        # Phase-0 telemetry: what the temperature ladder actually costs us and
+        # how confident the decode was (feeds the decoder-thresholds plan).
+        _dline = fmt_decoder_stats(dstats, profile)
+        if _dline:
+            log.info("%s (%.1fs audio)", _dline, len(audio_np) / 16000)
         if not seg_list:
             return ""
 
@@ -4917,7 +5157,9 @@ class FasterWhisperTranscriber(BaseTranscriber):
                 segments, _info = self.model.transcribe(
                     audio_np, beam_size=beam_size, language=lang,
                     initial_prompt=init_prompt, vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=500))
+                    vad_parameters=dict(min_silence_duration_ms=500),
+                    # Serve host = a continuous load: no temperature ladder.
+                    **decoder_kwargs("chunk"))
                 return [{"start": float(s.start), "end": float(s.end),
                          "text": s.text} for s in segments]
         try:
@@ -4958,6 +5200,8 @@ class FasterWhisperTranscriber(BaseTranscriber):
             vad_parameters=dict(
                 min_silence_duration_ms=500,
             ),
+            # Offline file: one cheap retry instead of the full 6-step ladder.
+            **decoder_kwargs("file"),
         )
 
         def _run():
@@ -5382,6 +5626,63 @@ class BilingualRouterTranscriber(BaseTranscriber):
 # ============================================================
 # Parakeet Transcriber — LOCAL multi-language ASR (25 European langs, v3)
 # ============================================================
+def _parakeet_threads_for(cpu_count):
+    """ORT intra-op threads for Parakeet. MEASURED 2026-09-16 on the 20-core
+    265K (int8 CPU, 40 English clips): uncapped default 29.6x realtime,
+    4 threads 37.4x, 8 threads 42.1x, 12 threads 40.0x, text identical in all.
+    So: half the cores, capped at 8, floor 2 (a 4-core laptop gets 2, an
+    8-core gets 4). Never the uncapped default (the slowest setting)."""
+    try:
+        n = int(cpu_count or 0)
+    except (TypeError, ValueError):
+        n = 0
+    return min(8, max(2, (n or 4) // 2))
+
+
+PARAKEET_INTRA_OP_THREADS = _parakeet_threads_for(os.cpu_count())
+
+
+def _parakeet_file_workers_for(cpu_count):
+    """Concurrent 55 s pieces for a FILE transcription. MEASURED 2026-09-16:
+    on one ORT session, 2 workers +61%, 3 workers +89% wall time on a 3-min
+    file, pieces byte-identical to sequential. 3 on a 12+ core machine, 2
+    below that (a 4-core laptop still gains from 2)."""
+    try:
+        n = int(cpu_count or 0)
+    except (TypeError, ValueError):
+        n = 0
+    return 3 if n >= 12 else 2
+
+
+PARAKEET_FILE_WORKERS = _parakeet_file_workers_for(os.cpu_count())
+
+
+def _chunk_is_silent(audio_np, thresh=0.005):
+    """Pre-decode guard for a meeting chunk: True when the chunk is near-silent
+    by the SAME RMS rule the chunk worker uses AFTER the decode to classify
+    "empty" (0.0001 = silence, ~0.04 = speech). Skipping the decode changes no
+    transcript (the chunk would be dropped anyway - measured 0/32 chunks on a
+    real meeting) but saves the decode on a muted stretch and keeps a silence
+    artifact from any backend out of the live transcript. Fails OPEN (decode)."""
+    try:
+        return _rms_energy(audio_np) < thresh
+    except Exception:
+        return False
+
+
+def _parakeet_hub_cache_dir(model_name):
+    """The HF hub cache dir onnx-asr resolves `model_name` into (the istupakov
+    ONNX exports), e.g. <hub>/models--istupakov--parakeet-tdt-0.6b-v3-onnx.
+    Derived from the model name (the old hardcoded v3 string wiped the wrong
+    dir for v2). A module-level SEAM so the self-heal test can point the wipe
+    at a temp dir: until 2026-09-16 that test wiped the user's REAL cache on
+    every suite run (680 MB re-downloaded at each app start, and English
+    dictation silently on the Hebrew model in between)."""
+    from huggingface_hub.constants import HF_HUB_CACHE
+    base = model_name[5:] if model_name.startswith("nemo-") else model_name
+    return os.path.join(HF_HUB_CACHE, "models--istupakov--%s-onnx" % base)
+
+
 class ParakeetTranscriber(BaseTranscriber):
     """NVIDIA Parakeet TDT 0.6B v3 via the onnx-asr runtime — the local
     MULTI-LANGUAGE backend: 25 European languages (auto-detected), ~6.3% avg
@@ -5417,12 +5718,32 @@ class ParakeetTranscriber(BaseTranscriber):
     # split below this many seconds at the quietest boundary region.
     FILE_CHUNK_S = 55.0
 
-    def __init__(self, model_size="parakeet-tdt-0.6b-v3", device="cpu"):
+    def __init__(self, model_size="parakeet-tdt-0.6b-v3", device="cpu", threads=None):
         super().__init__(model_size=model_size, cpu_threads=0)
         self.device = device
         self.custom_vocabulary = ""   # contract parity; inert (see docstring)
         self._infer_lock = threading.Lock()
         self._lang_warned = False
+        # ORT intra-op threads (config `parakeet_threads` 0 = auto formula).
+        self.threads = int(threads) if threads else PARAKEET_INTRA_OP_THREADS
+        # File decode: 0 = auto (PARAKEET_FILE_WORKERS); the factory wires
+        # `meeting_active` so the pool shrinks to 2 while a meeting records.
+        self.file_workers = 0
+        self.meeting_active = lambda: False
+        self._last_file_workers = None
+
+    def _session_options(self):
+        """ORT session options for the load: the measured thread cap (see
+        _parakeet_threads_for). None when onnxruntime is unavailable, which
+        lets onnx-asr fall back to its defaults."""
+        try:
+            import onnxruntime as _ort
+            so = _ort.SessionOptions()
+            so.intra_op_num_threads = int(self.threads)
+            return so
+        except Exception as e:
+            log.debug("Parakeet session options unavailable: %s", e)
+            return None
 
     def load_model(self, callback=None):
         if self.model is not None:
@@ -5440,12 +5761,14 @@ class ParakeetTranscriber(BaseTranscriber):
             name = self.model_size
             if not name.startswith("nemo-"):
                 name = "nemo-" + name
-            kwargs = {"quantization": "int8"}
+            so = self._session_options()
+            kwargs = {"quantization": "int8", "sess_options": so}
             if self.device == "cuda":
                 # Opt-in CUDA: full-precision weights + the CUDA EP (int8 is
                 # the CPU story). Requires onnxruntime-gpu; falls back below.
                 kwargs = {"providers": ["CUDAExecutionProvider",
-                                        "CPUExecutionProvider"]}
+                                        "CPUExecutionProvider"],
+                          "sess_options": so}
             try:
                 try:
                     self.model = onnx_asr.load_model(name, **kwargs)
@@ -5454,7 +5777,8 @@ class ParakeetTranscriber(BaseTranscriber):
                         raise
                     log.warning("Parakeet CUDA load failed (%s) — falling "
                                 "back to int8 CPU", gpu_e)
-                    self.model = onnx_asr.load_model(name, quantization="int8")
+                    self.model = onnx_asr.load_model(name, quantization="int8",
+                                                     sess_options=so)
             except Exception as e:
                 # SELF-HEAL (2026-08-29 field failure): an interrupted first
                 # download leaves a truncated .onnx in the HF cache, and
@@ -5472,21 +5796,20 @@ class ParakeetTranscriber(BaseTranscriber):
                             "re-downloading once", msg[:200])
                 try:
                     import shutil as _sh
-                    from huggingface_hub.constants import HF_HUB_CACHE
-                    cache_dir = os.path.join(
-                        HF_HUB_CACHE,
-                        "models--istupakov--parakeet-tdt-0.6b-v3-onnx")
+                    cache_dir = _parakeet_hub_cache_dir(name)
                     if os.path.isdir(cache_dir):
                         _sh.rmtree(cache_dir, ignore_errors=True)
-                        log.info("Wiped Parakeet cache: %s", cache_dir)
+                        log.warning("Wiped Parakeet cache (corrupt download): %s",
+                                    cache_dir)
                 except Exception as wipe_e:
                     log.warning("Parakeet cache wipe failed: %s", wipe_e)
                 if callback:
                     callback("Re-downloading Parakeet (multilingual)...")
-                self.model = onnx_asr.load_model(name, quantization="int8")
+                self.model = onnx_asr.load_model(name, quantization="int8",
+                                                 sess_options=so)
                 log.info("Parakeet recovered after cache wipe (%s)", name)
-            log.info("Parakeet model loaded in %.1fs (%s, %s)",
-                     time.time() - t0, name, self.device)
+            log.info("Parakeet model loaded in %.1fs (%s, %s, %d threads)",
+                     time.time() - t0, name, self.device, self.threads)
             if callback:
                 callback("Parakeet ready")
         except Exception:
@@ -5496,9 +5819,24 @@ class ParakeetTranscriber(BaseTranscriber):
             self._loading = False
 
     def _recognize(self, audio_np):
-        audio = np.asarray(audio_np, dtype=np.float32)
+        """One decode under the instance lock (dictation / meeting chunks)."""
         with self._infer_lock:
-            text = self.model.recognize(audio, sample_rate=16000) or ""
+            return self._recognize_nolock(audio_np)
+
+    def _recognize_nolock(self, audio_np):
+        """One decode with NO lock: ORT `run()` is thread-safe, and the file
+        path runs several of these concurrently on the one session (measured
+        2026-09-16: pieces byte-identical to sequential). Telemetry line per
+        decode (duration, realtime factor, threads) mirrors the Whisper
+        `decoder[...]` line so a slow field report is answerable from lia.log."""
+        audio = np.asarray(audio_np, dtype=np.float32)
+        t0 = time.time()
+        text = self.model.recognize(audio, sample_rate=16000) or ""
+        dt = time.time() - t0
+        secs = len(audio) / 16000.0
+        log.info("parakeet: %.1fs audio in %.2fs (%.0fx realtime, %s threads)",
+                 secs, dt, (secs / dt) if dt > 0 else 0.0,
+                 getattr(self, "threads", "?"))
         # Same tail hygiene as the Whisper backends + the repeated-word
         # collapse (Parakeet's documented failure mode is word-run repeats).
         text = strip_hallucinated_tail(text.strip())
@@ -5532,10 +5870,48 @@ class ParakeetTranscriber(BaseTranscriber):
         n_chunk = int(self.FILE_CHUNK_S * 16000)
         if len(audio) <= n_chunk:
             return self._recognize(audio)
-        # Long file: fixed ~FILE_CHUNK_S windows, each cut at the quietest
-        # 250ms in the last 5s of the window so we never split a word.
-        # Deterministic + fully offline (no VAD model download).
-        parts, pos = [], 0
+        pieces = self._split_file_audio(audio, n_chunk)
+        # Concurrent decode of the pieces on the ONE session (WP2, measured
+        # +61% with 2 workers, +89% with 3, output identical). Shrinks to 2
+        # while a meeting records so the 15 s chunk cadence keeps its CPU.
+        workers = int(getattr(self, "file_workers", 0) or 0) or PARAKEET_FILE_WORKERS
+        try:
+            probe = getattr(self, "meeting_active", None)
+            if probe is not None and probe():
+                workers = min(workers, 2)
+        except Exception:
+            pass
+        self._last_file_workers = workers
+        t0 = time.time()
+        if workers <= 1 or len(pieces) <= 1:
+            parts = [self._recognize(p) for p in pieces]
+        else:
+            def _one(item):
+                i, piece = item
+                try:
+                    return self._recognize_nolock(piece)
+                except Exception as e:
+                    # A transport/runtime hiccup on one piece: retry it once
+                    # (an EMPTY result is a model output and is kept as is).
+                    log.warning("Parakeet file piece %d failed (%s) - retrying once", i, e)
+                    return self._recognize_nolock(piece)
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                parts = list(ex.map(_one, enumerate(pieces)))   # map keeps order
+        dt = time.time() - t0
+        secs = len(audio) / 16000.0
+        log.info("parakeet file: %.1f min in %d pieces, %d workers, %.1fs (%.0fx realtime)",
+                 secs / 60, len(pieces), workers, dt, (secs / dt) if dt > 0 else 0.0)
+        return " ".join(p for p in parts if p).strip()
+
+    @staticmethod
+    def _split_file_audio(audio, n_chunk):
+        """Long file: fixed ~FILE_CHUNK_S windows, each cut at the quietest
+        250ms in the last 5s of the window so we never split a word
+        (measured 2026-09-16: costs ~0.2 WER points vs single clips, far
+        better than a hard cut). Deterministic + fully offline (no VAD
+        model). Sub-500ms slivers are dropped."""
+        pieces, pos = [], 0
         while pos < len(audio):
             end = min(pos + n_chunk, len(audio))
             if end < len(audio):
@@ -5547,10 +5923,10 @@ class ParakeetTranscriber(BaseTranscriber):
                     q = int(np.argmin(rms)) * win
                     end = end - 5 * 16000 + q + win
             piece = audio[pos:end]
-            if len(piece) >= 16000 // 2:      # skip sub-500ms slivers
-                parts.append(self._recognize(piece))
+            if len(piece) >= 16000 // 2:
+                pieces.append(piece)
             pos = end
-        return " ".join(p for p in parts if p).strip()
+        return pieces
 
 
 # ============================================================
@@ -10950,14 +11326,18 @@ class MeetingSession:
             if self._cancelled:
                 return
             try:
-                if self._chunk_transcriber is not None:
-                    text = self._chunk_transcriber.transcribe(
-                        audio_np, language=self._chunk_language,
-                        beam_size=1, task="transcribe")
+                if _chunk_is_silent(audio_np):
+                    text = ""    # near-silent: skip the decode (see _submit_chunk)
                 else:
-                    text = self.app._transcribe_with_fallback(
-                        audio_np, language=self.app._get_language(),
-                        beam_size=1, task="transcribe")
+                    with decoder_profile("chunk"):
+                        if self._chunk_transcriber is not None:
+                            text = self._chunk_transcriber.transcribe(
+                                audio_np, language=self._chunk_language,
+                                beam_size=1, task="transcribe")
+                        else:
+                            text = self.app._transcribe_with_fallback(
+                                audio_np, language=self.app._get_language(),
+                                beam_size=1, task="transcribe")
                 text = (text or "").strip()
             except Exception as e:
                 log.debug("Live-peek chunk transcription failed: %s", e)
@@ -11705,20 +12085,30 @@ class MeetingSession:
                 # directly so the meeting doesn't follow the press-to-talk
                 # backend choice. Otherwise fall back to the app-wide
                 # transcriber path (preserves the old behaviour).
-                if self._chunk_transcriber is not None:
-                    text = self._chunk_transcriber.transcribe(
-                        audio_np,
-                        language=self._chunk_language,
-                        beam_size=1,
-                        task="transcribe",
-                    )
+                if _chunk_is_silent(audio_np):
+                    # Near-silent chunk: skip the decode. It is classified
+                    # "empty" below by the same RMS rule, so the transcript is
+                    # unchanged; the decode (and any silence artifact) is saved.
+                    text = ""
                 else:
-                    text = self.app._transcribe_with_fallback(
-                        audio_np,
-                        language=self.app._get_language(),
-                        beam_size=1,
-                        task="transcribe",
-                    )
+                    # "chunk" decoder profile (DECODER_PROFILES; currently the
+                    # library defaults, kept as the per-call-shape seam).
+                    # Cloud backends ignore the profile.
+                    with decoder_profile("chunk"):
+                        if self._chunk_transcriber is not None:
+                            text = self._chunk_transcriber.transcribe(
+                                audio_np,
+                                language=self._chunk_language,
+                                beam_size=1,
+                                task="transcribe",
+                            )
+                        else:
+                            text = self.app._transcribe_with_fallback(
+                                audio_np,
+                                language=self.app._get_language(),
+                                beam_size=1,
+                                task="transcribe",
+                            )
                 text = text or ""
                 errored = False
             except Exception as e:
@@ -12003,6 +12393,10 @@ class MeetingSession:
                 l: e for l, e in (result.get("speaker_embeddings") or {}).items()
                 if _talk_s.get(l, 0.0) >= 10.0}
 
+            # Outcome tallies for the ONE-line naming summary logged below
+            # (2026-09-17: the layers used to be invisible in the field).
+            _self_lab, _self_gap, _sharp = None, 0.0, (0, 0)
+            _vp_matched, _llm_votes = {}, {}
             # Speaker naming, phase 1b: the diarized cluster whose talk
             # intervals correlate with the MIC channel (vs loopback) is the
             # LOCAL user - name it deterministically, no ML, no cloud.
@@ -12012,6 +12406,15 @@ class MeetingSession:
                     lab, gap = pick_self_speaker(
                         utts_sn, self._mic_rms_1s, self._loop_rms_1s)
                     if lab:
+                        _self_lab, _self_gap = lab, gap
+                        # Phase 1c (WP6): the channel signal also fixes turns
+                        # the diarizer misfiled relative to the local user.
+                        if bool(self.app.config.get("speaker_self_sharpen", True)):
+                            _sharp = sharpen_self_turns(
+                                utts_sn, lab, self._mic_rms_1s, self._loop_rms_1s)
+                            if any(_sharp):
+                                log.info("Self turns sharpened by channel: "
+                                         "%d -> self, %d -> other", *_sharp)
                         name = self.app._self_speaker_name()
                         for u in utts_sn:
                             if u.get("speaker") == lab:
@@ -12050,6 +12453,7 @@ class MeetingSession:
                     cand = {l: e for l, e in self._speaker_embeddings.items()
                             if l not in named}
                     matched = speaker_profiles.match(cand)
+                    _vp_matched = matched
                     for u in utts_sp:
                         nm = matched.get(u.get("speaker"))
                         if nm and not u.get("speaker_name"):
@@ -12065,12 +12469,18 @@ class MeetingSession:
             # deterministic layers and never overrides them. LLM-inferred names
             # are NOT learned into the voiceprint store (only user-confirmed
             # renames and the mic-correlated self cluster are).
+            # Gate first: don't feed candidates from an unrelated appointment
+            # that only overlapped this recording in time (uses the window-title
+            # guess for auto-detected meetings; the header write re-gates with
+            # the final title).
+            self._gate_calendar_meta()
             if (self.attendees
                     and bool(self.app.config.get("speaker_name_pass", True))):
                 try:
                     utts_np = result.get("utterances") or []
                     votes = self.app._llm_assign_speaker_names(
                         utts_np, self.attendees)
+                    _llm_votes = votes
                     for u in utts_np:
                         nm = votes.get(u.get("speaker"))
                         if nm and not u.get("speaker_name"):
@@ -12080,12 +12490,28 @@ class MeetingSession:
                 except Exception as e:
                     log.warning("Speaker name pass failed: %s", e)
 
+            # ONE line per meeting with every naming layer's outcome, so a
+            # "why is nobody named?" question is answerable from lia.log.
+            try:
+                _uu = result.get("utterances") or []
+                _labs = {u.get("speaker") for u in _uu if u.get("speaker")}
+                _named = {u.get("speaker") for u in _uu if u.get("speaker_name")}
+                log.info("Speaker naming: speakers=%d self=%s sharpened=%d/%d "
+                         "voiceprint=%d llm=%d -> named %d/%d",
+                         len(_labs),
+                         ("%s(%.1f)" % (_self_lab, _self_gap)) if _self_lab else "none",
+                         _sharp[0], _sharp[1], len(_vp_matched), len(_llm_votes),
+                         len(_named), len(_labs))
+            except Exception:
+                pass
+
             if self._discarded.is_set():
                 raise _MeetingDiscarded()
             if self.summarize:
                 stage = "summarize"
                 ov.meeting_status_step("summarize", gen=gen)
             md_path = self._write_diarized_markdown(result)
+            self._write_speaker_sidecar(md_path, result)
             log.info("Diarized meeting saved: %s", md_path)
             # Final state for the live window (Phase 4): the diarized transcript
             # (and its summary, if any) are on disk.
@@ -12319,6 +12745,29 @@ class MeetingSession:
                  upgraded, n, elapsed)
         return utterances
 
+    def _write_speaker_sidecar(self, md_path, result):
+        """WP5: `<transcript>_speakers.json` = {label: {name, status}} where
+        status is "auto" (self-detect / voiceprint / LLM) or "provisional"
+        (unnamed). The rename dialog upgrades a user-typed name to "locked";
+        automated layers never overwrite a locked name. Best-effort."""
+        try:
+            path = speaker_sidecar_path(md_path)
+            if not path:
+                return
+            data = load_speaker_sidecar(path)
+            for u in (result.get("utterances") or []):
+                lab = u.get("speaker")
+                if not lab:
+                    continue
+                cur = data.get(lab) or {}
+                if cur.get("status") == "locked":
+                    continue
+                nm = u.get("speaker_name") or ""
+                data[lab] = {"name": nm, "status": "auto" if nm else "provisional"}
+            save_speaker_sidecar(path, data)
+        except Exception as e:
+            log.debug("speaker sidecar write skipped: %s", e)
+
     def _meta_for_summary(self, duration_sec, num_speakers=None, lang="he"):
         """CONTEXT-ONLY metadata for the meeting-summary prompt, which must never
         print a date or a participant list. Deliberately EXCLUDES the auto-guessed
@@ -12361,6 +12810,10 @@ class MeetingSession:
             self._title_event.wait(timeout=120)
         except Exception:
             pass
+        # Re-gate with the final title (a stop-prompt title lands after the
+        # earlier pre-naming gate): drop attendees from an unrelated overlapping
+        # appointment before they reach the header / summary metadata.
+        self._gate_calendar_meta()
         title = (self.title or "").strip()
         slug = _slug_title(title)
         utterances = result.get("utterances") or []
@@ -12539,6 +12992,26 @@ class MeetingSession:
         return flow_chunk_paragraphs(chunks, para_seconds=para_s,
                                      enabled=enabled, live=live)
 
+    def _gate_calendar_meta(self):
+        """Drop the calendar attendees + subject when they belong to an
+        unrelated appointment that merely overlapped this recording in time -
+        i.e. the resolved meeting title matches NEITHER the calendar subject nor
+        any attendee (see meeting_calendar_matches; Naor 2026-09-16). Idempotent;
+        a no-op when there is nothing to gate or no title yet (ambiguous ->
+        keep, so speaker naming still gets the attendees when they DO fit)."""
+        if not self.attendees and not self.event_subject:
+            return
+        title = (self.title or self.title_guess or "").strip()
+        if not title:
+            return
+        if meeting_calendar_matches(title, self.event_subject, self.attendees):
+            return
+        log.info("Calendar meta dropped (title %r matches neither subject %r "
+                 "nor attendees %s) - overlapping unrelated appointment",
+                 title[:48], (self.event_subject or "")[:48], self.attendees[:4])
+        self.attendees = []
+        self.event_subject = ""
+
     def _assemble_transcript_plain(self, max_index=None):
         """Flat transcript text (for the LLM summarisation prompt): the same
         flowing paragraphs as the .txt, one per line, no timestamps / markers.
@@ -12566,6 +13039,10 @@ class MeetingSession:
             self._title_event.wait(timeout=120)
         except Exception:
             pass
+        # Now the title is resolved: drop calendar attendees that belong to an
+        # unrelated appointment overlapping this recording in time (Naor's manual
+        # Sergey call vs the Tali meeting on the calendar).
+        self._gate_calendar_meta()
         title = (self.title or "").strip()
         slug = _slug_title(title)
         file_stamp = start_dt.strftime("%Y-%m-%d_%H-%M-%S")
@@ -14332,18 +14809,18 @@ def _stamp_lia_launcher(exe_path):
         return False
     try:
         vi = VSVersionInfo(
-            ffi=FixedFileInfo(filevers=(1, 6, 0, 0), prodvers=(1, 6, 0, 0),
+            ffi=FixedFileInfo(filevers=(1, 6, 1, 0), prodvers=(1, 6, 1, 0),
                               mask=0x3f, flags=0x0, OS=0x40004,
                               fileType=0x1, subtype=0x0),
             kids=[
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.6.0.0'),
+                    StringStruct('FileVersion', '1.6.1.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.6.0.0'),
+                    StringStruct('ProductVersion', '1.6.1.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -19847,9 +20324,13 @@ class LiaApp:
         if model_size.startswith("parakeet"):
             # Parakeet (multi-language, v3): its own runtime (onnx-asr), no router —
             # the model is English-only by contract (MODEL_LANGUAGE = "en").
-            return ParakeetTranscriber(
+            t = ParakeetTranscriber(
                 model_size=model_size,
-                device=self.config.get("parakeet_device", "cpu"))
+                device=self.config.get("parakeet_device", "cpu"),
+                threads=self.config.get("parakeet_threads") or None)
+            # File decode shrinks its worker pool while a meeting records.
+            t.meeting_active = lambda: getattr(self, "_active_meeting", None) is not None
+            return t
         if (MODEL_LANGUAGE.get(model_size) == "he"
                 and bool(self.config.get("dictation_bilingual_auto", True))
                 and self._language_profile() == "hebrew"):
@@ -19870,8 +20351,11 @@ class LiaApp:
         onnx-asr runtime is present; None keeps the general-Whisper behavior."""
         if (self.config.get("bilingual_english_model", "whisper") == "parakeet"
                 and self._parakeet_available()):
-            return ParakeetTranscriber(
-                device=self.config.get("parakeet_device", "cpu"))
+            t = ParakeetTranscriber(
+                device=self.config.get("parakeet_device", "cpu"),
+                threads=self.config.get("parakeet_threads") or None)
+            t.meeting_active = lambda: getattr(self, "_active_meeting", None) is not None
+            return t
         return None
 
     def _load_model(self):
@@ -23680,6 +24164,16 @@ class LiaApp:
             self._meeting_xcribers[key] = triple
         return triple
 
+    def _local_diarize_ready(self):
+        """True when the offline pyannote bundle is on disk AND pyannote.audio
+        imports (a GPU makes it fast, not possible). Cheap; no model load."""
+        try:
+            import importlib.util
+            return bool(self._diarize_bundle_dir()) and \
+                importlib.util.find_spec("pyannote.audio") is not None
+        except Exception:
+            return False
+
     def _diarize_bundle_dir(self):
         """Return a ready OFFLINE pyannote bundle dir (a self-contained HF cache)
         or "". Priority: an explicit config path, else the default
@@ -25853,6 +26347,23 @@ class LiaApp:
                 )
                 session.start()
                 self._active_meeting = session
+                # One-time tip (WP2, 2026-09-17): the LOCAL diarizer measured far
+                # stronger than the cloud one on real meetings (self-detect 3/3,
+                # cross-meeting voiceprints 0.9+, and it is the only path that
+                # LEARNS voices). Point there once when a cloud diarize model is
+                # chosen while local speaker detection is installed.
+                try:
+                    if (is_diarized and diarize_backend != "local_pyannote"
+                            and not self.config.get("local_diarize_tip_shown")
+                            and self._local_diarize_ready()):
+                        self.config["local_diarize_tip_shown"] = True
+                        save_config(self.config)
+                        self._force_show_notice_overlay(
+                            "Tip: local speaker detection (pyannote) is ready - "
+                            "it recognizes you and learns voices. Settings > "
+                            "Models > Meeting model")
+                except Exception as e:
+                    log.debug("local diarize tip skipped: %s", e)
                 # Speaker naming, phase 1a: fetch the calendar attendees of the
                 # meeting overlapping NOW (async, de-elevated COM helper).
                 try:
@@ -28008,6 +28519,32 @@ class LiaApp:
             m = re.search(r"(?m)^‏?Invited:\s*(.+)$", content)
             if m:
                 attendees = [p.strip() for p in m.group(1).split(";") if p.strip()]
+        # WP4/WP5 (2026-09-17): a voiceprint that is CLOSE to a known voice but
+        # below the auto-name gate becomes a per-row suggestion in the hint
+        # ("voice: דנה?"), and a name the user locked earlier is shown as such.
+        attendees = list(attendees or [])
+        try:
+            side = load_speaker_sidecar(speaker_sidecar_path(txt_path))
+            vp_sugg = {}
+            if speaker_embeddings and bool(self.config.get("speaker_profiles_enabled", True)):
+                import speaker_profiles
+                vp_sugg = speaker_profiles.suggest(speaker_embeddings)
+            if side or vp_sugg:
+                new_speakers = []
+                for lab, hint in speakers:
+                    tag = []
+                    st = side.get(lab) or {}
+                    if st.get("status") == "locked" and st.get("name"):
+                        tag.append("locked: %s" % st["name"])
+                    if lab in vp_sugg:
+                        nm, sim = vp_sugg[lab]
+                        tag.append("voice: %s? (%.2f)" % (nm, sim))
+                        if nm not in attendees:
+                            attendees.append(nm)
+                    new_speakers.append((lab, ("[%s] " % "; ".join(tag) if tag else "") + (hint or "")))
+                speakers = new_speakers
+        except Exception as e:
+            log.debug("rename dialog suggestions skipped: %s", e)
         audio = self._resolve_meeting_audio(txt_path, audio_hint)
         best_ts = {lab: ts for lab, _h, ts in turns}
         on_play = None
@@ -28044,6 +28581,17 @@ class LiaApp:
                 log.warning("Rename speakers: write failed: %s", e)
                 self._force_show_error_overlay(f"Rename failed: {e}")
                 return
+            # WP5: a user-typed name is LOCKED in the sidecar - automated
+            # layers never overwrite it afterwards.
+            try:
+                sp = speaker_sidecar_path(txt_path)
+                if sp:
+                    side = load_speaker_sidecar(sp)
+                    for label, name in applied.items():
+                        side[label] = {"name": name, "status": "locked"}
+                    save_speaker_sidecar(sp, side)
+            except Exception as e:
+                log.debug("speaker sidecar lock skipped: %s", e)
             # LEARN: every saved name whose cluster has a voiceprint sharpens
             # (or creates) that person's profile - the auto-name asset.
             if speaker_embeddings and bool(
@@ -29323,6 +29871,28 @@ class LiaApp:
         except Exception as e:
             return (False, str(e)[:120])
 
+    def _speaker_profiles_state(self):
+        """Settings > Meetings "Known voices": [{name, count, updated}]."""
+        import speaker_profiles
+        import datetime as _dt
+        out = []
+        for name, cnt, upd in speaker_profiles.stats():
+            when = _dt.datetime.fromtimestamp(upd).strftime("%Y-%m-%d") if upd else ""
+            out.append({"name": name, "count": int(cnt), "updated": when})
+        # Settings-open only (never the tick): the count + the path actually
+        # read, so an empty list is explainable from lia.log alone.
+        log.info("Known voices: %d profile(s) from %s", len(out),
+                 speaker_profiles._store_path())
+        return out
+
+    def _delete_speaker_profile(self, name):
+        """Settings > Meetings: forget one learned voice (WP4). A QA-era noise
+        profile next to a real name defeats the margin gate for both."""
+        import speaker_profiles
+        ok = speaker_profiles.delete(name)
+        log.info("Voiceprint profile %s: %r", "deleted" if ok else "not found", name)
+        return (ok, ("Forgot %s" % name) if ok else "No such voice")
+
     def _rename_speakers_for(self, path):
         """Home preview: open the speaker-rename dialog for THIS meeting (no
         picker). Only a file inside the meetings dir."""
@@ -29533,6 +30103,7 @@ class LiaApp:
         add("get_meeting_details", self._get_meeting_details)
         add("open_meeting_transcript", self._open_meeting_transcript)
         add("rename_speakers_for", self._rename_speakers_for)
+        add("delete_speaker_profile", self._delete_speaker_profile)
         add("copy_meeting_summary", self._copy_meeting_summary)
         return A
 
@@ -29818,8 +30389,12 @@ class LiaApp:
             try:
                 return fn()
             except Exception as e:
-                log.debug("settings-state field failed (%s): %s",
-                          getattr(fn, "__name__", "?"), e)
+                # WARNING, not debug: the logger runs at INFO, so a debug line
+                # here made a whole Settings field vanish with no trace
+                # (Known voices, 2026-09-17). This path is open/reveal/mutation
+                # only - never the 1.5 s tick - so it cannot spam.
+                log.warning("settings-state field failed (%s): %r",
+                            getattr(fn, "__name__", "?"), e)
                 return default
 
         c = self.config
@@ -29854,6 +30429,9 @@ class LiaApp:
             "auto_start": _safe(lambda: bool(is_auto_start_enabled()), False),
             "home": {
                 "recent_meetings": _safe(lambda: self._recent_meetings(30), []),
+                # WP4: known voices (name, samples, last seen) for the Meetings
+                # page list with Delete (a wrong profile poisons matching).
+                "speaker_profiles": _safe(self._speaker_profiles_state, []),
                 "action_items_open": _safe(self._home_action_items_open_count, None),
                 "recording_source": c.get("recording_source", "microphone"),
                 "mic_name": (c.get("input_device_name")

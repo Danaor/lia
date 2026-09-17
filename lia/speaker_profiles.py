@@ -24,10 +24,13 @@ from the diarize_local subprocess).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 
 import numpy as np
+
+_log = logging.getLogger("Lia")
 
 # Calibrated conservatively for ECAPA-family embeddings: same-speaker cosine
 # typically lands 0.5-0.8 across sessions; different speakers 0.1-0.3.
@@ -49,13 +52,20 @@ def _norm(vec):
 
 
 def load():
+    path = _store_path()
     try:
-        with open(_store_path(), encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data.get("profiles"), list):
             return data
-    except Exception:
-        pass
+        # A store that exists but has the wrong shape used to vanish silently
+        # (Known voices empty, no trace - 2026-09-17). Say so.
+        _log.warning("Voiceprint store %s: unexpected shape (%s) - treating as empty",
+                     path, type(data.get("profiles")).__name__)
+    except FileNotFoundError:
+        pass   # first run: no store yet (normal, not worth a warning per call)
+    except Exception as e:
+        _log.warning("Voiceprint store %s unreadable: %r - treating as empty", path, e)
     return {"profiles": []}
 
 
@@ -122,6 +132,55 @@ def match(embeddings_by_label, threshold=MATCH_THRESHOLD, margin=MATCH_MARGIN):
 
 
 def stats():
-    """[(name, count, updated_epoch)] - for a future Settings surface."""
+    """[(name, count, updated_epoch)] - the Settings > Meetings "Known voices" list."""
     return [(p.get("name", ""), int(p.get("count", 0)), int(p.get("updated", 0)))
             for p in load()["profiles"]]
+
+
+def delete(name):
+    """Forget one profile by name (casefold). True when something was removed.
+    A wrong/noise profile next to a real name blocks the margin gate for both."""
+    name = (name or "").strip().casefold()
+    if not name:
+        return False
+    data = load()
+    keep = [p for p in data["profiles"] if p.get("name", "").casefold() != name]
+    if len(keep) == len(data["profiles"]):
+        return False
+    data["profiles"] = keep
+    _save(data)
+    return True
+
+
+SUGGEST_THRESHOLD = 0.45
+
+
+def suggest(embeddings_by_label, lo=SUGGEST_THRESHOLD,
+            threshold=MATCH_THRESHOLD, margin=MATCH_MARGIN):
+    """{label: (name, best_cosine)} for clusters that are CLOSE to a known
+    voice but NOT auto-named by match(): best in [lo, threshold) or best >=
+    threshold with a margin below `margin`. Shown as a suggestion in the
+    rename dialog, never written automatically. MEASURED 2026-09-17 on real
+    meetings: same person 0.83-0.94, different people <= 0.38, so this band
+    is rarely wrong and the auto band is safe. Never raises."""
+    out = {}
+    try:
+        profiles = load()["profiles"]
+        if not profiles or not embeddings_by_label:
+            return out
+        names = [p.get("name", "") for p in profiles]
+        cents = np.stack([_norm(p.get("centroid", [])) for p in profiles])
+        for lab, emb in embeddings_by_label.items():
+            e = _norm(emb)
+            if e.shape != cents.shape[1:] or not np.isfinite(e).all():
+                continue
+            sims = cents @ e
+            order = np.argsort(sims)[::-1]
+            best = float(sims[order[0]])
+            second = float(sims[order[1]]) if len(order) > 1 else -1.0
+            auto = best >= threshold and (best - second) >= margin
+            if not auto and best >= lo:
+                out[lab] = (names[int(order[0])], round(best, 3))
+    except Exception:
+        return {}
+    return out

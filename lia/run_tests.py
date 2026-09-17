@@ -623,7 +623,9 @@ def t_parakeet_long_file_chunks():
     p.model = object()                 # non-None so the loaded-guard passes
     p._infer_lock = threading.Lock()
     seen = []
-    p._recognize = lambda audio: (seen.append(len(audio)) or "x")
+    # The file path decodes pieces on a worker pool via _recognize_nolock
+    # (list.append is atomic under the GIL, so `seen` is safe here).
+    p._recognize_nolock = lambda audio: (seen.append(len(audio)) or "x")
     SR = 16000
     audio = np.zeros(3600 * SR, dtype=np.float32)   # one hour of audio
     orig = fwa.decode_audio
@@ -644,6 +646,186 @@ def t_parakeet_long_file_chunks():
 
 _test("parakeet: a 1-hour file is chunked (<=55s/pass, full coverage, no crash)",
       t_parakeet_long_file_chunks)
+
+
+def t_parakeet_threads_workers_guard():
+    """Parakeet WP1-WP3 (plans/PARAKEET_IMPLEMENTATION_PLAN_2026-09-16.md):
+    (1) the ORT intra-op thread cap follows the measured formula and reaches
+    onnx_asr as sess_options; (2) a long file decodes its 55 s pieces on a
+    worker pool that keeps piece ORDER, retries a failed piece once, and
+    shrinks to 2 workers while a meeting records; (3) the meeting chunk
+    workers skip the decode on a near-silent chunk via _chunk_is_silent."""
+    import sys
+    import types
+    import random
+    import threading
+    import time as _time
+    import inspect
+    import numpy as np
+    import lia as w
+    import faster_whisper.audio as fwa
+    # (1) formulas + sess_options plumbing
+    f = w._parakeet_threads_for
+    assert f(20) == 8 and f(16) == 8 and f(8) == 4 and f(4) == 2 and f(None) == 2 and f(2) == 2
+    g = w._parakeet_file_workers_for
+    assert g(20) == 3 and g(12) == 3 and g(8) == 2 and g(None) == 2
+    assert w.PARAKEET_INTRA_OP_THREADS == f(os.cpu_count())
+    old = sys.modules.get("onnx_asr")
+    cap = {}
+    fake = types.ModuleType("onnx_asr")
+    def _load(name, **kw):
+        cap.update(kw); return object()
+    fake.load_model = _load
+    sys.modules["onnx_asr"] = fake
+    try:
+        p = w.ParakeetTranscriber(threads=8)
+        p.load_model()
+        so = cap.get("sess_options")
+        assert so is not None and so.intra_op_num_threads == 8, cap
+        assert cap.get("quantization") == "int8"
+        p2 = w.ParakeetTranscriber()
+        assert p2.threads == w.PARAKEET_INTRA_OP_THREADS, "0/None = the formula"
+        assert p2.file_workers == 0 and p2.meeting_active() is False
+    finally:
+        sys.modules.pop("onnx_asr", None)
+        if old is not None:
+            sys.modules["onnx_asr"] = old
+    # (2) pooled file decode: order preserved under jitter, retry once, meeting shrink
+    P = w.ParakeetTranscriber
+    t = P.__new__(P)
+    t.model = object(); t._infer_lock = threading.Lock()
+    t.file_workers = 0; t.meeting_active = lambda: False
+    SR = 16000
+    n_pieces = 6
+    audio = np.concatenate([np.full(int(P.FILE_CHUNK_S * SR), (i + 1) / 1000.0, dtype=np.float32)
+                            for i in range(n_pieces)])
+    fails = {"left": 1}
+    rng = random.Random(7)
+    def _rec(piece):
+        _time.sleep(rng.random() * 0.02)
+        tag = int(round(float(piece[0]) * 1000))
+        if tag == 3 and fails["left"]:
+            fails["left"] -= 1
+            raise RuntimeError("transient")
+        return "p%d" % tag
+    t._recognize_nolock = _rec
+    orig = fwa.decode_audio
+    fwa.decode_audio = lambda path, sampling_rate=16000: audio
+    try:
+        out = t.transcribe_file("dummy.wav")
+        assert t._last_file_workers == w.PARAKEET_FILE_WORKERS, t._last_file_workers
+        assert fails["left"] == 0, "the failing piece must have been retried"
+        toks = out.split()
+        assert toks == sorted(toks, key=lambda s: int(s[1:])), ("order lost", out)
+        assert len(toks) >= n_pieces, out
+        t.meeting_active = lambda: True
+        t.transcribe_file("dummy.wav")
+        assert t._last_file_workers == 2, "a live meeting shrinks the pool to 2"
+    finally:
+        fwa.decode_audio = orig
+    # (3) silence guard: pure rule + wired into both meeting workers
+    assert w._chunk_is_silent(np.zeros(16000, dtype=np.float32)) is True
+    assert w._chunk_is_silent((np.random.RandomState(0).randn(16000) * 0.05).astype(np.float32)) is False
+    assert w._chunk_is_silent(None) is False, "fails open (decode) on bad input"
+    for fn in (w.MeetingSession._submit_chunk, w.MeetingSession._submit_live_peek):
+        src = inspect.getsource(fn)
+        assert src.index("_chunk_is_silent(audio_np)") < src.index('decoder_profile("chunk")'), fn.__name__
+    assert "sess_options" in inspect.getsource(P.load_model)
+    assert "parakeet file:" in inspect.getsource(P.transcribe_file)
+
+
+_test("parakeet: thread cap -> sess_options, ordered pooled file decode + retry, silence guard",
+      t_parakeet_threads_workers_guard)
+
+
+def t_speaker_naming_wp1_wp6():
+    """Speaker-ID plan 2026-09-17, WP1/WP4/WP5/WP6:
+    (1) the LLM vote parser matches labels by exact prefix - Gemini labels
+    with '-', ':' and spaces ("S11-spk:0", "S4-Speaker 1") now name (they were
+    0/38 in the field); longest label first; candidates/uniqueness enforced.
+    (2) sharpen_self_turns relabels only DECISIVE turns by the channel ratio:
+    a clearly-me turn in a remote cluster -> self; a clearly-not-me turn in the
+    self cluster -> the sole remote speaker (2-party) and untouched otherwise.
+    (3) speaker_profiles.delete / suggest (band below the auto gate).
+    (4) the speaker sidecar path + lock round-trip; wiring source checks."""
+    import inspect
+    import tempfile
+    import lia as w
+    import speaker_profiles as sp
+    # (1) vote parser
+    f = w._parse_speaker_name_votes
+    assert f("Speaker S11-spk:0: Avi Bar-Yuda", ["S11-spk:0"], ["Avi Bar-Yuda"]) == {"S11-spk:0": "Avi Bar-Yuda"}
+    assert f("S4-Speaker 1: Dana", ["S4-Speaker 1"], ["Dana"]) == {"S4-Speaker 1": "Dana"}
+    assert f("Speaker B: Avi Bar-Yuda", ["B"], ["Avi Bar-Yuda"]) == {"B": "Avi Bar-Yuda"}
+    # longest label first: "S1-spk:0" must not swallow "S11-spk:0"
+    assert f("S11-spk:0: Dana\nS1-spk:0: Avi", ["S1-spk:0", "S11-spk:0"], ["Dana", "Avi"]) == \
+        {"S11-spk:0": "Dana", "S1-spk:0": "Avi"}
+    assert f("B: Nobody", ["B"], ["Dana"]) == {}, "non-candidate names are dropped"
+    assert f("A: Dana\nB: Dana", ["A", "B"], ["Dana"]) == {"A": "Dana"}, "one name per label"
+    assert f("A: Dana", ["A"], ["Dana"], taken=["dana"]) == {}, "a taken name is never reused"
+    # (2) sharpen
+    utts = [{"speaker": "A", "start": 0, "end": 4000},       # me, misfiled as A
+            {"speaker": "S", "start": 4000, "end": 8000},    # self, correct
+            {"speaker": "S", "start": 8000, "end": 12000},   # other, misfiled as self
+            {"speaker": "A", "start": 12000, "end": 13000},  # too short: untouched
+            {"speaker": "A", "start": 13000, "end": 17000}]  # non-decisive: untouched
+    mic = [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.001, 0.001, 0.001, 0.001, 0.05, 0.02, 0.02, 0.02, 0.02]
+    loop = [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.05, 0.05, 0.05, 0.05, 0.001, 0.02, 0.02, 0.02, 0.02]
+    n_to, n_from = w.sharpen_self_turns(utts, "S", mic, loop)
+    assert (n_to, n_from) == (1, 1), (n_to, n_from)
+    assert [u["speaker"] for u in utts] == ["S", "S", "A", "A", "A"], [u["speaker"] for u in utts]
+    assert utts[0]["speaker_orig"] == "A" and utts[2]["speaker_orig"] == "S"
+    # several remote speakers: a not-me turn in the self cluster is left alone
+    utts2 = [{"speaker": "S", "start": 0, "end": 4000}, {"speaker": "A", "start": 4000, "end": 5000},
+             {"speaker": "B", "start": 5000, "end": 6000}]
+    assert w.sharpen_self_turns(utts2, "S", [0.001] * 6, [0.05] * 6) == (0, 0)
+    assert utts2[0]["speaker"] == "S"
+    assert w.sharpen_self_turns([], "S", [], []) == (0, 0)
+    # (3) profile store: delete + suggest (APPDATA is the suite's temp dir)
+    import numpy as np
+    rng = np.random.RandomState(3)
+    a = rng.randn(256); b = rng.randn(256)
+    assert sp.learn("דנה", a) == 1 and sp.learn("יובל", b) == 1
+    # A vector at cosine ~0.50 to Dana (0.5*a_hat + 0.866*orthogonal): inside
+    # the suggestion band [0.45, 0.55), below the auto gate.
+    a_hat = a / np.linalg.norm(a)
+    orth = rng.randn(256); orth -= orth @ a_hat * a_hat; orth /= np.linalg.norm(orth)
+    near = 0.5 * a_hat + 0.866 * orth
+    s = sp.suggest({"X": near, "Y": rng.randn(256)})
+    assert set(s) == {"X"} and s["X"][0] == "דנה" and 0.45 <= s["X"][1] < 0.55, s
+    assert sp.match({"X": near}) == {}, "the band never auto-names"
+    assert sp.match({"X": a}) == {"X": "דנה"}, "an exact voice still auto-names"
+    assert sp.suggest({"X": a}) == {}, "auto-named clusters are not also suggested"
+    assert sp.delete("דנה") is True and sp.delete("דנה") is False
+    assert [n for n, _c, _u in sp.stats()] == ["יובל"]
+    sp.delete("יובל")
+    # (4) sidecar
+    assert w.speaker_sidecar_path("X_meeting_diarized.txt") == "X_meeting_speakers.json"
+    assert w.speaker_sidecar_path("X_meeting.txt") == "X_meeting_speakers.json"
+    assert w.speaker_sidecar_path("X.html") == ""
+    d = tempfile.mkdtemp(); p = os.path.join(d, "m_speakers.json")
+    w.save_speaker_sidecar(p, {"A": {"name": "Dana", "status": "locked"}})
+    assert w.load_speaker_sidecar(p)["A"]["status"] == "locked"
+    assert w.load_speaker_sidecar(os.path.join(d, "missing.json")) == {}
+    # wiring
+    src = inspect.getsource(w.MeetingSession._run_diarize_job)
+    assert "sharpen_self_turns(" in src and "Speaker naming: speakers=" in src
+    assert "_write_speaker_sidecar(md_path, result)" in src
+    assert '"status": "locked"' in inspect.getsource(w.LiaApp._rename_speakers_dialog)
+    assert "speaker_profiles.suggest(" in inspect.getsource(w.LiaApp._rename_speakers_dialog)
+    assert "_local_diarize_ready()" in inspect.getsource(w.LiaApp._start_meeting)
+    assert w.DEFAULT_CONFIG["speaker_self_sharpen"] is True
+    lia_src = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)), "lia.py"),
+                   encoding="utf-8").read()
+    assert 'add("delete_speaker_profile", self._delete_speaker_profile)' in lia_src
+    assert '"speaker_profiles": _safe(self._speaker_profiles_state, [])' in lia_src
+    sw_src = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)), "settings_window.py"),
+                  encoding="utf-8").read()
+    assert 'data-call="delete_speaker_profile"' in sw_src and "Known voices" in sw_src
+
+
+_test("speakers: Gemini-label votes parse, channel-sharpened self turns, profile delete/suggest, lock sidecar",
+      t_speaker_naming_wp1_wp6)
 
 
 def t_strip_preserves_real_text():
@@ -4140,11 +4322,33 @@ def t_parakeet_cache_self_heal():
     raise immediately."""
     import sys
     import types
+    import tempfile
     import lia as wt
 
     old = sys.modules.get("onnx_asr")
 
-    # Corrupt-cache error on the first call -> retry succeeds
+    # The wipe is DESTRUCTIVE (shutil.rmtree of a hub model dir). Until
+    # 2026-09-16 this test let it hit the user's REAL HF cache on every suite
+    # run: the real 680 MB Parakeet vanished, every app start re-downloaded it
+    # (38 s), and English dictation silently fell back to the Hebrew model in
+    # between. Redirect the wipe to a temp hub and PROVE both that it happened
+    # there and that the real cache dir was never touched.
+    real_resolver = wt._parakeet_hub_cache_dir
+    assert real_resolver("nemo-parakeet-tdt-0.6b-v3").endswith(
+        "models--istupakov--parakeet-tdt-0.6b-v3-onnx")
+    assert real_resolver("nemo-parakeet-tdt-0.6b-v2").endswith(
+        "models--istupakov--parakeet-tdt-0.6b-v2-onnx"), "derived from the model name"
+    real_dir = real_resolver("nemo-parakeet-tdt-0.6b-v3")
+    real_state = (os.path.isdir(real_dir),
+                  sorted(os.listdir(real_dir)) if os.path.isdir(real_dir) else None)
+    tmp_hub = tempfile.mkdtemp()
+    fake_dir = os.path.join(tmp_hub, "models--istupakov--parakeet-tdt-0.6b-v3-onnx")
+    os.makedirs(fake_dir)
+    with open(os.path.join(fake_dir, "encoder.onnx"), "wb") as f:
+        f.write(b"truncated")
+    wt._parakeet_hub_cache_dir = lambda name: fake_dir
+
+    # Corrupt-cache error on the first call -> wipe (the temp dir) -> retry succeeds
     calls = []
     fake = types.ModuleType("onnx_asr")
     def _load(name, **kw):
@@ -4162,10 +4366,15 @@ def t_parakeet_cache_self_heal():
         assert p.model is not None, "self-heal retry did not load"
         assert len(calls) == 2, "expected exactly 1 retry, got %d calls" % len(calls)
         assert not p._loading
+        assert not os.path.isdir(fake_dir), "the wipe must remove the (redirected) cache dir"
     finally:
         sys.modules.pop("onnx_asr", None)
         if old is not None:
             sys.modules["onnx_asr"] = old
+        wt._parakeet_hub_cache_dir = real_resolver
+    real_after = (os.path.isdir(real_dir),
+                  sorted(os.listdir(real_dir)) if os.path.isdir(real_dir) else None)
+    assert real_after == real_state, "the self-heal test must NEVER touch the real HF cache"
 
     # A non-corrupt error (network) must raise with NO retry
     calls2 = []
@@ -10514,6 +10723,159 @@ def t_flow_live_tail():
 
 _test("transcript flow: live tail drops a dangling period; pending hidden live",
       t_flow_live_tail)
+
+
+def t_meeting_calendar_matches():
+    """A manual recording that overlaps an unrelated calendar meeting in time
+    must NOT inherit its invitees (Naor 2026-09-16): keep the attendees only
+    when the resolved title matches the calendar subject or an attendee; keep on
+    ambiguity (no title / nothing to compare)."""
+    import lia as w
+    m = w.meeting_calendar_matches
+    # The bug: Sergey call vs the Tali meeting's invitees -> drop.
+    assert m("Sergey Salasin", "Weekly sync", ["Tali Nanas", "Gabriela Shlomo", "Naor Daniel"]) is False
+    assert m("סרגיי סלסין", "פגישה שבועית", ["טלי ננס", "נאור דניאל"]) is False
+    # Title names an attendee -> keep (a Teams call titled after the person).
+    assert m("Dror Abulof", "Weekly sync", ["Dror Abulof", "Naor Daniel"]) is True
+    assert m("שיחה עם סרגיי", "סנכרון", ["סרגיי סלסין", "נאור"]) is True
+    # Title vs subject substring either way -> keep.
+    assert m("Sergey Salasin", "Call with Sergey Salasin", ["Naor"]) is True
+    assert m("Budget", "Q4 budget review", []) is True
+    # Ambiguity -> keep (old behaviour): no title, or nothing to compare.
+    assert m("", "Weekly sync", ["Tali"]) is True
+    assert m("Sergey", "", []) is True
+    # A title of only meeting stopwords can't judge -> keep.
+    assert m("Meeting", "Weekly sync", ["Tali"]) is True
+    # The session gate clears the metadata only on a real mismatch, idempotently.
+    s = w.MeetingSession.__new__(w.MeetingSession)
+    s.attendees = ["Tali Nanas", "Naor Daniel"]
+    s.event_subject = "Weekly sync"
+    s.title = "Sergey Salasin"
+    s.title_guess = None
+    s._gate_calendar_meta()
+    assert s.attendees == [] and s.event_subject == "", "mismatch -> cleared"
+    s._gate_calendar_meta()   # idempotent
+    assert s.attendees == []
+    # A matching title keeps them; a missing title keeps them (ambiguous).
+    s2 = w.MeetingSession.__new__(w.MeetingSession)
+    s2.attendees = ["Dror Abulof"]; s2.event_subject = "Weekly sync"
+    s2.title = "Dror Abulof"; s2.title_guess = None
+    s2._gate_calendar_meta()
+    assert s2.attendees == ["Dror Abulof"], "match -> kept"
+    s3 = w.MeetingSession.__new__(w.MeetingSession)
+    s3.attendees = ["Tali"]; s3.event_subject = "Weekly sync"
+    s3.title = None; s3.title_guess = None
+    s3._gate_calendar_meta()
+    assert s3.attendees == ["Tali"], "no title -> kept (ambiguous)"
+    # Wired into both writers + before diarized speaker naming.
+    import inspect
+    assert "_gate_calendar_meta()" in inspect.getsource(w.MeetingSession._write_output_file)
+    assert inspect.getsource(w.MeetingSession._run_diarize_job).count("_gate_calendar_meta()") >= 1
+    assert "_gate_calendar_meta()" in inspect.getsource(w.MeetingSession._write_diarized_markdown)
+
+
+_test("meeting: calendar invitees dropped when the title matches no attendee/subject",
+      t_meeting_calendar_matches)
+
+
+def t_decoder_profiles():
+    """Decoder profiles (plans/DECODER_THRESHOLDS_PLAN_2026-09-16.md): the
+    plumbing that lets each call shape (dictation / meeting chunk + serve /
+    file) carry its own decoder kwargs, plus Phase-0 telemetry. MEASURED
+    verdict (2026-09-16): every profile keeps the library temperature ladder -
+    on a real meeting it was the only thing that recovered a repetition loop,
+    for an 8% cost. This test pins that (a profile change must be deliberate)
+    and the mechanics: context-local selection that never leaks across
+    threads, and telemetry that reads segment fields defensively."""
+    import lia as w
+    import numpy as _np
+    import threading as _th
+    for name in ("dictation", "chunk", "file"):
+        assert w.DECODER_PROFILES[name] == {}, (
+            "%s must keep the full ladder (measured: it recovers repetition "
+            "loops on meeting audio) - change only with new corpus numbers" % name)
+    assert w.decoder_kwargs() == {} and w.decoder_kwargs("chunk") == {}
+    # Selection mechanics, exercised with a temporary non-empty profile.
+    w.DECODER_PROFILES["_probe"] = {"temperature": [0.0]}
+    try:
+        with w.decoder_profile("_probe"):
+            assert w.decoder_kwargs() == {"temperature": [0.0]}
+            with w.decoder_profile("file"):          # nested + reset
+                assert w.decoder_kwargs() == {}
+            assert w.decoder_kwargs() == {"temperature": [0.0]}
+        assert w.decoder_kwargs() == {}, "profile reset after the block"
+    finally:
+        del w.DECODER_PROFILES["_probe"]
+    try:
+        with w.decoder_profile("nope"):
+            pass
+        assert False, "unknown profile must raise"
+    except ValueError:
+        pass
+    # Context-local: a worker thread's profile does not leak into this thread.
+    seen = {}
+    w.DECODER_PROFILES["_probe"] = {"temperature": [0.0]}
+    try:
+        def worker():
+            with w.decoder_profile("_probe"):
+                seen["in"] = w.decoder_kwargs()
+        t = _th.Thread(target=worker); t.start(); t.join()
+        assert seen["in"] == {"temperature": [0.0]} and w.decoder_kwargs() == {}
+    finally:
+        del w.DECODER_PROFILES["_probe"]
+    # Telemetry over segment-like objects; missing fields are not counted.
+    class S:
+        def __init__(self, **k): self.__dict__.update(k)
+    st = w.decoder_stats([S(temperature=0.0, avg_logprob=-0.4, no_speech_prob=0.1, compression_ratio=1.2),
+                          S(temperature=0.4, avg_logprob=-1.3, no_speech_prob=0.7, compression_ratio=2.6),
+                          S(text="mock, no decode fields")])
+    assert st["windows"] == 2 and st["fallback"] == 1 and st["max_temp"] == 0.4
+    assert st["min_logprob"] == -1.3 and st["max_no_speech"] == 0.7 and st["max_cr"] == 2.6
+    line = w.fmt_decoder_stats(st, "chunk")
+    assert line.startswith("decoder[chunk] windows=2 fallback=1 max_temp=0.4"), line
+    assert w.fmt_decoder_stats(w.decoder_stats([S(text="x")])) == "", "nothing measured -> no line"
+    assert w.decoder_stats(None)["windows"] == 0
+    # The dictation call passes NO temperature override; under a (probe)
+    # profile the same method forwards that profile's kwargs; the serve host
+    # and the meeting workers select "chunk".
+    cap = {}
+    class _Seg:
+        text = "שלום"
+        start, end = 0.0, 1.0   # transcribe_segments reads the timestamps
+    class _Info:
+        language = "he"
+    class _FakeModel:
+        def transcribe(self, audio, **kw):
+            cap.update(kw); return ([_Seg()], _Info())
+    T = w.FasterWhisperTranscriber
+    tr = T.__new__(T); tr.model = _FakeModel(); tr.custom_vocabulary = ""
+    tr._infer_lock = _th.Lock(); tr._demote_to_cpu = lambda *a, **k: False
+    a = _np.zeros(16000, dtype=_np.float32)
+    tr.transcribe(a, language="he")
+    assert "temperature" not in cap, "dictation must stay on the library ladder"
+    cap.clear()
+    w.DECODER_PROFILES["_probe"] = {"temperature": [0.0]}
+    try:
+        with w.decoder_profile("_probe"):
+            tr.transcribe(a, language="he")
+        assert cap.get("temperature") == [0.0], cap
+    finally:
+        del w.DECODER_PROFILES["_probe"]
+    cap.clear()
+    tr.transcribe_segments(a, use_vocabulary=False)
+    assert "temperature" not in cap, "serve host = chunk profile = full ladder"
+    # Wiring: both meeting workers select the chunk profile; the serve host
+    # and the file path name theirs explicitly; dictation logs the telemetry.
+    import inspect
+    assert 'decoder_kwargs("chunk")' in inspect.getsource(T.transcribe_segments)
+    assert 'decoder_profile("chunk")' in inspect.getsource(w.MeetingSession._submit_chunk)
+    assert 'decoder_profile("chunk")' in inspect.getsource(w.MeetingSession._submit_live_peek)
+    assert 'decoder_kwargs("file")' in inspect.getsource(T.transcribe_file)
+    assert "fmt_decoder_stats(dstats, profile)" in inspect.getsource(T.transcribe)
+
+
+_test("decoder profiles: all keep the library ladder (measured), context-local selection, telemetry",
+      t_decoder_profiles)
 
 
 _test("transcript flow: paragraphs join chunks, split only at a real end after 60s",
