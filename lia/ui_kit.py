@@ -126,14 +126,21 @@ a:hover{text-decoration:underline;}
   display:flex; flex-direction:column; gap:2px;
 }
 .sidebar .brand{
-  display:flex; align-items:center; gap:var(--sp-3);
+  display:flex; flex-direction:column; align-items:center; gap:6px;
   padding:var(--sp-2) var(--sp-3) var(--sp-4);
   color:var(--ink);
 }
+/* The FULL Lia logo (mark above the 'lia' wordmark) as one image, so the
+   proportions match the brand artwork - the small typeset "Lia" beside a
+   tiny mark read wrong (2026-09-17). */
+.sidebar .brand .brand-full{height:58px; width:auto; display:block;}
 .sidebar .brand .brand-txt{display:flex; flex-direction:column; line-height:1.15; min-width:0;}
 .sidebar .brand .brand-name{font-size:var(--fs-h1); font-weight:700;}
+/* the 'lia' wordmark image (still used by the dev gallery + Tk fallback) */
+.sidebar .brand .brand-wordmark{height:22px; width:auto; align-self:flex-start;
+  display:block;}
 .sidebar .brand .brand-sub{font-size:10px; font-weight:600; letter-spacing:.02em;
-  text-transform:uppercase; color:var(--muted); margin-top:2px;}
+  text-transform:uppercase; color:var(--muted); margin-top:2px; text-align:center;}
 .sidebar .brand .logo{
   width:28px; height:28px; border-radius:8px; flex:0 0 28px;
   /* the brand orb (lia_logo.png) - transparent corners, own rim/glow, so no
@@ -480,6 +487,7 @@ input:disabled,select:disabled,textarea:disabled{opacity:.55; cursor:default;}
 .status.err .dot{background:var(--err);} .status.err{color:var(--err);}
 .status.busy .dot{background:var(--accent); animation:pulse 1s infinite;}
 .status.ok .dot{background:var(--ok);}
+.status.off .dot{background:var(--muted);}
 @keyframes pulse{50%{opacity:.35;}}
 
 /* --- spinner ------------------------------------------------------------ */
@@ -813,6 +821,50 @@ def logo_data_uri():
         _warn("logo_data_uri: " + str(e))
         _LOGO_URI_CACHE = ""
     return _LOGO_URI_CACHE
+
+
+_WORDMARK_URI_CACHE = None
+
+
+def wordmark_data_uri():
+    """Return the Lia WORDMARK (lia_text.png - the 'lia' lettering) as a base64
+    `data:` URI, so the brand header shows the real wordmark image instead of a
+    typeset "Lia". Cached; returns "" if missing so callers fall back to text."""
+    global _WORDMARK_URI_CACHE
+    if _WORDMARK_URI_CACHE is not None:
+        return _WORDMARK_URI_CACHE
+    try:
+        import base64
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lia_text.png")
+        with open(p, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        _WORDMARK_URI_CACHE = "data:image/png;base64," + b64
+    except Exception as e:
+        _warn("wordmark_data_uri: " + str(e))
+        _WORDMARK_URI_CACHE = ""
+    return _WORDMARK_URI_CACHE
+
+
+_FULLLOGO_URI_CACHE = None
+
+
+def full_logo_data_uri():
+    """Return the FULL Lia logo (lia.png - the mark ABOVE the 'lia' wordmark)
+    as a base64 `data:` URI, for the Settings brand header. Cached; "" if
+    missing so the header degrades gracefully."""
+    global _FULLLOGO_URI_CACHE
+    if _FULLLOGO_URI_CACHE is not None:
+        return _FULLLOGO_URI_CACHE
+    try:
+        import base64
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lia.png")
+        with open(p, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        _FULLLOGO_URI_CACHE = "data:image/png;base64," + b64
+    except Exception as e:
+        _warn("full_logo_data_uri: " + str(e))
+        _FULLLOGO_URI_CACHE = ""
+    return _FULLLOGO_URI_CACHE
 
 
 _ASSET_URI_CACHE = {}

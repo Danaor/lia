@@ -3378,7 +3378,8 @@ def t_meeting_status_card_api():
     import inspect
     for m in ("meeting_status_start", "meeting_status_step", "meeting_status_detail",
               "meeting_status_finish", "meeting_status_error", "meeting_status_hide",
-              "_create_meeting_card", "_meeting_card_animate", "_meeting_card_buttons"):
+              "meeting_status_discarded", "_mcard_render", "_ensure_mcard",
+              "_card_gen_stale"):
         assert hasattr(w.OverlayNotification, m), f"OverlayNotification missing {m}"
     for m in ("_open_meetings_folder", "_meeting_done_notify",
               "_edit_meeting_summary", "_open_summary_editor"):
@@ -3412,11 +3413,153 @@ def t_meeting_status_card_api():
     # No-op when the enhance transcriber is None -> input returned unchanged.
     _u = [{"start": 0, "end": 1000, "text": "x"}]
     assert w.MeetingSession._rerun_utterances("nofile.wav", _u, None) == _u
-    # Spinner frames present for the animation.
-    assert len(w.OverlayNotification._SPIN_FRAMES) >= 4
+    # The light card (2026-09-17 redesign) + its tokens import cleanly.
+    import notification_style as _ns, meeting_notifications as _mn
+    assert hasattr(_mn, "MeetingCard") and _ns.WIDTH >= 340
+    # tk.Button lacks native bidi, so button_text must reorder Hebrew.
+    assert _ns.button_text("שלום") != "שלום"
+    assert _ns.button_text("Open") == "Open"
 
 
 _test("meeting status card API + progress hooks present", t_meeting_status_card_api)
+
+
+def t_meeting_card_adapter_flow():
+    """The meeting_status_* adapter drives a MeetingCard from a state model,
+    with generation guards and a two-step discard. No Tk windows: a fake queue
+    runs work synchronously and a fake card records renders."""
+    import lia as w
+    import time as _t
+
+    class _FakeCard:
+        def __init__(self): self.renders = []; self.metas = []; self.hidden = 0
+        def render(self, s): self.renders.append(s)
+        def update_meta(self, **kw): self.metas.append(kw)
+        def hide(self): self.hidden += 1
+
+    class _FakeQ:
+        def put(self, fn): fn()
+
+    def _mk():
+        ov = w.OverlayNotification.__new__(w.OverlayNotification)
+        ov._root = object(); ov._tk_queue = _FakeQ(); ov._mcard = _FakeCard()
+        ov._mcard_model = None; ov._meeting_card_gen = 0
+        ov._meeting_card_active_gen = None
+        return ov, ov._mcard
+
+    # start -> processing
+    ov, card = _mk()
+    gen = ov.meeting_status_start([("a", "Alpha"), ("b", "Beta"), ("c", "Gamma")],
+                                  subtitle="Transcribing with gpt-transcribe",
+                                  on_discard=lambda: None, meeting_title="Weekly sync")
+    assert gen == 1
+    s = card.renders[-1]
+    assert s["kind"] == "processing" and s["dot"] == "busy"
+    assert s["meeting_title"] == "Weekly sync" and s["chips"] == ["gpt-transcribe"]
+    assert any(l == "Stop" for l, _c, _p in s["actions"])
+
+    # step marks earlier done, active current
+    ov.meeting_status_step("b", gen=gen)
+    marks = {k: st for k, _l, st in card.renders[-1]["stages"]}
+    assert marks == {"a": "done", "b": "active", "c": "pending"}, marks
+
+    # detail updates via update_meta, no re-render
+    n = len(card.renders)
+    ov.meeting_status_detail("b", "segment 12/47", gen=gen)
+    assert len(card.renders) == n, "detail must not rebuild"
+    assert card.metas[-1]["stage_label"] == "Beta · segment 12/47"
+
+    # stale generation is ignored
+    ov.meeting_status_step("c", gen=999)
+    assert {k: st for k, _l, st in card.renders[-1]["stages"]}["c"] == "pending"
+
+    # finish -> success, meeting name carried, actions ordered
+    ov.meeting_status_finish(title="Summary ready", on_open=lambda: None,
+                             on_folder=lambda: None, gen=gen)
+    s = card.renders[-1]
+    assert s["kind"] == "success" and s["dot"] == "ok"
+    assert s["meeting_title"] == "Weekly sync"
+    assert [l for l, _c, _p in s["actions"]] == ["Open", "Open folder"]
+
+    # A late step after finish must NOT drag the card back to processing.
+    n2 = len(card.renders)
+    ov.meeting_status_step("b", gen=gen)
+    assert len(card.renders) == n2, "post-finish step re-rendered the card"
+    assert card.renders[-1]["kind"] == "success"
+
+    # two-step discard fires on_discard only on confirm
+    fired = {"v": False}
+    ov, card = _mk()
+    gen = ov.meeting_status_start([("a", "Alpha")],
+                                  on_discard=lambda: fired.__setitem__("v", True))
+    ov._mcard_arm_stop(gen)
+    assert card.renders[-1]["kind"] == "confirm_stop"
+    ov._mcard_cancel_stop(gen)
+    assert card.renders[-1]["kind"] == "processing"
+    ov._mcard_arm_stop(gen)
+    ov._mcard_do_stop(gen)
+    _t.sleep(0.15)
+    assert fired["v"] is True
+
+    # error / discarded terminal states + hide
+    ov, card = _mk()
+    gen = ov.meeting_status_start([("a", "Alpha")])
+    ov.meeting_status_error("a", "boom", on_folder=lambda: None, gen=gen)
+    assert card.renders[-1]["kind"] == "error" and card.renders[-1]["dot"] == "err"
+    ov.meeting_status_discarded(on_folder=lambda: None, gen=gen)
+    assert card.renders[-1]["kind"] == "discarded"
+    ov.meeting_status_hide()
+    assert ov._mcard_model is None and card.hidden == 1
+
+
+_test("meeting card adapter flow (model, gen guard, discard)", t_meeting_card_adapter_flow)
+
+
+def t_notification_style_tokens():
+    """The light-card tokens: DPI Metrics scales pixel metrics (not fonts),
+    RTL detection + button bidi, and the modules stay import-cheap (no tkinter
+    at load)."""
+    import notification_style as ns
+    # Pixel metrics scale with DPI; fonts are points (Tk scales them itself).
+    m1, m2 = ns.Metrics(1.0), ns.Metrics(2.0)
+    assert m1.px(16) == 16 and m2.px(16) == 32
+    assert m1.px(1) == 1 and m2.px(1) == 2      # 1px border never disappears
+    assert m1.font(ns.PT_TITLE, semibold=True)[2] == "bold"
+    # RTL detection + Button bidi (Label bidis natively; Button does not).
+    assert ns.has_rtl("עברית") and not ns.has_rtl("hello")
+    assert ns.button_text("Open") == "Open"
+    assert ns.button_text("שלום") != "שלום"
+    assert ns.WIDTH >= ns.WIDTH_MIN >= 320
+    # notification_style must not import tkinter at module load (cheap tokens).
+    import sys
+    src = open(ns.__file__, encoding="utf-8").read()
+    assert "import tkinter" not in src, "notification_style must stay tk-free"
+
+
+_test("notification style tokens + DPI + bidi", t_notification_style_tokens)
+
+
+def t_prompt_secondary_wired():
+    """show_prompt / _create_prompt_toplevel accept an optional secondary
+    button (the explicit 'Keep recording'), and the Tk-dead fallback still
+    fires so the meeting-detector state machine can't wedge."""
+    import lia as w
+    import inspect
+    sp = inspect.signature(w.OverlayNotification.show_prompt).parameters
+    assert "secondary_label" in sp and "on_secondary" in sp
+    cp = inspect.signature(w.OverlayNotification._create_prompt_toplevel).parameters
+    assert "secondary_label" in cp and "on_secondary" in cp
+    # No-root fallback fires on_timeout (or on_dismiss) synchronously.
+    ov = w.OverlayNotification.__new__(w.OverlayNotification)
+    ov._root = None
+    fired = {"t": False, "d": False}
+    ov.show_prompt("h", "b", "ok", on_action=lambda: None,
+                   on_dismiss=lambda: fired.__setitem__("d", True),
+                   on_timeout=lambda: fired.__setitem__("t", True))
+    assert fired["t"] is True and fired["d"] is False, fired
+
+
+_test("prompt secondary button + no-root fallback", t_prompt_secondary_wired)
 
 
 def t_summary_html_render():

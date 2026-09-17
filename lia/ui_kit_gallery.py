@@ -21,7 +21,7 @@ def _body():
     return ("""
 <div class="shell">
   <nav class="sidebar">
-    <div class="brand"><img class="logo" src="__LOGO_SRC__" alt=""><span>Lia</span></div>
+    <div class="brand"><img class="logo" src="__LOGO_SRC__" alt=""><img class="brand-wordmark" src="__WORDMARK_SRC__" alt="lia"></div>
     <button class="nav-item on"><span class="ico">&#9881;</span>General</button>
     <button class="nav-item"><span class="ico">&#127911;</span>Audio</button>
     <button class="nav-item"><span class="ico">&#129504;</span>Models</button>
@@ -137,7 +137,7 @@ def _body():
     </div>
   </main>
 </div>
-""").replace("__LOGO_SRC__", uk.logo_data_uri())
+""").replace("__LOGO_SRC__", uk.logo_data_uri()).replace("__WORDMARK_SRC__", uk.wordmark_data_uri())
 
 
 def build_html(dark=False):

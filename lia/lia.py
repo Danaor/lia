@@ -378,7 +378,7 @@ if sys.platform == "win32":
     ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
 
 # --- Configuration ---
-APP_VERSION = "1.6.1"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
+APP_VERSION = "1.6.2"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Lia")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -12312,8 +12312,10 @@ class MeetingSession:
             self._discarded.set()
             log.info("Meeting processing discarded by user; recording kept: %s",
                      self._wav_path)
-        gen = ov.meeting_status_start(stages, title="Processing meeting",
-                                      subtitle=_sub, on_discard=_on_discard)
+        gen = ov.meeting_status_start(
+            stages, title="Processing meeting", subtitle=_sub,
+            on_discard=_on_discard,
+            meeting_title=(self.title or self.title_guess or "").strip())
 
         if silent:
             log.error("Diarized meeting: WAV has no detectable speech — skipping")
@@ -14809,18 +14811,18 @@ def _stamp_lia_launcher(exe_path):
         return False
     try:
         vi = VSVersionInfo(
-            ffi=FixedFileInfo(filevers=(1, 6, 1, 0), prodvers=(1, 6, 1, 0),
+            ffi=FixedFileInfo(filevers=(1, 6, 2, 0), prodvers=(1, 6, 2, 0),
                               mask=0x3f, flags=0x0, OS=0x40004,
                               fileType=0x1, subtype=0x0),
             kids=[
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.6.1.0'),
+                    StringStruct('FileVersion', '1.6.2.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.6.1.0'),
+                    StringStruct('ProductVersion', '1.6.2.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -15825,11 +15827,17 @@ class OverlayNotification:
         # meeting. Top-right of screen, NOT click-through (so the user
         # can click the Stop button). None when no meeting is active.
         self._recording_pill_top = None
-        # Persistent meeting-processing status card (bottom-right). Shows a
-        # live stepper (Uploading → Transcribing → Enhancing → Summarizing →
-        # ready) so a long pipeline never looks "stuck". None when idle.
-        self._meeting_card_top = None
-        self._meeting_card = None
+        # Persistent meeting-processing status card (bottom-right). Since the
+        # 2026-09-17 redesign this is the light MeetingCard (meeting_notifications
+        # .py); the meeting_status_* API below is an adapter over it. `_mcard` is
+        # the widget (one reused instance), `_mcard_model` the current state.
+        self._meeting_card_top = None      # legacy field (kept: reset paths poke it)
+        self._meeting_card = None          # legacy field
+        self._mcard = None                 # MeetingCard | None
+        self._mcard_model = None           # dict | None
+        self._brand_imgs = {}              # (filename, h) -> Tk PhotoImage cache
+        self._meeting_card_gen = 0
+        self._meeting_card_active_gen = None
 
         # With DPI awareness on, canvas coordinates and PhotoImage sizes
         # are in physical pixels. Scale pixel-space dimensions so the pill
@@ -15897,6 +15905,11 @@ class OverlayNotification:
         self._recording_pill_top = None
         self._meeting_card_top = None
         self._meeting_card = None
+        # The MeetingCard's Toplevel + the brand PhotoImages belonged to the
+        # dead root; drop them so the next meeting_status_* call rebuilds on the
+        # fresh root.
+        self._mcard = None
+        self._brand_imgs = {}
 
     def _run_tk(self):
         import tkinter as tk
@@ -16962,34 +16975,26 @@ class OverlayNotification:
         self.show(f"✕  {msg}", bg_color="#6b0f1a", duration=2200)
 
     def show_prompt(self, header, body, button_label, on_action,
-                    on_dismiss=None, duration_ms=30000, on_timeout=None):
-        """Show a clickable card with a primary button + dismiss (✕).
+                    on_dismiss=None, duration_ms=30000, on_timeout=None,
+                    secondary_label=None, on_secondary=None):
+        """Show a clickable meeting prompt card (white, matches the status
+        card since 2026-09-17). Primary button = on_action; an optional
+        secondary button (secondary_label/on_secondary) sits beside it; the ✕
+        = on_dismiss. Bottom-right of the work area. Auto-dismisses after
+        `duration_ms` unless acted on first.
 
-        Unlike the main pill (which is click-through via
-        WS_EX_TRANSPARENT), this card is a regular Toplevel that
-        receives mouse events. Bottom-right of the screen, ~80px
-        above the taskbar. Auto-dismisses after `duration_ms`
-        unless the user clicks the button or ✕ first.
+        on_timeout: fired when the card auto-dismisses with NO user action.
+        Defaults to on_dismiss - pass it separately when a timeout means
+        something different from an explicit ✕ (the call-ended Stop prompt:
+        ✕ / Keep = keep deliberately; timeout = user away, ask again later).
 
-        on_timeout: called when the card auto-dismisses with NO user
-        action. Defaults to on_dismiss — pass it separately when a
-        timeout means something different from an explicit ✕ (e.g. the
-        call-ended Stop prompt: '✕' = keep recording deliberately;
-        timeout = user is away, ask again later).
-
-        Tk-thread-safe: enqueues the actual widget creation onto
-        the overlay's Tk thread via the existing queue.
+        Tk-thread-safe via the overlay queue. ALWAYS bypasses silent_mode -
+        a prompt the user can't see would wedge the caller's state machine.
         """
-        # ALWAYS bypass silent_mode for prompts — they're interactive
-        # and the user can't act on what they can't see. (A silent-mode
-        # guard here once made meeting auto-detect silently dead AND
-        # wedged its state machine, because neither callback ever fired.)
-
         # Tk-dead fallback: if the overlay root never came up, the queued
         # builder would never run and the CALLER's state machine (the meeting
-        # detector) would wedge in 'prompting_stop' forever waiting for a
-        # callback that can't fire. Fire the no-action path synchronously so
-        # the caller resets. (Safety auto-stops are state-independent.)
+        # detector) would wedge forever waiting for a callback that can't fire.
+        # Fire the no-action path synchronously so the caller resets.
         if not self._root:
             cb = on_timeout if on_timeout is not None else on_dismiss
             if cb:
@@ -17004,7 +17009,8 @@ class OverlayNotification:
                 self._create_prompt_toplevel(
                     header, body, button_label,
                     on_action, on_dismiss, duration_ms,
-                    on_timeout if on_timeout is not None else on_dismiss)
+                    on_timeout if on_timeout is not None else on_dismiss,
+                    secondary_label, on_secondary)
             except Exception as e:
                 log.warning('show_prompt failed: %s', e)
 
@@ -17012,33 +17018,32 @@ class OverlayNotification:
 
     def _create_prompt_toplevel(self, header, body, button_label,
                                 on_action, on_dismiss, duration_ms,
-                                on_timeout=None):
-        """Build and show a clickable Toplevel. Runs on the Tk thread.
-
-        Card design — solid dark slate background, white header, lighter
-        body text, single primary indigo button. ✕ in the top-right corner
-        for dismiss. Padding matches Windows native toasts.
-        """
+                                on_timeout=None, secondary_label=None,
+                                on_secondary=None):
+        """Build and show the white prompt card. Runs on the Tk thread.
+        Same light language as the meeting status card (notification_style):
+        Lia brand row + ✕, a title, body text, a primary button and an
+        optional secondary. Real tk.Buttons (focusable); never steals focus."""
         if not self._root:
             return
         import tkinter as tk
+        import notification_style as ns
+        m = ns.Metrics(_DPI_SCALE)
+        pad = m.px(ns.PAD)
+        rtl = ns.has_rtl(header) or ns.has_rtl(body)
+        lead = 'right' if rtl else 'left'
+        trail = 'left' if rtl else 'right'
 
         top = tk.Toplevel(self._root)
         top.overrideredirect(True)
         top.attributes('-topmost', True)
-        # Solid background — this Toplevel is NOT click-through (no
-        # transparentcolor key set), so clicks land on its widgets
-        # rather than passing through to the desktop.
-        BG = '#1e293b'           # slate-800 (matches DEFAULT_TEXT_BG)
-        FG = '#f1f5f9'           # slate-100
-        SUB = '#94a3b8'          # slate-400
-        BTN = '#4338ca'          # indigo-700
-        BTN_HOVER = '#4f46e5'    # indigo-600
-        DISMISS = '#475569'      # slate-600
-        top.configure(bg=BG)
+        top.configure(bg=ns.BORDER)                 # 1px hairline border
+        b = m.px(1)
+        surface = tk.Frame(top, bg=ns.BG)
+        surface.pack(fill='both', expand=True, padx=b, pady=b)
+        outer = tk.Frame(surface, bg=ns.BG, padx=pad, pady=pad)
+        outer.pack(fill='both', expand=True)
 
-        # Flag we flip inside any close-path so the auto-dismiss timer
-        # doesn't double-destroy.
         state = {'closed': False}
 
         def _close_and(callback):
@@ -17052,58 +17057,143 @@ class OverlayNotification:
             if callback:
                 threading.Thread(target=callback, daemon=True).start()
 
-        outer = tk.Frame(top, bg=BG, padx=18, pady=14)
-        outer.pack()
+        def _icon(parent, glyph, cb):
+            ib = tk.Button(parent, text=glyph, bg=ns.BG, fg=ns.FAINT,
+                           activebackground=ns.ROW_HOVER, activeforeground=ns.INK,
+                           font=m.font(ns.PT_ICON), relief='flat', bd=0,
+                           cursor='hand2', width=2, highlightthickness=m.px(1),
+                           highlightbackground=ns.BG, highlightcolor=ns.BUSY,
+                           command=cb)
+            ib.bind('<Enter>', lambda _e: ib.configure(fg=ns.INK, bg=ns.ROW_HOVER))
+            ib.bind('<Leave>', lambda _e: ib.configure(fg=ns.FAINT, bg=ns.BG))
+            return ib
 
-        # Top row: header text + ✕ dismiss
-        head_row = tk.Frame(outer, bg=BG)
-        head_row.pack(fill='x')
-        tk.Label(head_row, text=header, bg=BG, fg=FG,
-                 font=('Segoe UI Variable Text', 11, 'bold'),
-                 anchor='w').pack(side='left')
+        def _btn(parent, label, cb, primary):
+            bg = ns.PRIMARY_BG if primary else ns.SECONDARY_BG
+            fg = ns.PRIMARY_FG if primary else ns.SECONDARY_FG
+            hov = ns.PRIMARY_HOVER if primary else ns.SECONDARY_HOVER
+            ab = tk.Button(parent, text=ns.button_text(label), bg=bg, fg=fg,
+                           activebackground=hov, activeforeground=fg,
+                           font=m.font(ns.PT_BTN, semibold=primary),
+                           relief='flat', bd=0, cursor='hand2',
+                           highlightthickness=m.px(1),
+                           highlightbackground=bg if primary else ns.SECONDARY_BORDER,
+                           highlightcolor=ns.BUSY,
+                           padx=m.px(ns.BTN_PAD_X), pady=m.px(6), command=cb)
+            ab.bind('<Enter>', lambda _e: ab.configure(bg=hov))
+            ab.bind('<Leave>', lambda _e: ab.configure(bg=bg))
+            return ab
 
-        dismiss = tk.Label(head_row, text='✕', bg=BG, fg=DISMISS,
-                           font=('Segoe UI', 11), cursor='hand2',
-                           padx=8)
-        dismiss.pack(side='right')
-        dismiss.bind('<Enter>', lambda _e: dismiss.configure(fg=FG))
-        dismiss.bind('<Leave>', lambda _e: dismiss.configure(fg=DISMISS))
-        dismiss.bind('<Button-1>', lambda _e: _close_and(on_dismiss))
+        # Brand row: Lia mark + 'lia' wordmark (image) + ✕
+        brand = tk.Frame(outer, bg=ns.BG)
+        brand.pack(fill='x')
+        _mk = self._brand_image("lia_logo.png", 18)
+        _wm = self._brand_image("lia_text.png", 15)
+        if _mk is not None:
+            tk.Label(brand, image=_mk, bg=ns.BG).pack(side=lead)
+        if _wm is not None:
+            tk.Label(brand, image=_wm, bg=ns.BG).pack(
+                side=lead, padx=(m.px(6) if _mk is not None else 0, 0))
+        else:
+            tk.Label(brand, text='Lia', bg=ns.BG, fg=ns.FAINT,
+                     font=m.font(ns.PT_BRAND, semibold=True)).pack(side=lead)
+        _icon(brand, '✕', lambda: _close_and(on_dismiss)).pack(side=trail)
 
-        # Body text
-        tk.Label(outer, text=body, bg=BG, fg=SUB,
-                 font=('Segoe UI Variable Text', 10),
-                 justify='left', anchor='w',
-                 wraplength=320).pack(fill='x', pady=(6, 12))
+        # Title
+        tk.Label(outer, text=header, bg=ns.BG, fg=ns.INK,
+                 font=m.font(ns.PT_TITLE, semibold=True),
+                 anchor='e' if rtl else 'w', justify='right' if rtl else 'left'
+                 ).pack(fill='x', pady=(m.px(ns.GAP_SM), 0))
 
-        # Action button — primary indigo
-        btn = tk.Label(outer, text=f'  {button_label}  ',
-                       bg=BTN, fg='#ffffff',
-                       font=('Segoe UI Variable Text', 10, 'bold'),
-                       padx=14, pady=7, cursor='hand2')
-        btn.pack(anchor='e')
-        btn.bind('<Enter>', lambda _e: btn.configure(bg=BTN_HOVER))
-        btn.bind('<Leave>', lambda _e: btn.configure(bg=BTN))
-        btn.bind('<Button-1>', lambda _e: _close_and(on_action))
+        # Body
+        if body:
+            tk.Label(outer, text=body, bg=ns.BG, fg=ns.SUB,
+                     font=m.font(ns.PT_META),
+                     anchor='e' if rtl else 'w', justify='right' if rtl else 'left',
+                     wraplength=m.px(ns.WIDTH - 2 * ns.PAD)
+                     ).pack(fill='x', pady=(m.px(6), 0))
 
-        # Position bottom-right above tray. Force a geometry update so
-        # winfo_reqwidth / winfo_reqheight reflect the packed contents.
+        # Actions: primary on the trailing edge, secondary inward.
+        row = tk.Frame(outer, bg=ns.BG)
+        row.pack(fill='x', pady=(m.px(ns.GAP_MD), 0))
+        padkw = (0, m.px(8)) if rtl else (m.px(8), 0)
+        _btn(row, button_label, lambda: _close_and(on_action), True).pack(
+            side=trail, padx=padkw)
+        if secondary_label:
+            _btn(row, secondary_label, lambda: _close_and(on_secondary), False).pack(
+                side=trail, padx=padkw)
+
+        # Bottom-right of the work area (not the physical screen edge).
         top.update_idletasks()
-        w = max(top.winfo_reqwidth(), 320)
+        w = max(top.winfo_reqwidth(), m.px(ns.WIDTH_MIN))
         h = top.winfo_reqheight()
-        screen_w = self._root.winfo_screenwidth()
-        screen_h = self._root.winfo_screenheight()
-        x = screen_w - w - 20
-        # 80px clearance above the bottom — leaves room for taskbar
-        # (~40-50px standard) plus visual breathing room.
-        y = screen_h - h - 80
+        ax, ay, aw, ah = self._prompt_work_area(top)
+        margin = m.px(ns.MARGIN)
+        x = max(ax, min(ax + aw - w - margin, ax + aw - w))
+        y = max(ay, min(ay + ah - h - margin, ay + ah - h))
         top.geometry(f'{w}x{h}+{x}+{y}')
+        self._prompt_round(top)
+        self._prompt_no_activate(top)
 
-        # Auto-dismiss after duration_ms unless already closed. Timeout fires
-        # on_timeout (defaults to on_dismiss via show_prompt).
         top.after(duration_ms,
                   lambda: _close_and(on_timeout if on_timeout is not None
                                      else on_dismiss))
+
+    @staticmethod
+    def _prompt_work_area(top):
+        """(x, y, w, h) of the monitor work area under `top`, device px."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class RECT(ctypes.Structure):
+                _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                            ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+
+            class MI(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", RECT),
+                            ("rcWork", RECT), ("dwFlags", wintypes.DWORD)]
+
+            mon = ctypes.windll.user32.MonitorFromWindow(top.winfo_id(), 2)
+            mi = MI(); mi.cbSize = ctypes.sizeof(MI)
+            if ctypes.windll.user32.GetMonitorInfoW(mon, ctypes.byref(mi)):
+                r = mi.rcWork
+                return (r.left, r.top, r.right - r.left, r.bottom - r.top)
+        except Exception:
+            pass
+        return (0, 0, top.winfo_screenwidth(), top.winfo_screenheight() - 48)
+
+    @staticmethod
+    def _prompt_round(top):
+        """Win11 rounded corners + hairline border (DWM). No-op if unavailable."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            import notification_style as ns
+            hwnd = top.winfo_id()
+            parent = ctypes.windll.user32.GetParent(hwnd) or hwnd
+            dwm = ctypes.windll.dwmapi
+            pref = ctypes.c_int(2)
+            r, g, bl = ns.DWM_BORDER_BGR
+            col = ctypes.c_int((bl << 16) | (g << 8) | r)
+            for h in {hwnd, parent}:
+                dwm.DwmSetWindowAttribute(wintypes.HWND(h), 33,
+                                          ctypes.byref(pref), ctypes.sizeof(pref))
+                dwm.DwmSetWindowAttribute(wintypes.HWND(h), 34,
+                                          ctypes.byref(col), ctypes.sizeof(col))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _prompt_no_activate(top):
+        """WS_EX_NOACTIVATE so the prompt never steals focus (still clickable)."""
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(top.winfo_id()) or top.winfo_id()
+            gwl = ctypes.windll.user32.GetWindowLongW(hwnd, -20)
+            ctypes.windll.user32.SetWindowLongW(hwnd, -20, gwl | 0x08000000)
+        except Exception:
+            pass
 
     def show_summary(self, title, text, on_open_file=None, on_save=None):
         """Pop up a window showing a summary (meeting OR the standalone
@@ -18420,514 +18510,310 @@ class OverlayNotification:
     # completion ("Summary ready" + Open / Open folder / Dismiss — no file
     # auto-opens). ALWAYS shown (progress for a long task is not "success
     # noise" that silent_mode should hide).
-    _SPIN_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    # ---- Meeting status card (light MeetingCard adapter, 2026-09-17) ------
+    # The old purple gradient card was replaced by
+    # meeting_notifications.MeetingCard. These methods KEEP their signatures +
+    # generation semantics, so every caller (the diarized + chunked pipelines)
+    # works unchanged; they now drive the white card through a small state model
+    # (self._mcard_model). All bodies run on the Tk thread via the queue.
 
-    def meeting_status_start(self, stages, title="Processing meeting", subtitle="",
-                             on_discard=None):
-        """Show the card. `stages` = ordered list of (key, label). `subtitle` is
-        a small dim line under the title (e.g. "Transcribing with gpt-transcribe"
-        so the user knows which engine is running). `on_discard`, if given, adds a
-        Discard control to the header (two-click confirm) that fires the callback
-        so the caller can abandon the transcription/summary work. Returns a
-        generation token — pass it to the meeting_status_* mutators below so a
-        STALE pipeline (a previous meeting still finalizing when a new meeting
-        starts and rebuilds the card) can't step/finish the NEW card."""
-        self._meeting_card_gen = getattr(self, "_meeting_card_gen", 0) + 1
-        gen = self._meeting_card_gen
-        def _do():
-            try:
-                self._create_meeting_card(stages, title, gen, subtitle=subtitle,
-                                          on_discard=on_discard)
-            except Exception as e:
-                log.warning("meeting_status_start failed: %s", e)
-        self._tk_queue.put(_do)
-        return gen
+    def _ensure_mcard(self):
+        """Create the MeetingCard once, on the current root. Tk-thread only."""
+        if self._mcard is not None or not self._root:
+            return self._mcard
+        try:
+            import meeting_notifications as _mn
+            self._mcard = _mn.MeetingCard(self._root, self._tk_queue,
+                                          dpi_scale=_DPI_SCALE,
+                                          logo_image=self._brand_image("lia_logo.png", 18),
+                                          wordmark_image=self._brand_image("lia_text.png", 15),
+                                          log=log)
+        except Exception as e:
+            log.warning("MeetingCard init failed: %s", e)
+            self._mcard = None
+        return self._mcard
+
+    def _brand_image(self, filename, target_h):
+        """A brand PNG (the mark lia_logo.png, or the 'lia' wordmark
+        lia_text.png) as a Tk PhotoImage scaled to ~target_h logical px, crisp
+        via PIL. Cached per (filename, target_h) + kept alive so Tk doesn't GC
+        it (reset with the root). None on any error -> the card falls back to
+        the 'Lia' text. Tk-thread only."""
+        key = (filename, target_h)
+        cache = self._brand_imgs
+        if key in cache:
+            return cache[key]
+        img = None
+        try:
+            from PIL import Image, ImageTk
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+            src = Image.open(path).convert("RGBA")
+            h = max(1, int(round(target_h * _DPI_SCALE)))
+            w = max(1, int(round(src.width * h / src.height)))
+            img = ImageTk.PhotoImage(src.resize((w, h), Image.LANCZOS),
+                                     master=self._root)
+        except Exception as e:
+            log.debug("brand image %s load failed: %s", filename, e)
+            img = None
+        cache[key] = img
+        return img
+
+    @staticmethod
+    def _engine_from_subtitle(subtitle):
+        """The old subtitle was "Transcribing with <engine>"; pull the engine
+        for a compact chip. A bare subtitle becomes the chip text as-is."""
+        if not subtitle:
+            return ""
+        pre = "Transcribing with "
+        return subtitle[len(pre):] if subtitle.startswith(pre) else subtitle
 
     def _card_gen_stale(self, gen):
         """Tk-thread check: True if `gen` is from a superseded card."""
-        return gen is not None and getattr(self, "_meeting_card_active_gen", None) != gen
+        return gen is not None and self._meeting_card_active_gen != gen
+
+    def _mcard_state(self):
+        """Build the MeetingCard state dict from the current model. Tk-thread."""
+        mo = self._mcard_model or {}
+        stages = mo.get("stages") or []
+        marks = mo.get("marks") or {}
+        labels = dict(stages)
+        kind = mo.get("kind", "processing")
+        st = {
+            "kind": kind,
+            "title": mo.get("title", ""),
+            "meeting_title": mo.get("meeting_title", ""),
+            "allow_close": True,
+            "anchor": mo.get("anchor"),
+        }
+        if kind == "processing":
+            active = mo.get("active")
+            detail = mo.get("detail") or ""
+            active_label = labels.get(active, "")
+            st["dot"] = "busy"
+            st["chips"] = [mo["engine"]] if mo.get("engine") else []
+            st["stage_label"] = (active_label + (" · " + detail if detail else "")
+                                 if active_label else detail)
+            st["stages"] = [(k, l, marks.get(k, "pending")) for k, l in stages]
+            st["allow_min"] = True
+            st["expanded"] = mo.get("expanded", False)
+            st["minimized"] = mo.get("minimized", False)
+            gen = mo.get("gen")
+            if mo.get("on_discard"):
+                st["actions"] = [("Stop", lambda g=gen: self._mcard_arm_stop(g), False)]
+        elif kind == "confirm_stop":
+            gen = mo.get("gen")
+            st["dot"] = "neutral"
+            st["title"] = "Stop processing?"
+            st["message"] = ("The recording is saved. Only the transcript / "
+                             "summary work stops.")
+            st["actions"] = [
+                ("Stop processing", lambda g=gen: self._mcard_do_stop(g), True),
+                ("Keep going", lambda g=gen: self._mcard_cancel_stop(g), False),
+            ]
+        else:  # success / error / discarded - terminal; actions preset in model
+            st["dot"] = mo.get("dot")
+            st["message"] = mo.get("message", "")
+            st["actions"] = mo.get("actions") or []
+        return st
+
+    def _mcard_render(self):
+        """(Re)render the card from the model. Tk-thread only."""
+        card = self._ensure_mcard()
+        if not card:
+            return
+        try:
+            card.render(self._mcard_state())
+        except Exception as e:
+            log.warning("MeetingCard render failed: %s", e)
+
+    def meeting_status_start(self, stages, title="Processing meeting", subtitle="",
+                             on_discard=None, meeting_title=""):
+        """Show the processing card. `stages` = ordered (key, label) list.
+        `subtitle` names the engine (shown as a chip). `meeting_title`, if given,
+        is the meeting's name. `on_discard` adds a Stop control (two-step
+        confirm) that abandons the transcript/summary work - the recording is
+        always kept. Returns a generation token: pass it to the meeting_status_*
+        mutators so a STALE pipeline can't step/finish a NEWER card."""
+        self._meeting_card_gen += 1
+        gen = self._meeting_card_gen
+        stages = list(stages or [])
+
+        def _do():
+            self._meeting_card_active_gen = gen
+            self._mcard_model = {
+                "gen": gen, "kind": "processing", "title": title,
+                "meeting_title": meeting_title or "",
+                "engine": self._engine_from_subtitle(subtitle),
+                "stages": stages, "marks": {k: "pending" for k, _ in stages},
+                "active": None, "detail": "", "on_discard": on_discard,
+                "expanded": False, "minimized": False,
+                "anchor": time.monotonic(),
+            }
+            self._mcard_render()
+        self._tk_queue.put(_do)
+        return gen
 
     def meeting_status_step(self, key, detail="", gen=None):
-        """Mark `key` ACTIVE (spinner) and every earlier stage DONE (✓)."""
+        """Mark `key` ACTIVE and every earlier stage DONE; re-render."""
         def _do():
             if self._card_gen_stale(gen):
                 return
-            c = self._meeting_card
-            if not c or key not in c["rows"]:
+            mo = self._mcard_model
+            if not mo or mo.get("kind") != "processing":
                 return
-            cols = c["colors"]
-            order = c["order"]
+            order = [k for k, _ in mo["stages"]]
+            if key not in order:
+                return
             idx = order.index(key)
             for i, k in enumerate(order):
-                r = c["rows"][k]
-                if i < idx and r["state"] != "error":
-                    r["state"] = "done"
-                    r["dot"].configure(text="✓", fg=cols["DONE"])
-                    r["name"].configure(fg=cols["FG"])
-                    r["detail"].configure(text="")
-                    r["xdetail"] = ""
+                if i < idx and mo["marks"].get(k) != "error":
+                    mo["marks"][k] = "done"
                 elif i == idx:
-                    r["state"] = "active"
-                    r["name"].configure(fg=cols["FG"])
-                    r["xdetail"] = detail or ""
-            c["active"] = key
-            c["stage_start"] = time.time()
-            self._position_meeting_card()
+                    mo["marks"][k] = "active"
+            mo["active"] = key
+            mo["detail"] = detail or ""
+            self._mcard_render()
         self._tk_queue.put(_do)
 
     def meeting_status_detail(self, key, detail, gen=None):
-        """Update the side text of a stage (e.g. AssemblyAI status, '12/47')."""
+        """Update the active stage's side text WITHOUT a rebuild (frequent
+        path: 'segment 12/47') so the timer/spinner don't reset."""
         def _do():
             if self._card_gen_stale(gen):
                 return
-            c = self._meeting_card
-            if not c or key not in c["rows"]:
+            mo = self._mcard_model
+            if not mo or mo.get("kind") != "processing":
                 return
-            c["rows"][key]["xdetail"] = detail or ""
+            mo["detail"] = detail or ""
+            labels = dict(mo["stages"])
+            active_label = labels.get(mo.get("active"), "")
+            text = (active_label + (" · " + mo["detail"] if mo["detail"] else "")
+                    if active_label else mo["detail"])
+            if self._mcard:
+                self._mcard.update_meta(stage_label=text)
         self._tk_queue.put(_do)
 
     def meeting_status_error(self, key, msg, on_folder=None, gen=None):
-        """Mark `key` failed and stop the card with an Open-folder/Dismiss row."""
+        """Mark the run failed and show an error card (Open folder + close)."""
         def _do():
             if self._card_gen_stale(gen):
                 return
-            c = self._meeting_card
-            if not c:
-                return
-            cols = c["colors"]
-            c["done"] = True
-            c["active"] = None
-            if key in c["rows"]:
-                r = c["rows"][key]
-                r["state"] = "error"
-                # Text stays soft white-grey; only the ✕ dot carries the colour.
-                r["dot"].configure(text="✕", fg=cols["ERR"])
-                r["name"].configure(fg=cols["FG"])
-                r["detail"].configure(text=(msg or "")[:42], fg=cols["SUB"])
-            c["title"].configure(text="✕  Couldn't finish", fg=cols["TITLE"])
-            if c.get("stripe"):
-                try: c["stripe"].configure(bg=cols["ERR"])
-                except Exception: pass
-            btns = []
+            actions = []
             if on_folder:
-                btns.append(("Open folder", on_folder, False))
-            self._meeting_card_buttons(btns)
-            self._position_meeting_card()
+                actions.append(("Open folder", on_folder, False))
+            self._mcard_model = {
+                "gen": gen, "kind": "error", "dot": "err",
+                "title": "Meeting processing failed",
+                "meeting_title": (self._mcard_model or {}).get("meeting_title", ""),
+                "message": (msg or "")[:120], "actions": actions,
+            }
+            self._mcard_render()
         self._tk_queue.put(_do)
 
     def meeting_status_finish(self, title="Summary ready", on_open=None,
                               on_edit=None, on_folder=None, on_rename=None,
                               gen=None):
-        """All stages done → actionable completion card. NO file auto-opens."""
+        """All stages done -> an actionable success card. No file auto-opens."""
         def _do():
             if self._card_gen_stale(gen):
                 return
-            c = self._meeting_card
-            if not c:
-                return
-            cols = c["colors"]
-            for k in c["order"]:
-                r = c["rows"][k]
-                if r["state"] not in ("done", "error"):
-                    r["state"] = "done"
-                    r["dot"].configure(text="✓", fg=cols["DONE"])
-                    r["name"].configure(fg=cols["FG"])
-                    r["detail"].configure(text="")
-            c["active"] = None
-            c["done"] = True
-            c["title"].configure(text="✓  " + title, fg=cols["TITLE"])
-            if c.get("stripe"):
-                try: c["stripe"].configure(bg=cols["DONE"])
-                except Exception: pass
-            btns = []
+            actions = []
             if on_open:
-                btns.append(("Open", on_open, True))
+                actions.append(("Open", on_open, True))
             if on_edit:
-                btns.append(("Edit", on_edit, False))
+                actions.append(("Edit", on_edit, False))
             if on_rename:
-                btns.append(("Rename speakers", on_rename, False))
+                actions.append(("Rename speakers", on_rename, False))
             if on_folder:
-                btns.append(("Open folder", on_folder, False))
-            self._meeting_card_buttons(btns)
-            self._position_meeting_card()
+                actions.append(("Open folder", on_folder, False))
+            self._mcard_model = {
+                "gen": gen, "kind": "success", "dot": "ok", "title": title,
+                "meeting_title": (self._mcard_model or {}).get("meeting_title", ""),
+                "actions": actions,
+            }
+            self._mcard_render()
+        self._tk_queue.put(_do)
+
+    def meeting_status_discarded(self, title="Processing stopped",
+                                 on_folder=None, gen=None):
+        """Terminal neutral state after the user discarded processing. The
+        recording was kept on purpose, so this is not styled as an error."""
+        def _do():
+            if self._card_gen_stale(gen):
+                return
+            actions = []
+            if on_folder:
+                actions.append(("Open folder", on_folder, False))
+            self._mcard_model = {
+                "gen": gen, "kind": "discarded", "dot": "neutral", "title": title,
+                "meeting_title": (self._mcard_model or {}).get("meeting_title", ""),
+                "message": "Recording saved.", "actions": actions,
+            }
+            self._mcard_render()
         self._tk_queue.put(_do)
 
     def meeting_status_hide(self):
         """Dismiss the card. No-op if not shown."""
         def _do():
-            self._destroy_meeting_card()
+            if self._mcard:
+                self._mcard.hide()
+            self._mcard_model = None
         self._tk_queue.put(_do)
 
-    def _meeting_card_discard_click(self):
-        """Header Discard control. First click arms (label -> 'Discard?'), the
-        second click within ~4s fires on_discard. Tk-thread only."""
-        c = self._meeting_card
-        if not c or c.get("done"):
-            return
-        lbl = c.get("disc_lbl")
-        cb = c.get("on_discard")
-        if not lbl or not cb:
-            return
-        cols = c["colors"]
-        if not c.get("disc_armed"):
-            c["disc_armed"] = True
-            try:
-                lbl.configure(text="Discard?", fg=cols["ERR"])
-            except Exception:
-                pass
-            # Auto-disarm if the user doesn't confirm.
-            def _disarm():
-                cc = self._meeting_card
-                if cc is c and c.get("disc_armed") and not c.get("done"):
-                    c["disc_armed"] = False
-                    try:
-                        lbl.configure(text="Discard", fg=cols["SUB"])
-                    except Exception:
-                        pass
-            top = self._meeting_card_top
-            if top:
-                top.after(4000, _disarm)
-            return
-        # Confirmed: fire the callback and show a transitional state. The caller
-        # unwinds its pipeline and replaces the card via meeting_status_discarded.
-        c["disc_armed"] = False
-        try:
-            lbl.configure(text="Discarding…", fg=cols["SUB"], cursor="arrow")
-            lbl.unbind("<Button-1>")
-            c["title"].configure(text="Discarding…", fg=cols["TITLE"])
-        except Exception:
-            pass
-        threading.Thread(target=cb, daemon=True).start()
-
-    def meeting_status_discarded(self, title="Discarded - recording saved",
-                                 on_folder=None, gen=None):
-        """Terminal state after the user discarded processing. Neutral styling
-        (not an error): the recording was kept on purpose."""
+    # ---- discard (two-step confirm) -------------------------------------
+    def _mcard_arm_stop(self, gen):
+        """First Stop click: swap the processing card for a confirm."""
         def _do():
             if self._card_gen_stale(gen):
                 return
-            c = self._meeting_card
-            if not c:
+            mo = self._mcard_model
+            if not mo or mo.get("kind") != "processing":
                 return
-            cols = c["colors"]
-            c["done"] = True
-            c["active"] = None
-            c["title"].configure(text="⊘  " + title, fg=cols["TITLE"])
-            if c.get("stripe"):
-                try:
-                    c["stripe"].configure(bg=cols["SUB"])
-                except Exception:
-                    pass
-            btns = []
-            if on_folder:
-                btns.append(("Open folder", on_folder, False))
-            self._meeting_card_buttons(btns)
-            self._position_meeting_card()
+            mo["_resume"] = {k: mo.get(k) for k in ("active", "detail",
+                                                    "expanded", "on_discard")}
+            mo["kind"] = "confirm_stop"
+            self._mcard_render()
         self._tk_queue.put(_do)
 
-    def _create_meeting_card(self, stages, title, gen=0, subtitle="", on_discard=None):
-        """Build the card. Tk-thread only."""
-        if not self._root:
-            return
-        self._destroy_meeting_card()
-        self._meeting_card_active_gen = gen
-        import tkinter as tk
+    def _mcard_cancel_stop(self, gen):
+        """"Keep going": return to the processing card unchanged."""
+        def _do():
+            if self._card_gen_stale(gen):
+                return
+            mo = self._mcard_model
+            if not mo or mo.get("kind") != "confirm_stop":
+                return
+            for k, v in (mo.pop("_resume", None) or {}).items():
+                mo[k] = v
+            mo["kind"] = "processing"
+            self._mcard_render()
+        self._tk_queue.put(_do)
 
-        # Vertical PURPLE gradient. Tk has no gradient fill and its widgets are
-        # opaque, so we build the card as edge-to-edge horizontal BANDS — one per
-        # content row — each a solid sample of the gradient, with all spacing
-        # kept INSIDE each band (its own colour fills the gaps). No foreign-colour
-        # seams, and pack still auto-sizes the card. Lighter at the top.
-        # Gentle range — with the 60% window opacity below, a small delta reads
-        # as a smooth wash rather than visible bands.
-        GTOP = (0x54, 0x4a, 0x82)   # light purple (top)
-        GBOT = (0x46, 0x3e, 0x70)   # slightly darker (bottom)
-        def _grad(t):
-            t = 0.0 if t < 0 else (1.0 if t > 1 else t)
-            return "#%02x%02x%02x" % tuple(
-                int(GTOP[i] + (GBOT[i] - GTOP[i]) * t) for i in range(3))
-
-        # Text is white with a touch of grey (low contrast); state is carried by
-        # the small dot icon + the accent stripe, not by colouring the text.
-        FG = "#dedbe6"; SUB = "#aba6ba"          # body / dim (soft white-grey)
-        ACTIVE = "#9fbbe0"; DONE = "#a7c997"; ERR = "#dba2ac"   # muted icons
-        MAUVE = "#cfb4f2"          # accent stripe
-        TITLE_FG = "#ecebf2"       # soft-white header
-        SURFACE = "#665b92"        # chip / tag background (raised purple)
-        TAG_FG = "#d9d6e2"         # engine tag text (soft white-grey)
-        C_BOT = _grad(1.0)
-
-        # Bands, top→bottom: header, [subtitle], then the stages — evenly ramped.
-        n_stage = len(stages)
-        n_bands = 1 + (1 if subtitle else 0) + n_stage
-        def _band_t(idx):
-            return idx / (n_bands - 1) if n_bands > 1 else 0.0
-        _bi = 0
-
-        top = tk.Toplevel(self._root)
-        top.overrideredirect(True)
-        top.attributes("-topmost", True)
-        top.attributes("-alpha", 0.75)   # 75% opacity — translucent but solid enough to read
-        top.configure(bg=C_BOT)
-
-        # Accent stripe over the left edge (full height); recoloured on finish.
-        stripe = tk.Frame(top, bg=MAUVE, width=3)
-        stripe.place(x=0, y=0, relheight=1.0)
-
-        # The band stack. Bottom padding (C_BOT) gives the card's lower margin.
-        stack = tk.Frame(top, bg=C_BOT)
-        stack.pack(fill="both", expand=True, pady=(0, 8))
-        stripe.lift()   # keep the placed stripe above the packed band stack
-
-        # NB: a Frame's -pady CONFIG option takes a single distance (not the
-        # 2-tuple that pack() accepts), so each band uses symmetric internal
-        # padding — its own colour fills the gap either way, so no seam.
-        c_head = _grad(_band_t(_bi)); _bi += 1
-        head = tk.Frame(stack, bg=c_head, padx=13, pady=8)
-        head.pack(fill="x")
-        title_lbl = tk.Label(head, text=title, bg=c_head, fg=TITLE_FG,
-                             font=("Segoe UI Variable Text", 10, "bold"), anchor="w")
-        title_lbl.pack(side="left")
-        # Minimize / restore toggle (top-right). Collapses the card to just this
-        # header bar (the elapsed keeps ticking) so a long processing run can be
-        # tucked out of the way; click again (or completion) to restore.
-        min_btn = tk.Label(head, text="–", bg=c_head, fg=SUB, cursor="hand2",
-                           font=("Segoe UI Variable Text", 11, "bold"), padx=3)
-        min_btn.pack(side="right")
-        min_btn.bind("<Enter>", lambda _e: min_btn.configure(fg=FG))
-        min_btn.bind("<Leave>", lambda _e: min_btn.configure(fg=SUB))
-        min_btn.bind("<Button-1>", lambda _e: self._meeting_card_toggle_min())
-        # Elapsed as a subtle chip (raised surface) rather than bare text.
-        elapsed_lbl = tk.Label(head, text="0:00", bg=SURFACE, fg="#d6cff0",
-                               font=("Segoe UI Variable Text", 7), anchor="e",
-                               padx=5, pady=1)
-        elapsed_lbl.pack(side="right", padx=(0, 6))
-        # Optional Discard control (left of the elapsed chip). Two clicks: the
-        # first arms ("Discard?"), the second fires on_discard. The recording is
-        # always kept - this only abandons the transcription/summary work.
-        disc_lbl = None
-        if on_discard:
-            disc_lbl = tk.Label(head, text="Discard", bg=c_head, fg=SUB,
-                                cursor="hand2",
-                                font=("Segoe UI Variable Text", 8), padx=6)
-            disc_lbl.pack(side="right", padx=(0, 6))
-            disc_lbl.bind("<Enter>", lambda _e: (
-                None if self._meeting_card and self._meeting_card.get("disc_armed")
-                else disc_lbl.configure(fg=FG)))
-            disc_lbl.bind("<Leave>", lambda _e: (
-                None if self._meeting_card and self._meeting_card.get("disc_armed")
-                else disc_lbl.configure(fg=SUB)))
-            disc_lbl.bind("<Button-1>", lambda _e: self._meeting_card_discard_click())
-
-        rows = {}
-        hideable = []
-        # Optional subtitle naming the transcription engine, rendered as
-        # "Transcribing with [ gpt-transcribe ]" — the engine in a tinted tag
-        # pill so the tool in use reads at a glance.
-        if subtitle:
-            c_sub = _grad(_band_t(_bi)); _bi += 1
-            sub = tk.Frame(stack, bg=c_sub, padx=13, pady=5)
-            sub.pack(fill="x")
-            hideable.append((sub, {"fill": "x"}))
-            _prefix, _engine = "Transcribing with", ""
-            if subtitle.startswith(_prefix + " "):
-                _engine = subtitle[len(_prefix) + 1:]
-            else:
-                _prefix, _engine = subtitle, ""
-            tk.Label(sub, text=_prefix, bg=c_sub, fg=SUB,
-                     font=("Segoe UI Variable Text", 8), anchor="w").pack(side="left")
-            if _engine:
-                tk.Label(sub, text=f" {_engine} ", bg=SURFACE, fg=TAG_FG,
-                         font=("Segoe UI Variable Text", 8, "bold"),
-                         padx=6, pady=1).pack(side="left", padx=(5, 0))
-        for key, label in stages:
-            c_row = _grad(_band_t(_bi)); _bi += 1
-            row = tk.Frame(stack, bg=c_row, padx=13, pady=3)
-            row.pack(fill="x")
-            hideable.append((row, {"fill": "x"}))
-            dot = tk.Label(row, text="○", bg=c_row, fg=SUB, width=2,
-                           font=("Segoe UI", 9))
-            dot.pack(side="left")
-            name = tk.Label(row, text=label, bg=c_row, fg=SUB,
-                            font=("Segoe UI Variable Text", 8), anchor="w")
-            name.pack(side="left", padx=(2, 0))
-            detail = tk.Label(row, text="", bg=c_row, fg=SUB,
-                              font=("Segoe UI Variable Text", 8), anchor="e")
-            detail.pack(side="right")
-            rows[key] = {"dot": dot, "name": name, "detail": detail,
-                         "state": "pending", "xdetail": ""}
-
-        self._meeting_card_top = top
-        self._meeting_card = {
-            "rows": rows, "order": [k for k, _ in stages], "active": None,
-            "title": title_lbl, "elapsed": elapsed_lbl, "outer": stack,
-            "stripe": stripe,
-            "total_start": time.time(), "stage_start": None, "spin": 0,
-            "done": False, "hideable": hideable, "minimized": False,
-            "min_btn": min_btn,
-            "on_discard": on_discard, "disc_lbl": disc_lbl, "disc_armed": False,
-            "colors": {"BG": C_BOT, "FG": FG, "SUB": SUB, "ACTIVE": ACTIVE,
-                       "DONE": DONE, "ERR": ERR, "TITLE": TITLE_FG},
-        }
-        self._position_meeting_card()
-        self._round_meeting_card()
-        self._meeting_card_animate()
-
-    def _round_meeting_card(self):
-        """Give the card native Win11 rounded corners + a subtle border (DWM).
-        Best-effort; a no-op on older Windows. Tk-thread only."""
-        top = self._meeting_card_top
-        if not top:
-            return
-        try:
-            import ctypes
-            from ctypes import wintypes
-            top.update_idletasks()
-            hwnd = top.winfo_id()
-            parent = ctypes.windll.user32.GetParent(hwnd) or hwnd
-            dwm = ctypes.windll.dwmapi
-            pref = ctypes.c_int(2)  # DWMWA_WINDOW_CORNER_PREFERENCE=33, ROUND=2
-            r, g, b = 0x45, 0x47, 0x5a   # border #45475a as 0x00BBGGRR
-            col = ctypes.c_int((b << 16) | (g << 8) | r)
-            for h in {hwnd, parent}:
-                dwm.DwmSetWindowAttribute(
-                    wintypes.HWND(h), 33, ctypes.byref(pref), ctypes.sizeof(pref))
-                dwm.DwmSetWindowAttribute(   # DWMWA_BORDER_COLOR=34
-                    wintypes.HWND(h), 34, ctypes.byref(col), ctypes.sizeof(col))
-        except Exception as e:
-            log.debug("meeting card rounding failed: %s", e)
-
-    def _meeting_card_toggle_min(self):
-        """Collapse the card to just its header bar, or restore it. Tk-thread."""
-        c = self._meeting_card
-        if not c or not self._meeting_card_top:
-            return
-        if c.get("minimized"):
-            self._meeting_card_restore()
-            return
-        for w, _kw in c.get("hideable", []):
-            try:
-                w.pack_forget()
-            except Exception:
-                pass
-        c["minimized"] = True
-        try:
-            c["min_btn"].configure(text="+")
-        except Exception:
-            pass
-        self._position_meeting_card()
-
-    def _meeting_card_restore(self):
-        """Re-expand a minimized card (also auto-called on completion). Tk-thread."""
-        c = self._meeting_card
-        if not c or not self._meeting_card_top or not c.get("minimized"):
-            return
-        for w, kw in c.get("hideable", []):
-            try:
-                w.pack(**kw)
-            except Exception:
-                pass
-        c["minimized"] = False
-        try:
-            c["min_btn"].configure(text="–")
-        except Exception:
-            pass
-        self._position_meeting_card()
-
-    def _position_meeting_card(self):
-        """Anchor bottom-right, clear of the taskbar. Tk-thread only."""
-        top = self._meeting_card_top
-        if not top:
-            return
-        top.update_idletasks()
-        w = max(top.winfo_reqwidth(), 240)
-        h = top.winfo_reqheight()
-        sw = self._root.winfo_screenwidth()
-        sh = self._root.winfo_screenheight()
-        # ~100px up from the screen bottom so the card sits fully ABOVE the
-        # taskbar/tray (a ~48px taskbar + breathing room), not overlapping it.
-        top.geometry(f"{w}x{h}+{sw - w - 16}+{sh - h - 100}")
-
-    def _meeting_card_animate(self):
-        """~150ms loop: spin the active dot + refresh per-stage/total elapsed."""
-        c = self._meeting_card
-        top = self._meeting_card_top
-        if not c or not top or c.get("done"):
-            return
-
-        def fmt(sec):
-            sec = int(max(0, sec))
-            return f"{sec // 60}:{sec % 60:02d}"
-
-        try:
-            c["spin"] = (c["spin"] + 1) % len(self._SPIN_FRAMES)
-            c["elapsed"].configure(text=fmt(time.time() - c["total_start"]))
-            active = c["active"]
-            if active and active in c["rows"]:
-                r = c["rows"][active]
-                if r["state"] == "active":
-                    r["dot"].configure(text=self._SPIN_FRAMES[c["spin"]],
-                                       fg=c["colors"]["ACTIVE"])
-                    el = fmt(time.time() - c["stage_start"]) if c.get("stage_start") else ""
-                    xd = r.get("xdetail") or ""
-                    r["detail"].configure(
-                        text=(f"{xd} · {el}" if xd and el else (xd or el)),
-                        fg=c["colors"]["SUB"])
-            top.after(150, self._meeting_card_animate)
-        except Exception:
-            return
-
-    def _meeting_card_buttons(self, btns):
-        """Append a button row (list of (label, cb, primary)). Every button
-        dismisses the card after firing its callback. Tk-thread only."""
-        c = self._meeting_card
-        top = self._meeting_card_top
-        if not c or not top:
-            return
-        # Completion / error always shows fully — un-minimize if the user did.
-        if c.get("minimized"):
-            self._meeting_card_restore()
-        import tkinter as tk
-        cols = c["colors"]
-        row = tk.Frame(c["outer"], bg=cols["BG"])
-        row.pack(fill="x", pady=(11, 0))
-        c.setdefault("hideable", []).append((row, {"fill": "x", "pady": (9, 0)}))
-
-        def mk(label, cb, primary):
-            base = cols["ACTIVE"] if primary else "#4c4478"   # purple-tinted
-            hov = "#b6d2ff" if primary else "#5d5490"
-            b = tk.Label(row, text=f"  {label}  ", bg=base,
-                         fg="#11111b" if primary else cols["FG"], cursor="hand2",
-                         font=("Segoe UI Variable Text", 8,
-                               "bold" if primary else "normal"),
-                         padx=9, pady=4)
-            b.bind("<Enter>", lambda _e: b.configure(bg=hov))
-            b.bind("<Leave>", lambda _e: b.configure(bg=base))
-
-            def click(_e):
-                self.meeting_status_hide()
-                if cb:
-                    threading.Thread(target=cb, daemon=True).start()
-            b.bind("<Button-1>", click)
-            return b
-
-        # Dismiss is always rightmost; the action buttons sit to its left in
-        # the given order (side='right' packs right-to-left, so reverse).
-        mk("Dismiss", None, False).pack(side="right")
-        for label, cb, primary in reversed(btns):
-            mk(label, cb, primary).pack(side="right", padx=(0, 8))
+    def _mcard_do_stop(self, gen):
+        """Confirmed: fire the meeting's on_discard on a worker; the caller
+        unwinds its pipeline and replaces the card via meeting_status_discarded."""
+        def _do():
+            if self._card_gen_stale(gen):
+                return
+            mo = self._mcard_model
+            cb = (mo or {}).get("on_discard") or (mo or {}).get("_resume", {}).get("on_discard")
+            if mo:
+                mo["kind"] = "processing"
+                mo["title"] = "Stopping…"
+                mo["on_discard"] = None
+                self._mcard_render()
+            if cb:
+                threading.Thread(target=cb, daemon=True).start()
+        self._tk_queue.put(_do)
 
     def _destroy_meeting_card(self):
-        """Tk-thread-side teardown."""
-        if self._meeting_card is not None:
-            self._meeting_card["done"] = True
-        if self._meeting_card_top is not None:
+        """Tk-thread teardown (legacy name; kept for any late caller)."""
+        if self._mcard:
             try:
-                self._meeting_card_top.destroy()
+                self._mcard.hide()
             except Exception:
                 pass
-            self._meeting_card_top = None
-        self._meeting_card = None
+        self._mcard_model = None
 
 
 # ============================================================
@@ -26706,7 +26592,7 @@ class LiaApp:
              "so you can transcribe it later."
              if keep_audio else
              "The recording will be deleted — nothing transcribed or saved."),
-            "🗑  Discard",
+            "Discard meeting",
             on_action=_do_cancel,
             duration_ms=20000,
         )
@@ -26774,7 +26660,8 @@ class LiaApp:
                 _sub = (f"Transcribing with {session.transcribe_label}"
                         if getattr(session, "transcribe_label", "") else "")
                 session._card_gen = self.overlay.meeting_status_start(
-                    cstages, title="Processing meeting", subtitle=_sub)
+                    cstages, title="Processing meeting", subtitle=_sub,
+                    meeting_title=(session.title or session.title_guess or "").strip())
                 self.overlay.meeting_status_step("finalize", gen=session._card_gen)
             try:
                 path = session.stop(save=True)
@@ -26846,11 +26733,19 @@ class LiaApp:
         threading.Thread(target=_finalise_wrapper, daemon=True).start()
 
     def _meeting_done_notify(self, title):
-        """Fire a native tray balloon when a meeting finishes processing — a
-        nudge in case the user is in another window and missed the card."""
+        """One channel per event (2026-09-17 redesign): the completion status
+        CARD is the primary surface. The native tray balloon is a FALLBACK,
+        fired only when the card can't show (the overlay Tk root is down), so a
+        finished meeting isn't announced twice. Safety notices (auto-stop /
+        error) keep their own always-on paths - this only dedups 'ready'."""
         try:
+            card_available = bool(getattr(getattr(self, "overlay", None),
+                                          "_root", None))
+            if card_available:
+                return  # the meeting_status_finish card already announced it
             if self.tray_icon:
-                self.tray_icon.notify(f"{title} — open it from the card", "Lia")
+                self.tray_icon.notify(f"{title} — open it from Lia's meetings",
+                                      "Lia")
         except Exception:
             pass
 
@@ -27763,9 +27658,9 @@ class LiaApp:
 
         try:
             self.overlay.show_prompt(
-                header=f"🎙  {kind_label} meeting detected",
+                header=f"{kind_label} meeting detected",
                 body=body,
-                button_label='🎙  Start recording',
+                button_label='Start recording',
                 on_action=on_start,
                 on_dismiss=on_dismiss,
                 duration_ms=6500,  # auto-dismiss in ~6.5s — no need to click ✕
@@ -27850,22 +27745,26 @@ class LiaApp:
                 self._meeting_detect_consec_absent = 0
 
         if reason == "silence":
-            header = '⏹  Meeting seems over'
+            header = 'Meeting seems over'
             mins = silent_min or int(self.config.get(
                 "meeting_silence_prompt_min", 5) or 5)
             body = (f"No voice for ~{mins} min but the meeting is still "
-                    "recording.\nStop the recording?")
+                    "recording. Stop the recording?")
         else:
-            header = '⏹  Call ended'
-            body = 'The detected call ended.\nStop the recording?'
+            header = 'Call ended'
+            body = 'The detected call ended. Stop the recording?'
 
         try:
             self.overlay.show_prompt(
                 header=header,
                 body=body,
-                button_label='⏹  Stop recording',
+                button_label='Stop recording',
                 on_action=on_stop,
                 on_dismiss=on_continue,
+                # An explicit Keep control (the ✕ means the same); both count
+                # as a deliberate keep, unlike a timeout.
+                secondary_label='Keep recording',
+                on_secondary=on_continue,
                 # 60s window (was 30s): this fires exactly when the user is
                 # wrapping up / stepping away — give it room to be noticed.
                 duration_ms=60000,

@@ -361,7 +361,7 @@ def _nav_html():
 BODY = """
 <div class="shell">
   <nav class="sidebar">
-    <div class="brand"><img class="logo" src="__LOGO_SRC__" alt=""><span class="brand-txt"><span class="brand-name">Lia</span><span class="brand-sub">Local Inference Assistant</span></span></div>
+    <div class="brand"><img class="brand-full" src="__FULLLOGO_SRC__" alt="Lia"><span class="brand-sub">Local Inference Assistant</span></div>
     <div class="nav-search">
       <span class="nav-search-ic">__SEARCH_ICON__</span>
       <input type="text" id="settingsSearch" placeholder="Search settings…" autocomplete="off" spellcheck="false" aria-label="Search settings">
@@ -374,8 +374,9 @@ BODY = """
 """
 BODY = BODY.replace("__NAV__", _nav_html())
 BODY = BODY.replace("__SEARCH_ICON__", uk.icon("search", size=15))
-# Embed the brand orb inline (CSP-safe data: URI; "" if the asset is missing).
-BODY = BODY.replace("__LOGO_SRC__", uk.logo_data_uri())
+# Embed the full brand logo inline (CSP-safe data: URI; "" if the asset is
+# missing, so the header degrades to no image rather than a broken one).
+BODY = BODY.replace("__FULLLOGO_SRC__", uk.full_logo_data_uri())
 
 EXTRA_CSS = """
 /* Maximized / wide window: center the WHOLE app (sidebar + content) as one
@@ -984,8 +985,13 @@ APP_JS = r"""
         mhtml = '<div class="hint">Cleanup is Off - pick a style above to choose a provider &amp; model.</div>'+mhtml;
       }
     }
-    return '<div class="content-head"><h1>AI Cleanup</h1>'+
-      '<span class="status"><span class="dot"></span>'+esc(S.cleanup_model_label||"")+'</span></div>'+
+    // When cleanup is Off no model runs, so the header must not read as active
+    // (a green dot + model name looked like the motor was on - Naor 2026-09-17):
+    // show a muted "Off" instead of the model badge.
+    var head = isOff
+      ? '<span class="status off"><span class="dot"></span>Off</span>'
+      : '<span class="status ok"><span class="dot"></span>'+esc(S.cleanup_model_label||"")+'</span>';
+    return '<div class="content-head"><h1>AI Cleanup</h1>'+head+'</div>'+
       '<div class="page"><div class="section-title">Style</div>'+styles+'</div>'+
       '<div class="page"'+(isOff?' style="opacity:.55"':'')+'><div class="section-title">Provider &amp; model</div>'+mhtml+'</div>';
   };
