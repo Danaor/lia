@@ -1,0 +1,2102 @@
+"""Lia Settings - a pywebview child window (sidebar + pages) on ui_kit.
+
+Spawned by the running app (LiaApp._open_settings_window) with stdin +
+stdout PIPES. It is the single home for everything that used to live in the
+deeply-nested tray "Options" submenus.
+
+IPC (see lia.py for the parent half):
+  child -> parent (stdout, one JSON line per message, prefixed "@@LIA "):
+      {"t":"call","id":N,"method":..,"args":[..]}   - run an allowlisted action
+      {"t":"refresh"}                                - please resend full state
+      {"t":"closed"}                                 - the window is closing
+  parent -> child (stdin, one JSON line each; applied via evaluate_js):
+      {"t":"state","state":{..}}   - full state (re-render current page)
+      {"t":"result","id":N,"ok":..,"msg":..,"data":..}
+      {"t":"tick", ...volatile...} - lightweight status update (no re-render)
+      {"t":"toast","level":..,"msg":..}
+      {"t":"focus","page":..,"focus":..}
+      {"t":"close"}
+
+We must NOT redirect stdout (it is the IPC channel) - only stderr goes to a log.
+"""
+import json
+import os
+import sys
+import threading
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ui_kit as uk  # noqa: E402
+
+CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Lia")
+LOG_PATH = os.path.join(CONFIG_DIR, "settings_window.log")
+
+_WINDOW = None
+_READY = False
+_OUT_LOCK = threading.Lock()
+# The real stdout pipe, captured before anything can reassign it.
+_STDOUT = sys.stdout
+
+
+def _emit(obj):
+    """Send one message to the parent on stdout (prefixed, one line, flushed)."""
+    try:
+        line = "@@LIA " + json.dumps(obj, ensure_ascii=True) + "\n"
+    except Exception:
+        return
+    with _OUT_LOCK:
+        try:
+            _STDOUT.write(line)
+            _STDOUT.flush()
+        except Exception:
+            pass
+
+
+class Bridge:
+    """JS-facing API. JS calls pywebview.api.emit({...}) to reach the parent."""
+
+    def emit(self, msg):
+        try:
+            _emit(msg)
+        except Exception:
+            pass
+        return True
+
+    def mark_ready(self):
+        global _READY
+        _READY = True
+        return True
+
+
+def _push_to_js(msg):
+    """Parent->child: hand a message to the page (buffered there until ready)."""
+    win = _WINDOW
+    if win is None:
+        return
+    try:
+        win.evaluate_js("window.__lia_push(%s)" % json.dumps(msg, ensure_ascii=True))
+    except Exception:
+        pass
+
+
+def _reveal_window():
+    """Bring the window to the front from ANY state: pre-warmed hidden (show),
+    minimized to the taskbar (restore un-minimizes it - show() alone does NOT),
+    or just behind another window (show -> Activate). restore() is a no-op when
+    the window isn't minimized, so calling both is always safe/idempotent."""
+    global _READY
+    win = _WINDOW
+    if win is None:
+        return
+    try:
+        win.restore()   # WindowState -> Normal: un-minimize if minimized
+    except Exception:
+        pass
+    try:
+        win.show()      # Show() + Activate(): visible + foreground
+    except Exception:
+        pass
+    _READY = True  # revealed => JS has certainly run; satisfy the ready watchdog.
+
+
+def _stdin_reader():
+    """Read parent messages line-by-line; EOF or {"t":"close"} => close."""
+    try:
+        for raw in iter(sys.stdin.readline, ""):
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except Exception:
+                continue
+            mt = msg.get("t")
+            if mt == "close":
+                break
+            if mt in ("show", "focus"):
+                _reveal_window()
+            _push_to_js(msg)
+    except Exception:
+        pass
+    # parent gone (EOF) or asked to close -> tear down the window
+    try:
+        if _WINDOW is not None:
+            _WINDOW.destroy()
+    except Exception:
+        pass
+
+
+def _on_closing():
+    _emit({"t": "closed"})
+    return True  # allow the close
+
+
+def _js(obj):
+    """JSON for embedding inside a <script> (guard the </script> sequence)."""
+    return json.dumps(obj, ensure_ascii=True).replace("</", "<\\/")
+
+
+def build_window(webview, payload):
+    global _WINDOW
+    init_state = payload.get("state", {})
+    page = payload.get("page", "general")
+    focus = payload.get("focus", "")
+    prewarm = bool(payload.get("prewarm"))
+    head = ("<script>window.__LIA_INIT__=%s;window.__LIA_PAGE__=%s;"
+            "window.__LIA_FOCUS__=%s;</script>" %
+            (_js(init_state), _js(page), _js(focus or "")))
+    theme = "dark" if (init_state.get("config", {}).get("ui_theme") == "dark") else None
+    html = uk.page("Lia Settings", BODY, extra_css=EXTRA_CSS, extra_js=APP_JS,
+                   head_extra=head, theme=theme)
+    # "settings2" (2026-08-29): a fresh geometry key so every user gets the
+    # new larger centered default ONCE (the old "settings" entry may carry a
+    # cramped/off-screen geometry); resizes are remembered from then on.
+    # clamp_to_workarea keeps the window fully INSIDE the screen-minus-
+    # taskbar area - it must never open touching or behind the taskbar.
+    geo = uk.window_geometry("settings2", {"width": 1100, "height": 780})
+    kw = uk.clamp_to_workarea(geo.get("width", 1100), geo.get("height", 780),
+                              geo.get("x"), geo.get("y"))
+    kw["min_size"] = (820, 600)
+    if prewarm:
+        # Pre-warmed: boot the WebView2 engine + render now, but stay hidden
+        # until the parent sends a reveal (t:"focus"/"show"). WebView2 still
+        # loads the DOM + runs JS while hidden, so the window is ready-and-warm.
+        kw["hidden"] = True
+    _WINDOW = webview.create_window("Lia Settings", html=html, js_api=Bridge(), **kw)
+    try:
+        _WINDOW.events.closing += _on_closing
+    except Exception:
+        pass
+    uk.attach_geometry_memory(_WINDOW, "settings2")
+    threading.Thread(target=_stdin_reader, daemon=True).start()
+    return _WINDOW
+
+
+def _demo_state():
+    """A canned state that exercises every page (for --demo / --html QA)."""
+    return {
+        # Advanced > cloud summary-prompt addendum editor (placeholder text: the
+        # real default lives in lia.py, which this child module must not import)
+        "summary_addendum_default": ("כללים נוספים מחייבים:\n- (demo) כל עובדה קונקרטית "
+                                     "נכנסת לתוך הבולט הרלוונטי.\n- (demo) 'דגשים מרכזיים' "
+                                     "נשאר 3-6 בולטים."),
+        "summary_base_prompt": ("You are an experienced project manager writing the final "
+                                "Hebrew meeting summary. (demo placeholder for the full base "
+                                "prompt - the real one is ~150 lines and lives in lia.py.)\n\n"
+                                "## כותרת הדיון\n## תקציר\n## דגשים מרכזיים\n## משימות"),
+        "summary_templates": [
+            {"id": "technical", "name_en": "Technical / Project",
+             "desc_en": "Project-manager notes: decisions, project status, work done, tasks with owners."},
+            {"id": "general", "name_en": "General meeting",
+             "desc_en": "A clean everyday recap: summary, key points, decisions, tasks, open questions."},
+            {"id": "minutes", "name_en": "Detailed minutes",
+             "desc_en": "Formal minutes: participants, topics, decisions with rationale, action items, next steps."},
+        ],
+        "config": {
+            "hotkey": "ctrl+space", "recording_mode": "toggle",
+            "paste_mode": "auto_paste", "clipboard_auto_restore": True,
+            "press_enter_after_paste": False, "silent_mode": True,
+            "beep_device_index": "off", "recording_source": "both",
+            "input_device_index": 1, "loopback_device_index": None,
+            "cleanup_style": "spoken", "auto_detect_meetings": True,
+            "custom_vocabulary": "git, push, React, GuardDuty, Landing Zone",
+            "vocab_autolearn": True, "meeting_model": "local_hebrew_turbo",
+            "file_transcribe_model": "", "summary_model": "gpt-6-sol",
+            "summary_template": "general", "whisper_device": "auto",
+        },
+        "secrets": {"openai_api_key": "sk-abc…7xQ", "groq_api_key": "",
+                    "gemini_api_key": "AQ.xyz…9kk", "assemblyai_api_key": "",
+                    "hf_token": "", "remote_server_token": ""},
+        "has": {"openai_api_key": True, "groq_api_key": False,
+                "gemini_api_key": True, "assemblyai_api_key": False,
+                "hf_token": False, "remote_server_token": False},
+        # the demo shows the red "rejected" state on the Gemini card
+        "rejected": {"openai_api_key": False, "groq_api_key": False,
+                     "gemini_api_key": True},
+        # ... and a newer release (the Home + Advanced update bar)
+        "update": {"available": True, "version": "1.6.6", "current": "1.6.5",
+                   "kind": "installer", "url": "https://github.com/Danaor/lia/releases/latest",
+                   "status": "idle", "progress": 0, "error": "", "auto": True},
+        "status_line": "Ready", "model_loaded": True, "recording": False,
+        "meeting_active": False, "live_transcript_available": False,
+        "home": {"recording_source": "both", "mic_name": "JOUNIVO Mic",
+                 "meeting_mic_name": "Jabra Headset", "action_items_open": 3,
+                 "speaker_profiles": [
+                     {"name": "דנה", "count": 3, "updated": "2026-09-14"},
+                     {"name": "Avi Bar-Yuda", "count": 1, "updated": "2026-09-17"}],
+                 "recent_meetings": [
+                     {"title": "Meeting %d" % i,
+                      "date": "2026-09-%02d %02d:%02d" % (16 - i // 3, 9 + i % 8, (i * 7) % 60),
+                      "path": "m%d" % i, "has_summary": (i % 3 == 0)}
+                     for i in range(24)]},
+        "loopback_available": True, "whisper_device_label": "Auto",
+        "cleanup_model_label": "gpt-6-luna", "cleanup_provider": "openai",
+        "vocab_pending": 4, "auto_start": True,
+        "serve": {"enabled": True, "autostart": False, "running": True,
+                  "port": 9090, "has_token": False,
+                  "tailscale_ip": "100.100.100.100",
+                  "ws_url": "ws://100.100.100.100:9090",
+                  "host": "auto", "host_label": "Tailscale 100.100.100.100",
+                  "insecure": False,
+                  "role": "server", "model": "",
+                  "gpu": {"has_cuda": True, "name": "NVIDIA GeForce RTX 3090",
+                          "vram_gb": 24.0, "verdict": "good",
+                          "note": "NVIDIA GeForce RTX 3090 · 24 GB VRAM - good "
+                                  "for hosting a transcription server."}},
+        "lexicon": {"installed": True, "loaded": True, "enabled": True,
+                    "suggest": True, "size_mb": 5.7, "words": 341806},
+        "hotkeys": {"main": "ctrl+space", "undo": "ctrl+alt+z", "cancel": "esc",
+                    "ask": "ctrl+alt+m", "actions": "ctrl+alt+t",
+                    "email": "ctrl+alt+f", "chat": "ctrl+alt+c"},
+        "paths": {"config": r"C:\Users\you\AppData\Roaming\Lia",
+                  "log": r"C:\Users\you\AppData\Roaming\Lia\lia.log",
+                  "meetings": r"C:\Users\you\AppData\Roaming\Lia\meetings"},
+        "mics": [{"idx": 1, "name": "USB Microphone"},
+                 {"idx": 2, "name": "Logitech C920"}],
+        "loopbacks": [{"idx": 5, "name": "Speakers (Realtek)"}],
+        "outputs": [{"idx": 3, "name": "Speakers (Realtek)"},
+                    {"idx": 4, "name": "Focusrite USB"}],
+        "tables": {
+            "dictation": [{"idx": 0, "label": "Whisper Hebrew Local", "checked": True, "where": "local", "wnote": "GPU (4 GB+) recommended · slower on CPU"},
+                          {"idx": 1, "label": "Parakeet Multi-Language Local (25 languages)", "checked": False, "where": "local", "wnote": "fast on a plain CPU · no GPU needed"},
+                          {"idx": 4, "label": "OpenAI GPT transcribe", "checked": False, "where": "cloud", "wnote": "API key set · ~$0.27 per audio hour"},
+                          {"idx": 6, "label": "Groq Multi-Language", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · Free Tier Available"},
+                          {"idx": 7, "label": "Gemini 3.5 transcribe Multi-Language", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · Free Tier Available · ~3.6s, slower than Groq"},
+                          {"idx": 8, "label": "Remote Transcription server", "checked": False, "where": "remote"}],
+            "meeting": [{"key": "local_hebrew_turbo", "label": "Whisper Hebrew Local", "checked": True, "enabled": True, "where": "local", "wnote": "GPU (4 GB+) recommended · CPU: ready ~5 min after a 1h meeting", "note": ""},
+                        {"key": "local_pyannote_hebrew", "label": "Whisper Hebrew Local + Pyannote Diarization", "checked": False, "enabled": True, "where": "local", "wnote": "GPU (6 GB+) strongly recommended · CPU: ~90 min per meeting hour", "note": ""},
+                        {"key": "local_parakeet_english", "label": "Parakeet Multi-Language Local (25 languages)", "checked": False, "enabled": True, "where": "local", "wnote": "fast on a plain CPU · no GPU needed", "note": ""},
+                        {"key": "local_pyannote_parakeet", "label": "Parakeet Multi-Language Local + Pyannote Diarization", "checked": False, "enabled": True, "where": "local", "wnote": "GPU (6 GB+) strongly recommended · CPU: ~90 min per meeting hour", "note": ""},
+                        {"key": "local_multilang_turbo", "label": "Whisper Multi-Language Local (99 languages)", "checked": False, "enabled": True, "where": "local", "wnote": "GPU (4 GB+) recommended · CPU: ready ~5 min after a 1h meeting", "note": ""},
+                        {"key": "local_pyannote_multilang", "label": "Whisper Multi-Language Local + Pyannote Diarization", "checked": False, "enabled": True, "where": "local", "wnote": "GPU (6 GB+) strongly recommended · CPU: ~90 min per meeting hour", "note": ""},
+                        {"key": "gemini_transcribe", "label": "Gemini 3.5 transcribe Multi-Language", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · Free Tier Available", "note": "needs gemini_api_key"},
+                        {"key": "openai_gpt_transcribe", "label": "OpenAI GPT transcribe", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · ~$0.27 per meeting hour", "note": "needs openai_api_key"}],
+            "file": [{"key": "", "label": "Same as meeting model", "checked": True, "enabled": True, "note": ""}],
+            "summary": [{"model": "off", "label": "Off - transcript only (no AI summary)", "checked": True, "enabled": True, "note": ""},
+                        {"model": "gpt-6-sol", "label": "OpenAI ChatGPT 6 Sol", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · ~$0.05 per meeting summary", "note": ""},
+                        {"model": "gemini-3.8-flash", "label": "Gemini 3.8 Flash", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · Free Tier Available", "note": "set Gemini key"},
+                        {"model": "gemma4:31b-it-qat", "label": "Gemma 4 31B QAT (best quality · needs a 24 GB GPU)", "checked": False, "enabled": False, "where": "local", "note": "start Ollama"}],
+            "cleanup_styles": [{"style": "off", "label": "Off - raw transcription", "checked": False},
+                               {"style": "spoken", "label": "Spoken - remove fillers + self-corrections", "checked": True},
+                               {"style": "proofread", "label": "Proofread - full polish", "checked": False}],
+            "cleanup_models": [{"provider": "gemini", "model": "gemini-3.5-flash-lite", "label": "Gemini 3.5 Flash-Lite (free, fastest)", "checked": False},
+                               {"provider": "openai", "model": "gpt-6-luna", "label": "OpenAI ChatGPT 6 Luna - light, fast", "checked": True}],
+            "device": [{"key": "auto", "label": "Auto (GPU if available)", "checked": True},
+                       {"key": "cuda", "label": "GPU (CUDA)", "checked": False},
+                       {"key": "cpu", "label": "CPU (no GPU needed)", "checked": False}],
+            "gpu_busy": [{"key": k, "label": l, "checked": k == "openai", "enabled": k != "groq"}
+                         for k, l in (("openai", "OpenAI"), ("gemini", "Gemini"), ("groq", "Groq"),
+                                      ("off", "Off (wait for the GPU)"))],
+            "summary_gpu_busy": [{"key": k, "label": l, "checked": k == "off", "enabled": k != "groq"}
+                                 for k, l in (("openai", "OpenAI"), ("gemini", "Gemini"), ("groq", "Groq"),
+                                              ("off", "Off (wait for the GPU)"))],
+            "cleanup_any_key": True,
+        },
+    }
+
+
+def _demo_html(page="general"):
+    head = ("<script>window.__LIA_INIT__=%s;window.__LIA_PAGE__=%s;"
+            "window.__LIA_FOCUS__='';window.__LIA_DEMO__=true;</script>" %
+            (_js(_demo_state()), _js(page)))
+    return uk.page("Lia Settings", BODY, extra_css=EXTRA_CSS, extra_js=APP_JS,
+                   head_extra=head)
+
+
+def main():
+    if "--html" in sys.argv:
+        out = sys.argv[sys.argv.index("--html") + 1]
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(_demo_html())
+        sys.stdout.write("wrote %s\n" % out)
+        return
+    if "--demo" in sys.argv:
+        try:
+            import webview
+        except Exception as e:
+            sys.stderr.write("pywebview unavailable: %r\n" % (e,))
+            sys.exit(2)
+        webview.create_window("Lia Settings (demo)", html=_demo_html(),
+                              width=960, height=680, min_size=(760, 540))
+        uk.webview_start(webview)
+        return
+    # stderr -> log; stdout stays the IPC channel (never redirect it).
+    uk.install_stderr_sink(LOG_PATH)
+    # A pre-warmed window stays hidden until the user opens it, so it may not be
+    # "ready" for a while (it flips ready on reveal). Give its watchdog lots of
+    # slack; a normal visible open keeps the tight 30s hang-guard.
+    prewarm = False
+    try:
+        prewarm = bool(uk.read_payload().get("prewarm"))
+    except Exception:
+        prewarm = False
+    uk.child_main(build_window, ready_check=lambda: _READY,
+                  watchdog_s=(3600 if prewarm else 30))
+
+
+# ============================================================
+# Front-end
+# ============================================================
+# Sidebar nav, grouped by task (page ids unchanged so deep links keep working).
+# Each item is (page id, ui_kit icon name, label). Local SVG icons, not emoji.
+_NAV_GROUPS = [
+    ("Daily use", [
+        ("general", "general", "General"),
+        ("audio", "audio", "Audio"),
+        ("meetings", "meetings", "Meetings"),
+    ]),
+    ("Transcription & text", [
+        ("models", "models", "Models"),
+        ("cleanup", "cleanup", "AI Cleanup"),
+        ("vocab", "vocabulary", "Vocabulary"),
+        ("snippets", "snippets", "Snippets"),
+    ]),
+    ("Connections & advanced", [
+        ("keys", "keys", "API Keys"),
+        ("server", "server", "Transcription server"),
+        ("advanced", "advanced", "Advanced"),
+    ]),
+]
+
+
+def _nav_button(page_id, icon_name, label):
+    return ('<button class="nav-item" data-page="%s"><span class="ico">%s</span>%s</button>'
+            % (page_id, uk.icon(icon_name, size=20), label))
+
+
+def _nav_html():
+    parts = [_nav_button("home", "home", "Home")]
+    for group_label, items in _NAV_GROUPS:
+        parts.append('<div class="nav-group">%s</div>' % uk._h(group_label))
+        parts.extend(_nav_button(*it) for it in items)
+    return "\n    ".join(parts)
+
+
+BODY = """
+<div class="shell">
+  <nav class="sidebar">
+    <div class="brand"><img class="brand-full" src="__FULLLOGO_SRC__" alt="Lia"></div>
+    <div class="nav-search">
+      <span class="nav-search-ic">__SEARCH_ICON__</span>
+      <input type="text" id="settingsSearch" placeholder="Search settings…" autocomplete="off" spellcheck="false" aria-label="Search settings">
+      <div id="searchResults" class="search-results" role="listbox" hidden></div>
+    </div>
+    __NAV__
+  </nav>
+  <main class="content" id="content"></main>
+</div>
+"""
+BODY = BODY.replace("__NAV__", _nav_html())
+BODY = BODY.replace("__SEARCH_ICON__", uk.icon("search", size=15))
+# Embed the full brand logo inline (CSP-safe data: URI; "" if the asset is
+# missing, so the header degrades to no image rather than a broken one).
+BODY = BODY.replace("__FULLLOGO_SRC__", uk.full_logo_data_uri())
+
+EXTRA_CSS = """
+/* Maximized / wide window: center the WHOLE app (sidebar + content) as one
+   capped block. SETTINGS pages keep a readable form width, centered in the work
+   area; the HOME page (data-dense: meetings list + preview) uses the full width
+   so a maximized window is put to work instead of stretched into empty gutters.
+   The sidebar stays edge-anchored (fixed width, first in the flex row). */
+.content:not(.home-mode){max-width:1000px; margin-inline:auto;}
+.content.home-mode{max-width:none; margin-inline:0;
+  padding:16px 22px; display:flex; flex-direction:column; gap:12px; overflow:hidden;}
+
+/* --- Home: compact header row (title + status + primary actions) --- */
+.home-head{display:flex; align-items:center; gap:12px; flex-wrap:wrap;}
+.home-head h1{margin:0; font-size:var(--fs-title); font-weight:700; color:var(--ink);}
+.home-head .hh-actions{margin-inline-start:auto; display:flex; gap:8px;
+  align-items:center; flex-wrap:wrap;}
+.home-menu{position:relative;}
+.home-menu-pop{position:absolute; inset-inline-end:0; top:calc(100% + 4px); z-index:20;
+  background:var(--card); border:1px solid var(--line); border-radius:var(--r-m);
+  box-shadow:var(--shadow); min-width:210px; padding:6px; display:none;}
+.home-menu.open .home-menu-pop{display:block;}
+.home-menu-pop button{display:flex; align-items:center; gap:9px; width:100%;
+  text-align:start; background:none; border:0; color:var(--ink); cursor:pointer;
+  font:inherit; padding:8px 10px; border-radius:var(--r-s);}
+.home-menu-pop button:hover{background:var(--accent-soft);}
+.home-info{display:flex; flex-wrap:wrap; gap:8px; align-items:center;}
+.home-actions{display:flex; flex-wrap:wrap; gap:8px; align-items:center;}
+.home-live{display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+  padding:8px 12px; border:1px solid var(--accent); border-radius:var(--r-m);
+  background:var(--accent-soft);}
+/* a newer Lia release is available (Home + Advanced > About) */
+.upd-bar{display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin:0 0 12px;
+  padding:8px 12px; border:1px solid var(--info); border-radius:var(--r-m);
+  background:var(--info-soft);}
+.upd-bar .grow{flex:1 1 auto;}
+.upd-bar .upd-err{color:var(--err); font-weight:600;}
+
+/* --- Home: meetings area fills the remaining height --- */
+.home-body{flex:1 1 auto; min-height:0; display:flex; gap:14px;}
+.mtg-list{display:flex; flex-direction:column; min-height:0; flex:1 1 44%;
+  border:1px solid var(--line); border-radius:var(--r-l); background:var(--card);
+  overflow:hidden;}
+.mtg-listhead{display:flex; align-items:center; gap:8px; padding:8px 10px;
+  border-bottom:1px solid var(--line);}
+.mtg-search{flex:1 1 auto; position:relative; display:flex; align-items:center;}
+.mtg-search .ic{position:absolute; inset-inline-start:9px; color:var(--faint);
+  display:inline-flex; pointer-events:none;}
+.mtg-search input{width:100%; padding:7px 10px 7px 30px; border:1px solid var(--line);
+  border-radius:var(--r-s); background:var(--bg); color:var(--ink); font:inherit;}
+.mtg-search input:focus{outline:none; border-color:var(--accent); box-shadow:var(--ring);}
+.mtg-count{color:var(--muted); font-size:var(--fs-small); flex:0 0 auto;}
+.mtg-rows{flex:1 1 auto; overflow-y:auto; min-height:0; padding:6px;}
+.mtg-row{display:grid; grid-template-columns:1fr auto; gap:4px 10px; align-items:center;
+  width:100%; text-align:start; cursor:pointer; font:inherit; color:var(--ink);
+  background:none; border:1px solid transparent; border-radius:var(--r-s);
+  padding:8px 10px; margin-bottom:2px;}
+.mtg-row:hover{background:var(--accent-soft);}
+.mtg-row.sel{background:var(--accent-soft); border-color:var(--accent);}
+.mtg-row .rn{font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.mtg-row .rmeta{grid-column:1 / -1; display:flex; align-items:center; gap:8px;
+  color:var(--muted); font-size:var(--fs-small);}
+.mtg-row .rtag{font-weight:700; color:var(--accent); background:var(--accent-soft);
+  border-radius:var(--r-pill); padding:0 7px;}
+.mtg-row .rdate{font-variant-numeric:tabular-nums;}
+.mtg-empty{color:var(--muted); padding:18px 12px; font-size:var(--fs-hint);}
+
+/* --- Home: preview pane (selected meeting) --- */
+.mtg-preview{flex:1 1 56%; min-height:0; overflow-y:auto;
+  border:1px solid var(--line); border-radius:var(--r-l); background:var(--card);
+  padding:16px 18px;}
+.mtg-preview .pv-title{font-size:var(--fs-section); font-weight:700; margin:0 0 2px;}
+.mtg-preview .pv-sub{color:var(--muted); font-size:var(--fs-hint); margin-bottom:12px;}
+.mtg-preview .pv-actions{display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px;}
+.mtg-preview .pv-body{white-space:pre-wrap; line-height:1.5; color:var(--ink-2);
+  font-size:var(--fs-base);}
+.mtg-preview .pv-none{color:var(--muted);}
+.mtg-preview.empty{display:flex; align-items:center; justify-content:center;
+  color:var(--faint); text-align:center;}
+/* Normal / narrow window: one column, the preview drops (selecting opens the
+   editor instead). Wide window: list + preview side by side. */
+@media (max-width: 980px){
+  .home-body{flex-direction:column;}
+  .mtg-preview{display:none;}
+  .mtg-list{flex:1 1 auto;}
+}
+.kv{display:flex; gap:8px; flex-wrap:wrap; font-size:var(--fs-hint); color:var(--muted);}
+.kv .k{color:var(--ink-2); font-weight:600;}
+/* Keys & Server page: each service is a standalone card on the page ground
+   (the wrapping .page frame is dropped via .keys-page) with subtle depth. */
+.page.keys-page{background:transparent; border:none; box-shadow:none; padding:0;}
+.credcard{background:var(--card); border:1px solid var(--line); border-radius:var(--r-l);
+  padding:18px 20px; margin-bottom:16px; box-shadow:0 1px 2px rgba(16,24,40,.05);
+  transition:box-shadow .18s ease, border-color .18s ease;}
+.credcard:hover{border-color:var(--line-2);
+  box-shadow:0 1px 2px rgba(16,24,40,.06), 0 10px 24px rgba(16,24,40,.07);}
+.credcard .head{display:flex; align-items:center; gap:12px; margin-bottom:14px;}
+.credcard .bdg{width:38px;height:38px;border-radius:11px;display:flex;align-items:center;
+  justify-content:center;font-weight:800;font-size:16px;color:var(--on-accent);flex:0 0 38px;
+  box-shadow:0 2px 6px rgba(16,24,40,.16), inset 0 1px 0 rgba(255,255,255,.28);}
+.credcard .bdg.img{background:#fff;padding:6px;box-shadow:0 2px 6px rgba(16,24,40,.16),
+  inset 0 0 0 1px rgba(16,24,40,.08);}
+.credcard .bdg.img img{width:100%;height:100%;object-fit:contain;display:block;}
+.credcard h3{margin:0;font-size:15.5px;font-weight:700;letter-spacing:-.01em;}
+.credcard .sub{color:var(--muted);font-size:var(--fs-hint);margin-top:2px;line-height:1.45;}
+/* current-key value shown as a soft pill (dashed + faint when unset) */
+.credcard .keyline{display:flex; align-items:center; gap:8px; margin:0 0 12px;
+  font-size:var(--fs-hint); color:var(--muted);}
+.credcard .keyline .masked{font-size:12px; background:var(--accent-soft);
+  border:1px solid var(--line); padding:3px 10px; border-radius:var(--r-pill); letter-spacing:.02em;}
+.credcard .keyline .masked.empty{background:transparent; border-style:dashed;}
+/* the provider rejected the saved key (revoked / deleted / mistyped) */
+.credcard .keyline .masked.bad{color:var(--err); background:var(--err-soft); border-color:var(--err);}
+.credcard .keybad{margin:-4px 0 12px; font-size:var(--fs-hint); color:var(--err); font-weight:600;}
+.credcard .row-inline{margin-top:2px;}
+.btnrow{display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:12px;}
+.btnrow .grow{flex:1 1 auto;}
+.tbl{width:100%; border-collapse:collapse;}
+.tbl td{padding:7px 6px; border-bottom:1px solid var(--line); vertical-align:middle;}
+.tbl td.act{width:36px; text-align:end;}
+.muted{color:var(--muted);}
+.tbl tr.corr-unused td{opacity:.5;}
+.tbl tr.corr-unused .muted{color:var(--warn);}
+.note{color:var(--warn); font-size:var(--fs-hint); margin-inline-start:8px;}
+.rowbtn{display:flex; align-items:center; gap:10px; padding:9px 12px; border:1px solid var(--line);
+  border-radius:var(--r-s); margin-bottom:8px; cursor:pointer; transition:background var(--tr),border-color var(--tr);}
+.rowbtn:hover{background:var(--accent-soft); border-color:var(--accent);}
+.rowbtn .ic{display:inline-flex; align-items:center; justify-content:center; width:20px; flex:0 0 20px; color:var(--muted);}
+.rowbtn:hover .ic{color:var(--accent);}
+
+/* --- settings search (sidebar) ----------------------------------------- */
+.nav-search{position:relative; margin:0 6px 8px; display:flex; align-items:center;}
+.nav-search-ic{position:absolute; inset-inline-start:9px; display:inline-flex; color:var(--faint); pointer-events:none;}
+.nav-search input{width:100%; padding:8px 10px 8px 30px; border:1px solid var(--line);
+  border-radius:var(--r-s); background:var(--card); color:var(--ink); font-size:var(--fs-hint);}
+.nav-search input:focus{outline:none; border-color:var(--accent); box-shadow:var(--ring);}
+.search-results{position:absolute; top:calc(100% + 4px); inset-inline:0; z-index:20;
+  background:var(--card); border:1px solid var(--line); border-radius:var(--r-m);
+  box-shadow:var(--shadow); max-height:320px; overflow:auto; padding:4px;}
+.search-results .sr{display:block; width:100%; text-align:start; border:0; background:transparent;
+  cursor:pointer; padding:7px 9px; border-radius:var(--r-s); color:var(--ink); font-family:inherit; font-size:var(--fs-hint);}
+.search-results .sr:hover,.search-results .sr.hi{background:var(--accent-soft);}
+.search-results .sr .sr-page{display:block; font-size:var(--fs-small); color:var(--muted); margin-top:1px;}
+.search-results .sr-none{padding:10px 9px; color:var(--muted); font-size:var(--fs-hint); text-align:center;}
+/* flash a jumped-to setting so the eye lands on it */
+@keyframes settingFlash{0%{background:var(--accent-soft);}100%{background:transparent;}}
+.setting-flash{animation:settingFlash 1.3s ease-out;}
+
+/* --- Models: active-engines summary ------------------------------------ */
+.eng-grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:10px;}
+.eng{border:1px solid var(--line); border-radius:var(--r-m); padding:11px 13px; background:var(--card-2);}
+.eng-role{font-size:var(--fs-small); font-weight:600; color:var(--muted);}
+.eng-name{font-size:var(--fs-base); font-weight:600; color:var(--ink); margin:2px 0 7px; line-height:1.35; word-break:break-word;}
+.eng-name.muted{color:var(--faint); font-weight:500;}
+.eng-meta{display:flex; align-items:center; gap:8px; flex-wrap:wrap;}
+.place{font-size:var(--fs-small); font-weight:700; padding:2px 8px; border-radius:var(--r-pill);}
+.place.local{background:var(--ok-soft); color:var(--ok);}
+.place.cloud{background:var(--info-soft); color:var(--info);}
+.place.server{background:var(--accent-soft); color:var(--accent);}
+
+/* --- Home landing page -------------------------------------------------- */
+.hchips{display:flex; flex-wrap:wrap; gap:8px;}
+.hchip{font-size:var(--fs-hint); color:var(--ink-2); background:var(--card-2); border:1px solid var(--line);
+  border-radius:var(--r-pill); padding:4px 11px;}
+.home-hero{display:flex; flex-direction:column; align-items:flex-start; gap:10px;}
+.home-hero.live{border-color:var(--accent);}
+.home-hero .hero-title{font-size:var(--fs-section); font-weight:700; display:flex; align-items:center; gap:8px;}
+.btn.big{font-size:15px; padding:11px 20px; display:inline-flex; align-items:center; gap:9px;}
+.home-acts{display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px;}
+.home-act{appearance:none; cursor:pointer; font-family:inherit; text-align:start;
+  display:flex; align-items:center; gap:10px; padding:12px 14px; border:1px solid var(--line);
+  border-radius:var(--r-m); background:var(--card); color:var(--ink); font-size:var(--fs-base); font-weight:500;
+  transition:border-color var(--tr),background var(--tr);}
+.home-act:hover{border-color:var(--accent); background:var(--accent-soft);}
+.home-act:focus-visible{outline:none; box-shadow:var(--ring);}
+.home-act .ha-ic{color:var(--muted); display:inline-flex;}
+.home-act:hover .ha-ic{color:var(--accent);}
+.recent-row{appearance:none; cursor:pointer; font-family:inherit; width:100%; text-align:start;
+  display:flex; align-items:center; gap:10px; padding:9px 12px; border:1px solid var(--line);
+  border-radius:var(--r-s); background:var(--card); color:var(--ink); margin-top:8px; font-size:var(--fs-base);
+  transition:border-color var(--tr),background var(--tr);}
+.recent-row:hover{border-color:var(--accent); background:var(--accent-soft);}
+.recent-row:focus-visible{outline:none; box-shadow:var(--ring);}
+.recent-row .rr-ic{color:var(--muted); display:inline-flex; flex:0 0 auto;}
+.recent-row .rr-title{flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.recent-row .rr-tag{font-size:var(--fs-small); font-weight:700; color:var(--accent); background:var(--accent-soft);
+  border-radius:var(--r-pill); padding:1px 8px; flex:0 0 auto;}
+.recent-row .rr-date{font-size:var(--fs-small); color:var(--muted); font-variant-numeric:tabular-nums; flex:0 0 auto;}
+/* Recent meetings: a scroll area so the last ~30 are reachable without the Home
+   page growing unbounded. Sized to ~7 rows; the rest scroll. A little end
+   padding keeps the scrollbar off the row borders. */
+.recent-list{max-height:360px; overflow-y:auto; padding-inline-end:4px;}
+.recent-list .recent-row:first-child{margin-top:0;}
+.rowbtn .hk{margin-inline-start:auto; color:var(--muted); font-size:var(--fs-hint);}
+/* A badge (e.g. BETA) takes over the right-push; the hotkey trails it. */
+.rowbtn .wb{margin-inline-start:auto;}
+.rowbtn .wb ~ .hk{margin-inline-start:0;}
+.disabledrow{opacity:.5;}
+.subhead{font-size:13px; font-weight:600; margin:14px 0 2px;}
+/* Small provider logo before a model label (OpenAI / Gemini rows). */
+.radio .txt .prov-ico{width:15px;height:15px;object-fit:contain;
+  vertical-align:-3px;margin-inline-end:7px;border-radius:3px;}
+"""
+
+APP_JS = r"""
+(function(){
+  var S = window.__LIA_INIT__ || {};
+  var PAGE = window.__LIA_PAGE__ || "home";
+  var FOCUS = window.__LIA_FOCUS__ || "";
+  // Provider/model logos (inlined data URIs; "" -> the placeholder stays, guarded below).
+  var PROV_LOGO = {openai:"__OPENAI_LOGO__", gemini:"__GEMINI_LOGO__",
+                   groq:"__GROQ_LOGO__", parakeet:"__PARAKEET_LOGO__",
+                   whisper:"__WHISPER_LOGO__"};
+  function provIcon(label){
+    var l = (label||"").toLowerCase();
+    var key = l.indexOf("gemini")>=0 ? "gemini"
+            : l.indexOf("openai")>=0 ? "openai"
+            : l.indexOf("parakeet")>=0 ? "parakeet"
+            : l.indexOf("groq")>=0 ? "groq"
+            : (l.indexOf("whisper")>=0 ? "whisper" : "");
+    var src = key && PROV_LOGO[key];
+    if(!src || src.indexOf("data:")!==0) return "";
+    return '<img class="prov-ico" src="'+src+'" alt="">';
+  }
+  var DRAFT = {};            // text fields that must survive re-render, by id
+  var pending = {};          // call id -> {resolve}
+  var nextId = 1;
+  var homeSearch = "";       // Home: meetings search query (survives re-render)
+  var homeSel = null;        // Home: selected meeting path (drives the preview)
+  var $ = RK.$;
+
+  function esc(s){ return RK.esc(s); }
+  function cfg(k, d){ var c = S.config || {}; return (k in c) ? c[k] : d; }
+  function draftOr(id, val){ return (id in DRAFT) ? DRAFT[id] : val; }
+
+  function call(method, args, slow){
+    if(window.__LIA_DEMO__) return demoCall(method, args||[]);
+    var id = nextId++;
+    RK.api && RK.api.emit({t:"call", id:id, method:method, args:args||[]});
+    return new Promise(function(res){ pending[id] = {res:res, slow:!!slow}; });
+  }
+  // Offline demo (ui_kit_gallery / _demo_html): resolve a few reads with fakes so
+  // the layout is previewable without the parent process.
+  function demoCall(method, args){
+    return new Promise(function(res){ setTimeout(function(){
+      if(method==="get_meeting_details"){
+        res({ok:true, data:{has_summary:true, diarized:true, date:"2026-09-14 16:07",
+          summary_text:"## תקציר\nפגישת דמו על מדיניות ענן.\n\n## דגשים\n- נקודה ראשונה לדוגמה\n- נקודה שנייה\n\n## משימות\n- [ ] לסיים את המסמך"}});
+        return; }
+      res({ok:true, msg:""});
+    }, 60); });
+  }
+
+  // ---------- generic control builders ----------
+  function field(label, control, hint){
+    return '<div class="field"><label>'+esc(label)+'</label>'+control+
+      (hint?'<div class="hint">'+esc(hint)+'</div>':'')+'</div>';
+  }
+  function sw(label, checked, method, disabled){
+    return '<label class="switch'+(disabled?' disabled':'')+'">'+
+      '<input type="checkbox" data-toggle="'+esc(method)+'"'+(checked?' checked':'')+
+      (disabled?' disabled':'')+'><span class="track"></span><span>'+esc(label)+'</span></label>';
+  }
+  var WB_TEXT = {local:'🖥️ LOCAL', cloud:'CLOUD',
+                 remote:'REMOTE LOCAL GPU'};
+  var WB_SUB = {remote:'Use a GPU on another PC in your local network'};
+  function radio(name, method, arg, argtype, label, checked, enabled, note, where, wnote, noicon){
+    var dis = enabled===false;
+    var wsub = wnote || (where ? (WB_SUB[where]||'') : '');
+    var badge = '';
+    if(where){
+      var pill = '<span class="wb '+esc(where)+'">'+(WB_TEXT[where]||esc(where))+'</span>';
+      if(wsub){
+        badge = '<span class="wb-group">'+pill+'<span class="wb-sub">'+esc(wsub)+'</span></span>';
+      } else {
+        badge = pill;
+      }
+    }
+    return '<label class="radio'+(checked?' on':'')+(dis?' disabled':'')+'">'+
+      '<input type="radio" name="'+esc(name)+'" data-radio="'+esc(method)+'" '+
+      'data-arg="'+esc(arg)+'" data-argtype="'+(argtype||'str')+'"'+
+      (checked?' checked':'')+(dis?' disabled':'')+'>'+
+      '<span class="box"></span><span class="txt">'+(noicon?'':provIcon(label))+esc(label)+
+      (note?'<small>'+esc(note)+'</small>':'')+'</span>'+badge+'</label>';
+  }
+  function btn(label, method, args, kind, slow){
+    return '<button class="btn '+(kind||'')+'" data-call="'+esc(method)+'" '+
+      'data-args=\''+esc(JSON.stringify(args||[]))+'\''+(slow?' data-slow="1"':'')+
+      '>'+esc(label)+'</button>';
+  }
+
+  // A newer Lia release (S.update, from the parent's GitHub check): one bar,
+  // shown on Home and on Advanced > About. Installed copy -> "Update now"
+  // (download + verify + silent install + restart); portable -> "Download".
+  function updateBar(){
+    var u = S.update || {};
+    if(!u.available) return '';
+    var txt, acts = '';
+    if(u.status === 'downloading'){
+      txt = 'Downloading Lia '+esc(u.version)+'… '+(u.progress||0)+'%';
+    } else if(u.status === 'installing'){
+      txt = 'Installing Lia '+esc(u.version)+' - Lia restarts in a moment';
+    } else {
+      txt = '<b>Lia '+esc(u.version)+' is available</b> (you have '+esc(u.current)+')';
+      acts = btn(u.kind === 'installer' ? 'Update now' : 'Download', 'update_now', [], 'primary', true);
+    }
+    return '<div class="upd-bar">'+RK.icon('download',{size:16})+'<span class="grow">'+txt+
+      (u.error ? ' <span class="upd-err">'+esc(u.error)+'</span>' : '')+'</span>'+acts+
+      (u.url ? '<a href="#" data-openurl="'+esc(u.url)+'">What’s new ↗</a>' : '')+'</div>';
+  }
+
+  // ---------- page renderers ----------
+  var PAGES = {};
+
+  // Home page state: the meetings search query + the selected meeting path
+  // (survive re-renders; the preview loads that meeting's summary on the side).
+  function homeMeetings(){ return ((S.home||{}).recent_meetings)||[]; }
+  function homeFiltered(){
+    var q = (homeSearch||'').toLowerCase();
+    return homeMeetings().filter(function(m){
+      return !q || (m.title||'').toLowerCase().indexOf(q)>=0; });
+  }
+  function homeIsNarrow(){ return window.matchMedia('(max-width: 980px)').matches; }
+
+  PAGES.home = function(){
+    var h = S.home || {}, hk = S.hotkeys || {};
+    var active = !!S.meeting_active;
+
+    // --- compact header: title + status + overflow menu (primary actions sit
+    //     UNDER the info line, per Naor 2026-09-16) ---
+    var statusPill = '<span class="status ok"><span class="dot"></span>'+
+      esc(S.status_line||'Ready')+'</span>';
+    var menu = '<div class="home-menu" id="homeMenu">'+
+      '<button class="btn iconbtn" id="homeMenuBtn" aria-label="More actions" title="More">⋯</button>'+
+      '<div class="home-menu-pop">'+
+        '<button data-call="show_history" data-args="[]">'+RK.icon('history',{size:16})+' History</button>'+
+        '<button data-call="open_meetings_folder" data-args="[]">'+RK.icon('folder',{size:16})+' Open meetings folder</button>'+
+        '<button data-call="summarize_text_dialog" data-args="[]">'+RK.icon('summarize',{size:16})+' Summarize a meeting file</button>'+
+      '</div></div>';
+    var head = '<div class="home-head"><h1>Home</h1>'+statusPill+
+      '<div class="hh-actions">'+menu+'</div></div>';
+
+    // --- info line + primary actions, OR the live bar while a meeting runs ---
+    var info;
+    if(active){
+      info = '<div class="home-live">'+RK.icon('mic',{size:18})+
+        '<span class="grow"><b>Meeting in progress</b></span>'+
+        (S.live_transcript_available ? '<button class="btn" data-call="open_live_transcript" data-args="[]">Open live transcript</button>':'')+
+        '<button class="btn primary" data-call="home_stop_meeting" data-args="[true]">End &amp; summarize</button>'+
+        '<button class="btn" data-call="home_stop_meeting" data-args="[false]">End</button>'+
+        '<button class="btn danger" data-call="cancel_meeting" data-args="[]">Discard</button>'+
+        '</div>';
+    } else {
+      var src = h.recording_source;
+      var srcTxt = src==='both'?'Mic + system audio':(src==='stereo_mix'?'System audio':'Microphone');
+      function chip(t){ return '<span class="hchip">'+esc(t)+'</span>'; }
+      info = '<div class="home-info">'+
+        chip('Mic: '+(h.mic_name||'Default'))+
+        (h.meeting_mic_name?chip('Meeting mic: '+h.meeting_mic_name):'')+
+        chip(srcTxt)+ chip('Hotkey '+(hk.main||'ctrl+space'))+'</div>'+
+        '<div class="home-actions">'+
+          '<button class="btn primary" data-call="home_start_meeting" data-args="[]">'+
+            RK.icon('meetings',{size:16})+' Start meeting</button>'+
+          '<button class="btn" data-call="transcribe_file" data-args="[]">'+
+            RK.icon('mic',{size:16})+' Transcribe file</button>'+
+        '</div>';
+    }
+
+    // --- meetings list (the main content) ---
+    var all = homeMeetings(), rows = homeFiltered();
+    if(rows.length && (homeSel==null || !rows.some(function(m){return m.path===homeSel;})))
+      homeSel = rows[0].path;
+    var rowsHtml = rows.length ? rows.map(function(m){
+      return '<button class="mtg-row'+(m.path===homeSel?' sel':'')+'" data-mtg="'+esc(m.path)+'">'+
+        '<span class="rn rtl-auto" dir="auto">'+esc(m.title)+'</span>'+
+        (m.has_summary?'<span class="rtag">summary</span>':'<span></span>')+
+        '<span class="rmeta"><span class="rdate">'+esc(m.date)+'</span>'+
+          (m.diarized?'<span>· speakers</span>':'')+'</span>'+
+      '</button>';
+    }).join('') : (all.length
+        ? '<div class="mtg-empty">No meetings match “'+esc(homeSearch)+'”.</div>'
+        : '<div class="mtg-empty">No meetings yet. Start one above - it appears here once saved.</div>');
+    var list = '<div class="mtg-list">'+
+      '<div class="mtg-listhead">'+
+        '<div class="mtg-search">'+RK.icon('search',{size:14})+
+          '<input type="text" id="mtgSearch" placeholder="Search meetings…" autocomplete="off" spellcheck="false" value="'+esc(homeSearch||'')+'">'+
+        '</div><span class="mtg-count" id="mtgCount">'+rows.length+'</span>'+
+      '</div>'+
+      '<div class="mtg-rows" id="mtgRows">'+rowsHtml+'</div>'+
+    '</div>';
+
+    var preview = '<div class="mtg-preview empty" id="mtgPreview">'+
+      RK.icon('meetings',{size:22})+'<div style="margin-top:8px">Select a meeting to preview its summary.</div></div>';
+
+    return head + updateBar() + info + '<div class="home-body">'+list+preview+'</div>';
+  };
+
+  PAGES.general = function(){
+    var hk = (S.hotkeys||{});
+    var histWeeks = parseInt(cfg("history_retention_weeks", 2), 10);
+    if(isNaN(histWeeks) || histWeeks < 0) histWeeks = 2;
+    if(histWeeks > 12) histWeeks = 12;
+    var shortcuts = '<div class="list">'+
+      Object.keys(hk).map(function(k){
+        return '<div class="row"><span class="grow">'+esc(k)+'</span><span class="kbd">'+esc(hk[k])+'</span></div>';
+      }).join('')+'</div>';
+    // Languages (multi-language, 2026-09-15): a primary-language dropdown, a
+    // "lock to one language" switch, and an enabled-languages checklist (the
+    // anti-roaming control - the app never picks a language outside this set).
+    var LANGS = (S.languages && S.languages.rows) || [];
+    var LPRIM = (S.languages && S.languages.primary) || cfg("primary_language","he");
+    var LLOCK = !!(S.languages && S.languages.locked);
+    var LCOUNT = (S.languages && S.languages.model_lang_count) || LANGS.length;
+    var langOpts = LANGS.map(function(r){
+      return '<option value="'+esc(r.id)+'"'+(r.id===LPRIM?' selected':'')+'>'+
+             esc(r.native)+(r.native!==r.name_en?' ('+esc(r.name_en)+')':'')+'</option>';
+    }).join('');
+    var langChecks = LANGS.map(function(r){
+      var nm = ((r.native||'')+' '+(r.name_en||'')).toLowerCase();
+      return '<label class="switch lang-item" data-lang-name="'+esc(nm)+'" '+
+        'style="display:flex;width:100%;margin:1px 0"'+(r.supported===false?' title="Not supported by the current model"':'')+'>'+
+        '<input type="checkbox" data-lang-enable data-lang-code="'+esc(r.id)+'"'+
+        (r.enabled?' checked':'')+'><span class="track"></span>'+
+        '<span>'+esc(r.native)+(r.native!==r.name_en?' ('+esc(r.name_en)+')':'')+
+        (r.supported===false?' <small style="opacity:.6">not in this model</small>':'')+'</span></label>';
+    }).join('');
+    var langSection =
+      '<div class="page"><div class="section-title">Languages</div>'+
+        '<div class="row-inline"><span class="grow">Primary language</span>'+
+          '<select data-select-str="set_primary_language" style="max-width:260px">'+langOpts+'</select></div>'+
+        '<div class="hint">The language you mainly dictate and hold meetings in, and <b>the default language your meeting and text summaries are written in</b>, and which models the app prefers. '+
+          'To write summaries in a different language, change <b>Summary language</b> on the Meetings page.</div>'+
+        '<label class="switch" style="margin-top:6px"><input type="checkbox" data-lang-lock data-lang-primary="'+esc(LPRIM)+'"'+
+          (LLOCK?' checked':'')+'><span class="track"></span><span>Lock to one language (primary only)</span></label>'+
+        '<div class="hint">On: transcribe only your primary language - no detection, never switches. Off: detect among the languages you tick below.</div>'+
+        '<div class="section-title" style="margin-top:8px">Languages I use  <small style="opacity:.6">('+LCOUNT+' in this model)</small></div>'+
+        '<input type="text" id="langFilter" placeholder="Search '+LCOUNT+' languages…" style="width:100%;box-sizing:border-box;margin:4px 0 6px">'+
+        '<div id="langList" style="max-height:240px;overflow:auto;border:1px solid var(--line,#e2e2e6);border-radius:8px;padding:6px">'+langChecks+'</div>'+
+        '<div class="hint">Tick the languages you speak - the app never picks one outside this set. Tick exactly one (or use the lock) to force it. '+
+          'Whisper models auto-detect among your ticked set; Gemini pins to it; Parakeet always auto-detects among its own languages.</div>'+
+      '</div>';
+    // Each concern gets its OWN card (2026-08-29): one long undivided page
+    // made 'Recording mode' / 'Paste' / the toggles read as one blur.
+    return '<div class="content-head"><h1>General</h1></div>'+
+      // Hotkey + recording mode first: the daily-use controls lead the page.
+      '<div class="page"><div class="section-title">Press-to-talk hotkey</div>'+
+        '<div class="row-inline"><input type="text" id="hotkeyInput" style="max-width:220px" value="'+
+          esc(draftOr("hotkeyInput", hk.main||"ctrl+space"))+'">'+
+        '<button class="btn" id="btnCapture">Capture&#8230;</button>'+
+        '<button class="btn primary" data-save-hotkey="1">Save</button>'+
+        '<button class="btn ghost" data-reset-hotkey="1">Reset</button></div>'+
+        '<div class="hint">Click Capture, then press the combination. Needs a modifier (Ctrl/Alt/Shift).</div>'+
+      '</div>'+
+      '<div class="page"><div class="section-title">Recording mode</div>'+
+        '<div class="radio-row">'+
+        radio("rm","set_recording_mode","hold","str","Hold to record", cfg("recording_mode","hold")==="hold")+
+        radio("rm","set_recording_mode","toggle","str","Toggle (press start / press stop)", cfg("recording_mode")==="toggle")+
+        '</div>'+
+      '</div>'+
+      '<div class="page"><div class="section-title">Paste</div>'+
+        '<div class="radio-row">'+
+        radio("pm","set_paste_mode","auto_paste","str","Auto-paste (Ctrl+V)", cfg("paste_mode")==="auto_paste")+
+        radio("pm","set_paste_mode","clipboard_only","str","Clipboard only", cfg("paste_mode")==="clipboard_only")+
+        '</div>'+
+      '</div>'+
+      '<div class="page"><div class="section-title">Startup</div>'+
+        sw("Start Lia automatically when Windows starts", !!S.auto_start, "toggle_auto_start")+
+        '<div class="hint">Lia launches to the system tray on every boot, ready to dictate.</div>'+
+      '</div>'+
+      langSection+
+      '<div class="page"><div class="section-title">Behavior</div>'+
+        sw("Restore clipboard after paste", !!cfg("clipboard_auto_restore", true), "toggle_clipboard_auto_restore")+'<br>'+
+        sw("Press Enter after paste", !!cfg("press_enter_after_paste", false), "toggle_press_enter_after_paste")+'<br>'+
+        sw("Invisible mode (no overlay / waveform)", !!cfg("silent_mode", false), "toggle_silent_mode")+
+      '</div>'+
+      '<div class="page"><div class="section-title">History</div>'+
+        field("Keep transcription history for",
+          '<select id="sel_hist_weeks" data-select="set_history_retention_weeks" style="max-width:220px">'+
+            [1,2,3,4,5,6,7,8,9,10,11,12].map(function(w){
+              return '<option value="'+w+'"'+(histWeeks===w?' selected':'')+'>'+w+' week'+(w===1?'':'s')+(w===2?' (default)':'')+'</option>';
+            }).join('')+
+            '<option value="0"'+(histWeeks===0?' selected':'')+'>Keep everything</option>'+
+          '</select>',
+          "Older entries are removed automatically at startup and after each dictation.")+
+        '<div class="btnrow"><button class="btn danger" data-clear-history="1">Delete all history…</button></div>'+
+      '</div>'+
+      '<div class="page"><div class="section-title">Keyboard shortcuts</div>'+shortcuts+'</div>';
+  };
+
+  PAGES.audio = function(){
+    var src = cfg("recording_source","microphone");
+    var micOn = (src==="microphone"||src==="both");
+    var sysOn = (src==="stereo_mix"||src==="both");
+    var mid = cfg("input_device_index", null);
+    var lid = cfg("loopback_device_index", null);
+    function devRow(method, idx, name, checked){
+      return '<div class="rowbtn'+(checked?' sel':'')+'" data-call="'+method+'" data-args=\''+
+        JSON.stringify([idx])+'\''+(method==="toggle_loopback_device"?' data-slow="1"':'')+'>'+
+        '<span class="ic">'+(checked?'&#9679;':'&#9675;')+'</span><span class="grow rtl-auto" dir="auto">'+esc(name)+'</span></div>';
+    }
+    // Selection is matched by NAME when one is stored (indices shift on USB
+    // hot-plug - a headset's slot once became the Cam Link, and this radio
+    // dutifully highlighted the wrong device). Falls back to the index for a
+    // legacy config that has no name yet.
+    var mname = cfg("input_device_name", "") || "";
+    function isSel(storedIdx, storedName, d){ return storedName ? (d.name===storedName) : (storedIdx===d.idx); }
+    function gone(storedName){ return !!storedName && !(S.mics||[]).some(function(d){ return d.name===storedName; }); }
+    function goneRow(storedName){
+      return '<div class="rowbtn disabledrow"><span class="ic">&#9679;</span><span class="grow rtl-auto" dir="auto">'+esc(storedName)+
+        '</span><span class="hk">disconnected</span></div>';
+    }
+    var mics = [devRow("toggle_mic_device", null, "System Default", micOn && mid===null && !mname)];
+    (S.mics||[]).forEach(function(d){ mics.push(devRow("toggle_mic_device", d.idx, d.name, micOn && isSel(mid, mname, d))); });
+    if(gone(mname)) mics.push(goneRow(mname));
+    // Dedicated meeting mic (radio semantics; null = follow the dictation mic).
+    // Lets a headset own the meeting while a desk mic stays free for dictating
+    // mid-meeting. Falls back to the dictation mic if the device is unplugged.
+    var mmid = cfg("meeting_input_device_index", null);
+    var mmname = cfg("meeting_input_device_name", "") || "";
+    var mmics = [devRow("set_meeting_mic_device", null, "Same as dictation mic", mmid===null && !mmname)];
+    (S.mics||[]).forEach(function(d){ mmics.push(devRow("set_meeting_mic_device", d.idx, d.name, isSel(mmid, mmname, d))); });
+    if(gone(mmname)) mmics.push(goneRow(mmname));
+    var loops = "";
+    if(S.loopback_available){
+      var L = [devRow("toggle_loopback_device", null, "System Default", sysOn && lid===null)];
+      (S.loopbacks||[]).forEach(function(d){ L.push(devRow("toggle_loopback_device", d.idx, d.name, sysOn && lid===d.idx)); });
+      loops = '<div class="page"><div class="section-title">System audio</div>'+L.join('')+'</div>';
+    }
+    // Sounds (moved here from General 2026-09-15): the done-beep output device.
+    var beep = cfg("beep_device_index", "off");
+    var beepRows = [
+      radio("beep","set_beep_device","off","str","None (no beep)", beep==="off"),
+      radio("beep","set_beep_device","__null__","null","System Default", beep===null)
+    ];
+    (S.outputs||[]).forEach(function(d){
+      beepRows.push(radio("beep","set_beep_device",String(d.idx),"int",d.name, beep===d.idx));
+    });
+    var sounds = '<div class="page"><div class="section-title">Sounds</div>'+
+      '<div class="field-label">Done beep</div>'+beepRows.join('')+
+      '<div class="hint">A short beep after a transcription is pasted. None = silent.</div></div>';
+    return '<div class="content-head"><h1>Audio</h1></div>'+
+      '<div class="page"><div class="section-title">Recording sources</div>'+
+        sw("Record my microphone", micOn, "toggle_record_mic")+'<br>'+
+        sw("Record system audio", sysOn, "toggle_record_system", !S.loopback_available)+
+        '<div class="hint">Whether each source is captured at all. Which devices are used is set below (Dictation / Meeting microphone).</div>'+
+        '<div class="btnrow">'+btn("Refresh devices","refresh",[],"ghost",true)+'</div>'+
+      '</div>'+
+      '<div class="page"><div class="section-title">Dictation microphone</div>'+mics.join('')+
+        '<div class="hint">The mic used for press-to-talk dictation.</div>'+
+      '</div>'+
+      '<div class="page"><div class="section-title">Meeting microphone</div>'+mmics.join('')+
+        '<div class="hint">The mic that records YOUR side of a meeting (needs "Record my microphone" on above). Pick your call headset here for its close-up quality in meeting transcripts, while the Dictation microphone stays free for dictating mid-meeting. If this device is unplugged, meetings fall back to the dictation mic.</div>'+
+      '</div>'+
+      loops + sounds;
+  };
+
+  PAGES.models = function(){
+    var t = (S.tables||{});
+    // Active-engines summary: for each role, the SELECTED row's readable name,
+    // where it runs (local / cloud / server), and its real availability - all
+    // derived from the existing table data (no invented metrics).
+    function placeOf(row){
+      var w = (row && row.where) || "local";
+      if(w==="cloud") return {cls:"cloud", label:"Cloud"};
+      if(w==="server"||w==="remote") return {cls:"server", label:"Server"};
+      return {cls:"local", label:"Local"};
+    }
+    function engCard(role, rows){
+      var sel = (rows||[]).filter(function(r){ return r.checked; })[0];
+      if(!sel) return '<div class="eng"><div class="eng-role">'+esc(role)+'</div>'+
+        '<div class="eng-name muted">Not set</div></div>';
+      var pl = placeOf(sel);
+      var ready = sel.enabled!==false;
+      var status = ready
+        ? '<span class="status ok"><span class="dot"></span>Ready</span>'
+        : '<span class="status"><span class="dot" style="background:var(--warn)"></span>'+esc(sel.note||"Needs setup")+'</span>';
+      return '<div class="eng"><div class="eng-role">'+esc(role)+'</div>'+
+        '<div class="eng-name rtl-auto" dir="auto">'+esc(sel.label)+'</div>'+
+        '<div class="eng-meta"><span class="place '+pl.cls+'">'+pl.label+'</span>'+status+'</div></div>';
+    }
+    var engineSummary = '<div class="page"><div class="section-title">Active engines</div>'+
+      '<div class="eng-grid">'+
+        engCard("Dictation", t.dictation)+
+        engCard("Meeting transcription", t.meeting)+
+        engCard("Summaries", t.summary)+
+      '</div></div>';
+    function group(title, rows, method, argKey, argtype, slow){
+      var html = '<div class="page"><div class="section-title">'+esc(title)+'</div>';
+      (rows||[]).forEach(function(r){
+        html += radio(method, method, String(r[argKey]), argtype, r.label, r.checked, r.enabled!==false, r.note||"", r.where||"", r.wnote||"");
+      });
+      html += '</div>';
+      return html;
+    }
+    // Local processing options (moved here from General 2026-09-15): where the
+    // local Whisper model runs (GPU / CPU / auto).
+    var devHtml = '';
+    if((t.device||[]).length){
+      devHtml = '<div class="page"><div class="section-title">Local processing options</div>'+
+        '<div class="field-label">Local Whisper device ('+esc(S.whisper_device_label||"Auto")+')</div>'+
+        '<div class="radio-row">'+t.device.map(function(r){
+          return radio("dev","set_whisper_device",r.key,"str",r.label,r.checked,true,"");
+        }).join('')+'</div>'+
+        '<div class="hint">Where the local Whisper model runs. Auto uses the GPU when available, else the CPU.</div>'+
+        ((t.gpu_busy||[]).length ?
+          '<div class="field-label">When the GPU is busy, dictate with</div>'+
+          '<div class="radio-row">'+t.gpu_busy.map(function(r){
+            return radio("gpubusy","set_dictation_gpu_busy_cloud",r.key,"str",r.label,r.checked,r.enabled!==false,"");
+          }).join('')+'</div>'+
+          '<div class="hint">If another app keeps the GPU busy, a dictation goes to this cloud service first (then the others that have a key) and Lia tells you.</div>'
+          : '')+
+        ((t.summary_gpu_busy||[]).length ?
+          '<div class="field-label">When the GPU is busy, summarize meetings and files with</div>'+
+          '<div class="radio-row">'+t.summary_gpu_busy.map(function(r){
+            return radio("sumgpubusy","set_summary_gpu_busy_cloud",r.key,"str",r.label,r.checked,r.enabled!==false,"");
+          }).join('')+'</div>'+
+          '<div class="hint">A local summary (Gemma) that would wait for a busy GPU runs on this cloud service instead (then the others that have a key), and its card says so. The meeting transcript is sent to that service. Off = wait for the GPU. Transcription and speaker diarization always wait for the GPU.</div>'
+          : '')+
+        '</div>';
+    }
+    return '<div class="content-head"><h1>Models</h1></div>'+
+      engineSummary+
+      group("Dictation model", t.dictation, "set_dictation_model", "idx", "int")+
+      group("Meeting transcription model", t.meeting, "set_meeting_model", "key", "str")+
+      group("Meeting Summary Model", t.summary, "set_summary_model", "model", "str")+
+      group("Transcribe-file model", t.file, "set_file_model", "key", "str")+
+      devHtml;
+  };
+
+  PAGES.cleanup = function(){
+    var t = (S.tables||{});
+    // Cleanup Off -> no provider/model is used, so grey out that whole section
+    // (dim the card + disable its radios) until a style is picked (Naor's ask).
+    var isOff = (t.cleanup_styles||[]).some(function(r){ return r.checked && r.style==="off"; });
+    var styles = (t.cleanup_styles||[]).map(function(r){
+      // noicon: AI Cleanup rows carry NO provider logo (Naor 2026-09-16 - the
+      // logos live on the Models page; keep Cleanup plain).
+      return radio("cs","set_cleanup_style",r.style,"str",r.label,r.checked,true,"","","",true);
+    }).join('');
+    var models = (t.cleanup_models||[]);
+    var mhtml;
+    if(!models.length){
+      mhtml = '<div class="empty"><div class="big">&#128273;</div><div>No cleanup provider key set</div>'+
+        '<div class="sub">Add an OpenAI, Groq, or Gemini key on the Keys page to enable AI cleanup.</div>'+
+        '<button class="btn" data-page-link="keys">Go to Keys</button></div>';
+    } else {
+      mhtml = models.map(function(r){
+        return radio("cm","set_cleanup_provider_model",JSON.stringify([r.provider,r.model]),"json",r.label,r.checked,!isOff,"","","",true);
+      }).join('');
+      if(isOff){
+        mhtml = '<div class="hint">Cleanup is Off - pick a style above to choose a provider &amp; model.</div>'+mhtml;
+      }
+    }
+    // When cleanup is Off no model runs, so the header must not read as active
+    // (a green dot + model name looked like the motor was on - Naor 2026-09-17):
+    // show a muted "Off" instead of the model badge.
+    var head = isOff
+      ? '<span class="status off"><span class="dot"></span>Off</span>'
+      : '<span class="status ok"><span class="dot"></span>'+esc(S.cleanup_model_label||"")+'</span>';
+    return '<div class="content-head"><h1>AI Cleanup</h1>'+head+'</div>'+
+      '<div class="page"><div class="section-title">Style</div>'+styles+'</div>'+
+      '<div class="page"'+(isOff?' style="opacity:.55"':'')+'><div class="section-title">Provider &amp; model</div>'+mhtml+'</div>';
+  };
+
+  var KEYCARDS = [
+    {svc:"openai", key:"openai_api_key", name:"OpenAI", badge:"O", color:"#0aa37f", img:"__OPENAI_LOGO__",
+     sub:"Paid - best dictation, meeting transcription & summaries.",
+     save:"Save & Verify", url:"https://platform.openai.com/api-keys", slow:true},
+    {svc:"gemini", key:"gemini_api_key", name:"Gemini", badge:"G", color:"#3b6fd4", img:"__GEMINI_LOGO__",
+     sub:"Free meeting summaries + free AI cleanup (Google AI Studio).",
+     save:"Save", url:"https://aistudio.google.com/apikey", slow:true},
+    {svc:"hf", key:"hf_token", name:"Local Diarization", badge:"H", color:"#b08900",
+     sub:"100% local speaker labels on your GPU (pyannote + ivrit.ai).",
+     save:"Save & Download", url:"https://huggingface.co/settings/tokens", slow:true, noun:"token"},
+    {svc:"groq", key:"groq_api_key", name:"Groq", badge:"G", color:"#d97706",
+     sub:"Free, fast cloud dictation (Whisper v3 Turbo).",
+     save:"Save & Verify", url:"https://console.groq.com/keys", slow:true}
+    // AssemblyAI (paid cloud diarization) card removed 2026-09-01 - local
+    // pyannote + Gemini diarize cover meetings; the key/code path still exist.
+  ];
+
+  PAGES.keys = function(){
+    var secrets = S.secrets||{}, has = S.has||{}, rejected = S.rejected||{};
+    var cards = KEYCARDS.map(function(c){
+      var noun = c.noun||"key";
+      var bad = has[c.key] && rejected[c.key];
+      var cur = has[c.key] ? '<span class="masked'+(bad?' bad':'')+'">'+esc(secrets[c.key]||"set")+'</span>'
+                           : '<span class="masked empty">not set</span>';
+      var iid = "in_"+c.svc;
+      var bdg = (c.img && c.img.indexOf("data:")===0)
+        ? '<span class="bdg img"><img src="'+c.img+'" alt="'+esc(c.name)+'"></span>'
+        : '<span class="bdg" style="background:'+c.color+'">'+esc(c.badge)+'</span>';
+      return '<div class="credcard">'+
+        '<div class="head">'+bdg+
+        '<div><h3>'+esc(c.name)+'</h3><div class="sub">'+esc(c.sub)+'</div></div></div>'+
+        '<div class="keyline">Current '+esc(noun)+': '+cur+'</div>'+
+        (bad ? '<div class="keybad">'+esc(c.name)+' rejected this '+esc(noun)+
+               ' (revoked, deleted or mistyped). Paste a new one below.</div>' : '')+
+        '<div class="row-inline" style="margin-top:8px">'+
+          '<input type="password" id="'+iid+'" class="mono" placeholder="Enter '+esc(noun)+'…" style="flex:1" value="'+esc(draftOr(iid,""))+'">'+
+          '<button class="btn ghost" data-show="'+iid+'">Show</button></div>'+
+        '<div class="btnrow">'+
+          '<button class="btn primary" data-apply-key="'+c.svc+'" data-input="'+iid+'"'+(c.slow?' data-slow="1"':'')+'>'+esc(c.save)+'</button>'+
+          '<button class="btn danger" data-call="clear_key" data-args=\''+JSON.stringify([c.svc])+'\'>Clear</button>'+
+          '<span class="grow"></span>'+
+          '<a href="#" data-openurl="'+esc(c.url)+'">Get a '+esc(noun)+' ↗</a>'+
+        '</div>'+
+        '<div class="hint" id="st_'+c.svc+'"></div>'+
+      '</div>';
+    }).join('');
+    var privacy = '<div class="privacy-note">'+
+      '<span class="pn-ico">&#9888;&#65039;</span>'+
+      '<span>Please note: on <b>free cloud tiers</b>, providers often use the audio and text you send to <b>train their models</b>. Be mindful of the sensitivity of what you dictate or share - avoid confidential information on free plans. Local models (on your own GPU) never leave this machine.</span>'+
+    '</div>';
+    return '<div class="content-head"><h1>API Keys</h1></div><div class="page keys-page">'+privacy+cards+'</div>';
+  };
+
+  // ---- Transcription server: choose CLIENT (use a home server) or SERVER
+  //      (host one on this GPU). Moved out of Keys into its own page. ----
+  PAGES.server = function(){
+    var has = S.has || {};
+    var sv = S.serve || {};
+    var gpu = sv.gpu || {};
+    var svPort = sv.port || 9090;
+    var role = sv.role || "";
+    if(!role){ role = sv.enabled ? "server" : (cfg("remote_server_url","") ? "client" : ""); }
+
+    function modeCard(r, icon, title, desc){
+      return '<button class="mode-card'+(role===r?' sel':'')+'" data-set-role="'+r+'">'+
+        '<span class="mode-ico">'+icon+'</span>'+
+        '<span class="mode-t">'+esc(title)+'</span>'+
+        '<span class="mode-d">'+esc(desc)+'</span></button>';
+    }
+    var chooser = '<div class="mode-row">'+
+      modeCard("client","&#128421;","Client mode","Use a server: send audio to a transcription server running on another machine (your home GPU).")+
+      modeCard("server","&#128225;","Server mode","Host a server: run one on THIS machine’s GPU so your other devices transcribe against it.")+
+    '</div>';
+
+    // Prominent prerequisite: both machines need Tailscale.
+    var tsBanner = '<div class="ts-banner">'+
+      '<div class="ts-left">'+
+        '<span class="ts-ico">&#128279;</span>'+
+        '<div class="ts-body"><div class="ts-title">First, install Tailscale on both machines</div>'+
+        '<div class="ts-sub">It’s a free app that puts your PCs on one private network so they can reach each other - <b>no router setup, no open ports</b>. Sign in with the <b>same account</b> on the server and every device that connects.</div></div>'+
+      '</div>'+
+      '<button class="btn primary ts-btn" data-call="open_tailscale" data-args="[]">&#11015;&#65039;&nbsp; Download Tailscale</button>'+
+    '</div>';
+
+    // --- CLIENT panel (was Home Server) ---
+    var url = draftOr("in_remote_url", cfg("remote_server_url",""));
+    var clientPanel =
+      '<div class="srv-panel">'+
+        '<div class="srv-h"><span class="srv-ico" style="background:#0aa37f">&#128421;</span>'+
+          '<div><h3>Connect to a transcription server</h3><div class="sub">Enter the address of the server you run at home (over Tailscale).</div></div></div>'+
+        field("Server URL",'<input type="text" id="in_remote_url" class="mono" placeholder="ws://host:9090" value="'+esc(url)+'">',
+          "host:9090 · ws://host:9090 · wss://your-domain")+
+        field("Access token (optional)",
+          '<input type="password" id="in_remote_tok" class="mono" placeholder="'+
+          (has.remote_server_token?"(saved - leave blank to keep)":"none")+'" value="'+esc(draftOr("in_remote_tok",""))+'">')+
+        '<div class="btnrow">'+
+          '<button class="btn primary" data-apply-remote="1" data-slow="1">Save</button>'+
+          '<button class="btn" data-test-remote="1" data-slow="1">Test</button>'+
+          '<button class="btn danger" data-call="clear_key" data-args=\'["remote"]\'>Clear</button>'+
+          '<span class="grow"></span></div>'+
+        '<div class="hint" id="st_remote"></div>'+
+        '<details class="setup-help"><summary>How to set up (Tailscale)</summary><ol>'+
+          '<li>Install <b>Tailscale</b> on both machines from <span class="mono">tailscale.com/download</span> and sign in with the <b>same account</b>.</li>'+
+          '<li>On the server machine, switch to <b>Server mode</b> (the other tab here), turn it on, and note its <span class="mono">ws://…</span> address.</li>'+
+          '<li>Paste that address above, click <b>Test</b>, then <b>Save</b>.</li>'+
+          '<li>On the <b>Models</b> page, pick a <b>Home Server</b> model.</li>'+
+        '</ol><div class="hint">Work PC that blocks Tailscale? Use a Cloudflare tunnel with a <span class="mono">wss://your-domain</span> URL + token.</div></details>'+
+      '</div>';
+
+    // --- SERVER panel (host) with a GPU check + a graphical run control ---
+    var verdict = gpu.verdict || "none";
+    var gpuTitle = gpu.has_cuda
+      ? (esc(gpu.name || "CUDA GPU") + (gpu.vram_gb ? (' · ' + gpu.vram_gb + ' GB VRAM') : ''))
+      : "No dedicated GPU detected";
+    var gpuCard = '<div class="gpu-card '+verdict+'">'+
+      '<div class="gpu-h"><span class="gpu-dot"></span><span class="gpu-name">'+gpuTitle+'</span>'+
+        '<span class="gpu-tag '+verdict+'">'+({good:"Ready",marginal:"Marginal",none:"Not suitable"}[verdict])+'</span></div>'+
+      '<div class="gpu-note">'+esc(gpu.note||"")+'</div></div>';
+    var canServe = (verdict !== "none");
+    var runTitle = sv.running ? "Server is running" : (sv.enabled ? "Starting…" : "Server is off");
+    var runSub = sv.running ? ("Listening on port " + svPort)
+                            : (canServe ? "Turn on to host on this GPU" : "Needs a dedicated GPU");
+    var runState = sv.running ? "on" : (sv.enabled ? "starting" : "off");
+    var runControl = '<div class="run-box '+runState+(canServe?'':' locked')+'">'+
+      '<span class="run-led"></span>'+
+      '<div class="run-txt"><div class="run-title">'+runTitle+'</div><div class="run-sub">'+runSub+'</div></div>'+
+      '<label class="big-switch'+(canServe?'':' disabled')+'" title="'+(canServe?'':'No suitable GPU')+'">'+
+        '<input type="checkbox" data-toggle="toggle_serve"'+(sv.enabled?' checked':'')+(canServe?'':' disabled')+'>'+
+        '<span class="bs-track"></span><span class="bs-knob"></span></label>'+
+    '</div>';
+    // Which model the server loads. Add entries here to support more languages.
+    var svModel = sv.model || "";
+    var SERVE_MODELS = [
+      {id:"", label:"Hebrew - ivrit.ai turbo", note:"Specialised for Hebrew (default)"},
+      {id:"large-v3-turbo", label:"Multilingual - Whisper large-v3-turbo", note:"All languages, general purpose"}
+    ];
+    var modelPicker = '<div class="section-title">Server model</div>'+
+      SERVE_MODELS.map(function(m){
+        return radio("svmodel","set_serve_model",m.id,"str",m.label,svModel===m.id,canServe,m.note);
+      }).join('')+
+      '<div class="hint">Which model runs on the server. Hebrew is specialised (it garbles other languages); the multilingual model handles any language the client sends. Changing this reloads the server.</div>';
+    var urlLine = sv.ws_url
+      ? ('Other devices point their <b>Server URL</b> (the Use-a-server tab) here:<br><span class="mono copyable">' + esc(sv.ws_url) + '</span>')
+      : ('Install <a href="https://tailscale.com/download" target="_blank" rel="noopener">Tailscale</a> and sign in (same account) on both machines to get a private address, then use <span class="mono">ws://&lt;this-ip&gt;:' + svPort + '</span>.');
+    var serverPanel =
+      '<div class="srv-panel">'+
+        '<div class="srv-h"><span class="srv-ico" style="background:#7c5cff">&#128225;</span>'+
+          '<div><h3>Host a transcription server</h3><div class="sub">Runs a Whisper model on this GPU. No Docker, no extra install.</div></div></div>'+
+        gpuCard + runControl + modelPicker +
+        '<div class="section-title">Listen on</div>'+
+        radio("svhost","set_serve_host","auto","str","Tailscale, else this PC (recommended)", (sv.host||"auto")==="auto", canServe, "Reachable by your other devices over Tailscale; falls back to this-PC-only if Tailscale is off.")+
+        radio("svhost","set_serve_host","loopback","str","This PC only", (sv.host)==="loopback", canServe, "Nothing on the network can reach it.")+
+        radio("svhost","set_serve_host","all","str","All networks (needs a token)", (sv.host)==="all", canServe, "Every interface, including the LAN. Requires an access token.")+
+        '<div class="hint">Now bound to: <b>'+esc(sv.host_label||"")+'</b>.'+(sv.insecure?' <b style="color:#d08770">Set a token below - the server will refuse to start on a network interface without one.</b>':'')+'</div>'+
+        field("Port",'<input type="number" id="in_serve_port" class="mono" value="'+svPort+'" style="max-width:120px"'+(canServe?'':' disabled')+'>',"default 9090")+
+        field("Access token"+(((sv.host)==="all"||sv.insecure)?" (required)":" (optional)"),
+          '<input type="password" id="in_serve_tok" class="mono" placeholder="'+
+          (sv.has_token?"(saved - leave blank to keep)":"none")+'"'+(canServe?'':' disabled')+'>'+
+          ' <button class="btn" data-gen-token="1" data-slow="1"'+(canServe?'':' disabled')+'>Generate</button>'+
+          (sv.has_token?' <button class="btn" data-copy-token="1"'+(canServe?'':' disabled')+'>Copy</button>':''))+
+        '<div class="hint">Type any secret you like (a memorable passphrase is fine) and click <b>Save port / token</b> - it does not have to be the Generated one. <b>Generate</b> makes a strong random token and copies it to the clipboard. Put the <b>same</b> value in the client\'s <b>Access token</b> on your other device.</div>'+
+        '<div class="btnrow"><button class="btn" data-apply-serve="1" data-slow="1"'+(canServe?'':' disabled')+'>Save port / token</button><span class="grow"></span></div>'+
+        sw("Keep running after reboot (start at Windows logon)", !!sv.autostart, "toggle_serve_autostart", !canServe)+
+        '<div class="hint">'+urlLine+'</div>'+
+        '<details class="setup-help"><summary>How another device connects</summary><ol>'+
+          '<li>Turn the server on above - it loads a local Hebrew model on this GPU.</li>'+
+          '<li>Install <b>Tailscale</b> on both machines, same account.</li>'+
+          '<li>On the other device: <b>Transcription server → Client mode</b>, paste the URL above, <b>Test</b>, <b>Save</b>, then pick a <b>Home Server</b> model.</li>'+
+        '</ol><div class="hint">Hebrew only (one model); English falls back to the client’s own cloud/local.</div></details>'+
+        '<div class="hint" id="st_serve"></div>'+
+      '</div>';
+
+    var body = chooser + tsBanner;
+    if(role==="client") body += clientPanel;
+    else if(role==="server") body += serverPanel;
+    else body += '<div class="empty" style="padding:26px 8px"><div class="sub">Pick whether this device <b>uses</b> a server or <b>hosts</b> one.</div></div>';
+
+    return '<div class="content-head"><h1>Transcription server</h1>'+
+      '<div class="sub">Run Lia’s Hebrew transcription on one machine’s GPU and reach it from your others - no Docker.</div></div>'+
+      '<div class="page">'+body+'</div>';
+  };
+
+  PAGES.meetings = function(){
+    var hk = S.hotkeys||{};
+    function actrow(iconName, label, method, hkstr, beta){
+      return '<div class="rowbtn" data-call="'+method+'" data-args="[]">'+
+        '<span class="ic">'+RK.icon(iconName,{size:18})+'</span><span class="grow">'+esc(label)+'</span>'+
+        (beta?'<span class="wb beta">BETA</span>':'')+
+        (hkstr?'<span class="hk">'+esc(hkstr)+'</span>':'')+'</div>';
+    }
+    var live = S.live_transcript_available
+      ? actrow('file','Open live transcript','open_live_transcript','')
+      : '<div class="rowbtn disabledrow"><span class="ic">'+RK.icon('file',{size:18})+'</span><span class="grow">Live transcript (none active)</span></div>';
+    var mtgChunk = parseInt(cfg("meeting_chunk_seconds",15),10);
+    var mtgOpts = [8,10,15,20,30,45];
+    if(mtgOpts.indexOf(mtgChunk)<0 && mtgChunk>=5 && mtgChunk<=120){
+      mtgOpts = mtgOpts.concat([mtgChunk]).sort(function(a,b){return a-b;});
+    }
+    return '<div class="content-head"><h1>Meetings</h1></div>'+
+      '<div class="page">'+
+        sw("Auto-detect Zoom / Teams / Meet calls", !!cfg("auto_detect_meetings",false), "toggle_auto_detect_meetings")+'<br>'+
+        sw("Keep raw per-source tracks (mic / system / backup) next to the mixdown", !!cfg("keep_meeting_tracks",true), "toggle_keep_meeting_tracks")+'<br>'+
+        sw("Backup mic: also record the dictation mic when the meeting mic differs", !!cfg("meeting_backup_mic",true), "toggle_meeting_backup_mic")+'<br>'+
+        sw("Auto-switch to the dictation mic when the meeting mic is silent but the backup hears you", !!cfg("meeting_mic_auto_fallback",true), "toggle_meeting_mic_auto_fallback")+
+        '<div class="hint">Safety net for meeting transcripts: the mixdown is kept as before; the raw tracks let you re-transcribe one side alone and catch a wrong meeting mic. Same retention as the meeting audio.</div>'+
+      '</div>'+
+      '<div class="page"><div class="section-title">Live transcript</div>'+
+        field("Update interval",
+          '<select data-select="set_meeting_chunk_seconds" style="max-width:220px">'+
+            mtgOpts.map(function(s){
+              return '<option value="'+s+'"'+(mtgChunk===s?' selected':'')+'>every '+s+' seconds'+(s===15?' (default)':'')+'</option>';
+            }).join('')+
+          '</select>',
+          "How often a meeting transcribes a chunk, so the live transcript updates roughly this often. Lower = snappier realtime, more transcription calls; higher = more context per chunk. A meeting already running keeps its interval until it ends.")+
+        '<div style="height:6px"></div>'+live+
+      '</div>'+
+      '<div class="page"><div class="section-title">Meeting summaries (OpenAI / Gemini)</div>'+
+        '<div class="hint"><b>These affect OpenAI / Gemini meeting summaries only</b> - Lia makes '+
+        '<b>a single cloud call</b> per summary. The local Gemma summary uses the built-in technical '+
+        'pipeline (tune it on the Advanced page).</div>'+
+        '<div class="subhead">Template</div>'+
+        '<div class="radio-row">'+
+        (S.summary_templates||[]).map(function(tpl){
+          return radio("stpl","set_summary_template",tpl.id,"str",tpl.name_en,
+                       cfg("summary_template","technical")===tpl.id, true, tpl.desc_en);
+        }).join('')+
+        '</div>'+
+        '<div style="height:16px"></div>'+
+        sw("Parity rules + free code cleanups (dedup, tone, owners)", !!cfg("summary_cloud_parity",true), "toggle_summary_cloud_parity")+
+        '<div class="hint">Still one cloud call: the parity rules ride the same prompt and the cleanups are local code (no extra request).</div>'+
+        '<div class="subhead">Summary language</div>'+
+        '<div class="radio-row">'+
+        radio("slang","set_summary_language","primary","str","Follow primary language", cfg("summary_language","primary")==="primary")+
+        radio("slang","set_summary_language","auto","str","Follow the transcript", cfg("summary_language")==="auto")+
+        (((S.languages&&S.languages.rows)||[]).filter(function(r){return r.summary_ok;}).map(function(r){
+          return radio("slang","set_summary_language",r.id,"str","Always "+r.name_en, cfg("summary_language")===r.id);
+        }).join(''))+
+        '</div>'+
+        '<div class="hint">The language meeting and text summaries are written in, regardless of the language spoken.</div>'+
+      '</div>'+
+      '<div class="page"><div class="section-title">Speaker names</div>'+
+        field("Your name",
+          '<div class="btnrow" style="margin-top:0">'+
+            '<input id="selfName" dir="auto" style="max-width:260px" placeholder="e.g. נאור / Naor" value="'+esc(draftOr("selfName", cfg("speaker_self_name","")))+'">'+
+            '<button class="btn primary" data-save-selfname="1">Save</button>'+
+          '</div>',
+          "Written for your own turns in diarized transcripts and summaries, and biased into transcription so it is not misheard. Empty = your Windows account name.")+
+      '</div>'+
+      ((((S.home||{}).speaker_profiles)||[]).length ?
+      '<div class="page"><div class="section-title">Known voices</div>'+
+        '<div class="hint">Voices Lia learned when you named speakers (local speaker detection only). A wrong entry makes matching hesitate - forget it here.</div>'+
+        (((S.home||{}).speaker_profiles)||[]).map(function(p){
+          return '<div class="row" style="display:flex;align-items:center;gap:10px;padding:6px 0">'+
+            '<span dir="auto" style="flex:1">'+esc(p.name)+'</span>'+
+            '<span class="hint" style="margin:0">'+esc(String(p.count))+' sample'+(p.count===1?'':'s')+(p.updated?' · '+esc(p.updated):'')+'</span>'+
+            '<button class="btn" data-call="delete_speaker_profile" data-args=\''+esc(JSON.stringify([p.name]))+'\'>Forget</button>'+
+          '</div>';
+        }).join('')+
+      '</div>' : '')+
+      '<div class="page"><div class="section-title">Tools</div>'+
+        actrow('tasks','Action items (from meetings)…','open_action_items',hk.actions)+
+        actrow('folder','Open meeting folder','open_meetings_folder','')+
+        actrow('edit','Edit a meeting summary…','edit_meeting_summary','')+
+        actrow('meetings','Rename speakers in a meeting…','rename_speakers_old','')+
+        actrow('mic','Transcribe a file…','transcribe_file','')+
+        actrow('summarize','Summarize a meeting file…','summarize_text_dialog','')+
+      '</div>'+
+      '<div class="page"><div class="section-title">Experimental (Beta) - requires a 24 GB VRAM GPU</div>'+
+        '<div class="hint">These run local LLM / embedding models on your GPU (best on a 24 GB card such as an RTX 3090 / 4090) and work without any cloud key.</div>'+
+        actrow('ask','Ask your meetings…','open_meetings_ask',hk.ask,true)+
+        actrow('mic','Voice ask (speak a question, press again to answer)','voice_ask_now',hk.voice_ask,true)+
+        field("Voice ask answer goes to",
+          '<div class="radio-row">'+
+          radio("vao","set_voice_ask_output","card","str","Answer card (always visible)", cfg("voice_ask_output","card")==="card")+
+          radio("vao","set_voice_ask_output","paste","str","Paste at cursor", cfg("voice_ask_output")==="paste")+
+          radio("vao","set_voice_ask_output","both","str","Both", cfg("voice_ask_output")==="both")+
+          '</div>')+
+        actrow('email','Search your email…','open_email_search',hk.email,true)+
+      '</div>';
+  };
+
+  PAGES.vocab = function(){
+    return '<div class="content-head"><h1>Vocabulary</h1></div>'+
+      '<div class="page"><div class="section-title">Manual terms</div>'+
+        '<div class="hint">Comma- or newline-separated terms the transcriber should prefer.</div>'+
+        '<textarea id="vocabText" class="rtl-auto" dir="auto" style="min-height:120px">'+esc(draftOr("vocabText", cfg("custom_vocabulary","")))+'</textarea>'+
+        '<div class="btnrow"><button class="btn primary" data-save-vocab="1">Save terms</button>'+
+        '<button class="btn ghost" data-reset-vocab="1">Reset to default terms</button>'+
+        sw("Auto-learn new terms from meetings", !!cfg("vocab_autolearn",true), "toggle_vocab_autolearn")+'</div>'+
+      '</div>'+
+      '<div class="page"><div class="section-title">Suggestions <span class="badge soft">'+(S.vocab_pending||0)+'</span></div>'+
+        '<div class="btnrow">'+btn("Load suggestions","__load_pending",[],"")+
+        '<button class="btn ghost" data-vocab-apply="1">Apply checked / reject rest</button></div>'+
+        '<div id="pendingList"></div></div>'+
+      '<div class="page"><div class="section-title">Learned terms</div>'+
+        '<div class="btnrow">'+btn("Load learned","__load_learned",[],"")+
+        '<button class="btn danger" data-vocab-remove="1">Remove checked</button></div>'+
+        '<div id="learnedList"></div></div>'+
+      '<div class="page"><div class="section-title">Corrections (wrong &#8594; right)</div>'+
+        '<div class="hint">&#215;N = times applied in live dictation/meetings. hits = matches across your saved archive (press Scan). "unused" = zero of both &#8594; safe to prune.</div>'+
+        '<div class="btnrow">'+btn("Load corrections","__load_corr",[],"")+
+          btn("Scan archive","__scan_corr",[],"ghost",true)+
+          '<button class="btn" data-corr-unused="1">Select unused</button>'+
+          '<button class="btn danger" data-corr-remove="1">Remove checked</button></div>'+
+        '<div class="btnrow">'+btn("Harvest new meetings now","harvest_corrections_now",[],"ghost",true)+
+          sw("Auto-harvest corrections from new meetings (local)", !!cfg("corrections_autoharvest",true), "toggle_corrections_autoharvest")+'</div>'+
+        '<div id="corrList"></div>'+
+        '<div class="row-inline" style="margin-top:8px">'+
+          '<input type="text" id="corrWrong" class="mono" placeholder="Wrong" style="max-width:180px">'+
+          '<span>&#8594;</span>'+
+          '<input type="text" id="corrRight" class="mono" placeholder="Right" style="max-width:180px">'+
+          '<button class="btn" data-add-corr="1">Add</button></div>'+
+      '</div>'+
+      lexiconPanel()+
+      '<div class="page"><div class="btnrow">'+btn("Scan meetings for new terms","vocab_rebuild",[],"ghost",true)+'</div></div>';
+  };
+
+  function lexiconPanel(){
+    var lx = S.lexicon||{};
+    var status = lx.installed
+      ? (lx.loaded ? ('Installed &amp; active - '+(lx.words||0).toLocaleString()+' words')
+                   : ('Installed ('+(lx.size_mb||0)+' MB) - enable the fix to load it'))
+      : 'Not installed';
+    var head = '<div class="page"><div class="section-title">Hebrew spelling guard</div>'+
+      '<div class="hint">Fixes the fast-speech plural Whisper mishears, e.g. <b>&#1489;&#1497;&#1496;&#1493;&#1500;&#1497;&#1503;</b> &#8594; <b>&#1489;&#1497;&#1496;&#1493;&#1500;&#1497;&#1501;</b>. '+
+      'Uses the hspell Hebrew word list (AGPL-3.0), downloaded to your config folder - <b>not</b> bundled with Lia. '+
+      'Only the &#1497;&#1503;/&#1497;&#1501; plural is fixed automatically; every other unknown word is only <i>suggested</i> below.</div>'+
+      '<div class="kv"><span class="k">Status</span><span>'+status+'</span></div>';
+    var controls = lx.installed
+      ? (sw("Fix Hebrew plural &#1497;&#1503; &#8594; &#1497;&#1501; (&#1489;&#1497;&#1496;&#1493;&#1500;&#1497;&#1503; &#8594; &#1489;&#1497;&#1496;&#1493;&#1500;&#1497;&#1501;)", !!lx.enabled, "toggle_lexicon_fix")+'<br>'+
+         sw("Suggest other unknown Hebrew words", lx.suggest!==false, "toggle_lexicon_suggest"))
+      : '<div class="btnrow"><button class="btn primary" data-call="lexicon_download" data-args="[]" data-slow="1">Download dictionary (5.7 MB)</button></div>';
+    var sugg = '<div class="section-title" style="margin-top:14px">Suggested unknown words</div>'+
+      '<div class="hint">Words not in the dictionary that were left untouched, and fixes the meeting summary model proposed (pre-filled). Nothing here is applied until you click Add (it joins the corrections table).</div>'+
+      '<div class="btnrow">'+btn("Load suggestions","__load_oov",[],"")+'</div>'+
+      '<div id="oovList"></div>';
+    return head + controls + sugg + '</div>';
+  }
+
+  PAGES.snippets = function(){
+    return '<div class="content-head"><h1>Snippets</h1></div>'+
+      '<div class="page"><div class="hint">Say a cue to paste its expansion. Use \\n for line breaks.</div>'+
+        '<div class="btnrow">'+btn("Load snippets","__load_snips",[],"")+
+        '<button class="btn" data-add-snip="1">Add row</button>'+
+        '<button class="btn primary" data-save-snips="1">Save</button></div>'+
+        '<div id="snipList"></div></div>';
+  };
+
+  PAGES.advanced = function(){
+    var p = S.paths||{};
+    return '<div class="content-head"><h1>Advanced</h1></div>'+
+      '<div class="page"><div class="btnrow">'+
+        btn("Restart Lia","restart_app",[],"")+
+        btn("Open log","open_log",[],"ghost")+
+        btn("Open config folder","open_config_dir",[],"ghost")+
+        btn("Report a problem…","report_problem",[],"ghost",true)+
+        '<button class="btn danger" data-quit="1">Quit Lia</button>'+
+      '</div>'+
+      '<div class="hint">Report a problem builds a diagnostic zip (log + sanitized settings - API keys and personal lists removed), shows it in Explorer, and opens the GitHub issue page. Nothing is sent automatically - you attach the file yourself.</div>'+
+      '</div>'+
+      '<div class="page"><div class="section-title">Local summaries (Gemma / Ollama only)</div>'+
+        '<div class="hint"><b>These affect the LOCAL Gemma summary only</b> - they have NO effect on '+
+        'OpenAI / Gemini summaries. The defaults are recommended.</div>'+
+        sw("Add a dedicated tasks pass (more complete task list, +15-45s)", !!cfg("summary_local_tasks_pass",false), "toggle_summary_local_tasks_pass")+
+        '<div class="hint">Runs a narrow second pass that extracts every commitment and replaces the task list; strips speaker-label owners.</div>'+
+        sw("Merge twice-discussed topics (consolidate pass)", !!cfg("summary_consolidate_pass",true), "toggle_summary_consolidate_pass")+
+        sw("Mark tasks completed during the meeting as [x]", !!cfg("summary_task_done_pass",true), "toggle_summary_task_done_pass")+
+        sw("Coverage pass (add topics the summary missed, +30-60s)", !!cfg("summary_coverage_pass",false), "toggle_summary_coverage_pass")+
+        sw("Depth pass (numbers, the why, blockers; guarded, +2min)", !!cfg("summary_depth_pass",true), "toggle_summary_depth_pass")+
+        '<div class="hint">Each enabled pass adds a narrow local Ollama call. None of these ever touch the OpenAI / Gemini summary.</div>'+
+      '</div>'+
+      '<div class="page"><div class="section-title">Meeting summary prompt (OpenAI / Gemini)</div>'+
+        '<div class="hint"><b>Affects summaries written by OpenAI and Gemini only.</b> The local Gemma 4 '+
+        'summary is <b>not</b> affected: it runs through a pipeline of passes (depth, consolidate, '+
+        'task-done) that is hardcoded at this stage and never reads this field.</div>'+
+        '<div class="subhead">Base prompt</div>'+
+        '<div class="hint">The full instructions the model receives BEFORE your rules below. Shared '+
+        'with the local Gemma summary; editing here changes OpenAI / Gemini summaries only. Locked by '+
+        'default - unlock to edit.</div>'+
+        '<textarea id="summaryBase" class="rtl-auto" dir="auto" style="min-height:220px" disabled>'+
+          esc(draftOr("summaryBase", cfg("summary_base_prompt_override","") || (S.summary_base_prompt||"")))+
+        '</textarea>'+
+        '<div class="btnrow"><button class="btn" data-unlock-base="1">&#128274; Unlock to edit</button>'+
+          '<button class="btn primary" data-save-base="1" style="display:none">Save</button>'+
+          '<button class="btn ghost" data-reset-base="1">Reset to default</button>'+
+          (cfg("summary_base_prompt_override","")?'<span class="note">manual override active</span>':'')+
+        '</div>'+
+        '<div class="subhead">Additional rules (editable)</div>'+
+        '<div class="hint">Appended after the base prompt above. Empty, or unchanged from the default, '+
+        'keeps the built-in text.</div>'+
+        '<textarea id="summaryAddendum" class="rtl-auto" dir="auto" style="min-height:240px">'+
+          esc(draftOr("summaryAddendum", cfg("summary_cloud_addendum","") || (S.summary_addendum_default||"")))+
+        '</textarea>'+
+        '<div class="btnrow"><button class="btn primary" data-save-addendum="1">Save</button>'+
+          '<button class="btn ghost" data-reset-addendum="1">Reset to default</button>'+
+          (cfg("summary_cloud_addendum","")?'<span class="note">manual override active</span>':'')+
+        '</div>'+
+      '</div>'+
+      '<div class="page"><div class="section-title">About</div>'+
+        '<div style="font-weight:600">Lia - Local Inference Assistant</div>'+
+        '<div class="hint" style="margin-bottom:10px">The acronym explains what it does. '+
+          'The name was inspired by a little girl at home.</div>'+
+        updateBar()+
+        '<div class="kv"><span class="k">Version</span><span class="mono">'+esc(S.version||"")+'</span></div>'+
+        (function(){
+          var u = S.update || {};
+          if(u.kind === 'source')
+            return '<div class="hint">Running from a source checkout - update it with git.</div>';
+          var st = u.status === 'checking' ? 'Checking…'
+                 : (u.status === 'latest' ? 'Lia '+esc(u.current||'')+' is the latest version.' : '');
+          return '<div style="margin-top:10px">'+
+            sw("Check for updates automatically", u.auto !== false, "toggle_update_check")+'</div>'+
+            '<div class="btnrow">'+btn("Check now","update_check_now",[],"ghost",true)+
+            (st ? '<span class="note">'+st+'</span>' : '')+
+            (u.error && !u.available ? '<span class="note" style="color:var(--err)">'+esc(u.error)+'</span>' : '')+
+            '</div>';
+        })()+
+        '<div class="kv"><span class="k">Config</span><span class="rtl-auto" dir="auto">'+esc(p.config||"")+'</span></div>'+
+        '<div class="kv"><span class="k">Log</span><span class="rtl-auto" dir="auto">'+esc(p.log||"")+'</span></div>'+
+        '<div class="kv"><span class="k">Meetings</span><span class="rtl-auto" dir="auto">'+esc(p.meetings||"")+'</span></div>'+
+      '</div>'+
+      '<div class="page"><div class="section-title">Privacy &amp; data</div>'+
+        '<div class="hint">Everything Lia stores lives in the config folder above: recordings '+
+        '(WAV kept ~30 days, Opus ~2 years), transcripts, summaries, history, indexes and settings. '+
+        'Meeting transcripts are kept until you delete them; dictation history is pruned after '+
+        'the number of weeks set on the General page. The Hebrew dictionary (if downloaded) '+
+        'lives in the <span class="mono">lexicon</span> subfolder.</div>'+
+        '<div class="btnrow"><button class="btn danger" data-wipe="1">Delete all my data…</button></div>'+
+      '</div>'+
+      '<div class="page"><div class="section-title">Diagnostics</div>'+
+        sw("Keep dictation clips for tuning", !!cfg("debug_keep_dictation_clips", false), "toggle_debug_capture")+
+        '<div class="hint">Saves your last '+esc(cfg("debug_clips_ring", 100))+' dictation clips (audio + text) under '+
+        'the config folder’s <span class="mono">debug_clips</span> subfolder, for tuning punctuation / question-mark '+
+        'detection. Off by default; stays entirely on this PC and is removed by Delete all my data.</div>'+
+        '<div class="btnrow">'+btn("Open clips folder","open_debug_clips_dir",[],"ghost")+'</div>'+
+      '</div>'+
+      '<div class="page"><div class="section-title">GPU sharing</div>'+
+        sw("Share the GPU with another local app", !!cfg("gpu_lease_enabled", false), "toggle_gpu_lease")+
+        '<div class="hint">For a PC where another app of yours runs the same local AI model on this GPU. '+
+        'Both apps then take turns for heavy jobs through a small private folder '+
+        '(<span class="mono">C:\\ProgramData\\GpuLease</span>) instead of overloading the card. '+
+        'Leave it off if Lia is the only app using the GPU.</div>'+
+      '</div>';
+  };
+
+  // ---------- render ----------
+  function setStatus(){
+    var el = $("hdrStatus");
+    if(!el) return;
+    var busy = S.recording || S.meeting_active;
+    el.className = "status " + (busy ? "busy" : "ok");
+    el.innerHTML = '<span class="dot"></span>'+esc(S.status_line||"Ready");
+  }
+
+  // In-place save/result confirmation: after a real action result, the header
+  // briefly shows the ACTUAL message (a check for success, a warning for a
+  // failure) right by the settings, then reverts. The corner toast stays as the
+  // secondary channel. Most settings apply on change, so this is their "saved".
+  var _flashTimer = null;
+  function flashStatus(msg, ok){
+    var el = $("hdrStatus"); if(!el || !msg) return;
+    el.className = "status " + (ok ? "ok" : "err");
+    el.innerHTML = '<span class="dot"></span>' + (ok ? '✓ ' : '⚠ ') + esc(msg);
+    if(_flashTimer) clearTimeout(_flashTimer);
+    _flashTimer = setTimeout(function(){ setStatus(); }, 2200);
+  }
+
+  function render(){
+    var content = $("content");
+    if(!content) return;
+    var sc = content.scrollTop;
+    // preserve focused text input value + caret across re-render
+    var ae = document.activeElement, aid = ae && ae.id, asel = null;
+    if(ae && (ae.tagName==="INPUT"||ae.tagName==="TEXTAREA")){
+      try{ asel = [ae.selectionStart, ae.selectionEnd]; }catch(e){}
+    }
+    var fn = PAGES[PAGE] || PAGES.general;
+    var home = (PAGE==="home");
+    content.classList.toggle("home-mode", home);
+    // The Home page owns its own header/status; other pages get the sticky pill.
+    var pill = home ? '' :
+      '<div style="position:sticky;top:-20px;background:var(--bg);padding:2px 0 8px;z-index:4;margin:-4px 0 4px">'+
+      '<span class="status ok" id="hdrStatus"><span class="dot"></span>Ready</span></div>';
+    content.innerHTML = pill + fn();
+    setStatus();
+    content.scrollTop = sc;
+    document.querySelectorAll('.nav-item').forEach(function(b){
+      b.classList.toggle('on', b.getAttribute('data-page')===PAGE);
+    });
+    if(aid){ var re=document.getElementById(aid); if(re){ try{ re.focus();
+      if(asel && re.setSelectionRange) re.setSelectionRange(asel[0],asel[1]); }catch(e){} } }
+    // Home: load the selected meeting's summary into the side preview (wide only).
+    if(home && !S.meeting_active && homeSel && !homeIsNarrow()) loadHomePreview(homeSel);
+  }
+
+  // ---- Home: meetings preview (wide window) ----
+  function loadHomePreview(path){
+    var pv = $("mtgPreview"); if(!pv) return;
+    var m = homeMeetings().filter(function(x){ return x.path===path; })[0];
+    var title = m ? m.title : "Meeting";
+    pv.classList.remove("empty");
+    pv.innerHTML = '<div class="pv-title rtl-auto" dir="auto">'+esc(title)+'</div>'+
+      '<div class="pv-sub">Loading…</div>';
+    call("get_meeting_details", [path]).then(function(r){
+      if($("mtgPreview")!==pv) return;              // selection changed meanwhile
+      if(homeSel!==path) return;
+      var d = (r && r.data) || {};
+      var pj = JSON.stringify([path]);
+      var acts = '<div class="pv-actions">';
+      if(d.has_summary){
+        acts += '<button class="btn primary" data-call="open_meeting_path" data-args=\''+esc(pj)+'\'>'+RK.icon('edit',{size:15})+' Edit summary</button>'+
+                '<button class="btn" data-call="copy_meeting_summary" data-args=\''+esc(pj)+'\'>'+RK.icon('copy',{size:15})+' Copy summary</button>';
+      }
+      acts += '<button class="btn" data-call="open_meeting_transcript" data-args=\''+esc(pj)+'\'>'+RK.icon('file',{size:15})+' Open transcript</button>';
+      if(d.diarized)
+        acts += '<button class="btn" data-call="rename_speakers_for" data-args=\''+esc(pj)+'\'>'+RK.icon('meetings',{size:15})+' Rename speakers</button>';
+      acts += '</div>';
+      var bodyHtml = d.has_summary
+        ? '<div class="pv-body rtl-auto" dir="auto">'+esc(d.summary_text||"")+'</div>'
+        : '<div class="pv-body pv-none">No summary for this meeting - transcript only. Use Open transcript to read it.</div>';
+      pv.innerHTML = '<div class="pv-title rtl-auto" dir="auto">'+esc(title)+'</div>'+
+        '<div class="pv-sub">'+esc(d.date||(m&&m.date)||"")+(d.diarized?' · speakers':'')+'</div>'+
+        acts + bodyHtml;
+    });
+  }
+
+  // ---- Home: filter the meetings rows in place (no full re-render on keystroke) ----
+  function renderHomeRows(){
+    var box = $("mtgRows"); if(!box) return;
+    var rows = homeFiltered(), all = homeMeetings();
+    if(rows.length && (homeSel==null || !rows.some(function(m){return m.path===homeSel;})))
+      homeSel = rows[0].path;
+    var cnt = $("mtgCount"); if(cnt) cnt.textContent = rows.length;
+    box.innerHTML = rows.length ? rows.map(function(m){
+      return '<button class="mtg-row'+(m.path===homeSel?' sel':'')+'" data-mtg="'+esc(m.path)+'">'+
+        '<span class="rn rtl-auto" dir="auto">'+esc(m.title)+'</span>'+
+        (m.has_summary?'<span class="rtag">summary</span>':'<span></span>')+
+        '<span class="rmeta"><span class="rdate">'+esc(m.date)+'</span>'+
+          (m.diarized?'<span>· speakers</span>':'')+'</span>'+
+      '</button>';
+    }).join('') : (all.length
+        ? '<div class="mtg-empty">No meetings match “'+esc(homeSearch)+'”.</div>'
+        : '<div class="mtg-empty">No meetings yet.</div>');
+    if(homeSel && !homeIsNarrow()) loadHomePreview(homeSel);
+  }
+
+  function go(page){ PAGE = page; render(); }
+
+  // ---------- settings search (local, offline; no field values indexed) -----
+  var PAGE_LABEL = {general:'General', audio:'Audio', meetings:'Meetings',
+    models:'Models', cleanup:'AI Cleanup', vocab:'Vocabulary', snippets:'Snippets',
+    keys:'API Keys', server:'Transcription server', advanced:'Advanced'};
+  // Each entry: t=title, k=keywords (he+en aliases), p=page id, f=text to locate
+  // on that page (a section title / label; "" = just open the page). No secrets,
+  // no field values - only static labels.
+  var SEARCH_INDEX = [
+    {t:"Press-to-talk hotkey", k:"hotkey shortcut key dictation קיצור מקש דיבור הכתבה", p:"general", f:"Press-to-talk hotkey"},
+    {t:"Recording mode", k:"recording hold toggle מצב הקלטה", p:"general", f:"Recording mode"},
+    {t:"Paste mode", k:"paste clipboard enter הדבקה לוח", p:"general", f:"Paste"},
+    {t:"Start with Windows", k:"startup autostart boot launch הפעלה אתחול", p:"general", f:"Startup"},
+    {t:"Primary & speech languages", k:"language primary speech hebrew english שפה ראשית שפות דיבור עברית אנגלית", p:"general", f:"Languages"},
+    {t:"History retention", k:"history keep clear delete היסטוריה שמירה מחיקה", p:"general", f:"History"},
+    {t:"Invisible / silent mode", k:"invisible silent overlay waveform שקט מצב בלתי נראה", p:"general", f:"Behavior"},
+    {t:"Microphone device", k:"microphone mic input device מיקרופון התקן קלט", p:"audio", f:"microphone"},
+    {t:"System audio", k:"system audio loopback שמע מערכת", p:"audio", f:"system"},
+    {t:"Beep / sounds", k:"beep sound chime צליל ביפ", p:"audio", f:"Sounds"},
+    {t:"Dictation model", k:"dictation model engine הכתבה מודל מנוע", p:"models", f:"Dictation"},
+    {t:"Meeting model", k:"meeting model engine פגישות מודל", p:"models", f:"Meeting"},
+    {t:"Summary model", k:"summary model סיכום מודל", p:"models", f:"Summary"},
+    {t:"Local Whisper device (GPU / CPU)", k:"gpu cpu device whisper cuda מעבד כרטיס מסך", p:"models", f:"Local processing"},
+    {t:"AI cleanup style", k:"cleanup polish style proofread ניקוי סגנון עריכה הגהה", p:"cleanup", f:""},
+    {t:"OpenAI / Groq / Gemini keys", k:"api key openai groq gemini token מפתח", p:"keys", f:""},
+    {t:"Home server", k:"home server serve remote שרת בית מרוחק", p:"keys", f:"server"},
+    {t:"Auto-detect meetings", k:"auto detect meetings zoom teams meet זיהוי פגישות", p:"meetings", f:"Auto-detect"},
+    {t:"Live transcript interval", k:"live transcript interval chunk realtime תמלול חי מקצב מרווח", p:"meetings", f:"Live transcript"},
+    {t:"Summary template", k:"summary template technical minutes general תבנית סיכום", p:"meetings", f:"Meeting summaries"},
+    {t:"Summary language", k:"summary language שפת סיכום", p:"meetings", f:"Summary language"},
+    {t:"Vocabulary terms", k:"vocabulary terms glossary מילון מונחים אוצר מילים", p:"vocab", f:"Manual terms"},
+    {t:"Corrections", k:"corrections fix replace תיקונים", p:"vocab", f:"Corrections"},
+    {t:"Snippets", k:"snippets expansion abbreviation קיצורים הרחבה", p:"snippets", f:""},
+    {t:"Transcription server (client / host)", k:"transcription server serve client host שרת תמלול", p:"server", f:""},
+    {t:"Restart / open log", k:"restart log logs quit about אתחול יומן לוג", p:"advanced", f:""},
+  ];
+
+  function searchHide(){ var b=$("searchResults"); if(b){ b.hidden=true; b.innerHTML=''; } }
+  function searchSetHi(items, idx){
+    items.forEach(function(it,i){ it.classList.toggle('hi', i===idx); });
+    if(items[idx]) items[idx].scrollIntoView({block:'nearest'});
+  }
+  function searchRun(q){
+    var box = $("searchResults"); if(!box) return;
+    q = (q||'').trim().toLowerCase();
+    if(!q){ searchHide(); return; }
+    var toks = q.split(/\s+/);
+    var hits = SEARCH_INDEX.filter(function(e){
+      var hay = (e.t+' '+e.k+' '+(PAGE_LABEL[e.p]||'')).toLowerCase();
+      return toks.every(function(t){ return hay.indexOf(t)>=0; });
+    }).slice(0,12);
+    if(!hits.length){ box.innerHTML='<div class="sr-none">No settings found</div>'; box.hidden=false; return; }
+    box.innerHTML = hits.map(function(e,i){
+      return '<button class="sr'+(i===0?' hi':'')+'" data-sr-page="'+RK.esc(e.p)+
+        '" data-sr-find="'+RK.esc(e.f||'')+'">'+RK.esc(e.t)+
+        '<span class="sr-page">'+RK.esc(PAGE_LABEL[e.p]||e.p)+'</span></button>';
+    }).join('');
+    box.hidden = false;
+  }
+  function jumpTo(page, find){
+    go(page);   // render() populates #content synchronously, so the DOM is ready
+    var content = $("content"); if(!content) return;
+    var target = null;
+    if(find){
+      var needle = find.toLowerCase();
+      var nodes = content.querySelectorAll('.section-title,.field-label,.field>label,.subhead,.switch,.row-inline,.rowbtn');
+      for(var i=0;i<nodes.length;i++){
+        if((nodes[i].textContent||'').toLowerCase().indexOf(needle)>=0){ target = nodes[i]; break; }
+      }
+    }
+    var card = target ? (target.closest('.page') || target) : content.firstElementChild;
+    if(!card) return;
+    try{ card.scrollIntoView({block:'center', behavior:'smooth'}); }catch(e){ try{ card.scrollIntoView(); }catch(_){} }
+    card.classList.remove('setting-flash'); void card.offsetWidth; card.classList.add('setting-flash');
+    var focusable = card.querySelector('input:not([type=hidden]),select,textarea,button');
+    if(focusable){ try{ focusable.focus({preventScroll:true}); }catch(e){ try{ focusable.focus(); }catch(_){} } }
+  }
+
+  // ---------- push handling ----------
+  RK.onPush(function(msg){
+    var t = msg.t;
+    if(t==="tick"){
+      var liveChanged = (S.live_transcript_available !== msg.live_transcript_available);
+      var meetingChanged = (S.meeting_active !== msg.meeting_active);
+      S.status_line = msg.status_line; S.recording = msg.recording;
+      S.meeting_active = msg.meeting_active; S.live_transcript_available = msg.live_transcript_available;
+      setStatus();
+      // the Meetings page shows a live-transcript affordance; the Home page shows
+      // the whole meeting-active hero + actions - re-render either when relevant.
+      if((liveChanged || meetingChanged) && PAGE==="meetings") render();
+      if(meetingChanged && PAGE==="home") render();
+      return;
+    }
+    if(t==="state"){ S = msg.state || S; render(); return; }
+    if(t==="result"){
+      var p = pending[msg.id]; if(p){ delete pending[msg.id]; p.res(msg); }
+      if(msg.msg){ RK.toast(msg.msg, msg.ok?"ok":"err"); flashStatus(msg.msg, msg.ok); }
+      return;
+    }
+    if(t==="toast"){ RK.toast(msg.msg, msg.level); return; }
+    if(t==="focus"){ if(msg.page){ go(msg.page); } return; }
+  });
+
+  // ---------- event wiring (delegated, attached once) ----------
+  function argOf(elm){
+    var v = elm.getAttribute('data-arg'), ty = elm.getAttribute('data-argtype');
+    if(ty==="int") return parseInt(v,10);
+    if(ty==="null") return null;
+    if(ty==="json"){ try{ return JSON.parse(v); }catch(e){ return v; } }
+    return v;
+  }
+
+  document.addEventListener('click', function(e){
+    // a click anywhere outside the search box dismisses the results
+    if(!e.target.closest('.nav-search')) searchHide();
+    // Home overflow menu: toggle on its button, close on an item or outside click
+    if(e.target.closest('#homeMenuBtn')){
+      var hm=$("homeMenu"); if(hm) hm.classList.toggle('open'); return; }
+    if(e.target.closest('.home-menu-pop button')){
+      var hmo=$("homeMenu"); if(hmo) hmo.classList.remove('open'); }  // then fall through to data-call
+    else if(!e.target.closest('#homeMenu')){
+      var hmc=$("homeMenu"); if(hmc) hmc.classList.remove('open'); }
+    // Home meeting row: WIDE -> select + side preview; NARROW -> open the editor
+    var mr = e.target.closest('.mtg-row');
+    if(mr){
+      var mp = mr.getAttribute('data-mtg'); homeSel = mp;
+      if(homeIsNarrow()){ call('open_meeting_path',[mp]); return; }
+      var box=$("mtgRows");
+      if(box) box.querySelectorAll('.mtg-row').forEach(function(b){ b.classList.toggle('sel', b===mr); });
+      loadHomePreview(mp); return;
+    }
+    var sr = e.target.closest('[data-sr-page]');
+    if(sr){ var si=$("settingsSearch"); if(si) si.value=''; searchHide();
+      jumpTo(sr.getAttribute('data-sr-page'), sr.getAttribute('data-sr-find')); return; }
+    var el = e.target.closest('[data-page]');
+    if(el){ go(el.getAttribute('data-page')); return; }
+    var pl = e.target.closest('[data-page-link]');
+    if(pl){ go(pl.getAttribute('data-page-link')); return; }
+    var url = e.target.closest('[data-openurl]');
+    if(url){ e.preventDefault(); try{ RK.api.emit({t:"openurl", url:url.getAttribute('data-openurl')}); }catch(_){}
+             window.open(url.getAttribute('data-openurl'),'_blank'); return; }
+    var show = e.target.closest('[data-show]');
+    if(show){ var inp=document.getElementById(show.getAttribute('data-show'));
+      if(inp){ inp.type = inp.type==="password"?"text":"password"; show.textContent = inp.type==="password"?"Show":"Hide"; } return; }
+    // generic call button
+    var cb = e.target.closest('[data-call]');
+    if(cb){
+      var m = cb.getAttribute('data-call');
+      var args = JSON.parse(cb.getAttribute('data-args')||"[]");
+      var slow = cb.getAttribute('data-slow')==="1";
+      // internal loaders (client-only)
+      if(m==="__load_pending"){ loadList("vocab_pending_list","pendingList","pending"); return; }
+      if(m==="__load_learned"){ loadList("vocab_learned_list","learnedList","learned"); return; }
+      if(m==="__load_corr"){ loadCorr(); return; }
+      if(m==="__scan_corr"){ busy(cb,true); call("vocab_corrections_scan",[],true).then(function(r){ unbusy(cb); renderCorr(r.data||[]); }); return; }
+      if(m==="harvest_corrections_now"){ busy(cb,true); call(m,args,true).then(function(){ unbusy(cb); loadCorr(); }); return; }
+      if(m==="__load_snips"){ loadSnips(); return; }
+      if(m==="__load_oov"){ loadOov(); return; }
+      busy(cb, slow);
+      call(m, args, slow).then(function(){ unbusy(cb); });
+      return;
+    }
+    // Hotkey capture: read the combo IN THIS WINDOW via keydown, NOT the
+    // parent's global keyboard.read_hotkey - that fought the app's own keyboard
+    // hooks + the dead-hook watchdog and could crash/hang the app. The parent
+    // still validates (needs a modifier) when Save is clicked.
+    var cap = e.target.closest('#btnCapture');
+    if(cap){
+      var input=document.getElementById("hotkeyInput");
+      var orig=cap.textContent; cap.textContent="Press keys…"; cap.classList.add("primary");
+      function keyName(ev){
+        var c=ev.code||"";
+        if(/^Key[A-Z]$/.test(c)) return c.slice(3).toLowerCase();
+        if(/^Digit[0-9]$/.test(c)) return c.slice(5);
+        if(/^Numpad[0-9]$/.test(c)) return c.slice(6);
+        if(/^F([1-9]|1[0-9]|2[0-4])$/.test(c)) return c.toLowerCase();
+        var M={Space:"space",Enter:"enter",Tab:"tab",Backspace:"backspace",
+          Delete:"delete",Escape:"esc",Home:"home",End:"end",Insert:"insert",
+          PageUp:"page up",PageDown:"page down",ArrowUp:"up",ArrowDown:"down",
+          ArrowLeft:"left",ArrowRight:"right",Minus:"-",Equal:"=",Semicolon:";",
+          Quote:"'",Comma:",",Period:".",Slash:"/",Backquote:"`",
+          BracketLeft:"[",BracketRight:"]"};
+        if(M[c]) return M[c];
+        if(/^(Control|Alt|Shift|Meta|OS)/.test(c)) return null; // pure modifier
+        if(ev.key && ev.key.length===1) return ev.key.toLowerCase();
+        return null;
+      }
+      function stop(){ document.removeEventListener("keydown",onKey,true);
+        cap.textContent=orig; cap.classList.remove("primary"); }
+      function onKey(ev){
+        ev.preventDefault(); ev.stopPropagation();
+        var bare=!ev.ctrlKey&&!ev.altKey&&!ev.shiftKey&&!ev.metaKey;
+        if(ev.key==="Escape"&&bare){ stop(); return; }   // cancel capture
+        var k=keyName(ev); if(k===null) return;           // wait for a real key
+        var mods=[]; if(ev.ctrlKey)mods.push("ctrl"); if(ev.altKey)mods.push("alt");
+        if(ev.shiftKey)mods.push("shift"); if(ev.metaKey)mods.push("windows");
+        var combo=mods.concat([k]).join("+");
+        DRAFT["hotkeyInput"]=combo; if(input) input.value=combo;
+        stop();
+      }
+      document.addEventListener("keydown",onKey,true);
+      return;
+    }
+    var sh = e.target.closest('[data-save-hotkey]');
+    if(sh){ var v=(document.getElementById("hotkeyInput")||{}).value||"";
+      call("set_hotkey",[v]).then(function(r){ if(r.ok) delete DRAFT["hotkeyInput"]; }); return; }
+    var rh = e.target.closest('[data-reset-hotkey]');
+    if(rh){ DRAFT["hotkeyInput"]="ctrl+space"; call("set_hotkey",["ctrl+space"]); return; }
+    var ak = e.target.closest('[data-apply-key]');
+    if(ak){ var svc=ak.getAttribute('data-apply-key'); var iid=ak.getAttribute('data-input');
+      var val=(document.getElementById(iid)||{}).value||"";
+      busy(ak,true); call("apply_key",[svc,val],true).then(function(r){ unbusy(ak);
+        if(r.ok) delete DRAFT[iid]; var st=document.getElementById("st_"+svc); if(st){st.textContent=r.msg||"";} }); return; }
+    var ar = e.target.closest('[data-apply-remote]');
+    if(ar){ var u=(document.getElementById("in_remote_url")||{}).value||"";
+      var tk=(document.getElementById("in_remote_tok")||{}).value||"";
+      busy(ar,true); call("apply_remote",[u,tk],true).then(function(r){ unbusy(ar);
+        if(r.ok){ delete DRAFT["in_remote_url"]; delete DRAFT["in_remote_tok"]; }
+        var st=document.getElementById("st_remote"); if(st) st.textContent=r.msg||""; }); return; }
+    var tr = e.target.closest('[data-test-remote]');
+    if(tr){ var u2=(document.getElementById("in_remote_url")||{}).value||"";
+      var tk2=(document.getElementById("in_remote_tok")||{}).value||"";
+      busy(tr,true); call("test_remote",[u2,tk2],true).then(function(r){ unbusy(tr);
+        var st=document.getElementById("st_remote"); if(st) st.textContent=r.msg||""; }); return; }
+    var gtk = e.target.closest('[data-gen-token]');
+    if(gtk){ busy(gtk,true); call("gen_serve_token",[],true).then(function(r){ unbusy(gtk);
+        var st=document.getElementById("st_serve");
+        if(r.ok){ var inp=document.getElementById("in_serve_tok"); if(inp){ inp.type="text"; inp.value=r.msg; }
+          if(st) st.textContent="New token generated and copied to the clipboard - paste it into the client's Access token on your other device."; }
+        else if(st){ st.textContent=r.msg||""; } }); return; }
+    var ctk = e.target.closest('[data-copy-token]');
+    if(ctk){ busy(ctk,true); call("copy_serve_token",[],true).then(function(r){ unbusy(ctk);
+        var st=document.getElementById("st_serve"); if(st) st.textContent=r.msg||""; }); return; }
+    var asv = e.target.closest('[data-apply-serve]');
+    if(asv){ var sp=(document.getElementById("in_serve_port")||{}).value||"";
+      var stk=(document.getElementById("in_serve_tok")||{}).value||"";
+      busy(asv,true); call("apply_serve",[sp,stk],true).then(function(r){ unbusy(asv);
+        if(r.ok){ delete DRAFT["in_serve_port"]; delete DRAFT["in_serve_tok"]; }
+        var st=document.getElementById("st_serve"); if(st) st.textContent=r.msg||""; }); return; }
+    var mc = e.target.closest('[data-set-role]');
+    if(mc){ call("set_transcription_role",[mc.getAttribute('data-set-role')]); return; }
+    var sv = e.target.closest('[data-save-vocab]');
+    if(sv){ var vt=(document.getElementById("vocabText")||{}).value||"";
+      call("save_vocabulary",[vt]).then(function(r){ if(r.ok) delete DRAFT["vocabText"]; }); return; }
+    var ssn = e.target.closest('[data-save-selfname]');
+    if(ssn){ var nv=(document.getElementById("selfName")||{}).value||"";
+      call("set_speaker_self_name",[nv]).then(function(r){ if(r.ok) delete DRAFT["selfName"]; }); return; }
+    var rv = e.target.closest('[data-reset-vocab]');
+    if(rv){ if(!confirm("Replace the terms above with the shipped default set?")) return;
+      call("reset_vocab_default",[]).then(function(r){ if(r.ok) delete DRAFT["vocabText"]; }); return; }
+    var sa = e.target.closest('[data-save-addendum]');
+    if(sa){ var at=(document.getElementById("summaryAddendum")||{}).value||"";
+      call("save_summary_addendum",[at]).then(function(r){ if(r.ok) delete DRAFT["summaryAddendum"]; }); return; }
+    var ra = e.target.closest('[data-reset-addendum]');
+    if(ra){ if(!confirm("Replace the text above with the built-in default?")) return;
+      call("reset_summary_addendum",[]).then(function(r){ if(r.ok) delete DRAFT["summaryAddendum"]; }); return; }
+    var ulb = e.target.closest('[data-unlock-base]');
+    if(ulb){ if(ulb.dataset.on==="1") return;
+      if(!confirm("Editing the base prompt can cause unexpected changes to your OpenAI / Gemini "+
+        "summaries - wrong headers, a broken format, or lost faithfulness. It does NOT affect the "+
+        "local Gemma summary. Continue?")) return;
+      var bt=document.getElementById("summaryBase"); if(bt){ bt.disabled=false; bt.focus(); }
+      ulb.dataset.on="1"; ulb.textContent="🔓 Editing enabled";
+      var sbb=document.querySelector('[data-save-base]'); if(sbb) sbb.style.display=""; return; }
+    var sb2 = e.target.closest('[data-save-base]');
+    if(sb2){ var bv=(document.getElementById("summaryBase")||{}).value||"";
+      call("save_summary_base_prompt",[bv]).then(function(r){ if(r.ok) delete DRAFT["summaryBase"]; }); return; }
+    var rb2 = e.target.closest('[data-reset-base]');
+    if(rb2){ if(!confirm("Replace the base prompt with the built-in default?")) return;
+      call("reset_summary_base_prompt",[]).then(function(r){ if(r.ok) delete DRAFT["summaryBase"]; }); return; }
+    var va = e.target.closest('[data-vocab-apply]');
+    if(va){ applyPending(); return; }
+    var vr = e.target.closest('[data-vocab-remove]');
+    if(vr){ removeLearned(); return; }
+    var ac = e.target.closest('[data-add-corr]');
+    if(ac){ var w=(document.getElementById("corrWrong")||{}).value||"";
+      var ri=(document.getElementById("corrRight")||{}).value||"";
+      call("vocab_add_correction",[w,ri]).then(function(r){ if(r.ok){ loadCorr();
+        var a=document.getElementById("corrWrong"); var b=document.getElementById("corrRight"); if(a)a.value=""; if(b)b.value=""; } }); return; }
+    var dc = e.target.closest('[data-del-corr]');
+    if(dc){ call("vocab_remove_correction",[dc.getAttribute('data-del-corr')]).then(loadCorr); return; }
+    var oa = e.target.closest('[data-oov-add]');
+    if(oa){ var ow=oa.getAttribute('data-oov-add');
+      var inp=document.querySelector('[data-oov-right="'+ow+'"]'); var ri=(inp&&inp.value||"").trim();
+      if(!ri){ RK.toast("Type the correct spelling first","err"); return; }
+      call("vocab_add_correction",[ow,ri]).then(function(r){ if(r.ok){ call("lexicon_oov_dismiss",[[ow]]).then(loadOov); } }); return; }
+    var od = e.target.closest('[data-oov-dismiss]');
+    if(od){ call("lexicon_oov_dismiss",[[od.getAttribute('data-oov-dismiss')]]).then(loadOov); return; }
+    var cun = e.target.closest('[data-corr-unused]');
+    if(cun){ Array.prototype.slice.call(document.querySelectorAll('#corrList tr.corr-unused input[data-ck]'))
+      .forEach(function(x){ x.checked=true; }); return; }
+    var crm = e.target.closest('[data-corr-remove]');
+    if(crm){ var keys=Array.prototype.slice.call(document.querySelectorAll('#corrList input[data-ck]'))
+      .filter(function(x){return x.checked;}).map(function(x){return x.getAttribute('data-ck');});
+      if(!keys.length) return;
+      if(!confirm("Remove "+keys.length+" correction(s)?")) return;
+      call("vocab_remove_corrections",[keys]).then(loadCorr); return; }
+    var asn = e.target.closest('[data-add-snip]');
+    if(asn){ addSnipRow("",""); return; }
+    var dsn = e.target.closest('[data-del-snip]');
+    if(dsn){ dsn.closest('tr').remove(); return; }
+    var ss = e.target.closest('[data-save-snips]');
+    if(ss){ saveSnips(); return; }
+    var q = e.target.closest('[data-quit]');
+    if(q){ if(confirm("Quit Lia? Dictation and meetings will stop.")) call("quit_app",[]); return; }
+    var ch = e.target.closest('[data-clear-history]');
+    if(ch){ if(!confirm("Delete ALL transcription history?\n\nThis cannot be undone.")) return;
+      call("clear_history",[]); return; }
+    var dw = e.target.closest('[data-wipe]');
+    if(dw){
+      var msg = "Delete ALL Lia data?\n\nThis permanently removes:\n"+
+        "- meeting recordings, transcripts and summaries\n"+
+        "- transcription history and chat history\n"+
+        "- the email/meeting indexes and voiceprints\n"+
+        "- vocabulary, settings, API keys and the log\n\n"+
+        "Close any other open Lia windows first.\n"+
+        "Lia will quit when done. This cannot be undone.";
+      if(!confirm(msg)) return;
+      var typed = prompt("Type DELETE to confirm:");
+      if(((typed||"").trim().toUpperCase())!=="DELETE") return;
+      call("delete_all_data",[],true); return;
+    }
+  });
+
+  document.addEventListener('change', function(e){
+    var t = e.target;
+    if(t.matches('[data-toggle]')){ call(t.getAttribute('data-toggle'),[]); return; }
+    if(t.matches('[data-select]')){ call(t.getAttribute('data-select'),[parseInt(t.value,10)]); return; }
+    if(t.matches('[data-select-str]')){ call(t.getAttribute('data-select-str'),[t.value]); return; }
+    if(t.matches('[data-lang-enable]')){
+      var codes=[]; document.querySelectorAll('[data-lang-enable]').forEach(function(x){
+        if(x.checked) codes.push(x.getAttribute('data-lang-code')); });
+      call('set_enabled_languages',[codes]); return;
+    }
+    if(t.matches('[data-lang-lock]')){
+      var p=t.getAttribute('data-lang-primary')||'he';
+      call('set_enabled_languages', t.checked ? [[p]] : [[p, p==='en'?'he':'en']]); return;
+    }
+    if(t.matches('[data-radio]')){ if(t.checked){ var m=t.getAttribute('data-radio'), a=argOf(t);
+      call(m, m==="set_cleanup_provider_model"?a:[a], t.getAttribute('data-slow')==="1"); } return; }
+  });
+
+  document.addEventListener('input', function(e){
+    var t = e.target;
+    if(t.id==="mtgSearch"){ homeSearch = t.value; renderHomeRows(); return; }
+    if(t.id==="langFilter"){
+      var q=(t.value||"").toLowerCase();
+      document.querySelectorAll('#langList .lang-item').forEach(function(el){
+        var nm=el.getAttribute('data-lang-name')||"";
+        el.style.display=(!q || nm.indexOf(q)>=0) ? '' : 'none';
+      });
+      return;
+    }
+    if(t.id && (t.tagName==="INPUT"||t.tagName==="TEXTAREA")){ DRAFT[t.id]=t.value; }
+  });
+
+  function busy(el, slow){ if(el && slow){ el.classList.add('disabled'); el.dataset._t=el.textContent;
+    el.innerHTML='<span class="spinner"></span>'; } }
+  function unbusy(el){ if(el && el.dataset._t!=null){ el.classList.remove('disabled'); el.textContent=el.dataset._t; delete el.dataset._t; } }
+
+  // ---------- vocab / snippets list loaders ----------
+  function loadList(method, targetId, kind){
+    call(method,[]).then(function(r){
+      var data = r.data||[]; var el=document.getElementById(targetId); if(!el) return;
+      if(!data.length){ el.innerHTML='<div class="hint">None.</div>'; return; }
+      el.setAttribute("data-kind", kind);
+      el.innerHTML = data.map(function(it){
+        var k = it.term!=null ? it.term : (it.key||"");
+        var meta = kind==="pending" ? ("×"+(it.count_corpus||0)) : ("used "+(it.count_used||0));
+        return '<label class="check"><input type="checkbox" data-vk="'+esc(k)+'"><span class="box"></span>'+
+          '<span class="txt rtl-auto" dir="auto">'+esc(k)+' <small>'+esc(meta)+'</small></span></label>';
+      }).join('');
+    });
+  }
+  function checkedKeys(id){ return Array.prototype.slice.call(
+    document.querySelectorAll('#'+id+' input[data-vk]')).filter(function(x){return x.checked;})
+    .map(function(x){return x.getAttribute('data-vk');}); }
+  function allKeys(id){ return Array.prototype.slice.call(
+    document.querySelectorAll('#'+id+' input[data-vk]')).map(function(x){return x.getAttribute('data-vk');}); }
+  function applyPending(){
+    var approve = checkedKeys("pendingList");
+    var all = allKeys("pendingList");
+    var reject = all.filter(function(k){ return approve.indexOf(k)<0; });
+    call("vocab_resolve",[approve,reject]).then(function(){ loadList("vocab_pending_list","pendingList","pending"); });
+  }
+  function removeLearned(){
+    var keys = checkedKeys("learnedList");
+    if(!keys.length) return;
+    call("vocab_remove_learned",[keys]).then(function(){ loadList("vocab_learned_list","learnedList","learned"); });
+  }
+  function corrUnused(c){
+    // "unused" only makes sense once an archive scan has stamped corpus_hits.
+    return c.corpus_hits!=null && (c.count_applied||0)===0 && (c.corpus_hits||0)===0;
+  }
+  function corrMeta(c){
+    var parts = ['&#215;'+(c.count_applied||0)];
+    if(c.corpus_hits!=null) parts.push((c.corpus_hits||0)+' hits');
+    if(c.source && c.source!=="manual") parts.push(esc(c.source));
+    if(corrUnused(c)) parts.push('unused');
+    return parts.join(' &middot; ');
+  }
+  function renderCorr(data){
+    var el=document.getElementById("corrList"); if(!el) return;
+    if(!data.length){ el.innerHTML='<div class="hint">No corrections yet.</div>'; return; }
+    data.sort(function(a,b){ return (b.count_applied||0)-(a.count_applied||0)
+      || (b.corpus_hits||0)-(a.corpus_hits||0)
+      || String(a.wrong||"").localeCompare(String(b.wrong||"")); });
+    el.innerHTML='<table class="tbl">'+data.map(function(c){
+      var un=corrUnused(c);
+      return '<tr'+(un?' class="corr-unused"':'')+'>'+
+        '<td class="act"><input type="checkbox" data-ck="'+esc(c.wrong)+'"></td>'+
+        '<td class="rtl-auto" dir="auto">'+esc(c.wrong)+' &#8594; '+esc(c.right)+
+          ' <small class="muted">'+corrMeta(c)+'</small></td>'+
+        '<td class="act"><button class="btn ghost sm" data-del-corr="'+esc(c.wrong)+'">&#128465;</button></td></tr>';
+    }).join('')+'</table>';
+  }
+  function loadCorr(){ call("vocab_corrections_list",[]).then(function(r){ renderCorr(r.data||[]); }); }
+  function renderOov(data){
+    var el=document.getElementById("oovList"); if(!el) return;
+    if(!data.length){ el.innerHTML='<div class="hint">No unknown words recorded yet.</div>'; return; }
+    el.innerHTML='<table class="tbl">'+data.map(function(o){
+      var w=esc(o.word);
+      return '<tr>'+
+        '<td class="rtl-auto" dir="auto">'+w+' <small class="muted">&#215;'+(o.count||0)+
+          (o.proposed ? ' &#183; proposed by the '+esc(o.label||"summary") : '')+'</small></td>'+
+        '<td><input type="text" class="mono" data-oov-right="'+w+'" value="'+esc(o.proposed||"")+'" placeholder="Fix to&#8230;" style="max-width:150px"></td>'+
+        '<td class="act"><button class="btn sm" data-oov-add="'+w+'">Add</button> '+
+          '<button class="btn ghost sm" data-oov-dismiss="'+w+'">Dismiss</button></td></tr>';
+    }).join('')+'</table>';
+  }
+  function loadOov(){ call("lexicon_oov_list",[]).then(function(r){ renderOov(r.data||[]); }); }
+  function loadSnips(){
+    call("snippets_get",[]).then(function(r){
+      var data=r.data||[]; var el=document.getElementById("snipList"); if(!el) return;
+      el.innerHTML='<table class="tbl" id="snipTbl"></table>';
+      if(!data.length){ addSnipRow("",""); } else { data.forEach(function(s){ addSnipRow(s.cue||"", s.text||""); }); }
+    });
+  }
+  function addSnipRow(cue, text){
+    var tb = document.getElementById("snipTbl");
+    if(!tb){ var el=document.getElementById("snipList"); if(el){ el.innerHTML='<table class="tbl" id="snipTbl"></table>'; tb=document.getElementById("snipTbl"); } }
+    if(!tb) return;
+    var tr=document.createElement("tr");
+    tr.innerHTML='<td style="width:35%"><input type="text" class="snip-cue" value="'+esc(cue)+'" placeholder="cue"></td>'+
+      '<td><input type="text" class="snip-text rtl-auto" dir="auto" value="'+esc(text)+'" placeholder="expansion"></td>'+
+      '<td class="act"><button class="btn ghost sm" data-del-snip="1">&#128465;</button></td>';
+    tb.appendChild(tr);
+  }
+  function saveSnips(){
+    var rows = Array.prototype.slice.call(document.querySelectorAll('#snipTbl tr'));
+    var items = rows.map(function(tr){
+      return { cue:(tr.querySelector('.snip-cue')||{}).value||"", text:(tr.querySelector('.snip-text')||{}).value||"" };
+    });
+    // re-load from the store after saving so the table reflects what's persisted
+    // (and a later Save can't overwrite with a stale/empty table).
+    call("snippets_set",[items]).then(function(){ loadSnips(); });
+  }
+
+  // wire the settings-search input (a static element in BODY)
+  (function(){
+    var si = $("settingsSearch"); if(!si) return;
+    si.addEventListener('input', function(){ searchRun(si.value); });
+    si.addEventListener('focus', function(){ if(si.value) searchRun(si.value); });
+    si.addEventListener('keydown', function(e){
+      var box = $("searchResults");
+      var items = (box && !box.hidden) ? [].slice.call(box.querySelectorAll('.sr')) : [];
+      var hi = box ? box.querySelector('.sr.hi') : null;
+      var idx = items.indexOf(hi);
+      if(e.key==='ArrowDown'){ e.preventDefault(); if(items.length) searchSetHi(items, Math.min(items.length-1, idx+1)); }
+      else if(e.key==='ArrowUp'){ e.preventDefault(); if(items.length) searchSetHi(items, Math.max(0, idx-1)); }
+      else if(e.key==='Enter'){ e.preventDefault(); var pick = hi || items[0]; if(pick) pick.click(); }
+      else if(e.key==='Escape'){ si.value=''; searchHide(); si.blur(); }
+    });
+  })();
+
+  // ---------- boot ----------
+  if(window.__LIA_DEMO__){
+    // Static QA render (browser / no pywebview): render immediately.
+    go(PAGE);
+  } else {
+    RK.ready(function(){
+      try{ RK.api.mark_ready(); }catch(e){}
+      if(FOCUS){ /* reserved: focus a specific control */ }
+      go(PAGE);
+    });
+  }
+})();
+"""
+# Embed provider logos inline (CSP-safe data: URIs; left as the "__..._LOGO__"
+# placeholder if the asset is missing, so the render falls back to the letter badge).
+APP_JS = (APP_JS
+          .replace("__OPENAI_LOGO__", uk.asset_data_uri("provider_openai.png"))
+          .replace("__GEMINI_LOGO__", uk.asset_data_uri("provider_gemini.png"))
+          .replace("__GROQ_LOGO__", uk.asset_data_uri("provider_groq.png"))
+          .replace("__PARAKEET_LOGO__", uk.asset_data_uri("provider_parakeet.png"))
+          .replace("__WHISPER_LOGO__", uk.asset_data_uri("provider_whisper.png")))
+
+
+if __name__ == "__main__":
+    main()

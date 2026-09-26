@@ -1,0 +1,42 @@
+faster-whisper>=1.1.0
+pyaudio>=0.2.14
+PyAudioWPatch>=0.2.12.7
+keyboard>=0.13.5
+pyperclip>=1.8.2
+pystray>=0.19.5
+Pillow>=10.0.0
+numpy>=1.24.0
+requests>=2.31.0
+# websocket-client: the WhisperLive WebSocket client for the self-hosted
+# "remote" transcription backend (serve mode, home-GPU server), and the
+# retained GeminiLiveStream foundation. Without it the remote backend fails
+# with "websocket-client not installed".
+websocket-client>=1.7
+# websockets: the SERVER side - Lia's built-in "Host a transcription server"
+# (LiaTranscriptionServer, `lia.py --serve`) runs on it. Imported lazily, so
+# the tray app doesn't load it unless serve mode is on.
+websockets>=13
+# pywebview: the HTML/CSS windows (Settings, Ask-your-meetings, Action items,
+# Chat, Email search, Compose/Summary editor). edgechromium (WebView2) backend.
+pywebview>=6.2
+# pywin32: Outlook COM (win32com.client / pythoncom) for the email/summary
+# windows, and the de-elevation / window helpers.
+pywin32>=306
+# python-bidi: NO LONGER used for Tk display (this Tk renders bidi natively —
+# get_display would double-reverse). Kept only because _to_visual_rtl remains
+# for back-compat; safe to drop once that helper is removed.
+python-bidi>=0.4.2
+# onnx-asr: the LOCAL multi-language backend (NVIDIA Parakeet TDT 0.6B v3 (25 European languages), int8 ONNX,
+# CC-BY-4.0). Tiny footprint (numpy + onnxruntime, no torch); the model
+# (~670MB) auto-downloads on first use. CPU is several-x realtime.
+onnx-asr[cpu,hub]>=0.12
+# Optional: Intel GPU/NPU acceleration (uncomment to install)
+# openvino-genai
+# huggingface-hub
+
+# Optional: NVIDIA GPU (CUDA) acceleration for local faster-whisper.
+# With an NVIDIA card + recent driver, install these and the app auto-uses the
+# GPU (config "whisper_device": "auto"). They ship the CUDA 12 cuBLAS + cuDNN 9
+# runtime DLLs CTranslate2 needs; the app adds them to the DLL search path at
+# startup. ~1.2 GB. Not needed on CPU-only machines.
+# pip install nvidia-cublas-cu12 "nvidia-cudnn-cu12>=9,<10"
