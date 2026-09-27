@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """Lia brand asset derivation (2026-09-17 brand refresh; artwork replaced
-2026-09-24 with the purple-blue petals + dot mark).
+2026-09-27 with the purple-blue ribbon 'L').
 
 TWO master inputs (kept safe, never generated):
 
   lia.png        the FULL logo - the mark ABOVE the "lia" wordmark.
                  The app's reference brand artwork.
   lia_mark.png   the MARK ONLY (no wordmark), transparent.
-  (lia_text.png, the wordmark alone, is cropped from lia.png below the mark.)
+  (lia_text.png, the wordmark alone, is the dark lettering separated from
+                 lia.png by colour - the ribbon overlaps its rows.)
 
 The small icon slots (the OS app icon at 16-48 px, the 28 px Settings-header
 brand) can't read the wordmark, so BOTH derived assets come from the MARK:

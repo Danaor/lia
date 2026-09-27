@@ -2892,6 +2892,24 @@ _BUNDLE_SCRUB = [
 ]
 
 
+# Key-shaped strings an HTTP error body can echo back (a provider may quote
+# the rejected key, even partly masked): masked before the body is logged.
+_SECRET_LIKE_RE = re.compile(
+    r"(?i)(?:\bBearer\s+[A-Za-z0-9._~+/=-]{8,}"
+    r"|\b(?:sk|gsk|hf|ghp|gho|xox[a-z])[-_][A-Za-z0-9*._-]{8,}"
+    r"|\bAIza[0-9A-Za-z_-]{20,})")
+
+
+def _http_body_for_log(resp, limit=300):
+    """The start of an HTTP error body for the log, with key-like strings
+    masked (model_not_found / rate-limit reasons stay readable)."""
+    try:
+        body = (resp.text or "")[:limit]
+    except Exception:
+        return ""
+    return _SECRET_LIKE_RE.sub("<redacted>", body)
+
+
 def _scrub_for_bundle(text):
     """Text bound for a PUBLIC issue: meeting titles in file names, the Windows
     account name in paths, e-mail addresses and IP addresses are replaced
@@ -10269,7 +10287,7 @@ class GroqLLMCleaner:
             )
             if resp.status_code != 200:
                 log.warning("LLM cleanup: HTTP %d, body=%s — using raw text",
-                            resp.status_code, resp.text[:200])
+                            resp.status_code, _http_body_for_log(resp, 200))
                 # 429 = rate limit. Don't pummel Groq for the next 5
                 # minutes — every request inside the limit window will
                 # fail with the same error AND consume retry-allowance.
@@ -10940,7 +10958,7 @@ class GroqLLMCleaner:
                 # account can't reach yet) otherwise looks like "the meeting just
                 # didn't get a summary" with no clue why.
                 log.warning("Summary (%s): HTTP %d, body=%s",
-                            self.model, resp.status_code, resp.text[:300])
+                            self.model, resp.status_code, _http_body_for_log(resp))
                 self._note_summary_error("%s answered HTTP %d%s" % (
                     self.model, resp.status_code,
                     " (invalid key)" if resp.status_code == 401 else
@@ -11048,7 +11066,7 @@ class GroqLLMCleaner:
         # already under way - _summary_with_gpu_fallback).
         self._ollama_calls = getattr(self, "_ollama_calls", 0) + 1
         if resp.status_code != 200:
-            log.warning("Summary: HTTP %d, body=%s", resp.status_code, resp.text[:300])
+            log.warning("Summary: HTTP %d, body=%s", resp.status_code, _http_body_for_log(resp))
             self._note_summary_error("the local model answered HTTP %d%s" % (
                 resp.status_code,
                 (" (%s)" % resp.text[:80].strip()) if resp.text else ""))
@@ -11237,7 +11255,7 @@ class GroqLLMCleaner:
                 timeout=(10, timeout),
             )
             if resp.status_code != 200:
-                log.warning("LLM chat: HTTP %d, body=%s", resp.status_code, resp.text[:300])
+                log.warning("LLM chat: HTTP %d, body=%s", resp.status_code, _http_body_for_log(resp))
                 return ""
             data = resp.json()
             choice = (data.get("choices") or [{}])[0]
@@ -16178,7 +16196,7 @@ def _parse_coverage(text):
             cand = m.group(2).strip()
             if _looks_like_instruction(cand):
                 log.warning("Summary coverage pass: dropped an instruction-shaped "
-                            "candidate (possible injection): %r", cand[:80])
+                            "candidate (possible injection): %s", _priv(cand, 80))
                 continue
             out.append((m.group(1), cand))
         if len(out) == _COVERAGE_MAX:
@@ -16221,8 +16239,8 @@ def _splice_coverage(out, additions):
     added = 0
     for kind, text in additions:
         if _covered(out, text):
-            log.info("Summary coverage pass: skipped an addition already covered ('%s...').",
-                     text[:40])
+            log.info("Summary coverage pass: skipped an addition already covered (%s).",
+                     _priv(text, 40))
             continue
         line = "- " + text.lstrip("- ").strip()
         if kind == "דגשים":
@@ -16247,8 +16265,8 @@ def _coverage_fuzzy_filter(additions, out):
         dup = (next((r[1] for r in result if summary_dedup.is_near_duplicate(line_a, r[1])), None)
                or next((e for e in existing if summary_dedup.is_near_duplicate(line_a, e)), None))
         if dup is not None:
-            log.info("Summary coverage pass: candidate dropped as near-duplicate: %r ~ %r",
-                     line_a.strip(), dup.strip())
+            log.info("Summary coverage pass: candidate dropped as near-duplicate: %s ~ %s",
+                     _priv(line_a.strip()), _priv(dup.strip()))
             continue
         result.append((kind_a, line_a))
     return result
@@ -16431,13 +16449,13 @@ def _splice_depth(summary, enriched, lang="he", source=None):
             n_new, n_cur = (len(_DEPTH_BULLET_RE.findall(new)),
                             len(_DEPTH_BULLET_RE.findall(cur)))
             if n_new > _DEPTH_HIGHLIGHTS_CAP and n_new > n_cur:
-                log.info("Summary depth pass: rewritten '%s' inflated to %d bullets "
-                         "(contract 3-6, was %d) - kept original.", name, n_new, n_cur)
+                log.info("Summary depth pass: rewritten %s inflated to %d bullets "
+                         "(contract 3-6, was %d) - kept original.", _priv(name), n_new, n_cur)
                 continue
         reason = _depth_guard_reason(cur, new, known, lang, source)
         if reason:
-            log.info("Summary depth pass: rewritten '%s' tripped a faithfulness guard "
-                     "(%s) - kept original.", name, reason)
+            log.info("Summary depth pass: rewritten %s tripped a faithfulness guard "
+                     "(%s) - kept original.", _priv(name), reason)
             continue
         out = _replace_section(out, name, new)
     return out
@@ -16462,8 +16480,8 @@ def _merge_narrative_windows(parts, fuzzy=False):
                 if match is not None:
                     if len(raw.strip()) > len(match[1]):
                         match[1] = raw.strip()
-                    log.info("Summary depth pass: narrative merged (same topic twice): %r",
-                             heading)
+                    log.info("Summary depth pass: narrative merged (same topic twice): %s",
+                             _priv(heading))
                     continue
             blocks.append([heading, raw.strip()])
     return "\n\n".join(b[1] for b in blocks)
@@ -32391,6 +32409,22 @@ class LiaApp:
         n = st.dismiss_oov(words or [])
         return (True, "%d suggestion(s) dismissed." % n)
 
+    # Suggestion groups the Vocabulary page can accept in one click.
+    _ACCEPT_ALL_LABELS = ("auto-harvest",)
+
+    def _vocab_accept_suggestions(self, label):
+        """Settings > Vocabulary 'Add all fixes learned from meetings': the
+        user's explicit approval of every harvested suggestion (1.6.11 parked
+        them there, audit F3)."""
+        st = getattr(self, "_vocab_store", None)
+        if not st:
+            return (False, "No vocabulary store")
+        if label not in self._ACCEPT_ALL_LABELS:
+            return (False, "Unknown suggestion group.")
+        n = st.accept_correction_suggestions(label)
+        log.info("Vocab: %d suggestion(s) from %s added to corrections by the user", n, label)
+        return (True, "%d fix(es) added to the corrections table." % n)
+
     def _settings_push_state(self):
         """Push a fresh settings state to an open child (no-op if none)."""
         try:
@@ -34371,6 +34405,7 @@ class LiaApp:
         add("toggle_lexicon_suggest", self._toggle_lexicon_suggest)
         add("lexicon_oov_list", self._lexicon_oov_list)
         add("lexicon_oov_dismiss", self._lexicon_oov_dismiss)
+        add("vocab_accept_suggestions", self._vocab_accept_suggestions)
         # Snippets
         add("snippets_get", self._snippets_get)
         add("snippets_set", self._snippets_set_result)
@@ -34434,7 +34469,8 @@ class LiaApp:
                                        "vocab_add_correction",
                                        "vocab_remove_correction",
                                        "vocab_remove_corrections",
-                                       "lexicon_oov_dismiss"}
+                                       "lexicon_oov_dismiss",
+                                       "vocab_accept_suggestions"}
 
     def _settings_status_line(self):
         if self._is_meeting_active():

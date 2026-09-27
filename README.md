@@ -1,96 +1,139 @@
 <div align="center">
 
-<img src="lia/lia.png" alt="Lia" width="120">
+<img src="docs/img/hero.jpg" alt="Lia - your meetings never leave your computer" width="100%">
 
-# Lia
+<br>
 
-**Local Inference Assistant** - push-to-talk dictation and meeting intelligence for Windows.
-Local-first, Hebrew and English, zero friction.
+[![Release](https://img.shields.io/github/v/release/Danaor/lia?color=6d4aff&label=download)](https://github.com/Danaor/lia/releases/latest)
+[![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6.svg)](https://github.com/Danaor/lia/releases/latest)
+[![Runs locally](https://img.shields.io/badge/runs-100%25%20local-2ea44f.svg)](#-private-by-design)
+[![Hebrew first](https://img.shields.io/badge/Hebrew-first-7d3fc9.svg)](#-hebrew-first)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-[![Release](https://img.shields.io/github/v/release/Danaor/lia?color=7d3fc9)](https://github.com/Danaor/lia/releases/latest)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![Windows](https://img.shields.io/badge/platform-Windows-0078D6.svg)](https://www.microsoft.com/windows)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+**[Download for Windows](https://github.com/Danaor/lia/releases/latest)** &nbsp;·&nbsp; [How it works](#-how-a-meeting-works) &nbsp;·&nbsp; [GPU guide](#-what-you-need) &nbsp;·&nbsp; [Privacy](#-private-by-design)
 
 </div>
 
 ---
 
-Press a hotkey, speak, press it again - your words appear wherever your cursor is. Record a meeting and get a live transcript, speaker names, and a faithful AI summary with a real task list. Ask questions about everything your meetings ever said - fully on your own machine.
+## An AI note-taker that stays on your computer
+
+Most AI note-takers join your call as a bot, upload the recording to their cloud, and charge you every month. **Lia does none of that.**
+
+Lia sits quietly in your Windows tray. When a meeting starts, it records both sides of the call, transcribes it, works out who said what, and writes a clear summary with decisions and a real task list - **all on your own computer, on your own GPU.** The audio, the transcript and the summary never leave your machine at any point.
+
+- 🔒 **Nothing leaves your computer.** Recording, transcription, speaker identification and the AI summary all run locally. Unplug the network - it still works.
+- 🗣 **Hebrew first.** Built from day one for Hebrew and for real Israeli meetings that jump between Hebrew and English mid-sentence.
+- 🤖 **No bot in your call.** Lia records the audio on your PC. Nobody sees a "Notetaker has joined" message.
+- 💸 **Free and open source.** No account, no subscription, no per-minute pricing. MIT license.
 
 <div align="center">
-<table><tr>
-<td><img src="docs/settings_general.png" alt="Settings - General" width="460"></td>
-<td><img src="docs/settings_models.png" alt="Settings - Models" width="460"></td>
-</tr></table>
+<img src="docs/img/meeting_flow.gif" alt="A meeting in Lia: detected, recorded, transcribed on the local GPU, summarized, ready" width="820">
 </div>
 
-> **About the name.** L.I.A stands for **Local Inference Assistant**. It is also my daughter's name, which is the better reason.
+## 🎙 How a meeting works
 
-## Why Lia?
+1. **Start** - click *Start meeting*, or turn on meeting detection and Lia offers to record when your Zoom / Teams / Google Meet call begins.
+2. **Record** - your microphone and the call's audio are captured on your computer. A live transcript window follows the conversation as it happens.
+3. **Transcribe** - when the call ends, Lia transcribes the full meeting with a Hebrew-tuned speech model and separates the speakers.
+4. **Name the speakers** - Lia knows your voice, learns the people you meet often, and uses your calendar invitees to put real names on each speaker.
+5. **Summarize** - a local AI model (via [Ollama](https://ollama.com)) writes the summary: the gist, the key points, what was decided, and every task with its owner.
+6. **Done** - the summary and full transcript are saved in your meetings folder. Copy it, edit it, or send it on.
 
-Most dictation tools are subscriptions (SuperWhisper, Wispr Flow), cloud-locked (Otter, Rev), or mediocre outside English. Lia is different:
+<div align="center">
+<img src="docs/img/summary.png" alt="A Hebrew meeting summary created by Lia" width="560">
+<br><sub>A real-looking Hebrew summary (demo data) - the gist, key points and every task with its owner</sub>
+</div>
 
-- **Local-first.** Dictation, meeting transcription, diarization, summaries, and search can all run 100% on your machine. Disconnect the WiFi - everything still works.
-- **Hebrew that actually works.** The excellent [ivrit.ai](https://huggingface.co/ivrit-ai) fine-tuned Whisper models, plus a pipeline built for Hebrew business meetings.
-- **English that actually works.** NVIDIA [Parakeet](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) as a dedicated local English engine - better English accuracy than Whisper large-v3-turbo at ~15x the speed, with native punctuation, running in realtime on a plain CPU.
-- **One switch for your language.** Settings -> General -> Primary language sets the dictation model, meeting model, and summary language together. Mixed-language meetings are auto-routed per segment (Hebrew goes to the Hebrew model, English to the English one).
-- **Cloud when you want it.** Optional Groq / OpenAI transcription and cloud summaries, with automatic fallback to local when the network fails.
-- **Free and open source.** MIT licensed. No accounts, no telemetry, no payment wall.
+## 🗣 Hebrew first
 
-## What it does
+Hebrew is where most transcription tools fall apart. Lia was built for it:
 
-### Dictation
+- **The best open Hebrew speech models,** from [ivrit.ai](https://huggingface.co/ivrit-ai), running locally on your GPU.
+- **Mixed Hebrew and English.** Real meetings switch languages mid-sentence. Lia sends each part to the right model and keeps the English terms in English.
+- **Learns your vocabulary.** Product names, clients and technical terms are picked up from your meetings and fixed automatically after you approve them.
+- **Summaries written in Hebrew,** laid out right to left, with the tasks and names where you expect them.
+- **Not only Hebrew.** English gets a dedicated engine (NVIDIA Parakeet), and Lia transcribes 99 languages with Whisper.
+
+## 🔒 Private by design
+
+Your meetings are some of the most sensitive data you have: clients, salaries, strategy, people. Lia is built so that data stays with you.
+
+| | With Lia (local mode) |
+|---|---|
+| Where is the audio? | On your computer only |
+| Who transcribes it? | Your own GPU |
+| Who writes the summary? | A model running on your own GPU (Ollama) |
+| Does anyone join the call? | No - Lia listens to your PC's audio, not the meeting |
+| Account or sign-up? | None |
+| Can it work offline? | Yes, after the first model download |
+
+Cloud engines (Groq, OpenAI, Gemini) are there **only if you want them** - for a laptop without a strong GPU, for example. Each one is opt-in, clearly labeled *CLOUD* in Settings, and never used behind your back. Updates are installed only when you click *Update*, and only when the release is signed by the Lia release key. The details are in [SECURITY.md](SECURITY.md).
+
+## 🖥 What you need
+
+Windows 10 or 11. For the fully local, nothing-leaves-your-computer experience you need an **NVIDIA graphics card**. How much video memory (VRAM) it has decides how good the local summary is:
+
+| GPU memory (VRAM) | Example cards | What you get locally |
+|---|---|---|
+| **8 GB** (minimum) | RTX 3060 Ti, RTX 4060 | Fast Hebrew transcription + a quick local recap (Gemma 3 4B) |
+| **12 GB** (good) | RTX 3060 12 GB, RTX 4070 | The above + speaker separation on long meetings with room to spare |
+| **16 GB** (recommended) | RTX 4060 Ti 16 GB, RTX 4080 | Full, detailed project-style summaries (Gemma 3 12B) |
+| **24 GB** (best) | RTX 3090, RTX 4090 | The best local summary quality (Gemma 4 31B) - what Lia is developed on |
+
+**No NVIDIA GPU?** Lia still works. Dictation runs on the CPU (English is fast even without a GPU), and you can choose a cloud engine for meetings and summaries - Gemini has a free tier. In that mode your audio is sent to the provider you chose, so it is a trade-off, not the default.
+
+**Dictation** needs far less - any machine that runs Windows 11 will do.
+
+<div align="center">
+<img src="docs/img/home.png" alt="Lia home: your meetings and their summaries" width="900">
+<br><sub>All your meetings in one place - search them, open a summary, rename speakers</sub>
+</div>
+
+## ⌨️ Dictation, too
+
+Lia started as a dictation tool, and it is still one of the best on Windows:
+
+- Press **`Ctrl+Space`**, speak, press again - your words are typed wherever your cursor is: email, WhatsApp, Word, code.
+- Hebrew, English, or both in one sentence.
+- Optional AI cleanup removes "umm" and false starts ("at 5, actually 6" becomes "at 6").
+- Voice snippets, `Ctrl+Alt+Z` to undo a paste, and a searchable history.
+
+## ✨ Everything else
 
 | | |
 |---|---|
-| **Push-to-talk** | Press `Ctrl+Space`, speak, press again - text is pasted at your cursor (hold-to-record is a one-click option) |
-| **Local engines** | ivrit.ai Hebrew Whisper, NVIDIA Parakeet (English), general Whisper |
-| **Cloud engines** | Groq Whisper (free tier, ~0.5s), OpenAI gpt-transcribe |
-| **Bilingual auto-routing** | Each utterance is language-detected and sent to the best model |
-| **AI cleanup** (optional) | Removes fillers / resolves self-corrections ("meet at 5, actually 6" -> "meet at 6") |
-| **Self-learning vocabulary** | Learns your domain terms and fixes recurring speech-to-text garbles |
-| **Snippets, undo, history** | Voice snippets, `Ctrl+Alt+Z` undo-paste, searchable history window (auto-pruned after 2 weeks by default, adjustable 1-12 weeks, plus a Delete-all button) |
+| **Ask your meetings** | Ask a question and get the answer from everything your meetings ever said - "what did we decide about the pricing?" |
+| **Action items** | Every open task from every meeting, in one window |
+| **Voice Ask** | Press a hotkey, ask out loud, get an answer card |
+| **Transcribe a file** | Drop in any recording (mp3, m4a, wav, video) and get a transcript and summary |
+| **Summary styles** | Technical / project notes, a general recap, or formal minutes (with a cloud summary engine) |
+| **Remote GPU** | Laptop without a GPU? Use the GPU of your PC at home over your own network - see [docs/SELF_HOSTED_SERVER.md](docs/SELF_HOSTED_SERVER.md) |
 
-### Meetings
+<div align="center">
+<img src="docs/img/models.png" alt="Lia Settings: choose local or cloud engines" width="820">
+<br><sub>Every engine is labeled LOCAL or CLOUD - you always know where your audio goes</sub>
+</div>
 
-| | |
-|---|---|
-| **One-click recording** | Mic + system audio (both sides of the call), with a live transcript window |
-| **Local diarization** | pyannote speaker turns + per-turn transcription - who said what, offline |
-| **Speaker naming** | Calendar attendees, mic-channel self-detection, learning voiceprints, and an evidence-based LLM name pass |
-| **Faithful summaries** | A project-manager-grade summary with decisions, highlights, and a complete `- [ ]` task list with owners - in Hebrew or English, local (Ollama) or cloud |
-| **Ask your meetings** | Local RAG over every meeting - factual, synthesis, and action-item questions |
-| **Action-item tracker** | Every open task across all meetings in one window |
-| **Voice Ask** | Hotkey -> speak a question -> get an answer card from your meetings |
+## 🚀 Get started
 
-### Experimental
+1. **Download** `Lia-Setup` from the [latest release](https://github.com/Danaor/lia/releases/latest) and run it (no admin rights needed). Prefer no installer? Take `Lia-Portable`, extract it anywhere and double-click `Lia.bat`.
+2. **Find Lia in the tray** next to the clock and click it to open Settings. On the first run it downloads the speech model for your language (about 1.6 GB for Hebrew).
+3. **For local summaries**, install [Ollama](https://ollama.com) and pull the model that fits your GPU:
+   ```bash
+   ollama pull gemma3:4b          # 8 GB GPU
+   ollama pull gemma3:12b         # 16 GB GPU
+   ollama pull gemma4:31b-it-qat  # 24 GB GPU
+   ```
+   Then pick it in **Settings > Models > Summaries**.
+4. **Start a meeting** from the tray or the Home screen. That's it.
 
-| | |
-|---|---|
-| **Email search** | A fully local index of your Outlook mail (SQLite FTS5 + embeddings) with keyword search, semantic search, and "ask your email" over a local model. Windows + Outlook desktop only, and rougher than the rest of the app - treat it as an experiment that happens to be useful. |
+Windows SmartScreen may warn on the first run because Lia is not code-signed yet: click *More info* > *Run anyway*. Lia checks for new versions and updates itself when you click *Update*.
 
-## Quick start
+<details>
+<summary><b>Run from source (developers)</b></summary>
 
-### Option 1: Download and run (easiest)
-
-1. Download **Lia-Portable.zip** from the [latest release](https://github.com/Danaor/lia/releases/latest)
-2. Extract the zip anywhere
-3. Double-click `Lia.exe`
-
-No Python or command line needed. Windows SmartScreen may warn you on first run because the exe is unsigned - click "More info" then "Run anyway".
-
-**Locked / corporate PCs:** if `Lia.exe` is blocked with "Access denied" (WDAC or AppLocker policies block unsigned executables), run **`Lia (Work PC).bat`** instead. It launches Lia through the code-signed `pythonw.exe`, which those policies allow. Same app - it just shows as `pythonw.exe` in Task Manager.
-
-**Settings window won't open after extracting the zip?** A browser-downloaded zip carries Windows' "Mark of the Web", and extracting with File Explorer stamps it on every file. The .NET Framework then refuses to load the WebView2 bridge and no Settings/History window opens. Lia 1.4.2+ clears the mark automatically on startup; on an older build, right-click the zip > Properties > **Unblock** before extracting, or run in PowerShell:
-
-```powershell
-Get-ChildItem -Recurse "C:\path\to\Lia-Portable" | Unblock-File
-```
-
-### Option 2: Install from source
-
-Requires [Python 3.11+](https://www.python.org/downloads/) (check "Add to PATH" during install). Open PowerShell and paste:
+Requires [Python 3.11+](https://www.python.org/downloads/) (developed on 3.13).
 
 ```bash
 git clone https://github.com/Danaor/lia.git
@@ -99,103 +142,60 @@ pip install -r requirements.lock
 python lia.py
 ```
 
-Or without git - download the [source zip](https://github.com/Danaor/lia/archive/refs/heads/main.zip), extract it, open a terminal in the `lia/lia` folder, and run the last two lines.
+`requirements.lock` is the pinned, hash-verified dependency set. See [CONTRIBUTING.md](CONTRIBUTING.md) for the test suite.
+</details>
 
-(`requirements.lock` is the pinned, hash-verified dependency set; use
-`requirements.txt` instead if you prefer resolving the latest compatible
-versions yourself.)
+<details>
+<summary><b>Troubleshooting</b></summary>
 
-### First run
+- **Locked / corporate PC, `Lia.exe` blocked ("Access denied"):** run **`Lia (Work PC).bat`** from the portable folder. It starts Lia through the code-signed `pythonw.exe`, which WDAC / AppLocker policies allow.
+- **Settings window does not open after extracting the zip:** Lia 1.4.2+ clears Windows' "Mark of the Web" automatically. On an older build, right-click the zip > Properties > **Unblock** before extracting.
+- **Lia is not in the tray after a reboot:** `%APPDATA%\Lia\startup_trace.log` records every launch attempt. Settings > Advanced > *Report a problem* bundles it (with personal details removed).
+- **Dictating into admin windows** (Task Manager, admin consoles): Lia runs without admin rights by default. The installer can set up an elevated start when Lia is installed under Program Files.
+- **The tray icon is hidden** behind the `^` arrow: drag it next to the clock once and it stays.
+</details>
 
-On first run the app picks your primary language from Windows, downloads the matching model (Hebrew Turbo ~1.6 GB / Parakeet ~670 MB), and sits in the system tray. Left-click the tray icon for Settings. Lia pins its icon next to the clock on the first run; if Windows still tucks it behind the `^` overflow arrow, drag the orb out once and it stays.
-
-If Lia is set to start with Windows but is not there after a reboot, `%APPDATA%\Lia\startup_trace.log` records every launch attempt and where it stopped (a logon launch also retries itself a few times while Windows is still settling). Settings -> Advanced -> Report a problem bundles that file for you.
-
-Lia runs non-elevated by default; if you also want to dictate into admin windows, launch through `run.bat` - note that this runs the whole app with highest privileges for the session.
-
-Optional cloud speed: get a free [Groq key](https://console.groq.com/keys), paste it into Settings -> Keys & Server, and pick Groq in Settings -> Models.
-
-## Models
+<details>
+<summary><b>All engines</b></summary>
 
 | Purpose | Local (free, offline) | Cloud (optional) |
 |---|---|---|
-| Hebrew dictation | ivrit.ai Whisper large-v3-turbo | Groq Whisper, OpenAI gpt-transcribe, Gemini (free) |
-| English dictation | **NVIDIA Parakeet TDT 0.6B** (best English WER, realtime on CPU) | Groq Whisper, OpenAI gpt-transcribe, Gemini (free) |
-| Meetings | chunked or diarized (pyannote) variants of the above | Gemini Transcribe (free tier, incl. speaker diarization - BETA), AssemblyAI, OpenAI |
-| Summaries | Gemma via [Ollama](https://ollama.com) | OpenAI, Gemini (free tier) |
+| Hebrew | ivrit.ai Whisper large-v3-turbo | Groq Whisper, OpenAI gpt-transcribe, Gemini Transcribe (free tier) |
+| English + 24 European languages | NVIDIA Parakeet TDT 0.6B v3 (fast even on CPU) | same as above |
+| 99 languages | Whisper large-v3-turbo | same as above |
+| Speaker separation | pyannote community-1 | Gemini Transcribe diarization (beta) |
+| Summaries | Gemma via Ollama (4B / 12B / 31B) | OpenAI, Gemini (free tier) |
 
-Have one GPU box and several machines? Lia can also send audio to a WhisperLive server you host yourself - see [docs/SELF_HOSTED_SERVER.md](docs/SELF_HOSTED_SERVER.md).
-
-## Requirements
-
-- **OS**: Windows 10/11 (WASAPI for system audio)
-- **Python**: 3.11+ (developed on 3.13)
-- **RAM**: 8 GB minimum, 16 GB recommended
-- **GPU**: **strongly recommended** - see the performance table below. Everything works without one, but meeting processing is significantly slower. NVIDIA only (CUDA); AMD and Intel GPUs are not supported.
-- **Internet**: only for the first model download and optional cloud modes
-
-Settings live in `%APPDATA%\Lia\config.json`; every option is in the Settings window (tray left-click).
-
-### Performance: CPU vs GPU
-
-Everything in Lia runs on CPU, but an NVIDIA GPU makes local transcription dramatically faster. Short dictation clips are usable either way; meetings are where the GPU really matters.
-
-| Task | CPU only | With NVIDIA GPU |
+| Task | CPU only | With an NVIDIA GPU |
 |---|---|---|
-| **Dictation** (10s clip, Hebrew) | 5-15s wait | under 1s |
-| **Dictation** (10s clip, English Parakeet) | ~2s (fast on CPU) | ~1s |
-| **Meeting** (1h, chunked - no speaker names) | Keeps up during recording | Keeps up, no backlog |
-| **Meeting** (1h, diarized - with speaker names) | 60-90 min post-processing | 5-10 min |
-| **Local summary** (Ollama, gemma4 31B) | Very slow (needs 32 GB+ RAM) | 2-5 min (needs 20+ GB VRAM) |
+| Dictation, 10 s of Hebrew | 5-15 s | under 1 s |
+| Dictation, 10 s of English (Parakeet) | about 2 s | about 1 s |
+| 1-hour meeting with speaker names | 60-90 min after the call | 5-10 min |
+| Local summary of a 1-hour meeting | not practical | 2-5 min |
+</details>
 
-> **Bottom line:** for dictation-only use, CPU is fine - you wait a few seconds after releasing the hotkey. For meetings with speaker identification, a GPU turns a 90-minute wait into a 10-minute one.
+## 💜 About the name
 
-### Don't have a GPU? Use cloud APIs
-
-You don't need an expensive GPU to get fast transcription and quality summaries. Lia supports cloud backends that work great for most users:
-
-- **Dictation**: [Groq](https://console.groq.com/keys) offers free Whisper transcription (~0.5s per clip). OpenAI's gpt-transcribe is the most accurate (paid).
-- **Meetings**: [Gemini Transcribe](https://aistudio.google.com/apikey) is free (Google AI Studio key), transcribes Hebrew as well as the local model, and can label speakers with no GPU - a free alternative to local pyannote diarization or paid AssemblyAI. Pick it in Settings -> Models. Its diarized mode is BETA.
-- **Summaries**: [Gemini](https://aistudio.google.com/apikey) has a generous free tier. OpenAI GPT-5.6 produces the best results (paid).
-
-Cloud transcription and summaries are not processed locally - your audio and text are sent to the provider's servers, and a provider's free tier may use your data to improve its models. For most use cases this is perfectly fine, and it's the easiest way to get the full Lia experience without any GPU hardware.
-
-You can also skip the summary API entirely and paste the transcript into ChatGPT, Gemini, or any chat assistant to get a summary yourself. Lia's built-in summary pipeline does more than a single prompt - it runs a multi-stage process with specialized prompts designed to preserve factual accuracy, extract every action item with owners, and handle bilingual content correctly ([see the prompts in the source](lia/lia.py)) - but a manual paste-and-ask is always an option.
-
-### Recommended GPUs
-
-For those who want everything local, or faster local processing:
-
-| Tier | Examples | VRAM | What it unlocks |
-|---|---|---|---|
-| Entry | GTX 1650, RTX 3050 | 4-6 GB | Fast local dictation |
-| **Recommended** | **RTX 3060, RTX 4060** | **8-12 GB** | Fast dictation + diarized meetings |
-| Power user | RTX 3090, RTX 4090 | 24 GB | All of the above + local AI summaries (Ollama) |
-
-Already have a GPU on another machine? Lia's [remote mode](docs/SELF_HOSTED_SERVER.md) lets a laptop without a GPU use your home PC's GPU over the network.
-
-## Privacy
-
-Everything can run locally: audio capture, transcription, diarization, speaker naming, summaries (Ollama), vocabulary learning, and meeting search never have to leave your machine. Cloud backends are opt-in per feature and clearly labeled - including the option to use one while the GPU is busy. Meeting audio is kept (WAV short-term, Opus long-term) so a bad transcription is never a lost meeting - retention is configurable.
-
-Lia checks GitHub for a new release at launch and every 12 hours (Settings > Advanced > About turns it off). Updates install only after you click Update, and only when the release is signed by the Lia release key. See [SECURITY.md](SECURITY.md) for what is stored where and how each network feature is protected.
+**L.I.A** stands for **Local Inference Assistant** - which is exactly what it does. The name itself was inspired by a little girl at home.
 
 ## Contributing
 
-Bug reports and pull requests are welcome - see [CONTRIBUTING.md](CONTRIBUTING.md) for the dev setup and how to run the test suite.
+Bug reports, ideas and pull requests are welcome - see [CONTRIBUTING.md](CONTRIBUTING.md). Found a security issue? Please report it privately, as described in [SECURITY.md](SECURITY.md).
 
-## License and attribution
+## License and credits
 
-MIT for Lia's code. The models it uses carry their own licenses:
+Lia's code is MIT licensed. It stands on the shoulders of excellent open models and libraries, each under its own license:
 
-- [NVIDIA Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) - CC-BY-4.0 (local ASR, 25 European languages), via [onnx-asr](https://github.com/istupakov/onnx-asr)
 - [ivrit.ai Whisper models](https://huggingface.co/ivrit-ai) - Hebrew fine-tunes of OpenAI Whisper
-- [hspell Hebrew word list](http://hspell.ivrix.org.il/) via [dictionary-he](https://github.com/wooorm/dictionaries/tree/main/dictionaries/he) - AGPL-3.0 (downloaded on demand for the Hebrew spelling guard; not bundled)
-- [pyannote speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) - CC-BY-4.0 (local diarization)
+- [NVIDIA Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) - CC-BY-4.0, via [onnx-asr](https://github.com/istupakov/onnx-asr)
+- [pyannote speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) - CC-BY-4.0
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper) / CTranslate2 - fast local Whisper inference
-- [PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch) - WASAPI loopback recording
-- [Groq](https://groq.com) - fast cloud Whisper inference
+- [Gemma](https://ai.google.dev/gemma) via [Ollama](https://ollama.com) - local summaries
+- [hspell Hebrew word list](http://hspell.ivrix.org.il/) via [dictionary-he](https://github.com/wooorm/dictionaries/tree/main/dictionaries/he) - AGPL-3.0, downloaded on demand for the Hebrew spelling fix, never bundled
+- [PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch) - recording the call audio (WASAPI loopback)
 
 ---
 
-*Built because I wanted SuperWhisper on Windows with good Hebrew support and no subscription. It grew into a full local meeting-intelligence stack. The ingredients were all open source - they just needed gluing together.*
+<div align="center">
+<sub>Made in Israel for people who talk in Hebrew, think in two languages, and would rather keep their meetings to themselves.</sub>
+</div>

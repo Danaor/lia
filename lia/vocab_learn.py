@@ -572,6 +572,31 @@ class VocabStore:
             self.add_correction_suggestions(moved, label=label)
         return len(moved)
 
+    def accept_correction_suggestions(self, label):
+        """The user's one-click approval of every suggestion from `label` that
+        carries a proposed fix: each becomes a correction (source
+        'accepted-<label>') and leaves Suggestions. The store's normal guards
+        still apply (a pair whose `wrong` is an approved term stays a
+        suggestion). Returns #accepted."""
+        with self._lock:
+            picks = [dict(o) for o in self._oov.values()
+                     if o.get("label") == label and (o.get("proposed") or "").strip()]
+        if not picks:
+            return 0
+        self.add_corrections([{"wrong": o.get("word"), "right": o.get("proposed")}
+                              for o in picks], source="accepted-" + label)
+        accepted = 0
+        with self._lock:
+            for o in picks:
+                wk = _norm(o.get("word") or "")
+                c = self._corrections.get(wk)
+                if c is not None and c.get("right") == (o.get("proposed") or "").strip():
+                    if self._oov.pop(wk, None) is not None:
+                        accepted += 1
+        if accepted:
+            self.save()
+        return accepted
+
     def oov_candidates(self):
         """OOV suggestions, most-frequent first."""
         with self._lock:

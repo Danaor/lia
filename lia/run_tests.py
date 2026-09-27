@@ -6816,6 +6816,52 @@ _test("ollama: local features use ollama_base_url (loopback only), never the sum
       "URL; strict local check; child side refuses a cloud URL", t_local_ollama_never_leaves)
 
 
+def t_vocab_accept_harvested_suggestions():
+    """Vocabulary 'Add all fixes learned from meetings': every auto-harvest
+    suggestion with a proposed fix becomes a correction and leaves
+    Suggestions; other groups and approved terms are untouched."""
+    import tempfile
+    import lia as w
+    import vocab_learn as vl
+    d = tempfile.mkdtemp()
+    st = vl.VocabStore(os.path.join(d, "vocab.json"))
+    st.add_correction_suggestions([{"wrong": "למדה", "right": "Lambda"},
+                                   {"wrong": "קוברנטיס", "right": "Kubernetes"}], label="auto-harvest")
+    st.add_correction_suggestions([{"wrong": "אייג'ר", "right": "Azure"}], label="summary")
+    st.add_correction_suggestions([{"wrong": "טרפורם", "right": "Terraform"}], label="auto-harvest")
+    st._terms[vl._norm("טרפורם")] = {"term": "טרפורם", "status": "approved"}
+    n = st.accept_correction_suggestions("auto-harvest")
+    assert n == 2, n
+    rights = {c["wrong"]: (c["right"], c["source"]) for c in st.corrections()}
+    assert rights.get("למדה") == ("Lambda", "accepted-auto-harvest"), rights
+    assert rights.get("קוברנטיס") == ("Kubernetes", "accepted-auto-harvest"), rights
+    assert "אייג'ר" not in rights and "טרפורם" not in rights, rights
+    left = {o["word"]: o.get("label") for o in st.oov_candidates()}
+    assert left == {"אייג'ר": "summary", "טרפורם": "auto-harvest"}, left
+    assert st.accept_correction_suggestions("auto-harvest") == 0
+    st2 = vl.VocabStore(os.path.join(d, "vocab.json"))
+    assert {c["wrong"] for c in st2.corrections()} >= {"למדה", "קוברנטיס"}
+    assert {o["word"] for o in st2.oov_candidates()} == {"אייג'ר", "טרפורם"}
+
+    app = w.LiaApp.__new__(w.LiaApp)
+    app._vocab_store = st
+    ok, msg = app._vocab_accept_suggestions("summary")
+    assert not ok, msg
+    st.add_correction_suggestions([{"wrong": "גיטהאב", "right": "GitHub"}], label="auto-harvest")
+    ok, msg = app._vocab_accept_suggestions("auto-harvest")
+    assert ok and msg.startswith("1 "), msg
+    assert "vocab_accept_suggestions" in w.LiaApp._SETTINGS_LIST_MUTATION_METHODS
+
+    import settings_window as sw
+    src = open(sw.__file__, encoding="utf-8").read()
+    assert "data-oov-accept-all" in src and 'call("vocab_accept_suggestions",[lab])' in src
+
+
+_test("vocabulary: 'Add all fixes learned from meetings' accepts every harvested "
+      "suggestion (other groups and approved terms untouched)",
+      t_vocab_accept_harvested_suggestions)
+
+
 def t_corrections_untrusted_input():
     """Audit 2026-09-26 F3: meeting speech became ACTIVE correction rules (the
     background harvest), and the rule's right side was a regex template - a
@@ -14663,6 +14709,51 @@ def t_bundle_secret_scrub():
 
 _test("security WP2: one secret list covers config + bundle + settings; serve_token masked",
       t_bundle_secret_scrub)
+
+
+def t_http_body_and_summary_content_log_privacy():
+    """CodeQL triage 2026-09-26: an HTTP error body is logged with key-like
+    strings masked; summary content in the coverage/depth log lines is a size
+    unless log_transcripts is on."""
+    import lia as w
+
+    class R:
+        text = ('{"error":{"message":"Incorrect API key provided: sk-proj-abcdEFGH1234*****wxyz. '
+                'Bearer gsk_0123456789abcdef AIzaSyA0123456789abcdefghijk hf_abcdefghijkl",'
+                '"code":"model_not_found"}}')
+    out = w._http_body_for_log(R(), 400)
+    for bad in ("sk-proj-abcd", "gsk_0123", "AIzaSyA0", "hf_abcdef", "Bearer gsk"):
+        assert bad not in out, (bad, out)
+    assert "model_not_found" in out and "Incorrect API key provided" in out, out
+    assert len(w._http_body_for_log(R(), 30)) <= 30
+
+    class Bad:
+        @property
+        def text(self):
+            raise RuntimeError("no body")
+    assert w._http_body_for_log(Bad()) == ""
+
+    src = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)), "lia.py"),
+               encoding="utf-8").read()
+    assert "resp.text[:300]" not in src and "resp.text[:200]" not in src
+    for frag in ('_priv(cand, 80)', '_priv(text, 40)', '_priv(line_a.strip())',
+                 '_priv(dup.strip())', '_priv(heading)'):
+        assert frag in src, frag
+    assert src.count("kept original.\", _priv(name)") == 2, "depth-pass name lines"
+
+    old = w._LOG_CFG[0]
+    try:
+        w._LOG_CFG[0] = {"log_transcripts": False}
+        assert w._priv("נאור ישלח את ההצעה", 40) == "[18 chars]"
+        w._LOG_CFG[0] = {"log_transcripts": True}
+        assert w._priv("abc", 40) == "abc"
+    finally:
+        w._LOG_CFG[0] = old
+
+
+_test("privacy: HTTP error bodies logged with keys masked; summary content in the "
+      "coverage/depth log lines is a size by default",
+      t_http_body_and_summary_content_log_privacy)
 
 
 def t_bundle_and_log_privacy():

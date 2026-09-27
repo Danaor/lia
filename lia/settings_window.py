@@ -1886,6 +1886,12 @@ APP_JS = r"""
       var inp=document.querySelector('[data-oov-right="'+ow+'"]'); var ri=(inp&&inp.value||"").trim();
       if(!ri){ RK.toast("Type the correct spelling first","err"); return; }
       call("vocab_add_correction",[ow,ri]).then(function(r){ if(r.ok){ call("lexicon_oov_dismiss",[[ow]]).then(loadOov); } }); return; }
+    var oaa = e.target.closest('[data-oov-accept-all]');
+    if(oaa){ var lab=oaa.getAttribute('data-oov-accept-all');
+      if(!confirm("Add all "+oaa.getAttribute('data-n')+" fixes learned from meetings to the corrections table? "+
+                  "They will be applied to your dictation and meetings from now on.")) return;
+      call("vocab_accept_suggestions",[lab]).then(function(r){
+        RK.toast(r.msg||"", r.ok?"ok":"err"); loadOov(); loadCorr(); }); return; }
     var od = e.target.closest('[data-oov-dismiss]');
     if(od){ call("lexicon_oov_dismiss",[[od.getAttribute('data-oov-dismiss')]]).then(loadOov); return; }
     var cun = e.target.closest('[data-corr-unused]');
@@ -2020,7 +2026,10 @@ APP_JS = r"""
   function renderOov(data){
     var el=document.getElementById("oovList"); if(!el) return;
     if(!data.length){ el.innerHTML='<div class="hint">No unknown words recorded yet.</div>'; return; }
-    el.innerHTML='<table class="tbl">'+data.map(function(o){
+    var nHarv=data.filter(function(o){ return o.label==="auto-harvest" && o.proposed; }).length;
+    el.innerHTML=(nHarv ? '<div class="btnrow"><button class="btn sm" data-oov-accept-all="auto-harvest" data-n="'+nHarv+'">'+
+        'Add all '+nHarv+' fixes learned from meetings</button></div>' : '')+
+      '<table class="tbl">'+data.map(function(o){
       var w=esc(o.word);
       return '<tr>'+
         '<td class="rtl-auto" dir="auto">'+w+' <small class="muted">&#215;'+(o.count||0)+

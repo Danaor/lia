@@ -135,7 +135,8 @@ a:hover{text-decoration:underline;}
 /* The FULL Lia logo (mark above the 'lia' wordmark) as one image, so the
    proportions match the brand artwork - the small typeset "Lia" beside a
    tiny mark read wrong (2026-09-17). */
-.sidebar .brand .brand-full{height:58px; width:auto; display:block;}
+/* nudged 4px left: the ribbon's weight sits right of its box (Naor, 2026-09-27) */
+.sidebar .brand .brand-full{height:58px; width:auto; display:block; position:relative; left:-4px;}
 .sidebar .brand .brand-txt{display:flex; flex-direction:column; line-height:1.15; min-width:0;}
 .sidebar .brand .brand-name{font-size:var(--fs-h1); font-weight:700;}
 /* the 'lia' wordmark image (still used by the dev gallery + Tk fallback) */
