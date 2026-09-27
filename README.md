@@ -10,7 +10,7 @@
 [![Hebrew first](https://img.shields.io/badge/Hebrew-first-7d3fc9.svg)](#-hebrew-first)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**[Download for Windows](https://github.com/Danaor/lia/releases/latest)** &nbsp;·&nbsp; [How it works](#-how-a-meeting-works) &nbsp;·&nbsp; [GPU guide](#-what-you-need) &nbsp;·&nbsp; [Privacy](#-private-by-design)
+**[Download for Windows](https://github.com/Danaor/lia/releases/latest)** &nbsp;·&nbsp; [How it works](#-how-a-meeting-works) &nbsp;·&nbsp; [GPU guide](#-what-you-need) &nbsp;·&nbsp; [No GPU?](#-no-gpu-no-problem) &nbsp;·&nbsp; [Privacy](#-private-by-design)
 
 </div>
 
@@ -68,7 +68,7 @@ Your meetings are some of the most sensitive data you have: clients, salaries, s
 | Account or sign-up? | None |
 | Can it work offline? | Yes, after the first model download |
 
-Cloud engines (Groq, OpenAI, Gemini) are there **only if you want them** - for a laptop without a strong GPU, for example. Each one is opt-in, clearly labeled *CLOUD* in Settings, and never used behind your back. Updates are installed only when you click *Update*, and only when the release is signed by the Lia release key. The details are in [SECURITY.md](SECURITY.md).
+Cloud engines (OpenAI, Gemini, Groq) are there **only if you want them** - see [No GPU? No problem](#-no-gpu-no-problem). Each one is opt-in, clearly labeled *CLOUD* in Settings, and never used behind your back. Updates are installed only when you click *Update*, and only when the release is signed by the Lia release key. The details are in [SECURITY.md](SECURITY.md).
 
 ## 🖥 What you need
 
@@ -81,9 +81,18 @@ Windows 10 or 11. For the fully local, nothing-leaves-your-computer experience y
 | **16 GB** (recommended) | RTX 4060 Ti 16 GB, RTX 4080 | Full, detailed project-style summaries (Gemma 3 12B) |
 | **24 GB** (best) | RTX 3090, RTX 4090 | The best local summary quality (Gemma 4 31B) - what Lia is developed on |
 
-**No NVIDIA GPU?** Lia still works. Dictation runs on the CPU (English is fast even without a GPU), and you can choose a cloud engine for meetings and summaries - Gemini has a free tier. In that mode your audio is sent to the provider you chose, so it is a trade-off, not the default.
-
 **Dictation** needs far less - any machine that runs Windows 11 will do.
+
+## 💡 No GPU? No problem
+
+If your meetings are not especially sensitive, you don't need a graphics card at all. Lia works just as well with **OpenAI** and **Google Gemini** - for **both meeting transcription and meeting summaries** - and you get the full Lia experience: the same fast, stable app, the same Hebrew summaries with decisions and tasks, on any Windows laptop.
+
+- **Gemini has a generous free tier.** Create a free key in [Google AI Studio](https://aistudio.google.com/apikey), paste it into *Settings > API Keys*, and pick Gemini in *Settings > Models*. Transcription, summaries and even speaker labels (beta) - at no cost.
+- **OpenAI** (paid, pay-as-you-go) gives excellent accuracy - roughly $0.27 per hour of meeting audio and about $0.05 per summary.
+- **Groq** (free tier) makes dictation nearly instant.
+- **No middleman.** You use your own API key, and Lia talks directly to the provider's API. There is no Lia server, no account with us, and nobody in between - your audio and text go only to the provider you chose, under your own agreement with them.
+
+You can also mix and match: transcribe locally on a modest GPU and summarize in the cloud, or the other way around. Every engine is labeled *LOCAL* or *CLOUD*, so you always know where your data goes.
 
 <div align="center">
 <img src="docs/img/home.png" alt="Lia home: your meetings and their summaries" width="900">
