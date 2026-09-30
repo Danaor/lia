@@ -24,6 +24,7 @@ Lia sits quietly in your Windows tray. When a meeting starts, it records both si
 
 - 🔒 **Nothing leaves your computer.** Recording, transcription, speaker identification and the AI summary all run locally. Unplug the network - it still works.
 - 🗣 **Hebrew first.** Built from day one for Hebrew and for real Israeli meetings that jump between Hebrew and English mid-sentence.
+- 🧠 **Summaries that don't lose the details.** A multi-stage summary pipeline built so that even a two-hour meeting comes out complete - every topic, every decision, every task - from a model running on your own GPU.
 - 🤖 **No bot in your call.** Lia records the audio on your PC. Nobody sees a "Notetaker has joined" message.
 - 💸 **Free and open source.** No account, no subscription, no per-minute pricing. MIT license.
 
@@ -44,6 +45,28 @@ Lia sits quietly in your Windows tray. When a meeting starts, it records both si
 <img src="docs/img/summary.png" alt="A Hebrew meeting summary created by Lia" width="560">
 <br><sub>A real-looking Hebrew summary (demo data) - the gist, key points and every task with its owner</sub>
 </div>
+
+## 🧠 Meeting summaries that don't lose the details
+
+**The hard part of a local AI note-taker is not the transcript - it is the summary.**
+
+Local models are small. Hand one a 90-minute transcript in a single prompt, and things quietly go missing: the part of the meeting that did not fit is cut off, topics from the middle of the conversation fade, and the task someone agreed to in minute 47 never makes it to the list. The summary *looks* fine - you only find out what was missing when it matters.
+
+Lia does not ask one model call to do everything. It runs the summary as a **pipeline**, where each stage has one job and plain code checks the work:
+
+| Stage | What it does |
+|---|---|
+| **1. Right-sized context** | The transcript is measured before the call, so the model always sees all of it - nothing is silently cut off. |
+| **2. Overlapping windows** | Long meetings are split into windows that overlap by 3-4 minutes, so a discussion that crosses a boundary is always seen whole. Each window is summarized, then the notes are merged. |
+| **3. Depth pass** | Lia goes back to the raw transcript, writes a short narrative per topic - the numbers, the *why*, who backed what - and lets the model improve its own summary against them (local Hebrew summaries of longer meetings). |
+| **4. Merge and close** | A topic discussed twice becomes one clear point, and a task that was already done during the meeting is marked done instead of left open. |
+| **5. Code checks every edit** | A rewrite is accepted only if it is not shorter and keeps every number, name and qualifier, and adds no claim that something was completed - otherwise the original stays. Plain code then cleans up known failure patterns (a speaker label instead of a name, a duplicated task) - no AI involved. |
+
+**The result:** on a real 71-minute meeting, the depth pass recovered **all four** substantive points that a single-pass summary had dropped. Long meetings get the same care as short ones, and the summary tells you what was decided, why, and who owns each task.
+
+The same standards apply when you choose a cloud engine: OpenAI and Gemini get Lia's coverage rules - every topic discussed appears at least once, small talk never becomes a task - plus the same code clean-up on the result.
+
+No summary is perfect, and Lia keeps the full transcript next to every summary so you can always check. But a summary that quietly drops half the meeting is exactly the problem this pipeline was built to solve.
 
 ## 🗣 Hebrew first
 
