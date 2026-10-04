@@ -407,7 +407,7 @@ if sys.platform == "win32":
     ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
 
 # --- Configuration ---
-APP_VERSION = "1.6.11"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
+APP_VERSION = "1.6.12"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Lia")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -701,7 +701,7 @@ DEFAULT_CONFIG = {
     # OpenAI cleanup model (used when the effective provider is OpenAI).
     # gpt-6-luna is the DEFAULT (OPENAI_LIGHT_MODEL): the lightest/cheapest
     # reasoning model; it replaced gpt-5.6-luna 2026-09-24 (half the price).
-    # The alternative is gpt-6-sol (strongest, more thinking → more latency).
+    # The alternative is gpt-6.1-sol (strongest, more thinking → more latency).
     # NB: this only matters when cleanup_style is turned ON — cleanup ships OFF
     # by default. Reasoning models need `max_completion_tokens` (handled in
     # clean()).
@@ -718,7 +718,7 @@ DEFAULT_CONFIG = {
     # "off" = AI summaries disabled - meetings save a transcript only. The
     # honest keyless default (2026-08-29): a fresh install has no key, so
     # promising a summary would just degrade anyway. Saving an OpenAI key
-    # auto-upgrades this to gpt-6-sol (see _apply_openai_key); the user
+    # auto-upgrades this to gpt-6.1-sol (see _apply_openai_key); the user
     # can always pick a model (cloud/Gemini-free/local Ollama) in Settings.
     "summary_model": "off",
     # Meeting Summary Module: which LLM writes meeting summaries (+ the standalone
@@ -793,7 +793,7 @@ DEFAULT_CONFIG = {
     # Compose Mode (voice → professional written piece, with iterative
     # re-versioning). Tray → "Start Compose": records a spoken draft, transcribes
     # it, then rewrites it into a polished email/message/summary with cloud OpenAI
-    # (config compose_model, unset = gpt-6-sol). The editor then lets the user
+    # (config compose_model, unset = gpt-6.1-sol). The editor then lets the user
     # revise by voice/typed instruction. compose_style is the DEFAULT output the
     # window opens with (switchable in the window). compose_max_seconds is a
     # safety auto-stop for a forgotten draft recording.
@@ -923,7 +923,7 @@ DEFAULT_CONFIG = {
     "meetings_answer_model_local": "gemma4:31b-it-qat",   # or gemma4:e4b on an 8GB card
     "meetings_answer_model_gemini": "gemini-3.8-flash",   # = GEMINI_STRONG_MODEL
     "meetings_answer_model_groq": "qwen/qwen3.8-27b",
-    "meetings_answer_model_openai": "gpt-6-luna",          # paid; gpt-6-sol also valid
+    "meetings_answer_model_openai": "gpt-6-luna",          # paid; gpt-6.1-sol also valid
     "meetings_top_k": 20,                  # drop to 10-12 for local-light / 8GB
     "meetings_autoindex": True,            # incrementally index each meeting on save
     "meetings_intent_routing": True,       # auto-route factual / synthesis / action-item asks
@@ -9875,7 +9875,7 @@ _REASONING_GPT_RE = re.compile(r"^gpt-(\d+)")
 
 
 def _is_reasoning_model(model):
-    """OpenAI reasoning models: gpt-5 and every later major (gpt-5.x, gpt-6-*),
+    """OpenAI reasoning models: gpt-5 and every later major (gpt-5.x, gpt-6-*, gpt-6.1-*),
     plus the o-series. They reject `max_tokens` (HTTP 400 "Use
     'max_completion_tokens' instead") and any non-default temperature. The old
     prefix check on "gpt-5" sent gpt-6-sol the legacy shape (verified live
@@ -9893,15 +9893,20 @@ def _is_reasoning_model(model):
 # Terra has no reason left. A config that pins a retired id moves here, so a
 # user on Sol or Terra keeps a strong cloud model instead of falling to "off".
 # gpt-5.5 (the old Compose / Chat model) moved up to it the same day.
-OPENAI_STRONG_MODEL = "gpt-6-sol"
+# gpt-6.1-sol replaced gpt-6-sol (2026-09-30): the same list price ($2 in /
+# $2.50 cache write / $10 out per 1M, OpenAI model page), the same Chat
+# Completions endpoint and reasoning shaping; a config pinned to gpt-6-sol
+# moves here.
+OPENAI_STRONG_MODEL = "gpt-6.1-sol"
 # The light OpenAI model (cleanup default, the paid Ask row): gpt-6-luna
 # replaced gpt-5.6-luna 2026-09-24 - half the price ($0.10 / $0.50 per 1M).
 # Must equal DEFAULT_CONFIG["cleanup_llm_model_openai"] (a test pins it).
 OPENAI_LIGHT_MODEL = "gpt-6-luna"
-# retired id -> its gpt-6 successor (a strong model stays strong, a light one light)
+# retired id -> its current successor (a strong model stays strong, a light one light)
 OPENAI_LLM_SUCCESSOR = {"gpt-5.5": OPENAI_STRONG_MODEL,
                         "gpt-5.6-sol": OPENAI_STRONG_MODEL,
                         "gpt-5.6-terra": OPENAI_STRONG_MODEL,
+                        "gpt-6-sol": OPENAI_STRONG_MODEL,
                         "gpt-5.6-luna": OPENAI_LIGHT_MODEL}
 OPENAI_LLM_RETIRED = tuple(OPENAI_LLM_SUCCESSOR)
 
@@ -9955,7 +9960,8 @@ def _compose_model(cfg):
 # gpt-4o-transcribe $0.006/min. Summary: gpt-6-sol MEASURED 2026-09-24 through
 # _run_summary on two real meetings (incl. reasoning tokens; input $2, cache
 # write $2.50, output $10 per 1M): 26 min -> $0.045, 1h50 -> $0.074 (gpt-5.6-sol
-# measured ~$0.106). Re-check with the "Summary (...): ... usage=" log line.
+# measured ~$0.106). gpt-6.1-sol has the same list price; its hint is carried
+# over, NOT re-measured. Re-check with the "Summary (...): ... usage=" log line.
 _OPENAI_STT_PER_HOUR = {"gpt-transcribe": "~$0.27", "gpt-4o-transcribe": "~$0.36"}
 _OPENAI_SUMMARY_PRICE = {OPENAI_STRONG_MODEL: " · ~$0.05 per meeting summary"}
 
@@ -16955,9 +16961,9 @@ _HOOK_PROBE_VK = 0xFC
 
 def _inject_hook_probe():
     """SendInput one key-UP of _HOOK_PROBE_VK. True when Windows accepted the
-    event; False when it refused it (UIPI: an elevated window is in the
-    foreground - the event never entered the input queue, so a missing echo
-    would prove nothing) or on any error."""
+    event; False when it refused it or on any error. NB: with an ELEVATED
+    window in front, UIPI drops the event yet SendInput still returns 1
+    (2026-10-03, Quick Assist) - _hook_probe_miss_excuse covers that case."""
     if os.name != "nt":
         return False
     try:
@@ -16981,6 +16987,129 @@ def _inject_hook_probe():
             1, ctypes.byref(inp), ctypes.sizeof(_INPUT)) == 1
     except Exception:
         return False
+
+
+def _process_integrity_rid(pid):
+    """The mandatory integrity RID of process `pid` (0x2000 medium, 0x3000
+    high, 0x4000 system), or None when its token cannot be read from here -
+    from a non-elevated process that means it runs above us. Private WinDLL
+    handles, so the argtypes set here never leak to other ctypes users."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    adv.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                     ctypes.POINTER(wintypes.HANDLE)]
+    adv.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                        wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    adv.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+    adv.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
+    adv.GetSidSubAuthority.restype = ctypes.POINTER(wintypes.DWORD)
+    adv.GetSidSubAuthority.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    h = k32.OpenProcess(0x1000, False, int(pid))     # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return None
+    tok = wintypes.HANDLE()
+    try:
+        if not adv.OpenProcessToken(h, 0x0008, ctypes.byref(tok)):   # TOKEN_QUERY
+            return None
+        try:
+            need = wintypes.DWORD(0)
+            adv.GetTokenInformation(tok, 25, None, 0, ctypes.byref(need))  # TokenIntegrityLevel
+            if not need.value:
+                return None
+            buf = ctypes.create_string_buffer(need.value)
+            if not adv.GetTokenInformation(tok, 25, buf, need, ctypes.byref(need)):
+                return None
+            psid = ctypes.c_void_p.from_buffer(buf).value  # TOKEN_MANDATORY_LABEL.Label.Sid
+            n = adv.GetSidSubAuthorityCount(psid).contents.value
+            return int(adv.GetSidSubAuthority(psid, n - 1).contents.value) if n else None
+        finally:
+            k32.CloseHandle(tok)
+    finally:
+        k32.CloseHandle(h)
+
+
+def _foreground_process():
+    """(exe basename, above_us) for the foreground window, or None when there
+    is none (lock screen, UAC's secure desktop). above_us = that process runs
+    at a higher integrity than Lia, or its token is unreadable from here: UIPI
+    then hides its keys from Lia's hook AND drops an injected probe, without
+    SendInput saying so ("neither GetLastError nor the return value will
+    indicate the failure was caused by UIPI blocking" - SendInput docs)."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32 = ctypes.WinDLL("user32", use_last_error=True)
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        u32.GetForegroundWindow.restype = wintypes.HWND
+        u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
+                                                 ctypes.POINTER(wintypes.DWORD)]
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                                   wintypes.LPWSTR,
+                                                   ctypes.POINTER(wintypes.DWORD)]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        hwnd = u32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        pid = wintypes.DWORD(0)
+        u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not pid.value:
+            return ("?", False)
+        exe = "pid %d" % pid.value
+        h = k32.OpenProcess(0x1000, False, pid.value)
+        if h:
+            try:
+                buf = ctypes.create_unicode_buffer(1024)
+                size = wintypes.DWORD(len(buf))
+                if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                    exe = os.path.basename(buf.value) or exe
+            finally:
+                k32.CloseHandle(h)
+        mine = _process_integrity_rid(os.getpid())
+        theirs = _process_integrity_rid(pid.value)
+        above = mine is not None and (theirs is None or theirs > mine)
+        return exe, above
+    except Exception:
+        return ("?", False)      # unknown: a miss still counts (the old rule)
+
+
+def _hook_probe_miss_excuse(fg):
+    """Why a probe that was NOT echoed proves nothing about the hook, or ""
+    when the miss counts. fg = _foreground_process(). 2026-10-03: Quick
+    Assist runs at HIGH integrity (measured 0x3000 vs Lia's 0x2000); with it
+    in front every probe went unechoed, so the hook was declared dead and
+    Lia restarted 4 times in 30 min - while Ctrl+Space in a normal window
+    kept working (21:10:25, 27 s after a "miss")."""
+    if fg is None:
+        return "no foreground window (lock screen / secure desktop)"
+    exe, above = fg
+    if above:
+        return ("%s is in front and runs elevated - Windows (UIPI) hides its "
+                "input from Lia's hook" % exe)
+    return ""
+
+
+def _hook_press_miss_note(fg, misses):
+    """The log line for a physical hotkey press the hook never reported.
+    fg = _foreground_process(). Names the exe in front: a lone "miss 1/2"
+    (2026-10-04 11:55) could not be told apart from an elevated window in
+    front. Log only - the miss still counts."""
+    why = _hook_probe_miss_excuse(fg)
+    if why:
+        return ("Hook health: hotkey press with NO callback fire (miss %d/2) - "
+                "%s, so it says little about the hook" % (misses, why))
+    return ("Hook health: physical hotkey press with NO callback fire with %s "
+            "in front (miss %d/2) - hook may be dead." % (fg[0], misses))
 
 
 def _probe_keyboard_hook(seen, wait_s=2.0, inject=None):
@@ -17098,6 +17227,88 @@ def _child_survived(proc, wait_s=1.5):
         return True
     except Exception:
         return True   # can't tell: prefer the old behaviour over a stuck app
+
+
+# Left/right modifier VKs -> the generic VK: the keyboard library stores the
+# raw scan code, which is the SAME for left and right Ctrl / Alt.
+_VK_GENERIC_MODIFIER = {0xA0: 0x10, 0xA1: 0x10, 0xA2: 0x11, 0xA3: 0x11,
+                        0xA4: 0x12, 0xA5: 0x12}
+
+
+def _scan_code_vks(scan_code):
+    """The virtual key(s) whose physical state tells whether the keyboard
+    library's pressed `scan_code` is really down. () = unknown - never drop
+    such a key. Negative scan codes are the library's -vk for events that
+    carried no scan code."""
+    if os.name != "nt":
+        return ()
+    try:
+        sc = int(scan_code)
+        if sc < 0:
+            return (-sc,)
+        import ctypes
+        vk = ctypes.windll.user32.MapVirtualKeyW(sc, 3)      # MAPVK_VSC_TO_VK_EX
+        if not vk:
+            return ()
+        if vk in _VK_GENERIC_MODIFIER:
+            return (_VK_GENERIC_MODIFIER[vk],)
+        if vk in (0x5B, 0x5C):                               # left / right Win
+            return (0x5B, 0x5C)
+        return (vk,)
+    except Exception:
+        return ()
+
+
+def _reconcile_stuck_keys(kb, min_age_s=1.5, is_down=None, to_vks=None,
+                          now=None, settle_s=0.05):
+    """Drop keys the `keyboard` library still holds as PRESSED although they
+    are physically up, and return their names. Its hotkeys match the EXACT
+    set of pressed scan codes, so one key whose release never reached Lia's
+    hook kills every hotkey until that key is pressed again. 2026-10-03:
+    Ctrl+Space stopped firing while the hook was alive (the probe echoed and
+    the presses were physically there) - a key released while Quick Assist
+    (elevated) had focus, whose KEY_UP UIPI hid from Lia. Only entries older
+    than `min_age_s` and up on two looks `settle_s` apart are dropped: a key
+    going down right now, or held (it repeats, refreshing its entry), stays."""
+    if os.name != "nt" and is_down is None:
+        return []
+    lock = getattr(kb, "_pressed_events_lock", None)
+    pressed = getattr(kb, "_pressed_events", None)
+    if lock is None or pressed is None:
+        return []
+    if is_down is None:
+        import ctypes
+        _gaks = ctypes.windll.user32.GetAsyncKeyState
+        is_down = lambda vk: bool(_gaks(vk) & 0x8000)
+    to_vks = to_vks or _scan_code_vks
+    t = time.time() if now is None else now
+
+    def _up(sc):
+        vks = to_vks(sc)
+        return bool(vks) and not any(is_down(v) for v in vks)
+
+    with lock:
+        cand = [(sc, ev) for sc, ev in list(pressed.items())
+                if t - (getattr(ev, "time", None) or t) >= min_age_s]
+    stale = [(sc, ev) for sc, ev in cand if _up(sc)]
+    if not stale:
+        return []
+    if settle_s:
+        time.sleep(settle_s)
+    dropped = []
+    listener = getattr(kb, "_listener", None)
+    logical = getattr(kb, "_logically_pressed_keys", None)
+    with lock:
+        for sc, ev in stale:
+            if pressed.get(sc) is ev and _up(sc):
+                del pressed[sc]
+                if isinstance(logical, dict):
+                    logical.pop(sc, None)
+                mods = getattr(listener, "active_modifiers", None)
+                if isinstance(mods, set):
+                    mods.discard(sc)
+                dropped.append(getattr(ev, "name", None) or str(sc))
+    return dropped
 
 
 def _chord_physically_held(parts):
@@ -17330,18 +17541,18 @@ def _stamp_lia_launcher(exe_path):
         return False
     try:
         vi = VSVersionInfo(
-            ffi=FixedFileInfo(filevers=(1, 6, 11, 0), prodvers=(1, 6, 11, 0),
+            ffi=FixedFileInfo(filevers=(1, 6, 12, 0), prodvers=(1, 6, 12, 0),
                               mask=0x3f, flags=0x0, OS=0x40004,
                               fileType=0x1, subtype=0x0),
             kids=[
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.6.11.0'),
+                    StringStruct('FileVersion', '1.6.12.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.6.11.0'),
+                    StringStruct('ProductVersion', '1.6.12.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -22026,7 +22237,7 @@ class LiaApp:
         # pick is left exactly as-is. NOTE: cleanup-only — the summary + meetings
         # pickers keep a Flash model (GEMINI_STRONG_MODEL, different config keys),
         # where thinking is an asset.
-        # First preserve intent: a retired OpenAI id moves to its gpt-6 successor
+        # First preserve intent: a retired OpenAI id moves to its current successor
         # (the orphan rules below would drop Sol / Terra to Luna and a summary to "off"),
         # a retired Gemini Flash to the current one (the free Gemini choice stays).
         if _migrate_openai_retired(self.config):
@@ -22342,7 +22553,7 @@ class LiaApp:
         # _get_summary_cleaner(). Kept SEPARATE from _llm_cleaner so summaries
         # always use the strong model even when cleanup is off or on Groq.
         self._summary_cleaner = None
-        # Compose uses its OWN cloud cleaner (gpt-6-sol), kept separate from the
+        # Compose uses its OWN cloud cleaner (gpt-6.1-sol), kept separate from the
         # summary cleaner so picking a LOCAL summary model in the Meeting Summary
         # Module doesn't drag Compose onto a Hebrew 'thinking' model.
         self._compose_cleaner = None
@@ -24620,17 +24831,24 @@ class LiaApp:
                 self._hook_probe_logged_ok = True
                 log.info("Hook liveness probe: alive")
             return True
+        fg = _foreground_process()
+        why = _hook_probe_miss_excuse(fg)
+        if why:
+            log.info("Hook probe: no echo, not counted - %s", why)
+            return None
         # Phase 3.5: a miss whose re-check was BLOCKED used to be forgotten
         # (09-06, 09-07, 09-10: "miss 1/2" and then nothing). Keep it: the
         # next probe (the 2-min refresh) then counts as its re-check.
         pending = getattr(self, "_hook_probe_pending_miss", 0.0)
         if pending and time.time() - pending < 600:
-            log.warning("Hook probe: missed again (a miss %.0fs ago was never "
-                        "re-checked) - miss 2/2", time.time() - pending)
+            log.warning("Hook probe: missed again with %s in front (a miss %.0fs "
+                        "ago was never re-checked) - miss 2/2",
+                        fg[0], time.time() - pending)
         else:
             self._hook_probe_pending_miss = time.time()
             log.warning("Hook probe: the keyboard hook did not echo the probe "
-                        "(miss 1/2) - re-checking in %.0fs", recheck_delay_s)
+                        "with %s in front (miss 1/2) - re-checking in %.0fs",
+                        fg[0], recheck_delay_s)
             time.sleep(recheck_delay_s)
             if self._hook_probe_blocked():
                 log.info("Hook probe: re-check blocked (busy / idle) - the miss "
@@ -24643,6 +24861,11 @@ class LiaApp:
                 self._hook_probe_pending_miss = 0.0
                 log.info("Hook probe: alive on re-check (transient stall)")
                 return True
+            why = _hook_probe_miss_excuse(_foreground_process())
+            if why:
+                log.info("Hook probe: re-check not echoed, not counted - %s "
+                         "(the first miss is kept)", why)
+                return None
         self._hook_probe_pending_miss = 0.0
         if time.time() - getattr(self, "_last_hook_restart", 0.0) <= 120:
             log.warning("Hook probe: DEAD, but a hook restart ran under 120s "
@@ -24657,13 +24880,17 @@ class LiaApp:
     def _confirm_hook_dead(self):
         """The reactive path's confirmation: let the chord be released, then
         inject the probe. False = dead (restart), True = alive, None = could
-        not probe (SendInput refused: an elevated window has focus - UIPI).
+        not probe (SendInput refused, or an elevated window has focus - UIPI
+        hides both the presses and the probe from a live, non-elevated hook).
         Without probe support, keep the old behavior (dead)."""
         seen = getattr(self, "_hook_probe_seen", None)
         if seen is None or not getattr(self, "_hook_probe_enabled", True):
             return False
         time.sleep(1.0)
-        return _probe_keyboard_hook(seen)
+        r = _probe_keyboard_hook(seen)
+        if r is False and _hook_probe_miss_excuse(_foreground_process()):
+            return None
+        return r
 
     def _hook_health_watchdog(self):
         """Detect a silently-dead keyboard hook and auto-restart to revive it.
@@ -24692,9 +24919,27 @@ class LiaApp:
         misses = 0
         prev_main = prev_enter = False
         pending = []       # (eval_deadline_monotonic, press_wall_time)
+        next_reconcile = 0.0
+        try:
+            import keyboard as _kb_mod
+        except Exception:
+            _kb_mod = None
         while True:
             time.sleep(POLL)
             try:
+                # Every second, also while recording (the STOP press needs a
+                # clean state too): forget keys the library holds as pressed
+                # although they are physically up - one such key silently
+                # kills every hotkey (2026-10-03, see _reconcile_stuck_keys).
+                if _kb_mod is not None and time.monotonic() >= next_reconcile:
+                    next_reconcile = time.monotonic() + 1.0
+                    stuck = _reconcile_stuck_keys(_kb_mod)
+                    if stuck:
+                        log.warning("Hotkey: cleared stuck key(s) %s - the keyboard "
+                                    "library still held them as pressed, which "
+                                    "blocks every hotkey (their release never "
+                                    "reached Lia: an elevated window in front?)",
+                                    stuck)
                 main_parts = list(getattr(self, "_hotkey_parts", []) or [])
                 enter_parts = list(getattr(self, "_hotkey_enter_parts", []) or [])
 
@@ -24725,9 +24970,8 @@ class LiaApp:
                             misses = 0           # hook fired → alive
                         else:
                             misses += 1
-                            log.warning("Hook health: physical hotkey press with "
-                                        "NO callback fire (miss %d/2) — hook may "
-                                        "be dead.", misses)
+                            log.warning("%s", _hook_press_miss_note(
+                                _foreground_process(), misses))
                     else:
                         keep.append((deadline, t_press))
                 pending = keep
@@ -26407,7 +26651,7 @@ class LiaApp:
         return self._summary_cleaner
 
     def _get_compose_cleaner(self):
-        """Compose's cleaner — ALWAYS cloud OpenAI (default gpt-6-sol), independent
+        """Compose's cleaner - ALWAYS cloud OpenAI (default gpt-6.1-sol), independent
         of the Meeting Summary Module (a local 'thinking' model would emit
         <think> blocks and is Hebrew-tuned, unsuitable for compose). None if no
         OpenAI key. The editor window (compose_editor.py) uses the same model."""
@@ -27650,8 +27894,9 @@ class LiaApp:
         # verified on the user's key (GET /models + a 200 call). It is a
         # reasoning model (max_completion_tokens, no temperature; see
         # _is_reasoning_model). There is no gpt-6-terra; the retired ids
-        # migrate here (_migrate_openai_retired).
-        ("☁  OpenAI ChatGPT 6 Sol", OPENAI_STRONG_MODEL, ""),
+        # migrate here (_migrate_openai_retired). gpt-6.1-sol replaced it
+        # 2026-09-30 (see OPENAI_STRONG_MODEL).
+        ("☁  OpenAI ChatGPT 6.1 Sol", OPENAI_STRONG_MODEL, ""),
         # Gemini 3.8 Flash via Google AI Studio's OpenAI-compat endpoint - the
         # strongest FREE-tier model (no credit card; own gemini_api_key). It
         # superseded 3.7 (2026-09-24, see GEMINI_STRONG_MODEL) as 3.7 did 3.6.
@@ -29895,14 +30140,15 @@ class LiaApp:
     # OpenAI cleanup models offered in the picker (2026-09-24: the gpt-6 pair
     # replaced 5.6 Luna / Sol / Terra). gpt-6-luna is the light row and the
     # DEFAULT (OPENAI_LIGHT_MODEL): half of 5.6 Luna's price, a reasoning model
-    # with reasoning_tokens=0 on a short prompt (live-probed). gpt-6-sol is the
-    # stronger row for when quality matters. gpt-5.1 and gpt-4.1 were dropped
+    # with reasoning_tokens=0 on a short prompt (live-probed). The Sol row
+    # (gpt-6.1-sol since 2026-09-30) is the stronger one for when quality
+    # matters. gpt-5.1 and gpt-4.1 were dropped
     # 2026-08-15 (redundant with luna and with the free Gemini/Groq paths);
     # gpt-4o dropped earlier. Reasoning-model shaping (max_completion_tokens, no
     # temperature) is in OpenAILLMCleaner.clean().
     CLEANUP_OPENAI_MODELS = [
         ("OpenAI ChatGPT 6 Luna - light, fast", OPENAI_LIGHT_MODEL),
-        ("OpenAI ChatGPT 6 Sol - strongest", OPENAI_STRONG_MODEL),
+        ("OpenAI ChatGPT 6.1 Sol - strongest", OPENAI_STRONG_MODEL),
     ]
 
     # Gemini cleanup models (FREE tier, own gemini_api_key, via the OpenAI-compat
@@ -31251,7 +31497,7 @@ class LiaApp:
 
     def _open_chat_window(self):
         """Open the free-form chat window (local Ollama models by default; cloud
-        gpt-6-sol offered when an OpenAI key is set). Long-lived, non-blocking; a
+        gpt-6.1-sol offered when an OpenAI key is set). Long-lived, non-blocking; a
         fresh subprocess so it can't freeze the tray. No-op on a frozen build."""
         import tempfile
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -31275,7 +31521,7 @@ class LiaApp:
                         "disabled (a key is never written to disk in plaintext)")
             openai_key, protected_key = "", ""
         if openai_key:
-            models.append(["ChatGPT 6 Sol (ענן)", OPENAI_STRONG_MODEL])
+            models.append(["ChatGPT 6.1 Sol (ענן)", OPENAI_STRONG_MODEL])
             cloud_models.append(OPENAI_STRONG_MODEL)
         default_model = (self.config.get("chat_model")
                          or self.config.get("summary_model") or "gemma4:31b-it-qat")
@@ -31518,7 +31764,7 @@ class LiaApp:
         oa = (self.config.get("openai_api_key", "") or "").strip()
         if oa:
             om = self.config.get("meetings_answer_model_openai", OPENAI_LIGHT_MODEL)
-            _p = om.split("-")   # gpt-6-luna -> "GPT-6 Luna", gpt-6-sol -> "GPT-6 Sol"
+            _p = om.split("-")   # gpt-6-luna -> "GPT-6 Luna", gpt-6.1-sol -> "GPT-6.1 Sol"
             _name = "GPT-%s %s" % (_p[1], _p[2].title()) if len(_p) == 3 else om
             provs.append({
                 "label": "%s (ענן · בתשלום)" % _name,

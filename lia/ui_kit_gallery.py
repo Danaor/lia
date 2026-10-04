@@ -68,7 +68,7 @@ def _body():
       </div>
       <div class="field">
         <label>Summary model</label>
-        <select><option>ChatGPT 6 Sol (cloud)</option><option>Gemini 3.8 Flash (free)</option></select>
+        <select><option>ChatGPT 6.1 Sol (cloud)</option><option>Gemini 3.8 Flash (free)</option></select>
       </div>
       <div class="field">
         <label>Manual vocabulary</label>

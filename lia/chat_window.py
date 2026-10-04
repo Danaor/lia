@@ -2,7 +2,7 @@
 """Lia — free-form chat window (pywebview + local Ollama / cloud).
 
 A clean bilingual chat (English chrome, auto-RTL content) with the user's OWN models — local Ollama
-(Gemma 4) by default, or cloud gpt-6-sol if an OpenAI key is set.
+(Gemma 4) by default, or cloud gpt-6.1-sol if an OpenAI key is set.
 It is a plain assistant: a minimal, permissive system prompt, no task wrapper, no
 injected guard-rails. These are the user's local models on the user's machine.
 

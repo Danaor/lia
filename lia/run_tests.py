@@ -385,13 +385,13 @@ def t_config_seed_portable():
             "transcription_backend": "openai",
             "openai_model": "gpt-transcribe",
             "meeting_model": "openai_gpt_transcribe",
-            "summary_model": "gpt-6-sol",
+            "summary_model": "gpt-6.1-sol",
         }
         cfg = w.load_config()  # no config file → first run → seed applies
         assert cfg["transcription_backend"] == "openai", cfg["transcription_backend"]
         assert cfg["openai_model"] == "gpt-transcribe", cfg["openai_model"]
         assert cfg["meeting_model"] == "openai_gpt_transcribe", cfg["meeting_model"]
-        assert cfg["summary_model"] == "gpt-6-sol", cfg["summary_model"]
+        assert cfg["summary_model"] == "gpt-6.1-sol", cfg["summary_model"]
         # An existing saved config MUST win over the seed (seed is first-run only).
         w.save_config({"transcription_backend": "local",
                        "meeting_model": "local_hebrew_turbo"})
@@ -457,7 +457,7 @@ def t_gemini_summary_option():
     assert app._get_summary_cleaner() is None
     assert app._summary_available() is False
     # OpenAI cloud path still routes to the OpenAI endpoint.
-    app.config = {"summary_model": "gpt-6-sol", "summary_base_url": "",
+    app.config = {"summary_model": "gpt-6.1-sol", "summary_base_url": "",
                   "gemini_api_key": "", "openai_api_key": "sk-X"}
     app._summary_cleaner = None
     assert app._get_summary_cleaner().chat_url == w.OpenAILLMCleaner.CHAT_URL
@@ -480,13 +480,13 @@ def t_gemini_flash_migration():
     assert not set(w.GEMINI_LLM_SUCCESSOR) & set(ids), ids
     assert w.DEFAULT_CONFIG["meetings_answer_model_gemini"] == w.GEMINI_STRONG_MODEL
     cfg = {"summary_model": "gemini-3.7-flash", "meetings_answer_model_gemini": "gemini-3.6-flash",
-           "cleanup_llm_model_gemini": "gemini-3.5-flash-lite", "compose_model": "gpt-6-sol"}
+           "cleanup_llm_model_gemini": "gemini-3.5-flash-lite", "compose_model": "gpt-6.1-sol"}
     changed = w._migrate_gemini_retired(cfg)
     assert sorted(changed) == ["meetings_answer_model_gemini", "summary_model"], changed
     assert cfg == {"summary_model": "gemini-3.8-flash",
                    "meetings_answer_model_gemini": "gemini-3.8-flash",
                    "cleanup_llm_model_gemini": "gemini-3.5-flash-lite",
-                   "compose_model": "gpt-6-sol"}, cfg
+                   "compose_model": "gpt-6.1-sol"}, cfg
     keep = {"summary_model": "gemma4:31b-it-qat", "meetings_answer_model_gemini": "gemini-3.8-flash"}
     assert w._migrate_gemini_retired(dict(keep)) == []
     src = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)), "lia.py"),
@@ -969,9 +969,10 @@ def t_summary_module_wiring():
     assert any(m.startswith("gemma4") for m in models), models
     assert not any("qwen" in m.lower() for m in models), models
     assert not any("dicta" in m.lower() for m in models), models
-    # gpt-6-sol replaced 5.6 Sol + Terra (2026-09-24, LIVE-verified on the key);
+    # gpt-6-sol replaced 5.6 Sol + Terra (2026-09-24, LIVE-verified on the key)
+    # and gpt-6.1-sol replaced it (2026-09-30);
     # there is no gpt-6-terra, and no retired id may stay in the picker.
-    assert "gpt-6-sol" in models, models
+    assert "gpt-6.1-sol" in models, models
     assert not (set(models) & set(w.OPENAI_LLM_RETIRED)), models
     assert not any("terra" in m for m in models), models
     # cloud cleaner → OpenAI URL; a chat_url override (Ollama) points elsewhere
@@ -1008,7 +1009,7 @@ def t_local_summary_tiers():
     assert w.LOCAL_SUMMARY_TIERS["gemma3:12b"]["ctx_cap"] == 24576
     assert w.LOCAL_SUMMARY_TIERS["gemma4:31b-it-qat"]["prompt"] == "technical"
     # cloud / empty / unknown local -> the safe default (technical + full cap)
-    assert w._local_summary_tier("gpt-6-sol") is w.DEFAULT_LOCAL_TIER
+    assert w._local_summary_tier("gpt-6.1-sol") is w.DEFAULT_LOCAL_TIER
     assert w._local_summary_tier("")["prompt"] == "technical"
     assert w._local_summary_tier("unknown:99b")["ctx_cap"] == w._SUMMARY_CTX_CAP
     # the general recap base really differs from (and is far shorter than) GOLD
@@ -1050,7 +1051,7 @@ def t_local_summary_tiers():
     assert captured["ctx_cap"] == 24576
     assert captured["depth_pass"] is True
     # cloud model: technical GOLD base + full cap (byte-identical intent)
-    app = _make("gpt-6-sol")
+    app = _make("gpt-6.1-sol")
     app.config["summary_base_url"] = ""
     app._run_summary(txt, mode="meeting")
     assert captured["base"] == he_gold
@@ -2321,7 +2322,7 @@ def t_summary_shaping_gpt5():
     # `gpt-5` prefix check sent it max_tokens + temperature -> HTTP 400 live
     # (2026-09-24). Runs LAST: it rebinds `p`, and the gpt-5.5 assertions above
     # must see their own payload.
-    for mid in ("gpt-6-sol", "gpt-6-luna"):
+    for mid in ("gpt-6.1-sol", "gpt-6-luna"):
         cl = w.OpenAILLMCleaner(api_key="fake", model=mid)
         cl._session = FakeSession()
         cl.summarize("Some text to summarize, long enough.", "sys prompt")
@@ -3195,7 +3196,7 @@ def t_compose_chat_shaping():
     assert p["model"] == "gpt-5.5"
     # gpt-6-* too (the old `gpt-5` prefix check sent it the legacy shape -> 400)
     cap.clear()
-    cl6 = w.OpenAILLMCleaner(api_key="fake", model="gpt-6-sol")
+    cl6 = w.OpenAILLMCleaner(api_key="fake", model="gpt-6.1-sol")
     cl6._session = FakeSession()
     cl6.compose("a rough spoken draft about the quarterly plan", style="summary")
     p = cap["payload"]
@@ -7193,7 +7194,7 @@ def t_ollama_gate_wiring():
         assert sent[-1]["options"]["num_ctx"] == 12288, sent[-1]
         chat = cw.ChatApi.__new__(cw.ChatApi)
         chat._system, chat._base_url = "sys", "http://localhost:11434/v1/chat/completions"
-        chat._models, chat._cloud = [["G", "g"], ["Sol", "gpt-6-sol"]], {"gpt-6-sol"}
+        chat._models, chat._cloud = [["G", "g"], ["Sol", "gpt-6.1-sol"]], {"gpt-6.1-sol"}
         chat._stop, chat._gen = False, 1
         ev = []
         chat._emit = lambda gen, kind, *a: ev.append((kind,) + a)
@@ -8882,7 +8883,7 @@ def t_cleanup_provider_and_models():
     ids = [m for _l, m in App.CLEANUP_OPENAI_MODELS]
     for m in ("gpt-4o", "gpt-4.1", "gpt-5.1", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"):
         assert m not in ids, f"{m} should be removed from the cleanup picker: {ids}"
-    for m in ("gpt-6-luna", "gpt-6-sol"):
+    for m in ("gpt-6-luna", "gpt-6.1-sol"):
         assert m in ids, f"{m} missing from cleanup models: {ids}"
     assert wt.DEFAULT_CONFIG.get("cleanup_provider") == "auto"
     assert wt.DEFAULT_CONFIG.get("cleanup_llm_model_openai") == "gpt-6-luna" == wt.OPENAI_LIGHT_MODEL
@@ -8902,9 +8903,9 @@ def t_cleanup_provider_and_models():
     app = App.__new__(App)
     # auto + both keys → OpenAI (pay-as-you-go, no daily cap).
     app.config = {"openai_api_key": "sk-X", "groq_api_key": "gsk_Y",
-                  "cleanup_provider": "auto", "cleanup_llm_model_openai": "gpt-6-sol"}
+                  "cleanup_provider": "auto", "cleanup_llm_model_openai": "gpt-6.1-sol"}
     assert app._effective_cleanup_provider() == "openai"
-    assert app._cleanup_model_label() == "gpt-6-sol"
+    assert app._cleanup_model_label() == "gpt-6.1-sol"
     # explicit groq wins even with an OpenAI key present (the free path).
     app.config["cleanup_provider"] = "groq"
     assert app._effective_cleanup_provider() == "groq"
@@ -8924,7 +8925,7 @@ def t_cleanup_provider_and_models():
     app._ollama_cache = None
     picker = [r["label"] for r in App._settings_tables(app, ollama=False)["cleanup_models"]]
     assert any("Groq" in l for l in picker), picker
-    assert any("ChatGPT 6 Sol" in l for l in picker), picker
+    assert any("ChatGPT 6.1 Sol" in l for l in picker), picker
     assert not any("Terra" in l or "5.6 Sol" in l for l in picker), picker
     assert not any("GPT-4o" in l for l in picker), picker
 
@@ -9017,7 +9018,7 @@ def t_cleanup_gpt5_no_temperature():
         c.clean(sample, style="proofread")
         return captured["payload"]
 
-    for m in ("gpt-6-sol", "gpt-6-luna", "gpt-5.1", "o3-mini"):
+    for m in ("gpt-6.1-sol", "gpt-6-luna", "gpt-5.1", "o3-mini"):
         p = shaping(m)
         assert "temperature" not in p, (m, "must omit temperature", list(p))
         assert "max_completion_tokens" in p, (m, list(p))
@@ -9032,17 +9033,17 @@ _test("cleanup: gpt-5.x/o-series omit temperature (OpenAI 400 fix)",
 
 
 def t_openai_sol6_upgrade():
-    """2026-09-24: gpt-6-sol replaced gpt-5.6-sol + gpt-5.6-terra. (1) Every
+    """2026-09-24: gpt-6-sol replaced gpt-5.6-sol + gpt-5.6-terra (gpt-6.1-sol since 09-30). (1) Every
     OpenAI request path treats gpt-6 as a reasoning model: the old `gpt-5` prefix
     check sent it max_tokens + temperature -> HTTP 400 LIVE. lia and email_index
     (Ask / Chat windows) agree. (2) A config pinned to a retired id moves to
-    gpt-6-sol and keeps its intent - the orphan rules would have dropped a
+    the strong model and keeps its intent - the orphan rules would have dropped a
     summary to "off" and a cleanup to Luna. (3) The Settings price hints."""
     import requests
     import lia as w
     import email_index as ei
     import chat_window as cw
-    yes = ("gpt-5", "gpt-5.5", "gpt-5.6-luna", "gpt-6-sol", "gpt-6-luna",
+    yes = ("gpt-5", "gpt-5.5", "gpt-5.6-luna", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna",
            "gpt-6-astra", "GPT-6-SOL", "gpt-10-x", "o1", "o3-mini", "o4-mini")
     no = ("gpt-4.1", "gpt-4o", "gpt-4o-mini", "gpt-oss-120b", "openai/gpt-oss-20b",
           "qwen/qwen3.8-27b", "gemini-3.8-flash", "gemma4:31b-it-qat", "", None)
@@ -9070,7 +9071,7 @@ def t_openai_sol6_upgrade():
     orig = requests.Session
     requests.Session = lambda: S()
     try:
-        for m in ("gpt-6-sol", "gpt-4.1"):
+        for m in ("gpt-6.1-sol", "gpt-4.1"):
             sent.clear()
             ei._llm_chat("sys", "q", "https://api.openai.com/v1/chat/completions", m, "sk")
             chat = cw.ChatApi.__new__(cw.ChatApi)
@@ -9081,7 +9082,7 @@ def t_openai_sol6_upgrade():
             chat._stream_cloud(1, [{"role": "user", "content": "q"}], m)
             assert len(sent) == 2, sent
             for body in sent:
-                if m == "gpt-6-sol":
+                if m == "gpt-6.1-sol":
                     assert "max_completion_tokens" in body and "max_tokens" not in body, body
                     assert "temperature" not in body, body
                 else:
@@ -9098,7 +9099,7 @@ def t_openai_sol6_upgrade():
                                "meetings_answer_model_openai", "summary_model"], changed
     assert cfg["summary_model"] == cfg["cleanup_llm_model_openai"] == \
         cfg["meetings_answer_model_openai"] == cfg["compose_model"] == \
-        cfg["chat_model"] == "gpt-6-sol", cfg
+        cfg["chat_model"] == "gpt-6.1-sol", cfg
     assert cfg["cleanup_llm_model_gemini"] == "gemini-3.5-flash-lite", cfg
     keep = {"summary_model": "gemma4:31b-it-qat", "cleanup_llm_model_openai": "gpt-6-luna",
             "chat_model": "", "meetings_answer_model_openai": "gpt-6-luna"}
@@ -9107,6 +9108,12 @@ def t_openai_sol6_upgrade():
     lite = {"cleanup_llm_model_openai": "gpt-5.6-luna", "meetings_answer_model_openai": "gpt-5.6-luna"}
     assert sorted(w._migrate_openai_retired(lite)) == ["cleanup_llm_model_openai", "meetings_answer_model_openai"]
     assert lite == {"cleanup_llm_model_openai": "gpt-6-luna", "meetings_answer_model_openai": "gpt-6-luna"}, lite
+    # 2026-09-30: gpt-6-sol retired for gpt-6.1-sol on every Sol key
+    sol6 = {k: "gpt-6-sol" for k in ("summary_model", "cleanup_llm_model_openai",
+                                     "meetings_answer_model_openai", "compose_model", "chat_model")}
+    assert len(w._migrate_openai_retired(sol6)) == 5
+    assert set(sol6.values()) == {"gpt-6.1-sol"} == {w.OPENAI_STRONG_MODEL}, sol6
+    assert "gpt-6-sol" in w.OPENAI_LLM_RETIRED
     App = w.LiaApp
     assert cfg["summary_model"] in [m for _l, m, _u in App._SUMMARY_MODELS]
     assert cfg["cleanup_llm_model_openai"] in [m for _l, m in App.CLEANUP_OPENAI_MODELS]
@@ -9121,13 +9128,13 @@ def t_openai_sol6_upgrade():
 
     # (3) Settings price hints: summary + the gpt-transcribe rows
     app = App.__new__(App)
-    app.config = {"openai_api_key": "sk-X", "summary_model": "gpt-6-sol",
+    app.config = {"openai_api_key": "sk-X", "summary_model": "gpt-6.1-sol",
                   "summary_base_url": "", "transcription_backend": "openai",
                   "openai_model": "gpt-transcribe"}
     app._ollama_cache = None
     t = App._settings_tables(app, ollama=False)
-    sol = [r for r in t["summary"] if r["model"] == "gpt-6-sol"]
-    assert len(sol) == 1 and sol[0]["label"] == "OpenAI ChatGPT 6 Sol", sol
+    sol = [r for r in t["summary"] if r["model"] == "gpt-6.1-sol"]
+    assert len(sol) == 1 and sol[0]["label"] == "OpenAI ChatGPT 6.1 Sol", sol
     assert sol[0]["wnote"].endswith("~$0.05 per meeting summary"), sol[0]["wnote"]
     assert not any("terra" in r["model"] or r["model"] in w.OPENAI_LLM_RETIRED
                    for r in t["summary"])
@@ -9142,7 +9149,7 @@ _test("OpenAI Sol 6: reasoning shaping on every path + retired-id migration + pr
 
 
 def t_compose_chat_luna6():
-    """2026-09-24: Compose + Chat moved from gpt-5.5 to gpt-6-sol, and the AI
+    """2026-09-24: Compose + Chat moved from gpt-5.5 to Sol (gpt-6.1-sol since 09-30), and the AI
     Cleanup picker offers gpt-6-luna. The Compose editor window built its client
     from summary_model, so a gemma / Gemini / "off" summary choice sent that name
     to OpenAI and Revise / Regenerate failed - it now shares _compose_model."""
@@ -9151,19 +9158,19 @@ def t_compose_chat_luna6():
     import compose_editor as ce
     App = w.LiaApp
     # Compose: never the summary model
-    for sm in ("gemma4:31b-it-qat", "off", "gemini-3.8-flash", "gpt-6-sol", None):
-        assert w._compose_model({"summary_model": sm}) == "gpt-6-sol", sm
+    for sm in ("gemma4:31b-it-qat", "off", "gemini-3.8-flash", "gpt-6.1-sol", None):
+        assert w._compose_model({"summary_model": sm}) == "gpt-6.1-sol", sm
     assert w._compose_model({"compose_model": "gpt-6-luna"}) == "gpt-6-luna"
     app = App.__new__(App)
     app.config = {"openai_api_key": "sk-X", "summary_model": "gemma4:31b-it-qat"}
     app._compose_cleaner = None
     c = app._get_compose_cleaner()
-    assert c.model == "gpt-6-sol" and c.chat_url == w.OpenAILLMCleaner.CHAT_URL, c.model
+    assert c.model == "gpt-6.1-sol" and c.chat_url == w.OpenAILLMCleaner.CHAT_URL, c.model
     assert ce._compose_model is w._compose_model       # the editor imports the SAME rule
     src = open(ce.__file__, encoding="utf-8").read()
     assert "model=_compose_model(cfg)" in src and 'cfg.get("summary_model"' not in src
 
-    # Chat: the cloud row is gpt-6-sol (the payload the window receives)
+    # Chat: the cloud row is gpt-6.1-sol (the payload the window receives)
     got = {}
     orig = (w.spawn_helper, w.find_python_interpreter)
     w.spawn_helper = lambda args, **kw: got.setdefault("args", args)
@@ -9175,13 +9182,13 @@ def t_compose_chat_luna6():
         w.spawn_helper, w.find_python_interpreter = orig
     payload = _json.load(open(got["args"][-1], encoding="utf-8"))
     os.remove(got["args"][-1])
-    assert ["ChatGPT 6 Sol (ענן)", "gpt-6-sol"] in payload["models"], payload["models"]
-    assert payload["cloud_models"] == ["gpt-6-sol"], payload["cloud_models"]
+    assert ["ChatGPT 6.1 Sol (ענן)", "gpt-6.1-sol"] in payload["models"], payload["models"]
+    assert payload["cloud_models"] == ["gpt-6.1-sol"], payload["cloud_models"]
     assert not any("5.5" in m[1] for m in payload["models"]), payload["models"]
 
     # AI Cleanup offers only the gpt-6 pair (Luna 5.6 removed 2026-09-24)
     ids = [m for _l, m in App.CLEANUP_OPENAI_MODELS]
-    assert ids == ["gpt-6-luna", "gpt-6-sol"], ids
+    assert ids == ["gpt-6-luna", "gpt-6.1-sol"], ids
     assert w._is_reasoning_model("gpt-6-luna")
     app.config = {"openai_api_key": "sk-X", "cleanup_provider": "openai",
                   "cleanup_llm_model_openai": "gpt-6-luna"}
@@ -9632,7 +9639,7 @@ def t_summary_gpu_busy_cloud():
     assert app._summary_busy_candidates() == []
     app.config["summary_gpu_busy_cloud"] = "openai"
     c = app._summary_busy_candidates()
-    assert [(x.model, l) for x, l in c] == [("gpt-6-sol", "OpenAI"), ("gemini-3.8-flash", "Gemini")], c
+    assert [(x.model, l) for x, l in c] == [("gpt-6.1-sol", "OpenAI"), ("gemini-3.8-flash", "Gemini")], c
     assert c[0][0].chat_url == w.OpenAILLMCleaner.CHAT_URL and c[1][0].chat_url == w.GEMINI_CHAT_URL
     app.config.update(summary_gpu_busy_cloud="groq", groq_api_key="gsk_Q")
     c = app._summary_busy_candidates()
@@ -9658,12 +9665,12 @@ def t_summary_gpu_busy_cloud():
     app.config.update(summary_gpu_busy_cloud="openai", groq_api_key="")
     with w.gpu_wait_context(on_wait=card.append):
         # a cloud summary model: never wrapped
-        cloud = w.OpenAILLMCleaner(api_key="sk", model="gpt-6-sol")
+        cloud = w.OpenAILLMCleaner(api_key="sk", model="gpt-6.1-sol")
         assert app._summary_with_gpu_fallback(cloud, lambda cl: "X") == ("X", cloud)
         # local + about to wait before any local call -> the cloud, the card says so
         local._ollama_calls = 0
         out, used = app._summary_with_gpu_fallback(local, waits)
-        assert out == "CLOUD SUMMARY by gpt-6-sol" and used.model == "gpt-6-sol", out
+        assert out == "CLOUD SUMMARY by gpt-6.1-sol" and used.model == "gpt-6.1-sol", out
         assert card[-1] == "GPU busy - summarizing in the cloud (OpenAI)", card
         assert notices and "OpenAI" in notices[-1]
         # the local model already answered once -> a later wait stays a wait
@@ -9697,7 +9704,7 @@ def t_summary_gpu_busy_cloud():
         tried.append(cl.model)
         return ""
     out, used = app._summary_with_gpu_fallback(local, all_fail)
-    assert out == "" and tried == ["gpt-6-sol", "gemini-3.8-flash"], tried
+    assert out == "" and tried == ["gpt-6.1-sol", "gemini-3.8-flash"], tried
 
     # the divert passes THROUGH summarize()'s local branch (its `except
     # Exception` turns any error into "the summary failed")
@@ -10846,16 +10853,16 @@ def t_meetings_wiring():
     # all keys present -> 4 providers with the REAL endpoint constants
     app.config = {"meetings_answer_provider": "gemini",
                   "gemini_api_key": "AIza", "groq_api_key": "gsk", "openai_api_key": "sk",
-                  "meetings_answer_model_openai": "gpt-6-sol"}
+                  "meetings_answer_model_openai": "gpt-6.1-sol"}
     provs, default = app._meetings_providers()
     byp = {p["provider"]: p for p in provs}
     assert set(byp) == {"local", "gemini", "groq", "openai"}, list(byp)
     assert byp["gemini"]["base_url"] == w.GEMINI_CHAT_URL and byp["gemini"]["key"] == "AIza"
     assert byp["groq"]["base_url"] == w.GroqLLMCleaner.CHAT_URL
     assert byp["openai"]["base_url"] == w.OpenAILLMCleaner.CHAT_URL
-    assert byp["openai"]["model"] == "gpt-6-sol"
+    assert byp["openai"]["model"] == "gpt-6.1-sol"
     # the paid label reflects the model AND its version (it said "GPT-5.6" for all)
-    assert byp["openai"]["label"].startswith("GPT-6 Sol "), byp["openai"]["label"]
+    assert byp["openai"]["label"].startswith("GPT-6.1 Sol "), byp["openai"]["label"]
     app.config["meetings_answer_model_openai"] = "gpt-6-luna"
     luna = {p["provider"]: p for p in app._meetings_providers()[0]}["openai"]
     assert luna["label"].startswith("GPT-6 Luna "), luna["label"]
@@ -13414,7 +13421,7 @@ def t_cloud_parity():
     orig = w.OpenAILLMCleaner._ensure_session
     w.OpenAILLMCleaner._ensure_session = lambda self: _Sess()
     try:
-        c = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-6-sol")
+        c = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-6.1-sol")
         out = c.summarize("טקסט", "SYS", meeting_meta="Duration: 30",
                           cloud_parity=True)
         assert sent[0]["messages"][0]["content"].endswith(
@@ -13435,21 +13442,21 @@ def t_cloud_parity():
         # a manual override (Settings > Advanced, config summary_cloud_addendum)
         # REPLACES the built-in block on the cloud branch; blank = built-in
         sent.clear()
-        c2 = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-6-sol",
+        c2 = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-6.1-sol",
                                 log_cfg={"summary_cloud_addendum": "  כלל ידני אחד  "})
         c2.summarize("טקסט", "SYS", meeting_meta="Duration: 30", cloud_parity=True)
         sysp = sent[0]["messages"][0]["content"]
         assert sysp == "SYS\n\nכלל ידני אחד", sysp
         assert w._SUMMARY_CLOUD_PARITY_ADDENDUM not in sysp
         sent.clear()
-        c3 = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-6-sol",
+        c3 = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-6.1-sol",
                                 log_cfg={"summary_cloud_addendum": "   "})
         c3.summarize("טקסט", "SYS", meeting_meta="Duration: 30", cloud_parity=True)
         assert sent[0]["messages"][0]["content"].endswith(w._SUMMARY_CLOUD_PARITY_ADDENDUM)
         # a manual BASE-prompt override REPLACES the passed base on the cloud branch
         # (the addendum still appends after it); meeting mode only
         sent.clear()
-        c4 = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-6-sol",
+        c4 = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-6.1-sol",
                                 log_cfg={"summary_base_prompt_override": "פרומט בסיס ידני חדש"})
         c4.summarize("טקסט", "SYS", meeting_meta="Duration: 30", cloud_parity=True)
         sysp = sent[0]["messages"][0]["content"]
@@ -13537,7 +13544,7 @@ def t_summary_templates():
     orig = w.OpenAILLMCleaner._ensure_session
     w.OpenAILLMCleaner._ensure_session = lambda self: _Sess()
     try:
-        c = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-6-sol")
+        c = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-6.1-sol")
         # general -> template base REPLACES the passed technical base, template addendum appends
         out = c.summarize("טקסט", "TECH-SYS", meeting_meta="Duration: 30",
                           cloud_parity=True, lang="he", template="general")
@@ -13559,7 +13566,7 @@ def t_summary_templates():
         assert "## נושאים שנדונו" in sent[0]["messages"][0]["content"]
         # a manual BASE override beats the template
         sent.clear()
-        c2 = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-6-sol",
+        c2 = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-6.1-sol",
                                 log_cfg={"summary_base_prompt_override": "MY BASE"})
         c2.summarize("טקסט", "TECH-SYS", meeting_meta="Duration: 30",
                      cloud_parity=True, lang="he", template="general")
@@ -13567,7 +13574,7 @@ def t_summary_templates():
         assert sp.startswith("MY BASE") and "דגשים מרכזיים" not in sp.split("\n")[0]
         # a manual ADDENDUM override beats the template addendum
         sent.clear()
-        c3 = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-6-sol",
+        c3 = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-6.1-sol",
                                 log_cfg={"summary_cloud_addendum": "MY RULES"})
         c3.summarize("טקסט", "TECH-SYS", meeting_meta="Duration: 30",
                      cloud_parity=True, lang="he", template="general")
@@ -15429,10 +15436,17 @@ def t_summarize_meeting_file():
             assert "פגישת צוות" in h and "2:05 · diarized" in h
             assert open(dpath, encoding="utf-8").read() == w._meeting_txt_with_summary(draw, md)
             assert App._meeting_summary_html_for(dpath) == html   # Home sees it
-            # again: the previous summary is kept as a .bak.html, never lost
+            # again: the previous summary is kept as a .bak.html, never lost.
+            # Count only the NEW backup: part 2 left a summary .html, so the
+            # first call above already kept one, and the two .bak names differ
+            # when the calls straddle a clock second (a 1-in-N flake, 10-04).
+            before = {f for f in os.listdir(d) if f.endswith(".bak.html")}
+            prev = open(html, encoding="utf-8").read()
+            time.sleep(1.05)        # a distinct second = a distinct .bak name
             app._do_meeting_summary(draw.strip(), dpath)
-            baks = [f for f in os.listdir(d) if f.endswith(".bak.html")]
+            baks = sorted({f for f in os.listdir(d) if f.endswith(".bak.html")} - before)
             assert len(baks) == 1 and baks[0].startswith(os.path.basename(stem) + "_summary."), baks
+            assert open(os.path.join(d, baks[0]), encoding="utf-8").read() == prev
             # a meeting file OUTSIDE the meetings folder: summarized as a meeting,
             # saved to the summaries folder, the file itself untouched
             other = os.path.join(tempfile.mkdtemp(), os.path.basename(path))
@@ -15485,7 +15499,7 @@ def t_summarize_meeting_file():
             app._summarize_text_dialog()
             assert errs and "summary model" in errs[-1] and launched == [], (errs, launched)
             # with a model it opens (here: the Tk fallback, as no interpreter)
-            app.config = {"summary_model": "gpt-6-sol", "openai_api_key": "sk-x"}
+            app.config = {"summary_model": "gpt-6.1-sol", "openai_api_key": "sk-x"}
             app._summarize_text_dialog()
             assert launched == [app._do_meeting_summary], launched
         finally:
@@ -15625,6 +15639,9 @@ def t_hook_probe_watchdog_and_restart_notice():
     restarts = []
     app._restart_app = lambda reason="manual": restarts.append(reason)
     orig_probe, orig_idle = w._probe_keyboard_hook, w.get_system_idle_seconds
+    orig_fg = w._foreground_process
+    fg_now = [("notepad.exe", False)]               # a normal (non-elevated) app in front
+    w._foreground_process = lambda: fg_now[0]
     results = []
     try:
         w.get_system_idle_seconds = lambda: 5.0
@@ -15679,17 +15696,73 @@ def t_hook_probe_watchdog_and_restart_notice():
             assert App._confirm_hook_dead(app) is False
         finally:
             w.time.sleep = orig_sl
+        # 2026-10-03: an ELEVATED window in front (Quick Assist runs at HIGH
+        # integrity) hides the probe from a live hook and SendInput still says
+        # OK - those misses must never count (Lia restarted 4x in 30 min).
+        app._last_hook_restart = 0.0; restarts.clear()
+        app._hook_probe_pending_miss = 0.0
+        fg_now[0] = ("QuickAssist.exe", True)
+        results[:] = [False, False]
+        assert App._verify_keyboard_hook(app, recheck_delay_s=0) is None
+        assert results == [False] and not restarts and not app._hook_probe_pending_miss
+        fg_now[0] = None                             # lock screen / secure desktop
+        results[:] = [False]
+        assert App._verify_keyboard_hook(app, recheck_delay_s=0) is None and not restarts
+        # a first miss in a normal app, the re-check with Quick Assist in front:
+        # not counted, the first miss is kept for the next probe
+        fgs = iter([("notepad.exe", False), ("QuickAssist.exe", True)])
+        w._foreground_process = lambda: next(fgs)
+        results[:] = [False, False]
+        assert App._verify_keyboard_hook(app, recheck_delay_s=0) is None
+        assert app._hook_probe_pending_miss > 0 and not restarts
+        w._foreground_process = lambda: fg_now[0]
+        fg_now[0] = ("notepad.exe", False)           # next probe, normal app: 2/2
+        results[:] = [False]
+        assert App._verify_keyboard_hook(app, recheck_delay_s=0) is False
+        assert restarts == ["dead-hotkey-hook-probe"], restarts
+        # the reactive path: unseen presses + no echo with an elevated app in
+        # front = cannot tell (no restart); an unknown foreground still counts
+        orig_sl = w.time.sleep; w.time.sleep = lambda s_: None
+        try:
+            fg_now[0] = ("QuickAssist.exe", True)
+            results[:] = [False]
+            assert App._confirm_hook_dead(app) is None
+            fg_now[0] = ("?", False)
+            results[:] = [False]
+            assert App._confirm_hook_dead(app) is False
+        finally:
+            w.time.sleep = orig_sl
+        assert w._hook_probe_miss_excuse(("QuickAssist.exe", True))
+        assert w._hook_probe_miss_excuse(None)
+        assert w._hook_probe_miss_excuse(("code.exe", False)) == ""
         app._hook_probe_enabled = False              # observer failed -> never probes
         results[:] = [False, False]
         assert App._verify_keyboard_hook(app, recheck_delay_s=0) is None
         assert results == [False, False]
     finally:
         w._probe_keyboard_hook, w.get_system_idle_seconds = orig_probe, orig_idle
+        w._foreground_process = orig_fg
+    # the REAL helpers on this machine: our own token reads (medium or high),
+    # a SYSTEM process is unreadable from a non-elevated process, and the
+    # foreground lookup never raises
+    if os.name == "nt":
+        mine = w._process_integrity_rid(os.getpid())
+        assert mine in (0x2000, 0x2100, 0x3000, 0x4000), mine
+        fg = w._foreground_process()
+        assert fg is None or (isinstance(fg, tuple) and len(fg) == 2), fg
     # the echo wait is 2 s now (0.5 s missed real, busy-but-alive hooks)
     import inspect as _insp
     assert _insp.signature(w._probe_keyboard_hook).parameters["wait_s"].default == 2.0
     src_hw = _insp.getsource(App._hook_health_watchdog)
     assert "self._confirm_hook_dead()" in src_hw
+    # a missed physical press names the exe in front (log only, still counts)
+    assert "_hook_press_miss_note(" in src_hw and "_foreground_process()" in src_hw
+    note = w._hook_press_miss_note(("code.exe", False), 1)
+    assert "code.exe in front" in note and "miss 1/2" in note and "may be dead" in note
+    note = w._hook_press_miss_note(("QuickAssist.exe", True), 2)
+    assert "QuickAssist.exe is in front and runs elevated" in note
+    assert "miss 2/2" in note and "may be dead" not in note
+    assert "no foreground window" in w._hook_press_miss_note(None, 1)
     # --- the reason rides the relaunch argv ...
     # (2026-09-22) This used to mock _get_startup_target with the OLD args shape
     # ('"C:\\x\\lia.py"', no --autostart), so it passed while the real args
@@ -15749,6 +15822,75 @@ def t_hook_probe_watchdog_and_restart_notice():
 
 _test("hotkey: OS-hook liveness probe + proactive restart + restart notice",
       t_hook_probe_watchdog_and_restart_notice)
+
+
+def t_reconcile_stuck_keys():
+    """2026-10-03: Ctrl+Space stopped firing while the hook was ALIVE (the
+    probe echoed, the presses were physically there). The keyboard library
+    matches a hotkey against the EXACT set of keys it holds as pressed; one
+    key whose KEY_UP never reached Lia (released while Quick Assist -
+    elevated - had focus) blocks every hotkey. _reconcile_stuck_keys drops
+    entries that are old AND physically up on two looks; held, fresh,
+    unmappable or re-pressed keys stay. (Proven on the real library's
+    matching path: stuck F15 -> F13 hotkey dead, reconcile -> fires.)"""
+    import threading as _th
+    import types
+    import lia as w
+
+    class Ev:
+        def __init__(self, name, t):
+            self.name, self.time = name, t
+
+    now = 1000.0
+    kb = types.SimpleNamespace()
+    kb._pressed_events_lock = _th.Lock()
+    old_up, old_down, fresh_up, unknown = Ev("alt", now - 5), Ev("shift", now - 5),         Ev("f15", now - 0.2), Ev("weird", now - 5)
+    kb._pressed_events = {56: old_up, 42: old_down, 102: fresh_up, 999: unknown}
+    kb._logically_pressed_keys = {56: old_up}
+    kb._listener = types.SimpleNamespace(active_modifiers={56, 42})
+    vks = {56: (0x12,), 42: (0x10,), 102: (0x7E,), 999: ()}
+    down = {0x10}                                    # only Shift is physically held
+    got = w._reconcile_stuck_keys(kb, is_down=lambda v: v in down,
+                                  to_vks=lambda sc: vks.get(sc, ()), now=now, settle_s=0)
+    assert got == ["alt"], got
+    assert sorted(kb._pressed_events) == [42, 102, 999], kb._pressed_events
+    assert 56 not in kb._logically_pressed_keys and kb._listener.active_modifiers == {42}
+    # nothing stale -> nothing dropped, nothing slept
+    assert w._reconcile_stuck_keys(kb, is_down=lambda v: v in down,
+                                   to_vks=lambda sc: vks.get(sc, ()), now=now, settle_s=0) == []
+    # a key pressed AGAIN between the two looks (a new event object) is kept
+    again = Ev("ctrl", now - 5)
+    kb._pressed_events[29] = again
+    vks[29] = (0x11,)
+    looks = iter([False, True])                      # up on the first look, down on the second
+    got = w._reconcile_stuck_keys(kb, is_down=lambda v: (v == 0x11 and next(looks, True)) or v in down,
+                                  to_vks=lambda sc: vks.get(sc, ()), now=now, settle_s=0)
+    assert got == [] and 29 in kb._pressed_events, got
+    # a module without the library internals -> a no-op, never an exception
+    assert w._reconcile_stuck_keys(types.SimpleNamespace(), is_down=lambda v: False) == []
+    # the real library still has the internals this relies on (an upgrade that
+    # renames them would make the fix a silent no-op). Read from its SOURCE:
+    # other tests stub sys.modules["keyboard"].
+    import importlib.machinery as _im     # searches sys.path, ignores the stub
+    _src = open(_im.PathFinder.find_spec("keyboard").origin, encoding="utf-8").read()
+    for needle in ("_pressed_events_lock = _Lock()", "_pressed_events = {}",
+                   "_logically_pressed_keys = {}", "self.active_modifiers = set()",
+                   "hotkey = tuple(sorted(_pressed_events))"):
+        assert needle in _src, needle
+    # modifiers map to the generic VK (one scan code = left AND right key)
+    if os.name == "nt":
+        assert w._scan_code_vks(0x1D) == (0x11,)      # Ctrl
+        assert w._scan_code_vks(0x2A) == (0x10,)      # Shift
+        assert w._scan_code_vks(0x38) == (0x12,)      # Alt
+        assert w._scan_code_vks(-0x7C) == (0x7C,)     # the library's -vk form
+    # the hook-health loop runs it every second
+    import inspect as _insp
+    src = _insp.getsource(w.LiaApp._hook_health_watchdog)
+    assert "_reconcile_stuck_keys(_kb_mod)" in src and "next_reconcile" in src
+
+
+_test("hotkey: a stuck key in the keyboard library is cleared (it blocked every hotkey)",
+      t_reconcile_stuck_keys)
 
 
 def t_startup_target_autostart_flag():
