@@ -129,7 +129,7 @@ a:hover{text-decoration:underline;}
   display:flex; flex-direction:column; align-items:center; gap:6px;
   /* the logo alone (no tagline, 2026-09-25), centered in its band: 20px above
      (sidebar 12 + 8) and 20px below it to the search box */
-  padding:var(--sp-2) var(--sp-3) 18px;
+  padding:4px var(--sp-3) 10px;
   color:var(--ink);
 }
 /* The FULL Lia logo (mark above the 'lia' wordmark) as one image, so the
@@ -137,7 +137,8 @@ a:hover{text-decoration:underline;}
    tiny mark read wrong (2026-09-17). */
 /* centred as-is: the 2026-09-27 4px left nudge was for the ribbon's off-centre
    weight; the 2026-10-02 pebble mark is symmetric. */
-.sidebar .brand .brand-full{height:58px; width:auto; display:block;}
+/* 58 -> 42 px (2026-10-05 compact redesign): the whole nav fits at 810 px. */
+.sidebar .brand .brand-full{height:42px; width:auto; display:block;}
 .sidebar .brand .brand-txt{display:flex; flex-direction:column; line-height:1.15; min-width:0;}
 .sidebar .brand .brand-name{font-size:var(--fs-h1); font-weight:700;}
 /* the 'lia' wordmark image (still used by the dev gallery + Tk fallback) */
@@ -154,7 +155,7 @@ a:hover{text-decoration:underline;}
 .sidebar .brand img.logo{display:block;}
 .nav-item{
   appearance:none; border:0; width:100%; text-align:start; cursor:pointer;
-  padding:11px 16px; margin:2px 0; border-radius:var(--r-s);
+  padding:7px 12px; margin:1px 0; border-radius:var(--r-s);
   color:var(--ink-2); background:transparent; font-family:inherit;
   font-size:var(--fs-base); font-weight:500; transition:background var(--tr),color var(--tr);
   display:flex; align-items:center; gap:10px;
@@ -170,16 +171,16 @@ a:hover{text-decoration:underline;}
 /* Sidebar group label: sentence-case, faint, small - separates the nav into
    task groups without heavy dividers. */
 .nav-group{font-size:var(--fs-small); font-weight:600; color:var(--faint);
-  padding:14px 16px 3px;}
+  padding:10px 12px 2px;}
 .nav-group:first-of-type{padding-top:2px;}
 .sidebar .spacer{flex:1 1 auto;}
 
 .content{flex:1 1 auto; overflow-y:auto; padding:var(--sp-5) var(--sp-6);}
 .content-head{
   display:flex; align-items:center; gap:var(--sp-3);
-  margin-bottom:var(--sp-4);
+  margin-bottom:6px;
 }
-.content-head h1{margin:0; font-size:var(--fs-title); font-weight:700; color:var(--ink);}
+.content-head h1{margin:0; font-size:20px; font-weight:700; color:var(--ink);}
 .content-head .sub{color:var(--muted); font-size:var(--fs-hint);}
 
 /* --- page cards --------------------------------------------------------- */
@@ -196,6 +197,96 @@ a:hover{text-decoration:underline;}
 .divider{height:1px; background:var(--line); margin:var(--sp-4) 0;}
 .hint{font-size:var(--fs-hint); color:var(--muted); margin:6px 0 0;}
 
+/* --- compact settings rows (2026-10-05 redesign) -------------------------
+   One card per TOPIC (.grp, label above it in .grp-h), one ROW per setting
+   (.srow: title + one-line description on the left, the control on the
+   right). Short enums are a segmented control (.seg, built from .radio rows);
+   long lists collapse into a <details class="more"> whose summary row shows
+   the current value (.cur). Replaces a card per setting with the title above
+   the control, which made every page 2-3 screens tall. */
+.grp-h{display:flex; align-items:center; gap:8px; font-size:12.5px; font-weight:600;
+  color:var(--muted); margin:14px 4px 6px;}
+.grp-h .grp-act{margin-inline-start:auto; display:flex; gap:6px; font-weight:400;}
+.grp-h .grp-sub{font-weight:400; color:var(--faint);}
+.grp-h .btn{padding:3px 10px; font-size:var(--fs-label);}
+.grp{background:var(--card); border:1px solid var(--line); border-radius:var(--r-m); overflow:hidden;}
+.grp > * + *{border-top:1px solid var(--line);}
+.grp.danger{border-color:var(--err-soft);}
+.srow{display:flex; align-items:center; gap:16px; padding:9px 16px; min-height:46px;}
+/* the description gives way first; the control keeps its natural width */
+.srow-l{flex:1 1 0; min-width:0;}
+.srow-t{font-size:var(--fs-base); color:var(--ink); font-weight:500; line-height:1.3;}
+.srow-d{font-size:var(--fs-hint); color:var(--muted); margin-top:1px; line-height:1.35;}
+.srow-c{flex:0 0 auto; display:flex; align-items:center; gap:8px; flex-wrap:nowrap;
+  justify-content:flex-end; min-width:0;}
+.srow-c select{max-width:240px; width:auto;}
+.srow-c input[type=text],.srow-c input[type=password],.srow-c input[type=number]{width:220px;}
+.srow .btn, .srow select, .srow input{padding-top:5px; padding-bottom:5px;}
+.srow .btn{white-space:nowrap;}
+.srow.dim{opacity:.55;}
+/* a full-width body line inside a group (a list, a textarea, a note) */
+.gbody{padding:10px 16px 12px;}
+.gnote{padding:8px 16px; font-size:var(--fs-hint); color:var(--muted); background:var(--card-2);}
+/* segmented control */
+.seg{display:inline-flex; border:1px solid var(--line-2); border-radius:var(--r-s); padding:2px;
+  gap:2px; background:var(--bg); flex-wrap:nowrap;}
+.seg .radio{margin:0; border:0; padding:4px 12px; border-radius:6px; background:transparent;
+  font-weight:500; white-space:nowrap; min-width:0; flex:0 0 auto;}
+.seg .radio .box{display:none;}
+.seg .radio:hover{background:var(--accent-soft);}
+.seg .radio.on, .seg .radio:has(input:checked){background:var(--card); box-shadow:var(--shadow-sm);
+  color:var(--accent); font-weight:600; border:0;}
+.seg .radio:has(input:focus-visible){box-shadow:var(--ring);}
+.switch.bare{gap:0;}
+/* collapsed picker */
+details.more > summary{list-style:none; cursor:pointer;}
+details.more > summary::-webkit-details-marker{display:none;}
+details.more > summary:hover{background:var(--accent-soft);}
+details.more > summary:focus-visible{outline:none; box-shadow:inset var(--ring);}
+.chev{display:inline-block; transition:transform var(--tr); color:var(--muted); font-size:16px;
+  width:12px; text-align:center; flex:0 0 12px;}
+details.more[open] > summary .chev{transform:rotate(90deg);}
+.more-body{padding:10px 16px 12px; border-top:1px solid var(--line); background:var(--card-2);}
+.more-body .radio{margin-bottom:4px;}
+.more-body .radio:last-child{margin-bottom:0;}
+/* setting rows nested in a collapsed group (rarely changed switches) */
+.more-body > .srow{padding-inline:0; min-height:42px;}
+.more-body > .srow + .srow{border-top:1px solid var(--line);}
+.cur{display:inline-flex; align-items:center; gap:6px; font-size:13px; color:var(--ink-2);
+  font-weight:500; max-width:360px; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+.cur .prov-ico{width:15px; height:15px; object-fit:contain; flex:0 0 15px;}
+.cur.warn{color:var(--warn);} .cur.ok{color:var(--ok);} .cur.err{color:var(--err);}
+.cur.muted{color:var(--faint);}
+.srow-c .wb{margin-inline-start:0;}
+/* action rows / grid (tools, app commands) */
+.agrid{display:grid; grid-template-columns:1fr 1fr;}
+.agrid > .arow{border-top:1px solid var(--line);}
+.agrid > .arow:nth-child(-n+2){border-top:0;}
+.agrid > .arow:nth-child(2n){border-inline-start:1px solid var(--line);}
+.arow{display:flex; align-items:center; gap:10px; padding:9px 16px; min-height:42px; cursor:pointer;
+  background:none; border:0; width:100%; text-align:start; font:inherit; color:var(--ink);}
+.arow:hover{background:var(--accent-soft);}
+.arow .ic{display:inline-flex; color:var(--muted); flex:0 0 18px;}
+.arow:hover .ic{color:var(--accent);}
+.arow .grow{flex:1 1 auto; min-width:0;}
+.arow .hk{font-size:11px; color:var(--faint); font-family:var(--mono);}
+.arow.danger{color:var(--err);} .arow.danger .ic{color:var(--err);}
+.arow.disabledrow{opacity:.5; cursor:default; pointer-events:none;}
+/* a row with a wide control (hotkey: input + 3 buttons) drops the control
+   under its label sooner, before the label gets squeezed */
+@media (max-width:900px){
+  .srow.wide{flex-wrap:wrap;}
+  .srow.wide .srow-c{flex-basis:100%; justify-content:flex-start;}
+}
+@media (max-width:760px){
+  .srow{flex-wrap:wrap;}
+  .srow-c{flex-wrap:wrap; justify-content:flex-start; flex-shrink:1;}
+  .seg{flex-wrap:wrap;}
+  .agrid{grid-template-columns:1fr;}
+  .agrid > .arow:nth-child(2){border-top:1px solid var(--line);}
+  .agrid > .arow:nth-child(2n){border-inline-start:0;}
+}
+
 /* --- setup-help: a compact collapsible how-to inside a card ------------- */
 .setup-help{margin-top:var(--sp-3); border-top:1px solid var(--line); padding-top:var(--sp-3);}
 .setup-help > summary{
@@ -209,86 +300,16 @@ a:hover{text-decoration:underline;}
 .setup-help ol li{margin:0 0 6px;}
 .setup-help .hint{margin-top:var(--sp-3);}
 
-/* --- Transcription-server page: mode chooser + GPU card + run control --- */
-.mode-row{display:flex; gap:var(--sp-4); margin-bottom:var(--sp-5); flex-wrap:wrap;}
-.mode-card{
-  flex:1 1 220px; text-align:left; cursor:pointer; display:flex; flex-direction:column;
-  gap:6px; padding:var(--sp-4) var(--sp-5); border:1.5px solid var(--line);
-  border-radius:var(--r-l); background:var(--card); transition:all var(--tr);
-}
-.mode-card:hover{border-color:var(--accent); background:var(--card-2);}
-.mode-card.sel{border-color:var(--accent); background:var(--accent-soft); box-shadow:var(--shadow-sm);}
-.mode-ico{font-size:26px; line-height:1;}
-.mode-t{font-weight:700; font-size:var(--fs-base);}
-.mode-d{font-size:var(--fs-hint); color:var(--muted);}
-.mode-card.sel .mode-d{color:var(--ink-2);}
-
-.srv-panel{margin-top:var(--sp-3);}
-.srv-h{display:flex; align-items:center; gap:var(--sp-3); margin-bottom:var(--sp-4);}
-.srv-h h3{margin:0; font-size:var(--fs-section);}
-.srv-h .sub{font-size:var(--fs-hint); color:var(--muted);}
-.srv-ico{width:38px; height:38px; border-radius:var(--r-m); display:flex;
-  align-items:center; justify-content:center; font-size:20px; color:#fff; flex:none;}
-
-.gpu-card{border:1px solid var(--line); border-radius:var(--r-m); padding:var(--sp-4);
-  margin-bottom:var(--sp-4); background:var(--card-2);}
-.gpu-card.good{border-color:var(--ok); background:var(--ok-soft);}
-.gpu-card.marginal{border-color:var(--warn); background:var(--warn-soft);}
-.gpu-card.none{border-color:var(--err); background:var(--err-soft);}
-.gpu-h{display:flex; align-items:center; gap:8px; flex-wrap:wrap;}
-.gpu-dot{width:10px; height:10px; border-radius:50%; flex:none; background:var(--muted);}
-.gpu-card.good .gpu-dot{background:var(--ok);}
-.gpu-card.marginal .gpu-dot{background:var(--warn);}
-.gpu-card.none .gpu-dot{background:var(--err);}
-.gpu-name{font-weight:650;}
+/* --- Transcription-server page: GPU verdict tag + copyable address ----- */
 .gpu-tag{margin-left:auto; font-size:var(--fs-small); font-weight:700; text-transform:uppercase;
   letter-spacing:.03em; padding:2px 9px; border-radius:var(--r-pill); color:#fff;}
 .gpu-tag.good{background:var(--ok);} .gpu-tag.marginal{background:var(--warn);}
 .gpu-tag.none{background:var(--err);}
-.gpu-note{margin-top:6px; font-size:var(--fs-hint); color:var(--ink-2);}
 
-.run-box{display:flex; align-items:center; gap:var(--sp-4); padding:var(--sp-4) var(--sp-5);
-  border:1px solid var(--line); border-radius:var(--r-l); background:var(--card);
-  margin-bottom:var(--sp-5);}
-.run-box.on{border-color:var(--ok); background:var(--ok-soft);}
-.run-box.starting{border-color:var(--warn); background:var(--warn-soft);}
-.run-box.locked{opacity:.65;}
-.run-led{width:14px; height:14px; border-radius:50%; flex:none; background:var(--faint);
-  box-shadow:0 0 0 4px transparent; transition:all var(--tr);}
-.run-box.on .run-led{background:var(--ok); box-shadow:0 0 0 4px var(--ok-soft);
-  animation:pulse 2s ease-in-out infinite;}
-.run-box.starting .run-led{background:var(--warn); box-shadow:0 0 0 4px var(--warn-soft);}
 @keyframes pulse{50%{box-shadow:0 0 0 7px transparent;}}
-.run-txt{flex:1 1 auto; min-width:0;}
-.run-title{font-weight:700;}
-.run-sub{font-size:var(--fs-hint); color:var(--muted);}
 
-.big-switch{position:relative; width:56px; height:30px; flex:none; cursor:pointer; display:inline-block;}
-.big-switch.disabled{cursor:not-allowed;}
-.big-switch input{position:absolute; opacity:0; width:0; height:0;}
-.big-switch .bs-track{position:absolute; inset:0; border-radius:var(--r-pill);
-  background:var(--line-2); transition:background var(--tr);}
-.big-switch .bs-knob{position:absolute; top:3px; left:3px; width:24px; height:24px;
-  border-radius:50%; background:#fff; box-shadow:var(--shadow-sm); transition:transform var(--tr);}
-.big-switch input:checked ~ .bs-track{background:var(--ok);}
-.big-switch input:checked ~ .bs-knob{transform:translateX(26px);}
 .mono.copyable{display:inline-block; margin-top:4px; padding:3px 8px; border-radius:var(--r-s);
   background:var(--card-2); border:1px solid var(--line); user-select:all;}
-
-/* --- Tailscale prerequisite banner (prominent) ------------------------- */
-.ts-banner{display:flex; align-items:center; gap:var(--sp-4); flex-wrap:wrap;
-  padding:var(--sp-4) var(--sp-5); margin-bottom:var(--sp-5);
-  border:1.5px solid var(--accent); border-radius:var(--r-l);
-  background:var(--accent-soft); box-shadow:var(--shadow-sm);}
-.ts-banner .ts-left{display:flex; align-items:center; gap:var(--sp-4);
-  flex:1 1 300px; min-width:0;}
-.ts-banner .ts-ico{width:46px; height:46px; flex:none; border-radius:var(--r-m);
-  display:flex; align-items:center; justify-content:center; font-size:24px;
-  background:var(--accent); color:var(--on-accent);}
-.ts-banner .ts-title{font-weight:750; font-size:var(--fs-base); margin-bottom:2px;}
-.ts-banner .ts-sub{font-size:var(--fs-hint); color:var(--ink-2); line-height:1.45;}
-.ts-banner .ts-btn{flex:none; font-weight:700; padding:11px 20px; font-size:var(--fs-base);
-  box-shadow:var(--shadow-sm);}
 
 /* --- privacy note: a small, greyish-but-noticeable warning callout ------ */
 .privacy-note{display:flex; gap:10px; align-items:flex-start;
@@ -331,7 +352,7 @@ a:hover{text-decoration:underline;}
 .btn.sm{padding:6px 12px; font-size:var(--fs-hint);}
 
 /* --- inputs ------------------------------------------------------------- */
-input[type=text],input[type=password],input[type=search],select,textarea,.input{
+input[type=text],input[type=password],input[type=search],input[type=number],select,textarea,.input{
   width:100%; font-family:inherit; font-size:var(--fs-base); color:var(--ink);
   background:var(--card); border:1px solid var(--line-2); border-radius:var(--r-s);
   padding:8px 11px; transition:border-color var(--tr),box-shadow var(--tr);

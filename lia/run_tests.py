@@ -3342,8 +3342,10 @@ def _meeting_mock_app(summary_return):
             return "he"
 
         def _run_summary(self, text, mode="meeting", metadata="",
-                         collect_corrections=False):
+                         collect_corrections=False, should_stop=None):
             self.summary_calls.append((text, mode))
+            if callable(summary_return):          # a slow / custom summary
+                return summary_return(should_stop)
             return summary_return
 
         def _vocab_apply_corrections(self, text, **kw):
@@ -3404,6 +3406,9 @@ def t_meeting_summarize_writes_and_stores():
         assert "סיכום בדיקה" in content, content
         assert s.last_summary, "last_summary must be stored for the popup"
         assert "סיכום בדיקה" in s.last_summary
+        # the summary header shows the duration only, not Lia's "N chunks" (2026-10-05)
+        html = open(s.summary_html_path, encoding="utf-8").read()
+        assert "1m 0s" in html and "chunks" not in html, html[:400]
     finally:
         for p in (path, getattr(s, "summary_html_path", None)):
             if p:
@@ -3414,6 +3419,213 @@ def t_meeting_summarize_writes_and_stores():
 
 
 _test("meeting summarize mode: runs the summary model, embeds + stores summary", t_meeting_summarize_writes_and_stores)
+
+
+def t_chunked_meeting_discard_stops_summary():
+    """2026-10-04 (Naor): a chunked meeting's card ("Whisper Hebrew (local)",
+    Summarizing) had no Discard. Discard now stops the summary AT ONCE - also
+    a cloud call that never looks at should_stop - and keeps the transcript +
+    recording; a late summary result is dropped."""
+    import inspect
+    import threading as _th
+    import lia as w
+
+    def _session(summary):
+        app = _meeting_mock_app(summary)
+        s = w.MeetingSession(app, summarize=True)
+        s.start_time = time.time() - 60
+        s.stop_time = time.time()
+        s._title_event.set()
+        with s._chunks_lock:
+            s.chunks = [{"index": 0, "timestamp_rel": 0, "text": "שלום עולם",
+                         "status": "ok"}]
+        s._discarded = _th.Event()
+        return app, s
+
+    def _cleanup(*paths):
+        for p in paths:
+            if p:
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+    # 1. Discard in the middle of a slow summary that ignores should_stop
+    def _slow(_should_stop):
+        time.sleep(3.0)
+        return "## TL;DR\nסיכום מאוחר"
+    app, s = _session(_slow)
+    _th.Timer(0.3, s._discarded.set).start()
+    t0 = time.time()
+    path = s._write_output_file(60)
+    took = time.time() - t0
+    try:
+        content = open(path, encoding="utf-8").read()
+        assert took < 1.5, "Discard waited for the summary call (%.1fs)" % took
+        assert len(app.summary_calls) == 1
+        assert "שלום עולם" in content and "סיכום מאוחר" not in content
+        assert not s.last_summary and not getattr(s, "summary_html_path", None)
+        assert not getattr(s, "_summary_retry", None), "a discard is not a failure"
+    finally:
+        _cleanup(path, getattr(s, "summary_html_path", None))
+    time.sleep(3.0)          # the abandoned helper finishes; its result is dropped
+    assert not s.last_summary
+
+    # 2. Discarded before the summary started: no summary call at all
+    app, s = _session("## TL;DR\nלא אמור לרוץ")
+    s._discarded.set()
+    path = s._write_output_file(60)
+    try:
+        assert app.summary_calls == []
+        assert "שלום עולם" in open(path, encoding="utf-8").read()
+    finally:
+        _cleanup(path)
+
+    # 3. No Discard: unchanged (the helper thread returns the summary)
+    app, s = _session("## TL;DR\nסיכום רגיל")
+    path = s._write_output_file(60)
+    try:
+        assert "סיכום רגיל" in open(path, encoding="utf-8").read()
+        assert "סיכום רגיל" in s.last_summary
+    finally:
+        _cleanup(path, getattr(s, "summary_html_path", None))
+
+    # 4. Wiring: the chunked finalise passes on_discard + its own confirm text,
+    #    and ends on the discarded card that still opens the transcript
+    src = inspect.getsource(w.LiaApp._stop_meeting)
+    assert "on_discard=_on_discard" in src and "stop_message=" in src
+    assert "meeting_status_discarded(" in src and "on_open=lambda p=path" in src
+
+    # 5. The card: custom confirm text, and "Open transcript" on the end card
+    class _Card:
+        def __init__(self): self.renders = []
+        def render(self, st): self.renders.append(st)
+        def update_meta(self, **kw): pass
+        def hide(self): pass
+
+    class _Q:
+        def put(self, fn): fn()
+    ov = w.OverlayNotification.__new__(w.OverlayNotification)
+    ov._root = object(); ov._tk_queue = _Q(); ov._mcard = _Card()
+    ov._mcard_model = None; ov._meeting_card_gen = 0
+    ov._meeting_card_active_gen = None
+    gen = ov.meeting_status_start([("summarize", "Summarizing")],
+                                  on_discard=lambda: None,
+                                  stop_message="Only the summary stops.")
+    ov._mcard_arm_stop(gen)
+    assert ov._mcard.renders[-1]["message"] == "Only the summary stops."
+    ov.meeting_status_discarded("Summary stopped", message="Transcript and recording saved.",
+                                on_open=lambda: None, on_folder=lambda: None, gen=gen)
+    st = ov._mcard.renders[-1]
+    assert st["kind"] == "discarded" and st["message"] == "Transcript and recording saved."
+    assert [l for l, _c, _p in st["actions"]] == ["Open transcript", "Open folder"]
+
+
+_test("chunked meeting: Discard stops the summary at once, keeps the transcript",
+      t_chunked_meeting_discard_stops_summary)
+
+
+def t_meeting_transcript_only():
+    """2026-10-05 (Naor): while a meeting is still processing, "Transcript only"
+    skips the summary (or abandons a running one) and keeps the transcript -
+    both pipelines - and is not a summary failure."""
+    import inspect, tempfile
+    import threading as _th
+    import lia as w
+
+    def _chunked(summary):
+        app = _meeting_mock_app(summary)
+        s = w.MeetingSession(app, summarize=True)
+        s.start_time = time.time() - 60; s.stop_time = time.time()
+        s._title_event.set()
+        with s._chunks_lock:
+            s.chunks = [{"index": 0, "timestamp_rel": 0, "text": "שלום עולם", "status": "ok"}]
+        s._skip_summary = _th.Event()
+        return app, s
+
+    # chunked, skipped before the summary started: no call at all
+    app, s = _chunked("## TL;DR\nלא אמור לרוץ")
+    s._skip_summary.set()
+    p = s._write_output_file(60)
+    try:
+        assert app.summary_calls == [] and "שלום עולם" in open(p, encoding="utf-8").read()
+        assert not s.last_summary and not getattr(s, "_summary_retry", None)
+    finally:
+        os.remove(p)
+
+    # chunked, skipped mid-summary (a slow cloud call): returns at once, no summary
+    def _slow(_stop):
+        time.sleep(3.0); return "## TL;DR\nמאוחר"
+    app, s = _chunked(_slow)
+    _th.Timer(0.3, s._skip_summary.set).start()
+    t0 = time.time(); p = s._write_output_file(60); took = time.time() - t0
+    try:
+        assert took < 1.5, took
+        assert "מאוחר" not in open(p, encoding="utf-8").read() and not s.last_summary
+    finally:
+        os.remove(p)
+    time.sleep(3.0)
+
+    # diarized writer: skipped -> no summary call, transcript written
+    calls = []
+
+    class _App:
+        config = {}
+        def _run_summary(self, text, **k):
+            calls.append(text); return "## TL;DR\nלא אמור להופיע"
+        def _vocab_take_corrections(self, **k): return []
+        def _vocab_apply_corrections(self, t, **k): return t
+        def __getattr__(self, name): return lambda *a, **k: None
+
+    class _Sess(w.MeetingSession):
+        def __getattr__(self, name): return None
+    s = _Sess.__new__(_Sess)
+    s.app = _App(); s.summarize = True
+    s.start_time = 1790062321; s.stop_time = 1790062334
+    s.title = "t"; s.title_guess = ""; s.attendees = []; s.last_summary = ""
+    s._skip_summary = _th.Event(); s._skip_summary.set()
+    orig = w.MEETINGS_DIR
+    w.MEETINGS_DIR = tempfile.mkdtemp(prefix="lia_txonly_")
+    try:
+        md = s._write_diarized_markdown({"utterances": [
+            {"speaker": "A", "start": 0, "end": 1000, "text": "שלום לכולם"}]})
+        body = open(md, encoding="utf-8").read()
+        assert calls == [] and "שלום לכולם" in body and "לא אמור להופיע" not in body
+    finally:
+        w.MEETINGS_DIR = orig
+    src = inspect.getsource(w.MeetingSession._run_diarize_job)
+    assert "on_skip_summary=_on_skip" in src and "self._skip_summary = threading.Event()" in src
+    assert "on_skip_summary=_on_skip" in inspect.getsource(w.LiaApp._stop_meeting)
+
+    # the card: "Transcript only" before "Stop"; one click drops the stage and fires once
+    class _Card:
+        def __init__(self): self.renders = []
+        def render(self, st): self.renders.append(st)
+        def update_meta(self, **kw): pass
+        def hide(self): pass
+
+    class _Q:
+        def put(self, fn): fn()
+    ov = w.OverlayNotification.__new__(w.OverlayNotification)
+    ov._root = object(); ov._tk_queue = _Q(); ov._mcard = _Card()
+    ov._mcard_model = None; ov._meeting_card_gen = 0; ov._meeting_card_active_gen = None
+    fired = []
+    gen = ov.meeting_status_start([("finalize", "Finalizing transcript"), ("summarize", "Summarizing")],
+                                  on_discard=lambda: None, on_skip_summary=lambda: fired.append(1))
+    assert [a[0] for a in ov._mcard.renders[-1]["actions"]] == ["Transcript only", "Stop"]
+    ov._mcard_skip_summary(gen)
+    time.sleep(0.15)
+    st = ov._mcard.renders[-1]
+    assert fired == [1] and [k for k, _l, _m in st["stages"]] == ["finalize"]
+    assert [a[0] for a in st["actions"]] == ["Stop"]
+    ov._mcard_arm_stop(gen); ov._mcard_cancel_stop(gen)           # Keep going
+    assert [a[0] for a in ov._mcard.renders[-1]["actions"]] == ["Stop"]
+    ov._mcard_skip_summary(gen); time.sleep(0.1)
+    assert fired == [1], "fires once"
+
+
+_test("meeting: 'Transcript only' skips / abandons the summary (both pipelines)",
+      t_meeting_transcript_only)
 
 
 def t_summary_live_gpt5():
@@ -4938,6 +5150,48 @@ def t_meeting_chunk_cadence():
 
 _test("meeting: config-driven chunk cadence + live-transcript window",
       t_meeting_chunk_cadence)
+
+
+def t_live_transcript_save_txt():
+    """2026-10-05 (Naor): the live transcript window gets "Save .txt" next to
+    Copy all - a Save-as dialog, then the shown text with a title header."""
+    import importlib, sys as _sys, tempfile, types
+    lt = importlib.import_module("live_transcript_window")
+    d = tempfile.mkdtemp()
+    api = lt.LiveApi({"title": 'Kai, AWS: "onboarding"?', "started": "14:01"})
+    fn = api.default_filename()
+    assert fn.endswith(".txt") and not any(c in fn for c in '\\/:*?"<>|'), fn
+    assert fn.startswith("Kai, AWS onboarding"), fn
+    calls = []
+
+    class _Win:
+        def __init__(self, ret): self.ret = ret
+        def create_file_dialog(self, kind, **kw):
+            calls.append((kind, kw)); return self.ret
+
+    fake = types.SimpleNamespace(SAVE_DIALOG=30, windows=[_Win((os.path.join(d, "out"),))])
+    real = _sys.modules.get("webview")
+    _sys.modules["webview"] = fake
+    try:
+        r = api.save_txt("[0:15] hello\n[0:30] שלום")
+        assert r["ok"] and r["path"].endswith("out.txt"), r      # .txt appended
+        body = open(r["path"], encoding="utf-8").read()
+        assert body.startswith('Kai, AWS: "onboarding"? - started 14:01\n\n'), body
+        assert "[0:30] שלום" in body
+        assert calls[-1][0] == 30 and calls[-1][1]["save_filename"] == fn
+        fake.windows = [_Win(None)]                                # user cancelled
+        assert api.save_txt("x") == {"ok": False, "cancelled": True}
+        assert api.save_txt("   ")["ok"] is False                  # nothing to save
+    finally:
+        if real is not None:
+            _sys.modules["webview"] = real
+        else:
+            _sys.modules.pop("webview", None)
+    assert 'id="saveTxtBtn"' in lt.HTML and "API.save_txt(transcriptText())" in lt.HTML
+
+
+_test("live transcript: Save .txt writes the shown text via a Save-as dialog",
+      t_live_transcript_save_txt)
 
 
 def t_meeting_status_sidecar():
@@ -8466,7 +8720,7 @@ def t_webview_and_prompt_hardening():
     info = w._parse_meeting_file("Meeting — t\nDuration: 46m 53s · 281 chunks · source: both\n"
                                  + w.TXT_SEP_THICK + "\nFull transcript\n" + w.TXT_SEP_THICK
                                  + "\n[0:00]\nhello\n", "")
-    assert info["meta_line"] == "46m 53s · 281 chunks" and info["source"] == "both", info
+    assert info["meta_line"] == "46m 53s" and info["source"] == "both", info
     ss = open(os.path.join(here, "summarize_window.py"), encoding="utf-8").read()
     assert "5 * 1024 * 1024" in ss
     # meetings-folder actions: meeting-type files only
@@ -11448,37 +11702,107 @@ def t_settings_search():
     idx_block = src[i:src.index("];", i)]
     for secretish in ("gsk_", "sk-", "AIza", "dpapi:", "_api_key", "serve_token"):
         assert secretish not in idx_block, "search index leaks secret-shaped text: " + secretish
+    # every entry's target text exists on ITS page (2026-10-05 redesign: the
+    # labels moved, and a stale target silently lands on the page top). The
+    # page source is the builder plus the helpers it draws from.
+    import re
+    nl = chr(10)
+    extra = {"keys": src[src.index("var KEYCARDS"):src.index("PAGES.keys = function")],
+             "vocab": src[src.index("function lexiconPanel"):src.index(nl + "  }", src.index("function lexiconPanel"))]}
+    entries = re.findall(r'\{t:"[^"]+", k:"[^"]*", p:"([a-z]+)", f:"([^"]*)"\}', idx_block)
+    assert len(entries) >= 50, "search index shrank: %d" % len(entries)
+    for page, find in entries:
+        if not find:
+            continue
+        i = src.index("PAGES.%s = function" % page)
+        j = src.find(nl + "  };" + nl, i)
+        body = (src[i:j] + extra.get(page, "")).lower()
+        assert find.lower() in body, "search target %r is not on page %s" % (find, page)
+    # jumpTo reaches rows inside a closed picker (opens it first)
+    assert "target.closest('details')" in src and "OPENX[dk] = true" in src
 
 
 _test("settings: local search (he/en aliases, jump-to-field, no secrets)",
       t_settings_search)
 
 
-def t_settings_models_active_engines():
-    """Models page (Phase 3): an 'Active engines' summary derived from the
-    existing table data - the SELECTED model's readable name, a place tag
-    (local/cloud/server), and real availability - above the detail groups. No
-    invented metrics."""
+def _settings_page_src(src, page):
+    i = src.index("PAGES.%s = function" % page)
+    nl = chr(10)
+    ends = [j for j in (src.find(nl + "  PAGES.", i + 10),
+                        src.find(nl + "  function lexiconPanel", i + 10),
+                        src.find(nl + "  // ---------- render", i + 10)) if j > 0]
+    return src[i:min(ends)]
+
+
+def t_settings_models_compact():
+    """Models page (2026-10-05 redesign; replaced the 'Active engines' card):
+    each role is ONE collapsed row whose summary shows the SELECTED model's
+    name, provider logo and place badge (local/cloud/server); its availability
+    comes from the row's own enabled/note, never a made-up status. The full
+    radio list (same data-radio wiring) opens in place."""
     import os
     here = os.path.dirname(os.path.abspath(__file__))
     src = open(os.path.join(here, "settings_window.py"), encoding="utf-8").read()
-    for marker in ("Active engines", "function engCard(", "function placeOf(",
-                   "eng-grid", "engineSummary"):
-        assert marker in src, "models summary missing " + marker
-    # the three roles are summarized
-    for role in ('engCard("Dictation"', 'engCard("Meeting transcription"',
-                 'engCard("Summaries"'):
-        assert role in src, "missing engine card: " + role
+    i = src.index("PAGES.models = function")
+    body = _settings_page_src(src, "models")
+    assert "Active engines" not in body and "engCard(" not in body, "old summary card is back"
+    for role, method in (("m_dict", "set_dictation_model"), ("m_meet", "set_meeting_model"),
+                         ("m_sum", "set_summary_model"), ("m_file", "set_file_model")):
+        assert "pick('%s'" % role in body and '"%s"' % method in body, "missing picker " + role
     # availability comes from the row's own enabled/note, not a fabricated status
-    assert "sel.enabled!==false" in src, "status must derive from the row data"
-    # place badges exist for all three environments
-    ui = open(os.path.join(here, "settings_window.py"), encoding="utf-8").read()
-    for cls in (".place.local", ".place.cloud", ".place.server"):
-        assert cls in ui, "missing place badge style " + cls
+    assert "sel.enabled!==false" in body and "sel.note" in body
+    # place badges (LOCAL / CLOUD / REMOTE) on the current value + inside the list
+    assert "WB_TEXT[sel.where]" in body and "r.where" in body
+    # the local-processing choices are segmented controls on the same methods
+    for m in ("set_whisper_device", "set_dictation_gpu_busy_cloud", "set_summary_gpu_busy_cloud"):
+        assert '"%s"' % m in body, "missing " + m
+    # privacy: the busy-GPU summary fallback still says the transcript is sent
+    assert "the transcript is sent to it" in body
 
 
-_test("settings: Models 'active engines' summary (name + place + status)",
-      t_settings_models_active_engines)
+_test("settings: Models rows (current model + place + status, list in place)",
+      t_settings_models_compact)
+
+
+# Pages already moved to the compact row layout (grows phase by phase; the
+# 2026-10-05 redesign plan). A redesigned page may not bring back the old
+# card-per-setting markup.
+_COMPACT_PAGES = ["general", "models", "audio", "cleanup", "snippets", "meetings", "advanced", "keys", "server", "vocab"]
+
+
+def t_settings_compact_components():
+    """Settings redesign (2026-10-05): the shared row components exist in
+    ui_kit (group card, setting row, segmented control, collapsed picker,
+    action grid), the JS builders exist in settings_window, a collapsed picker
+    keeps its open state across re-renders (OPENX) and can lazy-load its list
+    on first open (ONOPEN), and every redesigned page uses rows, not one
+    .page card per setting."""
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    ui = open(os.path.join(here, "ui_kit.py"), encoding="utf-8").read()
+    for sel in (".grp{", ".grp-h{", ".srow{", ".srow-c{", ".seg{", "details.more",
+                ".more-body{", ".cur{", ".agrid{", ".arow{",
+                ".seg .radio:has(input:focus-visible)"):
+        assert sel in ui, "ui_kit lacks " + sel
+    src = open(os.path.join(here, "settings_window.py"), encoding="utf-8").read()
+    for fn in ("function grp(", "function srow(", "function swb(", "function seg(",
+               "function more(", "function arow(", "function curList(",
+               "var OPENX", "var ONOPEN", "addEventListener('toggle'"):
+        assert fn in src, "settings_window lacks " + fn
+    # the status pill shares the title row (it used to take a line of its own)
+    assert 'class="hdr-pill"' in src and ".hdr-pill{" in src
+    assert "position:sticky;top:-20px;background:var(--bg)" not in src
+    # wide window: rows are capped so a label stays near its control
+    assert ".content:not(.home-mode){max-width:928px" in src
+    for page in _COMPACT_PAGES:
+        body = _settings_page_src(src, page)
+        assert 'class="page"' not in body, page + " still renders an old .page card"
+        assert "grp(" in body, page + " does not use the row groups"
+
+
+_test("settings: compact row components + redesigned pages use rows",
+      t_settings_compact_components)
 
 
 def t_settings_save_feedback():
@@ -11575,9 +11899,88 @@ def t_recent_meetings_title_clean():
     assert "2026-05-28 14-24" not in rows and "2026-05-27" not in rows, rows
     assert "Untitled meeting" in rows, rows
 
+    # Home lists every meeting (the old default cap of 30 also capped the search)
+    for i in range(40):
+        open(_os.path.join(d, "2026-01-%02d_10-00-00_m%02d_meeting.txt" % (i % 28 + 1, i)),
+             "w").close()
+    lia.MEETINGS_DIR = d
+    try:
+        assert len(app._recent_meetings()) == 44
+    finally:
+        lia.MEETINGS_DIR = _orig
+    import inspect as _insp
+    assert "self._recent_meetings()" in _insp.getsource(App._settings_state)
+    assert App.HOME_MEETINGS_CAP >= 1000
+
 
 _test("home: recent-meeting titles drop the redundant time prefix",
       t_recent_meetings_title_clean)
+
+
+def t_vocab_suggestions_fix_and_restore():
+    """2026-10-05 (Naor): a suggestion Lia MISHEARD ("Ristructure") could only be
+    accepted or dropped, and "Apply checked / reject rest" dropped every
+    untouched one. Now: tick = add, typed spelling = fix (correction + the right
+    term learned), untouched = stays, dropped ones can come back; the learned
+    list has filter / sort / bulk checks."""
+    import inspect, tempfile
+    import lia as w
+    import vocab_learn as vl
+    d = tempfile.mkdtemp()
+    st = vl.VocabStore(os.path.join(d, "vocabulary.json"))
+    st.add_candidates([{"term": "Ristructure", "count": 3}, {"term": "Terraform", "count": 5},
+                       {"term": "Lendding", "count": 4}], source="meeting")
+    assert {t["term"] for t in st.pending()} == {"Ristructure", "Terraform", "Lendding"}
+
+    # the app path: tick Terraform, fix Ristructure, leave Lendding
+    app = w.LiaApp.__new__(w.LiaApp)
+    app._vocab_store = st
+    app._push_vocabulary_live = lambda: None
+    ok, _m = app._vocab_resolve(["Terraform"], [])
+    ok, msg = app._vocab_fix_suggestions([["Ristructure", "Restructure"]])
+    assert ok and "Ristructure -> Restructure" in msg, msg
+    assert [t["term"] for t in st.pending()] == ["Lendding"], "untouched must stay"
+    learned = {t["term"]: t for t in st.approved_autos()}
+    assert "Terraform" in learned and "Restructure" in learned
+    assert learned["Restructure"]["sources"] == ["fix"]
+    assert any(c["wrong"] == "Ristructure" and c["right"] == "Restructure"
+               for c in st.corrections())
+    dropped = st.dropped_autos()
+    assert dropped[0]["term"] == "Ristructure" and dropped[0]["fixed_to"] == "Restructure"
+    # a bad fix is reported, nothing changes
+    ok, msg = app._vocab_fix_suggestions([["Lendding", "x"]])
+    assert not ok and "Not fixed" in msg and st.pending()[0]["term"] == "Lendding", msg
+
+    # drop + restore
+    st.resolve(["Lendding"], False)
+    assert not st.pending() and st.dropped_autos()[0]["term"] == "Lendding"
+    ok, msg = app._vocab_reopen(["Lendding"])
+    assert ok and [t["term"] for t in st.pending()] == ["Lendding"], msg
+    # a manual term is never reopened as a suggestion
+    st.migrate_manual("AWS")
+    st.resolve(["AWS"], False)
+    assert app._vocab_reopen(["AWS"])[1].startswith("0 ")
+    # survives a reload from disk
+    st2 = vl.VocabStore(os.path.join(d, "vocabulary.json"))
+    assert {t["term"] for t in st2.approved_autos()} >= {"Terraform", "Restructure"}
+
+    # wiring: allowlisted, list-mutation (no page re-render), UI uses them
+    App = w.LiaApp
+    assert {"vocab_fix_suggestions", "vocab_reopen"} <= App._SETTINGS_LIST_MUTATION_METHODS
+    assert "vocab_dropped_list" in App._SETTINGS_READONLY_METHODS
+    amap = inspect.getsource(App._settings_action_map)
+    for m in ("vocab_fix_suggestions", "vocab_dropped_list", "vocab_reopen"):
+        assert '"%s"' % m in amap, m
+    import settings_window as sw
+    js = sw.APP_JS
+    assert ">Apply checked / reject rest<" not in sw.BODY + js   # the old button
+    for frag in ("vocab_fix_suggestions", "data-vocab-drop-rest", "data-learned-tool",
+                 "learnedFilter", "isGeneric", "vocab_reopen"):
+        assert frag in js or frag in sw.BODY, frag
+
+
+_test("vocabulary: suggestions tick / fix / leave + restore; learned bulk tools",
+      t_vocab_suggestions_fix_and_restore)
 
 
 def t_open_meeting_summary_editor():
@@ -15364,7 +15767,7 @@ def t_summarize_meeting_file():
         lang = w.lang_pack.resolve_summary_lang({}, info["plain"])
         assert w._summary_meta(info["duration_sec"], info["source"], info["num_speakers"],
                                info["attendees"], lang) == live["meta"], live["meta"]
-        assert info["meta_line"] == "2m 5s · 4 chunks", info["meta_line"]
+        assert info["meta_line"] == "2m 5s", info["meta_line"]
         # the Summary section added later == the one the writer writes live
         md = "## כותרת הדיון\nתקציב\n\n## משימות\n- [ ] לבדוק את השרת - **אחראי: דנה**"
         s1.app.summary_md = md

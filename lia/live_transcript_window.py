@@ -150,6 +150,47 @@ class LiveApi:
         except Exception:
             return {"ok": False}
 
+    def default_filename(self):
+        """'<meeting title> <yyyy-mm-dd HH-MM>.txt', safe for Windows."""
+        import re
+        import time
+        title = (self._payload.get("title") or "Live transcript").strip()
+        title = re.sub(r'[\\/:*?"<>|\r\n\t]+', " ", title)
+        title = re.sub(r"\s+", " ", title).strip(" .") or "Live transcript"
+        return "%s %s.txt" % (title[:80], time.strftime("%Y-%m-%d %H-%M"))
+
+    def save_txt(self, text):
+        """'Save .txt' (Naor, 2026-10-05): a Save-as dialog, then the text the
+        window shows ("[m:ss] line" per line) as UTF-8 with a short header.
+        The user picks the path; only a .txt is written."""
+        text = (text or "")[:2_000_000]
+        if not text.strip():
+            return {"ok": False, "error": "Nothing to save yet"}
+        try:
+            import webview
+            wins = list(getattr(webview, "windows", []) or [])
+            win = wins[0] if wins else None
+            if win is None:
+                return {"ok": False, "error": "no window"}
+            start = os.path.join(os.path.expanduser("~"), "Documents")
+            if not os.path.isdir(start):
+                start = os.path.expanduser("~")
+            res = win.create_file_dialog(webview.SAVE_DIALOG, directory=start,
+                                         save_filename=self.default_filename(),
+                                         file_types=("Text files (*.txt)",))
+            if not res:
+                return {"ok": False, "cancelled": True}
+            path = res[0] if isinstance(res, (list, tuple)) else res
+            if not str(path).lower().endswith(".txt"):
+                path = str(path) + ".txt"
+            meta = self.meta()
+            head = meta["title"] + ((" - started " + meta["started"]) if meta["started"] else "")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(head + "\n\n" + text.rstrip() + "\n")
+            return {"ok": True, "path": path, "name": os.path.basename(path)}
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200]}
+
 
 
 def _with_csp(html):
@@ -302,7 +343,8 @@ function renderFoot(r){
     document.getElementById('title').textContent = 'Meeting ended';
     html = '<span class="phase">✓ Saved</span>';
   }
-  if(phase!=='cancelled' && lastText) html = '<button id="copyAllBtn">Copy all</button>' + html;
+  if(phase!=='cancelled' && lastText)
+    html = '<button id="copyAllBtn">Copy all</button><button id="saveTxtBtn">Save .txt</button>' + html;
   foot.innerHTML = html;
 }
 
@@ -360,6 +402,15 @@ function transcriptText(){
   });
   return out.join('\n');
 }
+async function saveTxt(btn){
+  if(!API) return;
+  var r = {ok:false};
+  try{ r = await API.save_txt(transcriptText()); }catch(e){}
+  if(!btn || r.cancelled) return;
+  btn.textContent = r.ok ? 'Saved ✓' : 'Not saved';
+  btn.title = r.ok ? r.path : (r.error || '');
+  setTimeout(function(){ btn.textContent = 'Save .txt'; }, 2000);
+}
 async function copyAll(btn){
   if(!API) return;
   var r = {ok:false};
@@ -375,6 +426,7 @@ document.getElementById('wrap').addEventListener('scroll', function(){
 document.getElementById('foot').addEventListener('click', async function(ev){
   var f = ev.target.closest('#followBtn'); if(f){ setFollow(!follow); return; }
   var c = ev.target.closest('#copyAllBtn'); if(c){ copyAll(c); return; }
+  var sv = ev.target.closest('#saveTxtBtn'); if(sv){ saveTxt(sv); return; }
   var o = ev.target.closest('[data-open]');
   if(o && API){ try{ await API.open_artifact(o.getAttribute('data-open')); }catch(e){} }
 });

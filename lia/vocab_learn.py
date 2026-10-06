@@ -59,6 +59,13 @@ _WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9+#.\-']{0,29}")
 _ALLDIGIT_RE = re.compile(r"^[\d.\-+#']+$")
 
 
+def _stamp():
+    """A sortable resolution time with microseconds: two terms dropped in the
+    same second still list in the order they were dropped."""
+    t = time.time()
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)) + ".%06d" % int((t % 1) * 1e6)
+
+
 def _norm(term):
     """Case-insensitive dedup key."""
     return term.strip().lower()
@@ -346,12 +353,72 @@ class VocabStore:
     def resolve(self, keys, approve):
         """Approve or reject a batch of pending keys."""
         status = "approved" if approve else "rejected"
+        stamp = _stamp()
         with self._lock:
             for k in keys:
                 t = self._terms.get(_norm(k))
                 if t is not None:
                     t["status"] = status
+                    t["resolved_at"] = stamp
         self.save()
+
+    def reopen(self, keys):
+        """A dropped auto term goes back to the suggestions (status pending).
+        Manual terms are left alone (the host's manual list owns them)."""
+        n = 0
+        with self._lock:
+            for k in keys:
+                t = self._terms.get(_norm(k))
+                if t is not None and t.get("kind") == "auto" and t.get("status") == "rejected":
+                    t["status"] = "pending"
+                    t.pop("resolved_at", None)
+                    n += 1
+        if n:
+            self.save()
+        return n
+
+    def dropped_autos(self, limit=100):
+        """Rejected auto-learned terms, most recently dropped first (terms
+        dropped before resolved_at existed sort by last_seen)."""
+        with self._lock:
+            out = [dict(t) for t in self._terms.values()
+                   if t.get("status") == "rejected" and t.get("kind") == "auto"]
+        out.sort(key=lambda t: (t.get("resolved_at") or "", t.get("last_seen") or ""),
+                 reverse=True)
+        return out[:limit]
+
+    def fix_term(self, wrong, right):
+        """A suggestion the recognizer MISHEARD ("Ristructure"): drop the
+        misspelled key and keep the right spelling as an approved auto term
+        (source "fix") so it reaches the prompt. An auto term on purpose: a
+        manual term not in the host's manual list is demoted when that list is
+        saved (set_manual_terms). The wrong -> right correction itself is the
+        host's job (add_corrections). Returns the stored right term."""
+        right = (right or "").strip()
+        if not right:
+            return ""
+        today = time.strftime("%Y-%m-%d")
+        stamp = _stamp()
+        with self._lock:
+            w = self._terms.get(_norm(wrong))
+            seen = int((w or {}).get("count_corpus", 0))
+            if w is not None and _norm(wrong) != _norm(right):
+                w["status"] = "rejected"
+                w["resolved_at"] = stamp
+                w["fixed_to"] = right
+            cur = self._terms.get(_norm(right))
+            if cur is None:
+                self._terms[_norm(right)] = {
+                    "term": right, "kind": "auto", "status": "approved",
+                    "starred": False, "count_corpus": seen, "count_used": 0,
+                    "sources": ["fix"], "first_seen": today, "last_seen": today,
+                    "sample": "", "resolved_at": stamp,
+                }
+            elif cur.get("status") != "approved":
+                cur["status"] = "approved"
+                cur["resolved_at"] = stamp
+        self.save()
+        return right
 
     def pending_count(self):
         with self._lock:

@@ -231,6 +231,19 @@ def _demo_state():
         "loopback_available": True, "whisper_device_label": "Auto",
         "cleanup_model_label": "gpt-6-luna", "cleanup_provider": "openai",
         "vocab_pending": 4, "auto_start": True,
+        # the Languages controls (General) + summary-language choices (Meetings)
+        "languages": {"primary": "he", "locked": False, "profile": "hebrew",
+                      "model_lang_count": 99, "model_kind": "whisper",
+                      "rows": [{"id": c, "name_en": e, "native": n, "rtl": c in ("he", "ar"),
+                                "enabled": c in ("he", "en"), "summary_ok": c in ("he", "en", "es"),
+                                "primary": c == "he", "supported": True}
+                               for c, e, n in [("he", "Hebrew", "עברית"),
+                                               ("en", "English", "English"),
+                                               ("ar", "Arabic", "العربية"),
+                                               ("de", "German", "Deutsch"),
+                                               ("es", "Spanish", "Español"),
+                                               ("fr", "French", "Français")]]},
+        "vocab_learned_count": 112, "corrections_count": 37,
         "serve": {"enabled": True, "autostart": False, "running": True,
                   "port": 9090, "has_token": False,
                   "tailscale_ip": "100.100.100.100",
@@ -397,7 +410,29 @@ EXTRA_CSS = """
    area; the HOME page (data-dense: meetings list + preview) uses the full width
    so a maximized window is put to work instead of stretched into empty gutters.
    The sidebar stays edge-anchored (fixed width, first in the flex row). */
-.content:not(.home-mode){max-width:1000px; margin-inline:auto;}
+/* 928 = rows of ~880 px + padding (Naor 2026-10-05: on a wide window keep a
+   setting's label close to its control). */
+.content:not(.home-mode){max-width:928px; margin-inline:auto;}
+/* the status pill floats at the right end of the title row (it had its own line) */
+/* API Keys rows: a small provider badge before the name */
+.kname{display:inline-flex; align-items:center; gap:10px;}
+.kbdg{width:26px; height:26px; border-radius:8px; display:inline-flex; align-items:center;
+  justify-content:center; font-weight:800; font-size:13px; color:var(--on-accent); flex:0 0 26px;}
+.kbdg.img{background:#fff; padding:4px; box-shadow:inset 0 0 0 1px rgba(16,24,40,.10);}
+.kbdg.img img{width:100%; height:100%; object-fit:contain; display:block;}
+.srow-c .masked{font-size:12px;}
+.keybad{margin:0 0 8px; font-size:var(--fs-hint); color:var(--err); font-weight:600;}
+/* segmented control made of buttons (Transcription server: Client / Server) */
+.seg button.radio{font:inherit; cursor:pointer; color:var(--ink-2);}
+/* server status LED inside a row title */
+.run-led-sm{display:inline-block; width:9px; height:9px; border-radius:50%; margin-inline-end:8px;
+  background:var(--faint); vertical-align:middle;}
+.run-led-sm.on{background:var(--ok); box-shadow:0 0 0 3px var(--ok-soft);}
+.run-led-sm.starting{background:var(--warn); box-shadow:0 0 0 3px var(--warn-soft);}
+.srow-c .gpu-tag{margin-left:0;}
+.hdr-pill{position:sticky; top:-20px; height:0; z-index:4; text-align:end; pointer-events:none;}
+.hdr-pill .status{pointer-events:auto; position:relative; top:6px; background:var(--bg);
+  padding:2px 8px; border-radius:var(--r-pill);}
 .content.home-mode{max-width:none; margin-inline:0;
   padding:16px 22px; display:flex; flex-direction:column; gap:12px; overflow:hidden;}
 
@@ -442,6 +477,18 @@ EXTRA_CSS = """
 .mtg-search input:focus{outline:none; border-color:var(--accent); box-shadow:var(--ring);}
 .mtg-count{color:var(--muted); font-size:var(--fs-small); flex:0 0 auto;}
 .mtg-rows{flex:1 1 auto; overflow-y:auto; min-height:0; padding:6px;}
+/* Vocabulary: learned-term grid + tools, suggestion rows (2026-10-05) */
+.vtools{display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:10px 0 6px;}
+.vtools input[type=text]{flex:1 1 180px; min-width:140px; width:auto;}
+.vtools select{flex:0 0 auto; width:auto;}
+.vgrid{display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:0 14px;}
+.vgrid .check{padding:3px 0;}
+.sugg{padding:8px 0; border-bottom:1px solid var(--line);}
+.sugg:last-child{border-bottom:0;}
+.sugg-sample{color:var(--muted); font-size:var(--fs-hint); margin:2px 0 0 30px;}
+.sugg-fix{display:block; width:100%; max-width:380px; margin:6px 0 0 30px; box-sizing:border-box;}
+.drop-row{display:flex; gap:10px; align-items:center; padding:4px 0;}
+.drop-row .txt{flex:1;}
 .mtg-row{display:grid; grid-template-columns:1fr auto; gap:4px 10px; align-items:center;
   width:100%; text-align:start; cursor:pointer; font:inherit; color:var(--ink);
   background:none; border:1px solid transparent; border-radius:var(--r-s);
@@ -480,30 +527,6 @@ EXTRA_CSS = """
 /* Keys & Server page: each service is a standalone card on the page ground
    (the wrapping .page frame is dropped via .keys-page) with subtle depth. */
 .page.keys-page{background:transparent; border:none; box-shadow:none; padding:0;}
-.credcard{background:var(--card); border:1px solid var(--line); border-radius:var(--r-l);
-  padding:18px 20px; margin-bottom:16px; box-shadow:0 1px 2px rgba(16,24,40,.05);
-  transition:box-shadow .18s ease, border-color .18s ease;}
-.credcard:hover{border-color:var(--line-2);
-  box-shadow:0 1px 2px rgba(16,24,40,.06), 0 10px 24px rgba(16,24,40,.07);}
-.credcard .head{display:flex; align-items:center; gap:12px; margin-bottom:14px;}
-.credcard .bdg{width:38px;height:38px;border-radius:11px;display:flex;align-items:center;
-  justify-content:center;font-weight:800;font-size:16px;color:var(--on-accent);flex:0 0 38px;
-  box-shadow:0 2px 6px rgba(16,24,40,.16), inset 0 1px 0 rgba(255,255,255,.28);}
-.credcard .bdg.img{background:#fff;padding:6px;box-shadow:0 2px 6px rgba(16,24,40,.16),
-  inset 0 0 0 1px rgba(16,24,40,.08);}
-.credcard .bdg.img img{width:100%;height:100%;object-fit:contain;display:block;}
-.credcard h3{margin:0;font-size:15.5px;font-weight:700;letter-spacing:-.01em;}
-.credcard .sub{color:var(--muted);font-size:var(--fs-hint);margin-top:2px;line-height:1.45;}
-/* current-key value shown as a soft pill (dashed + faint when unset) */
-.credcard .keyline{display:flex; align-items:center; gap:8px; margin:0 0 12px;
-  font-size:var(--fs-hint); color:var(--muted);}
-.credcard .keyline .masked{font-size:12px; background:var(--accent-soft);
-  border:1px solid var(--line); padding:3px 10px; border-radius:var(--r-pill); letter-spacing:.02em;}
-.credcard .keyline .masked.empty{background:transparent; border-style:dashed;}
-/* the provider rejected the saved key (revoked / deleted / mistyped) */
-.credcard .keyline .masked.bad{color:var(--err); background:var(--err-soft); border-color:var(--err);}
-.credcard .keybad{margin:-4px 0 12px; font-size:var(--fs-hint); color:var(--err); font-weight:600;}
-.credcard .row-inline{margin-top:2px;}
 .btnrow{display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:12px;}
 .btnrow .grow{flex:1 1 auto;}
 .tbl{width:100%; border-collapse:collapse;}
@@ -537,17 +560,6 @@ EXTRA_CSS = """
 @keyframes settingFlash{0%{background:var(--accent-soft);}100%{background:transparent;}}
 .setting-flash{animation:settingFlash 1.3s ease-out;}
 
-/* --- Models: active-engines summary ------------------------------------ */
-.eng-grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:10px;}
-.eng{border:1px solid var(--line); border-radius:var(--r-m); padding:11px 13px; background:var(--card-2);}
-.eng-role{font-size:var(--fs-small); font-weight:600; color:var(--muted);}
-.eng-name{font-size:var(--fs-base); font-weight:600; color:var(--ink); margin:2px 0 7px; line-height:1.35; word-break:break-word;}
-.eng-name.muted{color:var(--faint); font-weight:500;}
-.eng-meta{display:flex; align-items:center; gap:8px; flex-wrap:wrap;}
-.place{font-size:var(--fs-small); font-weight:700; padding:2px 8px; border-radius:var(--r-pill);}
-.place.local{background:var(--ok-soft); color:var(--ok);}
-.place.cloud{background:var(--info-soft); color:var(--info);}
-.place.server{background:var(--accent-soft); color:var(--accent);}
 
 /* --- Home landing page -------------------------------------------------- */
 .hchips{display:flex; flex-wrap:wrap; gap:8px;}
@@ -633,11 +645,23 @@ APP_JS = r"""
   // Offline demo (ui_kit_gallery / _demo_html): resolve a few reads with fakes so
   // the layout is previewable without the parent process.
   function demoCall(method, args){
+    // demo/QA only: a log of every call, so a click test can check the wiring
+    (window.__calls = window.__calls || []).push([method, args]);
     return new Promise(function(res){ setTimeout(function(){
       if(method==="get_meeting_details"){
         res({ok:true, data:{has_summary:true, diarized:true, date:"2026-09-14 16:07",
           summary_text:"## תקציר\nפגישת דמו על מדיניות ענן.\n\n## דגשים\n- נקודה ראשונה לדוגמה\n- נקודה שנייה\n\n## משימות\n- [ ] לסיים את המסמך"}});
         return; }
+      if(method==="vocab_pending_list"){
+        res({ok:true, data:[{term:"Ristructure", count_corpus:3, sample:"שעשינו Domain Ristructure בחודש"},
+          {term:"Terraform", count_corpus:5, sample:"הגדרנו את זה ב-Terraform"}]}); return; }
+      if(method==="vocab_learned_list"){
+        res({ok:true, data:[{term:"API",count_used:100},{term:"Cloud",count_used:60},
+          {term:"account",count_used:40},{term:"Entra ID",count_used:15},{term:"Security",count_used:22},
+          {term:"Walkload",count_used:0},{term:"GitLab",count_used:14},{term:"monthly",count_used:0}]}); return; }
+      if(method==="vocab_dropped_list"){
+        res({ok:true, data:[{term:"Ristructure", count_corpus:3, fixed_to:"Restructure"},
+          {term:"Lendding", count_corpus:4}]}); return; }
       res({ok:true, msg:""});
     }, 60); });
   }
@@ -678,6 +702,73 @@ APP_JS = r"""
     return '<button class="btn '+(kind||'')+'" data-call="'+esc(method)+'" '+
       'data-args=\''+esc(JSON.stringify(args||[]))+'\''+(slow?' data-slow="1"':'')+
       '>'+esc(label)+'</button>';
+  }
+
+  // ---------- compact rows (2026-10-05 redesign) ----------
+  // One card per TOPIC (grp), one ROW per setting (srow): title + a one-line
+  // description on the left, the control on the right. Short enums are a
+  // segmented control (seg, built from radio() so the data-radio wiring is the
+  // same); long lists collapse into more() whose summary shows the current
+  // value. OPENX keeps a picker open across re-renders (a state push redraws
+  // the page). ONOPEN[k] fills picker k's list when it opens and again after a
+  // re-render while it is open; ONPAGE[page] does the same for a page. Each
+  // hook loads only when its list is still empty (render() carries a loaded
+  // list over, with whatever the user typed or ticked in it).
+  var OPENX = {};
+  var ONOPEN = {};
+  var ONPAGE = {};
+  function isEmpty(id){ var el = $(id); return !!el && !el.childNodes.length; }
+  document.addEventListener('toggle', function(e){
+    var d = e.target;
+    if(!(d && d.matches && d.matches('details[data-k]'))) return;
+    var k = d.getAttribute('data-k');
+    OPENX[k] = d.open;
+    // render() already ran the hook for a picker it drew open; Chromium then
+    // fires a toggle for it too, which would load the list a second time
+    if(d.open && ONOPEN[k] && !d.__hooked){ d.__hooked = true; try{ ONOPEN[k](); }catch(_){} }
+  }, true);
+  function opn(k, dflt){ return ((k in OPENX) ? OPENX[k] : !!dflt) ? ' open' : ''; }
+  function grp(title, rows, opts){
+    opts = opts || {};
+    return '<div class="grp-h">'+title+
+        (opts.sub?' <span class="grp-sub">'+opts.sub+'</span>':'')+
+        (opts.action?'<span class="grp-act">'+opts.action+'</span>':'')+'</div>'+
+      '<div class="grp'+(opts.tone?' '+opts.tone:'')+'"'+(opts.id?' id="'+opts.id+'"':'')+'>'+rows+'</div>';
+  }
+  function srow(title, desc, control, cls){
+    return '<div class="srow'+(cls?' '+cls:'')+'"><div class="srow-l"><div class="srow-t">'+title+'</div>'+
+      (desc?'<div class="srow-d">'+desc+'</div>':'')+'</div>'+
+      '<div class="srow-c">'+(control||'')+'</div></div>';
+  }
+  function swb(checked, method, disabled){
+    return '<label class="switch bare'+(disabled?' disabled':'')+'"><input type="checkbox" data-toggle="'+esc(method)+'"'+
+      (checked?' checked':'')+(disabled?' disabled':'')+'><span class="track"></span></label>';
+  }
+  // opts: [[arg, label, checked, enabled], ...]
+  function seg(name, method, argtype, opts){
+    return '<div class="seg">'+opts.map(function(o){
+      return radio(name, method, o[0], argtype, o[1], !!o[2], o[3]!==false, "", "", "", true);
+    }).join('')+'</div>';
+  }
+  function more(k, title, desc, cur, body, dfltOpen){
+    return '<details class="more" data-k="'+esc(k)+'"'+opn(k, dfltOpen)+'>'+
+      '<summary class="srow"><div class="srow-l"><div class="srow-t">'+title+'</div>'+
+      (desc?'<div class="srow-d">'+desc+'</div>':'')+'</div>'+
+      '<div class="srow-c">'+(cur||'')+'<span class="chev">&#8250;</span></div></summary>'+
+      '<div class="more-body">'+body+'</div></details>';
+  }
+  function arow(iconName, label, method, hkstr, beta, cls){
+    return '<button class="arow'+(cls?' '+cls:'')+'" data-call="'+esc(method)+'" data-args="[]">'+
+      '<span class="ic">'+RK.icon(iconName,{size:18})+'</span><span class="grow">'+esc(label)+'</span>'+
+      (beta?'<span class="wb beta">BETA</span>':'')+
+      (hkstr?'<span class="hk">'+esc(hkstr)+'</span>':'')+'</button>';
+  }
+  // a current-value list of names (mixed Hebrew/English) that keeps the list
+  // order left-to-right while each name picks its own direction
+  function curList(names, cls){
+    return '<span class="cur'+(cls?' '+cls:'')+'" dir="ltr">'+names.map(function(n){
+      return '<span dir="auto">'+esc(n)+'</span>';
+    }).join(' &#183; ')+'</span>';
   }
 
   // A newer Lia release (S.update, from the parent's GitHub check): one bar,
@@ -791,10 +882,6 @@ APP_JS = r"""
     var histWeeks = parseInt(cfg("history_retention_weeks", 2), 10);
     if(isNaN(histWeeks) || histWeeks < 0) histWeeks = 2;
     if(histWeeks > 12) histWeeks = 12;
-    var shortcuts = '<div class="list">'+
-      Object.keys(hk).map(function(k){
-        return '<div class="row"><span class="grow">'+esc(k)+'</span><span class="kbd">'+esc(hk[k])+'</span></div>';
-      }).join('')+'</div>';
     // Languages (multi-language, 2026-09-15): a primary-language dropdown, a
     // "lock to one language" switch, and an enabled-languages checklist (the
     // anti-roaming control - the app never picks a language outside this set).
@@ -815,67 +902,62 @@ APP_JS = r"""
         '<span>'+esc(r.native)+(r.native!==r.name_en?' ('+esc(r.name_en)+')':'')+
         (r.supported===false?' <small style="opacity:.6">not in this model</small>':'')+'</span></label>';
     }).join('');
-    var langSection =
-      '<div class="page"><div class="section-title">Languages</div>'+
-        '<div class="row-inline"><span class="grow">Primary language</span>'+
-          '<select data-select-str="set_primary_language" style="max-width:260px">'+langOpts+'</select></div>'+
-        '<div class="hint">The language you mainly dictate and hold meetings in, and <b>the default language your meeting and text summaries are written in</b>, and which models the app prefers. '+
-          'To write summaries in a different language, change <b>Summary language</b> on the Meetings page.</div>'+
-        '<label class="switch" style="margin-top:6px"><input type="checkbox" data-lang-lock data-lang-primary="'+esc(LPRIM)+'"'+
-          (LLOCK?' checked':'')+'><span class="track"></span><span>Lock to one language (primary only)</span></label>'+
-        '<div class="hint">On: transcribe only your primary language - no detection, never switches. Off: detect among the languages you tick below.</div>'+
-        '<div class="section-title" style="margin-top:8px">Languages I use  <small style="opacity:.6">('+LCOUNT+' in this model)</small></div>'+
-        '<input type="text" id="langFilter" placeholder="Search '+LCOUNT+' languages…" style="width:100%;box-sizing:border-box;margin:4px 0 6px">'+
-        '<div id="langList" style="max-height:240px;overflow:auto;border:1px solid var(--line,#e2e2e6);border-radius:8px;padding:6px">'+langChecks+'</div>'+
-        '<div class="hint">Tick the languages you speak - the app never picks one outside this set. Tick exactly one (or use the lock) to force it. '+
-          'Whisper models auto-detect among your ticked set; Gemini pins to it; Parakeet always auto-detects among its own languages.</div>'+
-      '</div>';
-    // Each concern gets its OWN card (2026-08-29): one long undivided page
-    // made 'Recording mode' / 'Paste' / the toggles read as one blur.
+    var enabledNames = LANGS.filter(function(r){ return r.enabled; }).map(function(r){ return r.native; });
+    var histSel = '<select id="sel_hist_weeks" data-select="set_history_retention_weeks" style="max-width:170px">'+
+      [1,2,3,4,5,6,7,8,9,10,11,12].map(function(w){
+        return '<option value="'+w+'"'+(histWeeks===w?' selected':'')+'>'+w+' week'+(w===1?'':'s')+(w===2?' (default)':'')+'</option>';
+      }).join('')+
+      '<option value="0"'+(histWeeks===0?' selected':'')+'>Keep everything</option></select>';
+    var shortcuts = '<div class="list">'+Object.keys(hk).map(function(k){
+      return '<div class="row"><span class="grow">'+esc(k)+'</span><span class="kbd">'+esc(hk[k])+'</span></div>';
+    }).join('')+'</div>';
+    var rm = cfg("recording_mode","hold");
+    var pm = cfg("paste_mode","auto_paste");
     return '<div class="content-head"><h1>General</h1></div>'+
-      // Hotkey + recording mode first: the daily-use controls lead the page.
-      '<div class="page"><div class="section-title">Press-to-talk hotkey</div>'+
-        '<div class="row-inline"><input type="text" id="hotkeyInput" style="max-width:220px" value="'+
-          esc(draftOr("hotkeyInput", hk.main||"ctrl+space"))+'">'+
-        '<button class="btn" id="btnCapture">Capture&#8230;</button>'+
-        '<button class="btn primary" data-save-hotkey="1">Save</button>'+
-        '<button class="btn ghost" data-reset-hotkey="1">Reset</button></div>'+
-        '<div class="hint">Click Capture, then press the combination. Needs a modifier (Ctrl/Alt/Shift).</div>'+
-      '</div>'+
-      '<div class="page"><div class="section-title">Recording mode</div>'+
-        '<div class="radio-row">'+
-        radio("rm","set_recording_mode","hold","str","Hold to record", cfg("recording_mode","hold")==="hold")+
-        radio("rm","set_recording_mode","toggle","str","Toggle (press start / press stop)", cfg("recording_mode")==="toggle")+
-        '</div>'+
-      '</div>'+
-      '<div class="page"><div class="section-title">Paste</div>'+
-        '<div class="radio-row">'+
-        radio("pm","set_paste_mode","auto_paste","str","Auto-paste (Ctrl+V)", cfg("paste_mode")==="auto_paste")+
-        radio("pm","set_paste_mode","clipboard_only","str","Clipboard only", cfg("paste_mode")==="clipboard_only")+
-        '</div>'+
-      '</div>'+
-      '<div class="page"><div class="section-title">Startup</div>'+
-        sw("Start Lia automatically when Windows starts", !!S.auto_start, "toggle_auto_start")+
-        '<div class="hint">Lia launches to the system tray on every boot, ready to dictate.</div>'+
-      '</div>'+
-      langSection+
-      '<div class="page"><div class="section-title">Behavior</div>'+
-        sw("Restore clipboard after paste", !!cfg("clipboard_auto_restore", true), "toggle_clipboard_auto_restore")+'<br>'+
-        sw("Press Enter after paste", !!cfg("press_enter_after_paste", false), "toggle_press_enter_after_paste")+'<br>'+
-        sw("Invisible mode (no overlay / waveform)", !!cfg("silent_mode", false), "toggle_silent_mode")+
-      '</div>'+
-      '<div class="page"><div class="section-title">History</div>'+
-        field("Keep transcription history for",
-          '<select id="sel_hist_weeks" data-select="set_history_retention_weeks" style="max-width:220px">'+
-            [1,2,3,4,5,6,7,8,9,10,11,12].map(function(w){
-              return '<option value="'+w+'"'+(histWeeks===w?' selected':'')+'>'+w+' week'+(w===1?'':'s')+(w===2?' (default)':'')+'</option>';
-            }).join('')+
-            '<option value="0"'+(histWeeks===0?' selected':'')+'>Keep everything</option>'+
-          '</select>',
-          "Older entries are removed automatically at startup and after each dictation.")+
-        '<div class="btnrow"><button class="btn danger" data-clear-history="1">Delete all history…</button></div>'+
-      '</div>'+
-      '<div class="page"><div class="section-title">Keyboard shortcuts</div>'+shortcuts+'</div>';
+      // Dictation first: the daily-use controls lead the page.
+      grp('Dictation',
+        srow('Press-to-talk hotkey', 'Click Capture, then press the keys. Needs Ctrl, Alt or Shift.',
+          '<input type="text" id="hotkeyInput" style="width:140px" value="'+
+            esc(draftOr("hotkeyInput", hk.main||"ctrl+space"))+'">'+
+          '<button class="btn" id="btnCapture">Capture&#8230;</button>'+
+          '<button class="btn primary" data-save-hotkey="1">Save</button>'+
+          '<button class="btn ghost" data-reset-hotkey="1">Reset</button>', 'wide')+
+        srow('Recording mode', rm==="toggle" ? 'Press once to start, press again to stop.'
+                                             : 'Records while you hold the hotkey down.',
+          seg("rm","set_recording_mode","str",[["hold","Hold",rm==="hold"],["toggle","Toggle",rm==="toggle"]]))+
+        srow('After transcription', pm==="clipboard_only" ? 'The text is copied; you paste it yourself.'
+                                                         : 'The text is pasted where your cursor is.',
+          seg("pm","set_paste_mode","str",[["auto_paste","Paste (Ctrl+V)",pm==="auto_paste"],
+                                            ["clipboard_only","Clipboard only",pm==="clipboard_only"]]))+
+        srow('Restore clipboard after paste', 'Puts back what you had copied, about 2 seconds later.',
+          swb(!!cfg("clipboard_auto_restore", true), "toggle_clipboard_auto_restore"))+
+        srow('Press Enter after paste', 'Sends the message right away in chat apps.',
+          swb(!!cfg("press_enter_after_paste", false), "toggle_press_enter_after_paste"))+
+        srow('Invisible mode', 'No overlay or waveform while recording; the tray icon still shows the state.',
+          swb(!!cfg("silent_mode", false), "toggle_silent_mode"))
+      )+
+      grp('Languages',
+        srow('Primary language', 'What you mainly speak, and the default language of summaries (Meetings page to change it).',
+          '<select data-select-str="set_primary_language" style="max-width:220px">'+langOpts+'</select>')+
+        srow('Lock to one language', 'Always transcribe the primary language, never detect another.',
+          '<label class="switch bare"><input type="checkbox" data-lang-lock data-lang-primary="'+esc(LPRIM)+'"'+
+            (LLOCK?' checked':'')+'><span class="track"></span></label>')+
+        more('langs', 'Languages I use', 'Lia only detects among these ('+LCOUNT+' in this model).',
+          curList(enabledNames.length ? enabledNames : ['None']),
+          '<input type="text" id="langFilter" placeholder="Search '+LCOUNT+' languages…" style="width:100%;box-sizing:border-box;margin:0 0 6px">'+
+          '<div id="langList" style="max-height:220px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:6px;background:var(--card)">'+langChecks+'</div>'+
+          '<div class="hint">Tick exactly one (or use the lock) to force it. Whisper models auto-detect among your ticked set; Gemini pins to it; Parakeet always auto-detects among its own languages.</div>')
+      )+
+      grp('Startup and history',
+        srow('Start with Windows', 'Lia starts in the system tray when you sign in, ready to dictate.',
+          swb(!!S.auto_start, "toggle_auto_start"))+
+        srow('Keep dictation history for', 'Older entries are removed at startup and after each dictation.',
+          histSel+'<button class="btn danger" data-clear-history="1">Delete all history&#8230;</button>')
+      )+
+      grp('Keyboard shortcuts',
+        more('shortcuts', 'All shortcuts', Object.keys(hk).length+' shortcuts',
+          '<span class="kbd">'+esc(hk.main||"ctrl+space")+'</span>', shortcuts)
+      );
   };
 
   PAGES.audio = function(){
@@ -900,6 +982,15 @@ APP_JS = r"""
       return '<div class="rowbtn disabledrow"><span class="ic">&#9679;</span><span class="grow rtl-auto" dir="auto">'+esc(storedName)+
         '</span><span class="hk">disconnected</span></div>';
     }
+    // the current value shown on a collapsed device row
+    function curDev(label, missing){
+      return '<span class="cur rtl-auto'+(missing?' warn':'')+'" dir="auto">'+esc(label)+(missing?' (disconnected)':'')+'</span>';
+    }
+    function nameOf(list, storedIdx, storedName, dflt){
+      if(storedName) return storedName;
+      var hit = (list||[]).filter(function(d){ return d.idx===storedIdx; })[0];
+      return hit ? hit.name : dflt;
+    }
     var mics = [devRow("toggle_mic_device", null, "System Default", micOn && mid===null && !mname)];
     (S.mics||[]).forEach(function(d){ mics.push(devRow("toggle_mic_device", d.idx, d.name, micOn && isSel(mid, mname, d))); });
     if(gone(mname)) mics.push(goneRow(mname));
@@ -915,7 +1006,9 @@ APP_JS = r"""
     if(S.loopback_available){
       var L = [devRow("toggle_loopback_device", null, "System Default", sysOn && lid===null)];
       (S.loopbacks||[]).forEach(function(d){ L.push(devRow("toggle_loopback_device", d.idx, d.name, sysOn && lid===d.idx)); });
-      loops = '<div class="page"><div class="section-title">System audio</div>'+L.join('')+'</div>';
+      loops = more('dev_sys', 'System audio device', 'The output whose sound is recorded (meetings, videos).',
+        sysOn ? curDev(nameOf(S.loopbacks, lid, "", "System Default")) : '<span class="cur muted">Off</span>',
+        L.join(''));
     }
     // Sounds (moved here from General 2026-09-15): the done-beep output device.
     var beep = cfg("beep_device_index", "off");
@@ -926,121 +1019,122 @@ APP_JS = r"""
     (S.outputs||[]).forEach(function(d){
       beepRows.push(radio("beep","set_beep_device",String(d.idx),"int",d.name, beep===d.idx));
     });
-    var sounds = '<div class="page"><div class="section-title">Sounds</div>'+
-      '<div class="field-label">Done beep</div>'+beepRows.join('')+
-      '<div class="hint">A short beep after a transcription is pasted. None = silent.</div></div>';
+    var beepCur = beep==="off" ? 'None' : (beep===null ? 'System Default' : nameOf(S.outputs, beep, "", "Device "+beep));
     return '<div class="content-head"><h1>Audio</h1></div>'+
-      '<div class="page"><div class="section-title">Recording sources</div>'+
-        sw("Record my microphone", micOn, "toggle_record_mic")+'<br>'+
-        sw("Record system audio", sysOn, "toggle_record_system", !S.loopback_available)+
-        '<div class="hint">Whether each source is captured at all. Which devices are used is set below (Dictation / Meeting microphone).</div>'+
-        '<div class="btnrow">'+btn("Refresh devices","refresh",[],"ghost",true)+'</div>'+
-      '</div>'+
-      '<div class="page"><div class="section-title">Dictation microphone</div>'+mics.join('')+
-        '<div class="hint">The mic used for press-to-talk dictation.</div>'+
-      '</div>'+
-      '<div class="page"><div class="section-title">Meeting microphone</div>'+mmics.join('')+
-        '<div class="hint">The mic that records YOUR side of a meeting (needs "Record my microphone" on above). Pick your call headset here for its close-up quality in meeting transcripts, while the Dictation microphone stays free for dictating mid-meeting. If this device is unplugged, meetings fall back to the dictation mic.</div>'+
-      '</div>'+
-      loops + sounds;
+      grp('Recording sources',
+        srow('Record my microphone', 'Your voice: dictation and your side of a meeting.', swb(micOn, "toggle_record_mic"))+
+        srow('Record system audio', S.loopback_available ? 'What the PC plays: the other side of a meeting.'
+                                                         : 'Not available on this PC (no loopback device).',
+          swb(sysOn, "toggle_record_system", !S.loopback_available)),
+        {action: btn("Refresh devices","refresh",[],"ghost",true)})+
+      grp('Devices',
+        more('dev_mic', 'Dictation microphone', 'The mic used for press-to-talk dictation.',
+          micOn ? curDev(mname || nameOf(S.mics, mid, "", "System Default"), gone(mname)) : '<span class="cur muted">Off</span>',
+          mics.join(''))+
+        more('dev_mtg', 'Meeting microphone', 'Your side of a meeting. Pick your call headset; unplugged = the dictation mic.',
+          curDev(mmname || (mmid===null ? "Same as dictation mic" : nameOf(S.mics, mmid, "", "Device "+mmid)), gone(mmname)),
+          mmics.join('')+
+          '<div class="hint">Needs "Record my microphone" on. The Dictation microphone stays free for dictating mid-meeting.</div>')+
+        loops
+      )+
+      grp('Sounds',
+        more('beep', 'Done beep', 'A short beep after a transcription is pasted.',
+          '<span class="cur rtl-auto" dir="auto">'+esc(beepCur)+'</span>', beepRows.join(''))
+      );
   };
 
   PAGES.models = function(){
     var t = (S.tables||{});
-    // Active-engines summary: for each role, the SELECTED row's readable name,
-    // where it runs (local / cloud / server), and its real availability - all
-    // derived from the existing table data (no invented metrics).
-    function placeOf(row){
-      var w = (row && row.where) || "local";
-      if(w==="cloud") return {cls:"cloud", label:"Cloud"};
-      if(w==="server"||w==="remote") return {cls:"server", label:"Server"};
-      return {cls:"local", label:"Local"};
+    // Each role is ONE row showing the selected model, its provider logo and
+    // where it runs (this replaced the separate engine-summary card,
+    // 2026-10-05); the full list opens in place. A selection that is not
+    // usable (no key / not installed) shows its note in the warning colour -
+    // derived from the row's own enabled/note, never a made-up status.
+    function pick(k, title, desc, rows, method, argKey, argtype){
+      rows = rows || [];
+      var sel = rows.filter(function(r){ return r.checked; })[0];
+      var cur;
+      if(!sel){
+        cur = '<span class="cur warn">Not set</span>';
+      } else {
+        var ready = sel.enabled!==false;
+        cur = '<span class="cur rtl-auto'+(ready?'':' warn')+'" dir="auto" title="'+esc(ready?sel.label:(sel.note||"Needs setup"))+'">'+
+            provIcon(sel.label)+esc(sel.label)+'</span>'+
+          (sel.where ? '<span class="wb '+esc(sel.where)+'">'+(WB_TEXT[sel.where]||esc(sel.where))+'</span>' : '');
+      }
+      var body = rows.map(function(r){
+        return radio(method, method, String(r[argKey]), argtype, r.label, r.checked, r.enabled!==false,
+                     r.note||"", r.where||"", r.wnote||"");
+      }).join('');
+      return more(k, title, desc, cur, body);
     }
-    function engCard(role, rows){
-      var sel = (rows||[]).filter(function(r){ return r.checked; })[0];
-      if(!sel) return '<div class="eng"><div class="eng-role">'+esc(role)+'</div>'+
-        '<div class="eng-name muted">Not set</div></div>';
-      var pl = placeOf(sel);
-      var ready = sel.enabled!==false;
-      var status = ready
-        ? '<span class="status ok"><span class="dot"></span>Ready</span>'
-        : '<span class="status"><span class="dot" style="background:var(--warn)"></span>'+esc(sel.note||"Needs setup")+'</span>';
-      return '<div class="eng"><div class="eng-role">'+esc(role)+'</div>'+
-        '<div class="eng-name rtl-auto" dir="auto">'+esc(sel.label)+'</div>'+
-        '<div class="eng-meta"><span class="place '+pl.cls+'">'+pl.label+'</span>'+status+'</div></div>';
-    }
-    var engineSummary = '<div class="page"><div class="section-title">Active engines</div>'+
-      '<div class="eng-grid">'+
-        engCard("Dictation", t.dictation)+
-        engCard("Meeting transcription", t.meeting)+
-        engCard("Summaries", t.summary)+
-      '</div></div>';
-    function group(title, rows, method, argKey, argtype, slow){
-      var html = '<div class="page"><div class="section-title">'+esc(title)+'</div>';
-      (rows||[]).forEach(function(r){
-        html += radio(method, method, String(r[argKey]), argtype, r.label, r.checked, r.enabled!==false, r.note||"", r.where||"", r.wnote||"");
-      });
-      html += '</div>';
-      return html;
+    // Short segment labels; the full wording stays in the row description.
+    var SHORT = {auto:"Auto", cuda:"GPU", cpu:"CPU", off:"Off (wait)"};
+    function segOf(name, method, rows){
+      return seg(name, method, "str", (rows||[]).map(function(r){
+        return [r.key, SHORT[r.key] || r.label, r.checked, r.enabled!==false];
+      }));
     }
     // Local processing options (moved here from General 2026-09-15): where the
-    // local Whisper model runs (GPU / CPU / auto).
-    var devHtml = '';
+    // local Whisper model runs, and what a busy GPU falls back to.
+    var local = '';
     if((t.device||[]).length){
-      devHtml = '<div class="page"><div class="section-title">Local processing options</div>'+
-        '<div class="field-label">Local Whisper device ('+esc(S.whisper_device_label||"Auto")+')</div>'+
-        '<div class="radio-row">'+t.device.map(function(r){
-          return radio("dev","set_whisper_device",r.key,"str",r.label,r.checked,true,"");
-        }).join('')+'</div>'+
-        '<div class="hint">Where the local Whisper model runs. Auto uses the GPU when available, else the CPU.</div>'+
+      local = grp('Local processing',
+        srow('Local Whisper device ('+esc(S.whisper_device_label||"Auto")+')',
+          'Auto uses the GPU when there is one, else the CPU.', segOf("dev","set_whisper_device",t.device))+
         ((t.gpu_busy||[]).length ?
-          '<div class="field-label">When the GPU is busy, dictate with</div>'+
-          '<div class="radio-row">'+t.gpu_busy.map(function(r){
-            return radio("gpubusy","set_dictation_gpu_busy_cloud",r.key,"str",r.label,r.checked,r.enabled!==false,"");
-          }).join('')+'</div>'+
-          '<div class="hint">If another app keeps the GPU busy, a dictation goes to this cloud service first (then the others that have a key) and Lia tells you.</div>'
-          : '')+
+          srow('When the GPU is busy, dictate with',
+            'If another app holds the GPU, a dictation goes to this service (then the others with a key) and Lia tells you.',
+            segOf("gpubusy","set_dictation_gpu_busy_cloud",t.gpu_busy)) : '')+
         ((t.summary_gpu_busy||[]).length ?
-          '<div class="field-label">When the GPU is busy, summarize meetings and files with</div>'+
-          '<div class="radio-row">'+t.summary_gpu_busy.map(function(r){
-            return radio("sumgpubusy","set_summary_gpu_busy_cloud",r.key,"str",r.label,r.checked,r.enabled!==false,"");
-          }).join('')+'</div>'+
-          '<div class="hint">A local summary (Gemma) that would wait for a busy GPU runs on this cloud service instead (then the others that have a key), and its card says so. The meeting transcript is sent to that service. Off = wait for the GPU. Transcription and speaker diarization always wait for the GPU.</div>'
-          : '')+
-        '</div>';
+          srow('When the GPU is busy, summarize with',
+            'A local summary that would wait runs on this service instead; the transcript is sent to it. Off = wait. Transcription and diarization always wait.',
+            segOf("sumgpubusy","set_summary_gpu_busy_cloud",t.summary_gpu_busy)) : '')
+      );
     }
     return '<div class="content-head"><h1>Models</h1></div>'+
-      engineSummary+
-      group("Dictation model", t.dictation, "set_dictation_model", "idx", "int")+
-      group("Meeting transcription model", t.meeting, "set_meeting_model", "key", "str")+
-      group("Meeting Summary Model", t.summary, "set_summary_model", "model", "str")+
-      group("Transcribe-file model", t.file, "set_file_model", "key", "str")+
-      devHtml;
+      grp('Engines',
+        pick('m_dict', 'Dictation model', 'Press-to-talk dictation.', t.dictation, "set_dictation_model", "idx", "int")+
+        pick('m_meet', 'Meeting transcription model', 'Live meetings.', t.meeting, "set_meeting_model", "key", "str")+
+        pick('m_sum', 'Meeting summary model', 'Writes the summary after a meeting.', t.summary, "set_summary_model", "model", "str")+
+        pick('m_file', 'Transcribe-file model', 'Tray > Transcribe a file.', t.file, "set_file_model", "key", "str")
+      )+
+      local;
   };
 
   PAGES.cleanup = function(){
     var t = (S.tables||{});
-    // Cleanup Off -> no provider/model is used, so grey out that whole section
-    // (dim the card + disable its radios) until a style is picked (Naor's ask).
+    // Cleanup Off -> no provider/model is used, so grey out that whole row
+    // (and disable its radios) until a style is picked (Naor's ask).
     var isOff = (t.cleanup_styles||[]).some(function(r){ return r.checked && r.style==="off"; });
-    var styles = (t.cleanup_styles||[]).map(function(r){
-      // noicon: AI Cleanup rows carry NO provider logo (Naor 2026-09-16 - the
-      // logos live on the Models page; keep Cleanup plain).
-      return radio("cs","set_cleanup_style",r.style,"str",r.label,r.checked,true,"","","",true);
-    }).join('');
+    // "Spoken - remove fillers ..." -> segment "Spoken", the rest describes it
+    var DASH = new RegExp('\\s[-' + String.fromCharCode(8212) + ']\\s');
+    function parts(label){
+      var m = DASH.exec(label||"");
+      return m ? [label.slice(0, m.index), label.slice(m.index + m[0].length)] : [label, ""];
+    }
+    var styles = t.cleanup_styles||[];
+    var cur = styles.filter(function(r){ return r.checked; })[0];
+    var curDesc = cur ? parts(cur.label)[1] : "";
+    // noicon: AI Cleanup rows carry NO provider logo (Naor 2026-09-16 - the
+    // logos live on the Models page; keep Cleanup plain).
+    var styleSeg = seg("cs","set_cleanup_style","str", styles.map(function(r){
+      return [r.style, parts(r.label)[0], r.checked];
+    }));
     var models = (t.cleanup_models||[]);
-    var mhtml;
+    var modelRow;
     if(!models.length){
-      mhtml = '<div class="empty"><div class="big">&#128273;</div><div>No cleanup provider key set</div>'+
-        '<div class="sub">Add an OpenAI, Groq, or Gemini key on the Keys page to enable AI cleanup.</div>'+
-        '<button class="btn" data-page-link="keys">Go to Keys</button></div>';
+      modelRow = srow('Provider and model', 'Add an OpenAI, Groq or Gemini key to enable AI cleanup.',
+        '<span class="cur warn">No key</span><button class="btn" data-page-link="keys">Go to API Keys</button>');
     } else {
-      mhtml = models.map(function(r){
-        return radio("cm","set_cleanup_provider_model",JSON.stringify([r.provider,r.model]),"json",r.label,r.checked,!isOff,"","","",true);
-      }).join('');
-      if(isOff){
-        mhtml = '<div class="hint">Cleanup is Off - pick a style above to choose a provider &amp; model.</div>'+mhtml;
-      }
+      var curModel = models.filter(function(r){ return r.checked; })[0];
+      modelRow = more('cl_model', 'Provider and model',
+        isOff ? 'Cleanup is Off - pick a style above to choose one.' : 'The model that rewrites each dictation.',
+        isOff ? '<span class="cur muted">Off</span>'
+              : '<span class="cur">'+esc(curModel ? curModel.label : (S.cleanup_model_label||"Not set"))+'</span>',
+        models.map(function(r){
+          return radio("cm","set_cleanup_provider_model",JSON.stringify([r.provider,r.model]),"json",r.label,r.checked,!isOff,"","","",true);
+        }).join(''));
     }
     // When cleanup is Off no model runs, so the header must not read as active
     // (a green dot + model name looked like the motor was on - Naor 2026-09-17):
@@ -1049,8 +1143,10 @@ APP_JS = r"""
       ? '<span class="status off"><span class="dot"></span>Off</span>'
       : '<span class="status ok"><span class="dot"></span>'+esc(S.cleanup_model_label||"")+'</span>';
     return '<div class="content-head"><h1>AI Cleanup</h1>'+head+'</div>'+
-      '<div class="page"><div class="section-title">Style</div>'+styles+'</div>'+
-      '<div class="page"'+(isOff?' style="opacity:.55"':'')+'><div class="section-title">Provider &amp; model</div>'+mhtml+'</div>';
+      grp('Cleanup after dictation',
+        srow('Style', curDesc ? esc(curDesc) : 'How the dictated text is polished before it is pasted.', styleSeg)+
+        modelRow
+      );
   };
 
   var KEYCARDS = [
@@ -1072,38 +1168,39 @@ APP_JS = r"""
 
   PAGES.keys = function(){
     var secrets = S.secrets||{}, has = S.has||{}, rejected = S.rejected||{};
-    var cards = KEYCARDS.map(function(c){
+    // One collapsed row per provider: logo + name + what it is for, and the
+    // key's state (set / not set / rejected). The editor opens in place; a
+    // rejected key opens by default so the fix is one paste away.
+    var rows = KEYCARDS.map(function(c){
       var noun = c.noun||"key";
       var bad = has[c.key] && rejected[c.key];
-      var cur = has[c.key] ? '<span class="masked'+(bad?' bad':'')+'">'+esc(secrets[c.key]||"set")+'</span>'
-                           : '<span class="masked empty">not set</span>';
+      var cur = bad ? '<span class="cur err">Rejected</span>'
+              : (has[c.key] ? '<span class="cur ok">Set</span> <span class="masked">'+esc(secrets[c.key]||"")+'</span>'
+                            : '<span class="cur muted">Not set</span>');
       var iid = "in_"+c.svc;
       var bdg = (c.img && c.img.indexOf("data:")===0)
-        ? '<span class="bdg img"><img src="'+c.img+'" alt="'+esc(c.name)+'"></span>'
-        : '<span class="bdg" style="background:'+c.color+'">'+esc(c.badge)+'</span>';
-      return '<div class="credcard">'+
-        '<div class="head">'+bdg+
-        '<div><h3>'+esc(c.name)+'</h3><div class="sub">'+esc(c.sub)+'</div></div></div>'+
-        '<div class="keyline">Current '+esc(noun)+': '+cur+'</div>'+
+        ? '<span class="kbdg img"><img src="'+c.img+'" alt=""></span>'
+        : '<span class="kbdg" style="background:'+c.color+'">'+esc(c.badge)+'</span>';
+      var title = '<span class="kname">'+bdg+'<span>'+esc(c.name)+'</span></span>';
+      var body =
         (bad ? '<div class="keybad">'+esc(c.name)+' rejected this '+esc(noun)+
                ' (revoked, deleted or mistyped). Paste a new one below.</div>' : '')+
-        '<div class="row-inline" style="margin-top:8px">'+
-          '<input type="password" id="'+iid+'" class="mono" placeholder="Enter '+esc(noun)+'…" style="flex:1" value="'+esc(draftOr(iid,""))+'">'+
-          '<button class="btn ghost" data-show="'+iid+'">Show</button></div>'+
-        '<div class="btnrow">'+
+        '<div class="row-inline">'+
+          '<input type="password" id="'+iid+'" class="mono" placeholder="'+(has[c.key]?'Paste a new '+esc(noun)+' to replace it…':'Enter '+esc(noun)+'…')+
+            '" style="flex:1" value="'+esc(draftOr(iid,""))+'">'+
+          '<button class="btn ghost" data-show="'+iid+'">Show</button>'+
           '<button class="btn primary" data-apply-key="'+c.svc+'" data-input="'+iid+'"'+(c.slow?' data-slow="1"':'')+'>'+esc(c.save)+'</button>'+
           '<button class="btn danger" data-call="clear_key" data-args=\''+JSON.stringify([c.svc])+'\'>Clear</button>'+
-          '<span class="grow"></span>'+
-          '<a href="#" data-openurl="'+esc(c.url)+'">Get a '+esc(noun)+' ↗</a>'+
         '</div>'+
-        '<div class="hint" id="st_'+c.svc+'"></div>'+
-      '</div>';
+        '<div class="btnrow" style="margin-top:6px"><span class="hint" id="st_'+c.svc+'" style="margin:0"></span><span class="grow"></span>'+
+          '<a href="#" data-openurl="'+esc(c.url)+'">Get a '+esc(noun)+' ↗</a></div>';
+      return more('key_'+c.svc, title, esc(c.sub), cur, body, bad);
     }).join('');
-    var privacy = '<div class="privacy-note">'+
-      '<span class="pn-ico">&#9888;&#65039;</span>'+
-      '<span>Please note: on <b>free cloud tiers</b>, providers often use the audio and text you send to <b>train their models</b>. Be mindful of the sensitivity of what you dictate or share - avoid confidential information on free plans. Local models (on your own GPU) never leave this machine.</span>'+
-    '</div>';
-    return '<div class="content-head"><h1>API Keys</h1></div><div class="page keys-page">'+privacy+cards+'</div>';
+    return '<div class="content-head"><h1>API Keys</h1></div>'+
+      grp('Providers', rows)+
+      '<div class="privacy-note" style="margin-top:12px"><span class="pn-ico">&#9888;&#65039;</span>'+
+        '<span>On <b>free cloud tiers</b> providers often use what you send to <b>train their models</b>. '+
+        'Avoid confidential material on free plans. Local models never leave this machine.</span></div>';
   };
 
   // ---- Transcription server: choose CLIENT (use a home server) or SERVER
@@ -1116,386 +1213,400 @@ APP_JS = r"""
     var role = sv.role || "";
     if(!role){ role = sv.enabled ? "server" : (cfg("remote_server_url","") ? "client" : ""); }
 
-    function modeCard(r, icon, title, desc){
-      return '<button class="mode-card'+(role===r?' sel':'')+'" data-set-role="'+r+'">'+
-        '<span class="mode-ico">'+icon+'</span>'+
-        '<span class="mode-t">'+esc(title)+'</span>'+
-        '<span class="mode-d">'+esc(desc)+'</span></button>';
+    // Client / Server as a two-button segmented control (the big mode cards
+    // took a third of the screen). Same data-set-role wiring.
+    function roleBtn(r, label){
+      return '<button class="radio'+(role===r?' on':'')+'" data-set-role="'+r+'">'+
+        '<span class="box"></span><span class="txt">'+esc(label)+'</span></button>';
     }
-    var chooser = '<div class="mode-row">'+
-      modeCard("client","&#128421;","Client mode","Use a server: send audio to a transcription server running on another machine (your home GPU).")+
-      modeCard("server","&#128225;","Server mode","Host a server: run one on THIS machine’s GPU so your other devices transcribe against it.")+
-    '</div>';
+    var modeRows =
+      srow('This PC', role==="client" ? 'Uses a transcription server running on another machine (your home GPU).'
+                    : (role==="server" ? 'Hosts a server on this GPU so your other devices transcribe against it.'
+                                       : 'Pick whether this PC uses a server or hosts one.'),
+        '<div class="seg">'+roleBtn("client","Client")+roleBtn("server","Server")+'</div>')+
+      srow('Tailscale', 'Free; puts your PCs on one private network. No router setup, no open ports. Same account on every machine.',
+        '<button class="btn" data-call="open_tailscale" data-args="[]">Download Tailscale</button>');
 
-    // Prominent prerequisite: both machines need Tailscale.
-    var tsBanner = '<div class="ts-banner">'+
-      '<div class="ts-left">'+
-        '<span class="ts-ico">&#128279;</span>'+
-        '<div class="ts-body"><div class="ts-title">First, install Tailscale on both machines</div>'+
-        '<div class="ts-sub">It’s a free app that puts your PCs on one private network so they can reach each other - <b>no router setup, no open ports</b>. Sign in with the <b>same account</b> on the server and every device that connects.</div></div>'+
-      '</div>'+
-      '<button class="btn primary ts-btn" data-call="open_tailscale" data-args="[]">&#11015;&#65039;&nbsp; Download Tailscale</button>'+
-    '</div>';
-
-    // --- CLIENT panel (was Home Server) ---
+    // --- CLIENT (was Home Server) ---
     var url = draftOr("in_remote_url", cfg("remote_server_url",""));
-    var clientPanel =
-      '<div class="srv-panel">'+
-        '<div class="srv-h"><span class="srv-ico" style="background:#0aa37f">&#128421;</span>'+
-          '<div><h3>Connect to a transcription server</h3><div class="sub">Enter the address of the server you run at home (over Tailscale).</div></div></div>'+
-        field("Server URL",'<input type="text" id="in_remote_url" class="mono" placeholder="ws://host:9090" value="'+esc(url)+'">',
-          "host:9090 · ws://host:9090 · wss://your-domain")+
-        field("Access token (optional)",
-          '<input type="password" id="in_remote_tok" class="mono" placeholder="'+
+    var clientGrp = grp('Connection',
+      srow('Server URL', 'host:9090 · ws://host:9090 · wss://your-domain',
+        '<input type="text" id="in_remote_url" class="mono" placeholder="ws://host:9090" style="width:260px" value="'+esc(url)+'">')+
+      srow('Access token', 'Optional. The same value as the server’s token.',
+        '<input type="password" id="in_remote_tok" class="mono" style="width:260px" placeholder="'+
           (has.remote_server_token?"(saved - leave blank to keep)":"none")+'" value="'+esc(draftOr("in_remote_tok",""))+'">')+
-        '<div class="btnrow">'+
-          '<button class="btn primary" data-apply-remote="1" data-slow="1">Save</button>'+
-          '<button class="btn" data-test-remote="1" data-slow="1">Test</button>'+
-          '<button class="btn danger" data-call="clear_key" data-args=\'["remote"]\'>Clear</button>'+
-          '<span class="grow"></span></div>'+
-        '<div class="hint" id="st_remote"></div>'+
-        '<details class="setup-help"><summary>How to set up (Tailscale)</summary><ol>'+
-          '<li>Install <b>Tailscale</b> on both machines from <span class="mono">tailscale.com/download</span> and sign in with the <b>same account</b>.</li>'+
-          '<li>On the server machine, switch to <b>Server mode</b> (the other tab here), turn it on, and note its <span class="mono">ws://…</span> address.</li>'+
-          '<li>Paste that address above, click <b>Test</b>, then <b>Save</b>.</li>'+
-          '<li>On the <b>Models</b> page, pick a <b>Home Server</b> model.</li>'+
-        '</ol><div class="hint">Work PC that blocks Tailscale? Use a Cloudflare tunnel with a <span class="mono">wss://your-domain</span> URL + token.</div></details>'+
-      '</div>';
+      srow('<span class="hint" id="st_remote" style="margin:0"></span>', '',
+        '<button class="btn primary" data-apply-remote="1" data-slow="1">Save</button>'+
+        '<button class="btn" data-test-remote="1" data-slow="1">Test</button>'+
+        '<button class="btn danger" data-call="clear_key" data-args=\'["remote"]\'>Clear</button>')+
+      '<div class="gbody"><details class="setup-help" style="margin:0;border:0;padding:0"><summary>How to set up (Tailscale)</summary><ol>'+
+        '<li>Install <b>Tailscale</b> on both machines from <span class="mono">tailscale.com/download</span> and sign in with the <b>same account</b>.</li>'+
+        '<li>On the server machine, set <b>This PC</b> to <b>Server</b>, turn it on, and note its <span class="mono">ws://…</span> address.</li>'+
+        '<li>Paste that address above, click <b>Test</b>, then <b>Save</b>.</li>'+
+        '<li>On the <b>Models</b> page, pick a <b>Home Server</b> model.</li>'+
+      '</ol><div class="hint">Work PC that blocks Tailscale? Use a Cloudflare tunnel with a <span class="mono">wss://your-domain</span> URL + token.</div></details></div>');
 
-    // --- SERVER panel (host) with a GPU check + a graphical run control ---
+    // --- SERVER (host) ---
     var verdict = gpu.verdict || "none";
+    var canServe = (verdict !== "none");
     var gpuTitle = gpu.has_cuda
       ? (esc(gpu.name || "CUDA GPU") + (gpu.vram_gb ? (' · ' + gpu.vram_gb + ' GB VRAM') : ''))
       : "No dedicated GPU detected";
-    var gpuCard = '<div class="gpu-card '+verdict+'">'+
-      '<div class="gpu-h"><span class="gpu-dot"></span><span class="gpu-name">'+gpuTitle+'</span>'+
-        '<span class="gpu-tag '+verdict+'">'+({good:"Ready",marginal:"Marginal",none:"Not suitable"}[verdict])+'</span></div>'+
-      '<div class="gpu-note">'+esc(gpu.note||"")+'</div></div>';
-    var canServe = (verdict !== "none");
-    var runTitle = sv.running ? "Server is running" : (sv.enabled ? "Starting…" : "Server is off");
+    var runState = sv.running ? "on" : (sv.enabled ? "starting" : "off");
+    var runTitle = sv.running ? "Running" : (sv.enabled ? "Starting…" : "Off");
     var runSub = sv.running ? ("Listening on port " + svPort)
                             : (canServe ? "Turn on to host on this GPU" : "Needs a dedicated GPU");
-    var runState = sv.running ? "on" : (sv.enabled ? "starting" : "off");
-    var runControl = '<div class="run-box '+runState+(canServe?'':' locked')+'">'+
-      '<span class="run-led"></span>'+
-      '<div class="run-txt"><div class="run-title">'+runTitle+'</div><div class="run-sub">'+runSub+'</div></div>'+
-      '<label class="big-switch'+(canServe?'':' disabled')+'" title="'+(canServe?'':'No suitable GPU')+'">'+
-        '<input type="checkbox" data-toggle="toggle_serve"'+(sv.enabled?' checked':'')+(canServe?'':' disabled')+'>'+
-        '<span class="bs-track"></span><span class="bs-knob"></span></label>'+
-    '</div>';
-    // Which model the server loads. Add entries here to support more languages.
     var svModel = sv.model || "";
+    // Which model the server loads. Add entries here to support more languages.
     var SERVE_MODELS = [
-      {id:"", label:"Hebrew - ivrit.ai turbo", note:"Specialised for Hebrew (default)"},
-      {id:"large-v3-turbo", label:"Multilingual - Whisper large-v3-turbo", note:"All languages, general purpose"}
+      {id:"", label:"Hebrew", note:"ivrit.ai turbo, specialised for Hebrew (default)"},
+      {id:"large-v3-turbo", label:"Multilingual", note:"Whisper large-v3-turbo, all languages"}
     ];
-    var modelPicker = '<div class="section-title">Server model</div>'+
-      SERVE_MODELS.map(function(m){
-        return radio("svmodel","set_serve_model",m.id,"str",m.label,svModel===m.id,canServe,m.note);
-      }).join('')+
-      '<div class="hint">Which model runs on the server. Hebrew is specialised (it garbles other languages); the multilingual model handles any language the client sends. Changing this reloads the server.</div>';
+    var svSel = SERVE_MODELS.filter(function(m){ return m.id===svModel; })[0] || SERVE_MODELS[0];
+    var HOSTS = [
+      {id:"auto", short:"Tailscale, else this PC", label:"Tailscale, else this PC (recommended)", note:"Reachable by your other devices over Tailscale; this PC only when Tailscale is off."},
+      {id:"loopback", short:"This PC only", label:"This PC only", note:"Nothing on the network can reach it."},
+      {id:"all", short:"All networks", label:"All networks (needs a token)", note:"Every interface, including the LAN. Requires an access token."}
+    ];
+    var hostCur = sv.host || "auto";
+    var hostSel = HOSTS.filter(function(h){ return h.id===hostCur; })[0] || HOSTS[0];
+    var tokReq = (hostCur==="all" || sv.insecure);
     var urlLine = sv.ws_url
-      ? ('Other devices point their <b>Server URL</b> (the Use-a-server tab) here:<br><span class="mono copyable">' + esc(sv.ws_url) + '</span>')
-      : ('Install <a href="https://tailscale.com/download" target="_blank" rel="noopener">Tailscale</a> and sign in (same account) on both machines to get a private address, then use <span class="mono">ws://&lt;this-ip&gt;:' + svPort + '</span>.');
-    var serverPanel =
-      '<div class="srv-panel">'+
-        '<div class="srv-h"><span class="srv-ico" style="background:#7c5cff">&#128225;</span>'+
-          '<div><h3>Host a transcription server</h3><div class="sub">Runs a Whisper model on this GPU. No Docker, no extra install.</div></div></div>'+
-        gpuCard + runControl + modelPicker +
-        '<div class="section-title">Listen on</div>'+
-        radio("svhost","set_serve_host","auto","str","Tailscale, else this PC (recommended)", (sv.host||"auto")==="auto", canServe, "Reachable by your other devices over Tailscale; falls back to this-PC-only if Tailscale is off.")+
-        radio("svhost","set_serve_host","loopback","str","This PC only", (sv.host)==="loopback", canServe, "Nothing on the network can reach it.")+
-        radio("svhost","set_serve_host","all","str","All networks (needs a token)", (sv.host)==="all", canServe, "Every interface, including the LAN. Requires an access token.")+
-        '<div class="hint">Now bound to: <b>'+esc(sv.host_label||"")+'</b>.'+(sv.insecure?' <b style="color:#d08770">Set a token below - the server will refuse to start on a network interface without one.</b>':'')+'</div>'+
-        field("Port",'<input type="number" id="in_serve_port" class="mono" value="'+svPort+'" style="max-width:120px"'+(canServe?'':' disabled')+'>',"default 9090")+
-        field("Access token"+(((sv.host)==="all"||sv.insecure)?" (required)":" (optional)"),
-          '<input type="password" id="in_serve_tok" class="mono" placeholder="'+
+      ? '<span class="mono copyable">' + esc(sv.ws_url) + '</span>'
+      : '<span class="hint" style="margin:0">Install Tailscale on both machines, then use <span class="mono">ws://&lt;this-ip&gt;:' + svPort + '</span></span>';
+    var serverGrp = grp('Server',
+      srow('<span class="run-led-sm '+runState+'"></span>'+runTitle, runSub,
+        '<label class="switch bare'+(canServe?'':' disabled')+'" title="'+(canServe?'':'No suitable GPU')+'">'+
+          '<input type="checkbox" data-toggle="toggle_serve"'+(sv.enabled?' checked':'')+(canServe?'':' disabled')+'><span class="track"></span></label>')+
+      srow('GPU', esc(gpu.note||"") || gpuTitle,
+        '<span class="gpu-tag '+verdict+'">'+({good:"Ready",marginal:"Marginal",none:"Not suitable"}[verdict])+'</span>')+
+      srow('Model', esc(svSel.note)+'. Changing it reloads the server.',
+        '<div class="seg">'+SERVE_MODELS.map(function(m){
+          return radio("svmodel","set_serve_model",m.id,"str",m.label,svModel===m.id,canServe,"","","",true);
+        }).join('')+'</div>')+
+      more('svhost', 'Listen on', esc(hostSel.note)+' Now bound to: <b>'+esc(sv.host_label||"")+'</b>.',
+        '<span class="cur">'+esc(hostSel.short)+'</span>',
+        HOSTS.map(function(h){
+          return radio("svhost","set_serve_host",h.id,"str",h.label,hostCur===h.id,canServe,h.note);
+        }).join('')+
+        (sv.insecure ? '<div class="hint" style="color:var(--warn)"><b>Set a token below - the server will refuse to start on a network interface without one.</b></div>' : ''))+
+      srow('Port', 'Default 9090.',
+        '<input type="number" id="in_serve_port" class="mono" value="'+svPort+'" style="width:110px"'+(canServe?'':' disabled')+'>')+
+      srow('Access token'+(tokReq?' (required)':''), 'Type any secret you like - it does not have to be the Generated one. Put the same value on the client.',
+        '<input type="password" id="in_serve_tok" class="mono" style="width:150px" placeholder="'+
           (sv.has_token?"(saved - leave blank to keep)":"none")+'"'+(canServe?'':' disabled')+'>'+
-          ' <button class="btn" data-gen-token="1" data-slow="1"'+(canServe?'':' disabled')+'>Generate</button>'+
-          (sv.has_token?' <button class="btn" data-copy-token="1"'+(canServe?'':' disabled')+'>Copy</button>':''))+
-        '<div class="hint">Type any secret you like (a memorable passphrase is fine) and click <b>Save port / token</b> - it does not have to be the Generated one. <b>Generate</b> makes a strong random token and copies it to the clipboard. Put the <b>same</b> value in the client\'s <b>Access token</b> on your other device.</div>'+
-        '<div class="btnrow"><button class="btn" data-apply-serve="1" data-slow="1"'+(canServe?'':' disabled')+'>Save port / token</button><span class="grow"></span></div>'+
-        sw("Keep running after reboot (start at Windows logon)", !!sv.autostart, "toggle_serve_autostart", !canServe)+
-        '<div class="hint">'+urlLine+'</div>'+
-        '<details class="setup-help"><summary>How another device connects</summary><ol>'+
-          '<li>Turn the server on above - it loads a local Hebrew model on this GPU.</li>'+
-          '<li>Install <b>Tailscale</b> on both machines, same account.</li>'+
-          '<li>On the other device: <b>Transcription server → Client mode</b>, paste the URL above, <b>Test</b>, <b>Save</b>, then pick a <b>Home Server</b> model.</li>'+
-        '</ol><div class="hint">Hebrew only (one model); English falls back to the client’s own cloud/local.</div></details>'+
-        '<div class="hint" id="st_serve"></div>'+
-      '</div>';
+        '<button class="btn" data-gen-token="1" data-slow="1"'+(canServe?'':' disabled')+'>Generate</button>'+
+        (sv.has_token?'<button class="btn" data-copy-token="1"'+(canServe?'':' disabled')+'>Copy</button>':''))+
+      srow('<span class="hint" id="st_serve" style="margin:0"></span>', '',
+        '<button class="btn primary" data-apply-serve="1" data-slow="1"'+(canServe?'':' disabled')+'>Save port and token</button>')+
+      srow('Start at Windows logon', 'Keeps the server running after a reboot.',
+        swb(!!sv.autostart, "toggle_serve_autostart", !canServe))+
+      srow('Address for other devices', 'Their Transcription server page > Client > Server URL.', urlLine)+
+      '<div class="gbody"><details class="setup-help" style="margin:0;border:0;padding:0"><summary>How another device connects</summary><ol>'+
+        '<li>Turn the server on above - it loads a local model on this GPU.</li>'+
+        '<li>Install <b>Tailscale</b> on both machines, same account.</li>'+
+        '<li>On the other device: <b>Transcription server → Client</b>, paste the address above, <b>Test</b>, <b>Save</b>, then pick a <b>Home Server</b> model.</li>'+
+      '</ol><div class="hint">One model per server; a language it does not cover falls back to the client’s own cloud / local model.</div></details></div>');
 
-    var body = chooser + tsBanner;
-    if(role==="client") body += clientPanel;
-    else if(role==="server") body += serverPanel;
-    else body += '<div class="empty" style="padding:26px 8px"><div class="sub">Pick whether this device <b>uses</b> a server or <b>hosts</b> one.</div></div>';
-
-    return '<div class="content-head"><h1>Transcription server</h1>'+
-      '<div class="sub">Run Lia’s Hebrew transcription on one machine’s GPU and reach it from your others - no Docker.</div></div>'+
-      '<div class="page">'+body+'</div>';
+    var body = grp('Mode', modeRows);
+    if(role==="client") body += clientGrp;
+    else if(role==="server") body += serverGrp;
+    return '<div class="content-head"><h1>Transcription server</h1></div>'+
+      '<div class="hint" style="margin:-2px 4px 4px">Run transcription on one machine’s GPU and reach it from your others - no Docker.</div>'+
+      body;
   };
 
   PAGES.meetings = function(){
     var hk = S.hotkeys||{};
-    function actrow(iconName, label, method, hkstr, beta){
-      return '<div class="rowbtn" data-call="'+method+'" data-args="[]">'+
-        '<span class="ic">'+RK.icon(iconName,{size:18})+'</span><span class="grow">'+esc(label)+'</span>'+
-        (beta?'<span class="wb beta">BETA</span>':'')+
-        (hkstr?'<span class="hk">'+esc(hkstr)+'</span>':'')+'</div>';
-    }
-    var live = S.live_transcript_available
-      ? actrow('file','Open live transcript','open_live_transcript','')
-      : '<div class="rowbtn disabledrow"><span class="ic">'+RK.icon('file',{size:18})+'</span><span class="grow">Live transcript (none active)</span></div>';
     var mtgChunk = parseInt(cfg("meeting_chunk_seconds",15),10);
     var mtgOpts = [8,10,15,20,30,45];
     if(mtgOpts.indexOf(mtgChunk)<0 && mtgChunk>=5 && mtgChunk<=120){
       mtgOpts = mtgOpts.concat([mtgChunk]).sort(function(a,b){return a-b;});
     }
+    var live = S.live_transcript_available
+      ? arow('file','Open live transcript','open_live_transcript','')
+      : '<div class="arow disabledrow"><span class="ic">'+RK.icon('file',{size:18})+'</span><span class="grow">Live transcript (no meeting running)</span></div>';
+    // Summary template (cloud only): the description follows the chosen template.
+    var TPL = S.summary_templates||[];
+    var tplCur = cfg("summary_template","technical");
+    var tplSel = TPL.filter(function(t){ return t.id===tplCur; })[0];
+    var TPL_SHORT = {technical:"Technical", general:"General", minutes:"Minutes"};
+    var tplSeg = seg("stpl","set_summary_template","str", TPL.map(function(t){
+      return [t.id, TPL_SHORT[t.id] || t.name_en, t.id===tplCur];
+    }));
+    // the audio safety net: three rarely changed switches, collapsed with a count
+    var SAFE = ["keep_meeting_tracks", "meeting_backup_mic", "meeting_mic_auto_fallback"];
+    var safeOn = SAFE.filter(function(k){ return !!cfg(k, true); }).length;
+    // Summary language: follow / always X (only languages that can be summarized)
+    var slang = cfg("summary_language","primary");
+    var slangRows = [["primary","Follow primary language"],["auto","Follow the transcript"]].concat(
+      ((S.languages&&S.languages.rows)||[]).filter(function(r){ return r.summary_ok; }).map(function(r){
+        return [r.id, "Always "+r.name_en];
+      }));
+    var slangCur = slangRows.filter(function(r){ return r[0]===slang; })[0];
+    var profiles = ((S.home||{}).speaker_profiles)||[];
     return '<div class="content-head"><h1>Meetings</h1></div>'+
-      '<div class="page">'+
-        sw("Auto-detect Zoom / Teams / Meet calls", !!cfg("auto_detect_meetings",false), "toggle_auto_detect_meetings")+'<br>'+
-        sw("Keep raw per-source tracks (mic / system / backup) next to the mixdown", !!cfg("keep_meeting_tracks",true), "toggle_keep_meeting_tracks")+'<br>'+
-        sw("Backup mic: also record the dictation mic when the meeting mic differs", !!cfg("meeting_backup_mic",true), "toggle_meeting_backup_mic")+'<br>'+
-        sw("Auto-switch to the dictation mic when the meeting mic is silent but the backup hears you", !!cfg("meeting_mic_auto_fallback",true), "toggle_meeting_mic_auto_fallback")+
-        '<div class="hint">Safety net for meeting transcripts: the mixdown is kept as before; the raw tracks let you re-transcribe one side alone and catch a wrong meeting mic. Same retention as the meeting audio.</div>'+
-      '</div>'+
-      '<div class="page"><div class="section-title">Live transcript</div>'+
-        field("Update interval",
-          '<select data-select="set_meeting_chunk_seconds" style="max-width:220px">'+
+      grp('Recording',
+        srow('Auto-detect Zoom / Teams / Meet calls', 'Offers to record when a call starts.',
+          swb(!!cfg("auto_detect_meetings",false), "toggle_auto_detect_meetings"))+
+        srow('Live transcript updates every',
+          'Lower = snappier, more transcription calls. A running meeting keeps its interval until it ends.',
+          '<select data-select="set_meeting_chunk_seconds" style="max-width:200px">'+
             mtgOpts.map(function(s){
-              return '<option value="'+s+'"'+(mtgChunk===s?' selected':'')+'>every '+s+' seconds'+(s===15?' (default)':'')+'</option>';
-            }).join('')+
-          '</select>',
-          "How often a meeting transcribes a chunk, so the live transcript updates roughly this often. Lower = snappier realtime, more transcription calls; higher = more context per chunk. A meeting already running keeps its interval until it ends.")+
-        '<div style="height:6px"></div>'+live+
+              return '<option value="'+s+'"'+(mtgChunk===s?' selected':'')+'>'+s+' seconds'+(s===15?' (default)':'')+'</option>';
+            }).join('')+'</select>')+
+        live
+      )+
+      grp('Audio safety net',
+        more('safety', 'Raw tracks, backup mic, auto-switch', 'Extra recordings that rescue a meeting when a mic fails.',
+          '<span class="cur'+(safeOn===SAFE.length?'':' warn')+'">'+safeOn+' of '+SAFE.length+' on</span>',
+          srow('Keep raw per-source tracks', 'Mic / system / backup next to the mixdown, to re-transcribe one side alone.',
+            swb(!!cfg("keep_meeting_tracks",true), "toggle_keep_meeting_tracks"))+
+          srow('Backup mic', 'Also record the dictation mic when the meeting mic is a different device.',
+            swb(!!cfg("meeting_backup_mic",true), "toggle_meeting_backup_mic"))+
+          srow('Auto-switch to the dictation mic', 'When the meeting mic is silent but the backup hears you.',
+            swb(!!cfg("meeting_mic_auto_fallback",true), "toggle_meeting_mic_auto_fallback"))+
+          '<div class="hint">The mixdown is always kept; the tracks follow the same retention as the meeting audio.</div>')
+      )+
+      grp('Summaries',
+        srow('Template', tplSel ? esc(tplSel.desc_en) : 'How the summary is laid out.', tplSeg)+
+        more('sum_lang', 'Summary language', 'The language summaries are written in, whatever was spoken.',
+          '<span class="cur">'+esc(slangCur ? slangCur[1] : slang)+'</span>',
+          slangRows.map(function(r){
+            return radio("slang","set_summary_language",r[0],"str",r[1], slang===r[0]);
+          }).join(''))+
+        srow('Parity rules + free code cleanups', 'Dedup, tone, owners. Still one cloud call; the cleanups are local code.',
+          swb(!!cfg("summary_cloud_parity",true), "toggle_summary_cloud_parity")),
+        {sub: 'OpenAI / Gemini only - the local Gemma summary is tuned on Advanced'})+
+      grp('Speakers',
+        srow('Your name', 'Written for your own turns and biased into transcription. Empty = your Windows name.',
+          '<input type="text" id="selfName" dir="auto" style="width:200px" placeholder="e.g. נאור / Naor" value="'+esc(draftOr("selfName", cfg("speaker_self_name","")))+'">'+
+          '<button class="btn primary" data-save-selfname="1">Save</button>')+
+        (profiles.length ?
+          more('voices', 'Known voices', 'Learned when you named speakers (local detection). Forget a wrong one.',
+            '<span class="cur">'+profiles.length+' voice'+(profiles.length===1?'':'s')+'</span>',
+            profiles.map(function(p){
+              return '<div class="row" style="display:flex;align-items:center;gap:10px;padding:6px 0">'+
+                '<span dir="auto" style="flex:1">'+esc(p.name)+'</span>'+
+                '<span class="hint" style="margin:0">'+esc(String(p.count))+' sample'+(p.count===1?'':'s')+(p.updated?' · '+esc(p.updated):'')+'</span>'+
+                '<button class="btn" data-call="delete_speaker_profile" data-args=\''+esc(JSON.stringify([p.name]))+'\'>Forget</button>'+
+              '</div>';
+            }).join('')) : '')
+      )+
+      // Tools stay on this page as a compact grid (Naor 2026-10-05).
+      '<div class="grp-h">Tools</div><div class="grp agrid">'+
+        arow('tasks','Action items (from meetings)…','open_action_items',hk.actions)+
+        arow('folder','Open meeting folder','open_meetings_folder','')+
+        arow('edit','Edit a meeting summary…','edit_meeting_summary','')+
+        arow('meetings','Rename speakers in a meeting…','rename_speakers_old','')+
+        arow('mic','Transcribe a file…','transcribe_file','')+
+        arow('summarize','Summarize a meeting file…','summarize_text_dialog','')+
       '</div>'+
-      '<div class="page"><div class="section-title">Meeting summaries (OpenAI / Gemini)</div>'+
-        '<div class="hint"><b>These affect OpenAI / Gemini meeting summaries only</b> - Lia makes '+
-        '<b>a single cloud call</b> per summary. The local Gemma summary uses the built-in technical '+
-        'pipeline (tune it on the Advanced page).</div>'+
-        '<div class="subhead">Template</div>'+
-        '<div class="radio-row">'+
-        (S.summary_templates||[]).map(function(tpl){
-          return radio("stpl","set_summary_template",tpl.id,"str",tpl.name_en,
-                       cfg("summary_template","technical")===tpl.id, true, tpl.desc_en);
-        }).join('')+
+      grp('Experimental (Beta)',
+        '<div class="agrid">'+
+          arow('ask','Ask your meetings…','open_meetings_ask',hk.ask,true)+
+          arow('mic','Voice ask (speak, press again)','voice_ask_now',hk.voice_ask,true)+
+          arow('email','Search your email…','open_email_search',hk.email,true)+
         '</div>'+
-        '<div style="height:16px"></div>'+
-        sw("Parity rules + free code cleanups (dedup, tone, owners)", !!cfg("summary_cloud_parity",true), "toggle_summary_cloud_parity")+
-        '<div class="hint">Still one cloud call: the parity rules ride the same prompt and the cleanups are local code (no extra request).</div>'+
-        '<div class="subhead">Summary language</div>'+
-        '<div class="radio-row">'+
-        radio("slang","set_summary_language","primary","str","Follow primary language", cfg("summary_language","primary")==="primary")+
-        radio("slang","set_summary_language","auto","str","Follow the transcript", cfg("summary_language")==="auto")+
-        (((S.languages&&S.languages.rows)||[]).filter(function(r){return r.summary_ok;}).map(function(r){
-          return radio("slang","set_summary_language",r.id,"str","Always "+r.name_en, cfg("summary_language")===r.id);
-        }).join(''))+
-        '</div>'+
-        '<div class="hint">The language meeting and text summaries are written in, regardless of the language spoken.</div>'+
-      '</div>'+
-      '<div class="page"><div class="section-title">Speaker names</div>'+
-        field("Your name",
-          '<div class="btnrow" style="margin-top:0">'+
-            '<input id="selfName" dir="auto" style="max-width:260px" placeholder="e.g. נאור / Naor" value="'+esc(draftOr("selfName", cfg("speaker_self_name","")))+'">'+
-            '<button class="btn primary" data-save-selfname="1">Save</button>'+
-          '</div>',
-          "Written for your own turns in diarized transcripts and summaries, and biased into transcription so it is not misheard. Empty = your Windows account name.")+
-      '</div>'+
-      ((((S.home||{}).speaker_profiles)||[]).length ?
-      '<div class="page"><div class="section-title">Known voices</div>'+
-        '<div class="hint">Voices Lia learned when you named speakers (local speaker detection only). A wrong entry makes matching hesitate - forget it here.</div>'+
-        (((S.home||{}).speaker_profiles)||[]).map(function(p){
-          return '<div class="row" style="display:flex;align-items:center;gap:10px;padding:6px 0">'+
-            '<span dir="auto" style="flex:1">'+esc(p.name)+'</span>'+
-            '<span class="hint" style="margin:0">'+esc(String(p.count))+' sample'+(p.count===1?'':'s')+(p.updated?' · '+esc(p.updated):'')+'</span>'+
-            '<button class="btn" data-call="delete_speaker_profile" data-args=\''+esc(JSON.stringify([p.name]))+'\'>Forget</button>'+
-          '</div>';
-        }).join('')+
-      '</div>' : '')+
-      '<div class="page"><div class="section-title">Tools</div>'+
-        actrow('tasks','Action items (from meetings)…','open_action_items',hk.actions)+
-        actrow('folder','Open meeting folder','open_meetings_folder','')+
-        actrow('edit','Edit a meeting summary…','edit_meeting_summary','')+
-        actrow('meetings','Rename speakers in a meeting…','rename_speakers_old','')+
-        actrow('mic','Transcribe a file…','transcribe_file','')+
-        actrow('summarize','Summarize a meeting file…','summarize_text_dialog','')+
-      '</div>'+
-      '<div class="page"><div class="section-title">Experimental (Beta) - requires a 24 GB VRAM GPU</div>'+
-        '<div class="hint">These run local LLM / embedding models on your GPU (best on a 24 GB card such as an RTX 3090 / 4090) and work without any cloud key.</div>'+
-        actrow('ask','Ask your meetings…','open_meetings_ask',hk.ask,true)+
-        actrow('mic','Voice ask (speak a question, press again to answer)','voice_ask_now',hk.voice_ask,true)+
-        field("Voice ask answer goes to",
-          '<div class="radio-row">'+
-          radio("vao","set_voice_ask_output","card","str","Answer card (always visible)", cfg("voice_ask_output","card")==="card")+
-          radio("vao","set_voice_ask_output","paste","str","Paste at cursor", cfg("voice_ask_output")==="paste")+
-          radio("vao","set_voice_ask_output","both","str","Both", cfg("voice_ask_output")==="both")+
-          '</div>')+
-        actrow('email','Search your email…','open_email_search',hk.email,true)+
-      '</div>';
+        srow('Voice ask answer goes to', '',
+          seg("vao","set_voice_ask_output","str",[["card","Answer card",cfg("voice_ask_output","card")==="card"],
+                                                   ["paste","Paste at cursor",cfg("voice_ask_output")==="paste"],
+                                                   ["both","Both",cfg("voice_ask_output")==="both"]])),
+        {sub: 'local models, needs a 24 GB VRAM GPU'});
   };
 
   PAGES.vocab = function(){
+    // Every list here loads when its row opens (ONOPEN below); a closed row
+    // shows the count from the state.
+    var manual = String(cfg("custom_vocabulary","")||"").split(/[,\n]/).filter(function(x){ return x.trim(); }).length;
     return '<div class="content-head"><h1>Vocabulary</h1></div>'+
-      '<div class="page"><div class="section-title">Manual terms</div>'+
-        '<div class="hint">Comma- or newline-separated terms the transcriber should prefer.</div>'+
-        '<textarea id="vocabText" class="rtl-auto" dir="auto" style="min-height:120px">'+esc(draftOr("vocabText", cfg("custom_vocabulary","")))+'</textarea>'+
-        '<div class="btnrow"><button class="btn primary" data-save-vocab="1">Save terms</button>'+
-        '<button class="btn ghost" data-reset-vocab="1">Reset to default terms</button>'+
-        sw("Auto-learn new terms from meetings", !!cfg("vocab_autolearn",true), "toggle_vocab_autolearn")+'</div>'+
-      '</div>'+
-      '<div class="page"><div class="section-title">Suggestions <span class="badge soft">'+(S.vocab_pending||0)+'</span></div>'+
-        '<div class="btnrow">'+btn("Load suggestions","__load_pending",[],"")+
-        '<button class="btn ghost" data-vocab-apply="1">Apply checked / reject rest</button></div>'+
-        '<div id="pendingList"></div></div>'+
-      '<div class="page"><div class="section-title">Learned terms</div>'+
-        '<div class="btnrow">'+btn("Load learned","__load_learned",[],"")+
-        '<button class="btn danger" data-vocab-remove="1">Remove checked</button></div>'+
-        '<div id="learnedList"></div></div>'+
-      '<div class="page"><div class="section-title">Corrections (wrong &#8594; right)</div>'+
-        '<div class="hint">&#215;N = times applied in live dictation/meetings. hits = matches across your saved archive (press Scan). "unused" = zero of both &#8594; safe to prune.</div>'+
-        '<div class="btnrow">'+btn("Load corrections","__load_corr",[],"")+
-          btn("Scan archive","__scan_corr",[],"ghost",true)+
-          '<button class="btn" data-corr-unused="1">Select unused</button>'+
-          '<button class="btn danger" data-corr-remove="1">Remove checked</button></div>'+
-        '<div class="btnrow">'+btn("Harvest new meetings now","harvest_corrections_now",[],"ghost",true)+
-          sw("Auto-harvest corrections from new meetings (local)", !!cfg("corrections_autoharvest",true), "toggle_corrections_autoharvest")+'</div>'+
-        '<div id="corrList"></div>'+
-        '<div class="row-inline" style="margin-top:8px">'+
-          '<input type="text" id="corrWrong" class="mono" placeholder="Wrong" style="max-width:180px">'+
-          '<span>&#8594;</span>'+
-          '<input type="text" id="corrRight" class="mono" placeholder="Right" style="max-width:180px">'+
-          '<button class="btn" data-add-corr="1">Add</button></div>'+
-      '</div>'+
-      lexiconPanel()+
-      '<div class="page"><div class="btnrow">'+btn("Scan meetings for new terms","vocab_rebuild",[],"ghost",true)+'</div></div>';
+      grp('Terms',
+        more('v_manual', 'Manual terms', 'Terms the transcriber should prefer, comma- or newline-separated.',
+          '<span class="cur">'+manual+' term'+(manual===1?'':'s')+'</span>',
+          '<textarea id="vocabText" class="rtl-auto" dir="auto" style="min-height:120px">'+esc(draftOr("vocabText", cfg("custom_vocabulary","")))+'</textarea>'+
+          '<div class="btnrow"><button class="btn primary" data-save-vocab="1">Save terms</button>'+
+          '<button class="btn ghost" data-reset-vocab="1">Reset to default terms</button></div>')+
+        srow('Auto-learn new terms from meetings', 'New terms found in your meetings are suggested below.',
+          swb(!!cfg("vocab_autolearn",true), "toggle_vocab_autolearn"))+
+        srow('Scan meetings for new terms', 'Runs that search over all your saved meetings now.',
+          btn("Scan now","vocab_rebuild",[],"ghost",true))
+      )+
+      grp('Learned from meetings',
+        more('v_pending', 'Suggestions',
+          '<b>Tick</b> a term spelled right, <b>type the right spelling</b> if Lia heard it wrong, or leave it. Untouched ones stay.',
+          '<span class="cur"><span class="badge soft" id="pendingBadge">'+(S.vocab_pending||0)+'</span> waiting</span>',
+          '<div class="btnrow" style="margin-top:0"><button class="btn primary" data-vocab-apply="1">Save choices</button>'+
+          '<button class="btn ghost" data-vocab-drop-rest="1">Drop the untouched ones</button></div>'+
+          '<div id="pendingList"></div>'+
+          '<details class="setup-help" data-k="v_dropped"'+opn("v_dropped")+'><summary>Dropped suggestions</summary><div id="droppedList"></div></details>')+
+        more('v_learned', 'Learned terms',
+          'English terms from your meetings, given to the transcriber as hints. Common words take room from rarer ones.',
+          '<span class="cur"><span class="badge soft" id="learnedBadge">'+(S.vocab_learned_count!=null?S.vocab_learned_count:'')+'</span> terms</span>',
+          '<div id="learnedTools" class="vtools" hidden>'+
+            '<input type="text" id="learnedFilter" placeholder="Filter…" autocomplete="off" spellcheck="false">'+
+            '<select id="learnedSort"><option value="used">Most used</option><option value="least">Least used</option><option value="az">A-Z</option></select>'+
+            '<button class="btn ghost sm" data-learned-tool="shown">Check all shown</button>'+
+            '<button class="btn ghost sm" data-learned-tool="generic">Check common words</button>'+
+            '<button class="btn ghost sm" data-learned-tool="clear">Clear checks</button>'+
+            '<button class="btn danger sm" data-vocab-remove="1">Remove checked</button>'+
+            '<span class="hint" id="learnedCount"></span>'+
+          '</div>'+
+          '<div class="hint" style="margin:0 0 6px">"used" = times the term showed up in your transcripts since it was learned.</div>'+
+          '<div id="learnedList" class="vgrid"></div>')
+      )+
+      grp('Corrections',
+        more('v_corr', 'Corrections (wrong &#8594; right)',
+          '&#215;N = applied live. hits = matches in your saved archive (Scan). "unused" = zero of both, safe to prune.',
+          '<span class="cur">'+(S.corrections_count!=null?S.corrections_count+' corrections':'')+'</span>',
+          '<div class="btnrow" style="margin-top:0">'+btn("Scan archive","__scan_corr",[],"ghost",true)+
+            '<button class="btn" data-corr-unused="1">Select unused</button>'+
+            '<button class="btn danger" data-corr-remove="1">Remove checked</button></div>'+
+          '<div id="corrList"></div>'+
+          '<div class="row-inline" style="margin-top:8px">'+
+            '<input type="text" id="corrWrong" class="mono" placeholder="Wrong" style="max-width:180px">'+
+            '<span>&#8594;</span>'+
+            '<input type="text" id="corrRight" class="mono" placeholder="Right" style="max-width:180px">'+
+            '<button class="btn" data-add-corr="1">Add</button></div>')+
+        srow('Auto-harvest corrections from new meetings', 'Local: takes the fixes a meeting summary proposed.',
+          swb(!!cfg("corrections_autoharvest",true), "toggle_corrections_autoharvest"))+
+        srow('Harvest new meetings now', '', btn("Harvest now","harvest_corrections_now",[],"ghost",true))
+      )+
+      lexiconPanel();
   };
 
   function lexiconPanel(){
     var lx = S.lexicon||{};
     var status = lx.installed
-      ? (lx.loaded ? ('Installed &amp; active - '+(lx.words||0).toLocaleString()+' words')
-                   : ('Installed ('+(lx.size_mb||0)+' MB) - enable the fix to load it'))
+      ? (lx.loaded ? ('Installed and active - '+(lx.words||0).toLocaleString()+' words')
+                   : ('Installed ('+(lx.size_mb||0)+' MB) - turn on the fix to load it'))
       : 'Not installed';
-    var head = '<div class="page"><div class="section-title">Hebrew spelling guard</div>'+
-      '<div class="hint">Fixes the fast-speech plural Whisper mishears, e.g. <b>&#1489;&#1497;&#1496;&#1493;&#1500;&#1497;&#1503;</b> &#8594; <b>&#1489;&#1497;&#1496;&#1493;&#1500;&#1497;&#1501;</b>. '+
-      'Uses the hspell Hebrew word list (AGPL-3.0), downloaded to your config folder - <b>not</b> bundled with Lia. '+
-      'Only the &#1497;&#1503;/&#1497;&#1501; plural is fixed automatically; every other unknown word is only <i>suggested</i> below.</div>'+
-      '<div class="kv"><span class="k">Status</span><span>'+status+'</span></div>';
-    var controls = lx.installed
-      ? (sw("Fix Hebrew plural &#1497;&#1503; &#8594; &#1497;&#1501; (&#1489;&#1497;&#1496;&#1493;&#1500;&#1497;&#1503; &#8594; &#1489;&#1497;&#1496;&#1493;&#1500;&#1497;&#1501;)", !!lx.enabled, "toggle_lexicon_fix")+'<br>'+
-         sw("Suggest other unknown Hebrew words", lx.suggest!==false, "toggle_lexicon_suggest"))
-      : '<div class="btnrow"><button class="btn primary" data-call="lexicon_download" data-args="[]" data-slow="1">Download dictionary (5.7 MB)</button></div>';
-    var sugg = '<div class="section-title" style="margin-top:14px">Suggested unknown words</div>'+
-      '<div class="hint">Words not in the dictionary that were left untouched, and fixes the meeting summary model proposed (pre-filled). Nothing here is applied until you click Add (it joins the corrections table).</div>'+
-      '<div class="btnrow">'+btn("Load suggestions","__load_oov",[],"")+'</div>'+
-      '<div id="oovList"></div>';
-    return head + controls + sugg + '</div>';
+    var rows = srow('Hebrew dictionary', status,
+        lx.installed ? '<span class="cur ok">Installed</span>'
+                     : '<button class="btn primary" data-call="lexicon_download" data-args="[]" data-slow="1">Download (5.7 MB)</button>');
+    if(lx.installed){
+      rows +=
+        // <bdi> keeps "wrong -> right" in reading order inside the English line
+        srow('Fix the plural <bdi>&#1497;&#1503;</bdi> &#8594; <bdi>&#1497;&#1501;</bdi>',
+          'e.g. <b><bdi>&#1489;&#1497;&#1496;&#1493;&#1500;&#1497;&#1503;</bdi></b> &#8594; <b><bdi>&#1489;&#1497;&#1496;&#1493;&#1500;&#1497;&#1501;</bdi></b>, the fast-speech plural Whisper mishears. Only this one is fixed automatically.',
+          swb(!!lx.enabled, "toggle_lexicon_fix"))+
+        srow('Suggest other unknown Hebrew words', 'They are listed below; nothing changes until you add one.',
+          swb(lx.suggest!==false, "toggle_lexicon_suggest"));
+    }
+    rows += more('v_oov', 'Suggested unknown words',
+      'Not in the dictionary, plus fixes a meeting summary proposed (pre-filled). Add = joins the corrections.',
+      '', '<div id="oovList"></div>');
+    return grp('Hebrew spelling guard', rows+
+      '<div class="gnote">Uses the hspell Hebrew word list (AGPL-3.0), downloaded to your config folder - <b>not</b> bundled with Lia.</div>');
   }
+  ONOPEN.v_pending = function(){ if(isEmpty("pendingList")) loadPending(); };
+  ONOPEN.v_dropped = function(){ if(isEmpty("droppedList")) loadDropped(); };
+  ONOPEN.v_learned = function(){ var t = $("learnedTools"); if(t && t.hidden) loadLearned(); };
+  ONOPEN.v_corr = function(){ if(isEmpty("corrList")) loadCorr(); };
+  ONOPEN.v_oov = function(){ if(isEmpty("oovList")) loadOov(); };
 
   PAGES.snippets = function(){
+    // the table loads by itself when the page opens (ONPAGE.snippets)
     return '<div class="content-head"><h1>Snippets</h1></div>'+
-      '<div class="page"><div class="hint">Say a cue to paste its expansion. Use \\n for line breaks.</div>'+
-        '<div class="btnrow">'+btn("Load snippets","__load_snips",[],"")+
-        '<button class="btn" data-add-snip="1">Add row</button>'+
-        '<button class="btn primary" data-save-snips="1">Save</button></div>'+
-        '<div id="snipList"></div></div>';
+      grp('Snippets',
+        '<div class="gnote">Say a cue to paste its expansion. Use \\n for line breaks.</div>'+
+        '<div class="gbody"><div id="snipList"></div></div>',
+        {action: '<button class="btn" data-add-snip="1">Add row</button>'+
+                 '<button class="btn primary" data-save-snips="1">Save</button>'});
   };
 
   PAGES.advanced = function(){
     var p = S.paths||{};
+    var u = S.update || {};
+    var updRow;
+    if(u.kind === 'source'){
+      updRow = srow('Updates', 'Running from a source checkout - update it with git.', '');
+    } else {
+      var st = u.status === 'checking' ? 'Checking…'
+             : (u.status === 'latest' ? 'Lia '+esc(u.current||'')+' is the latest version.' : '');
+      if(!st && u.error && !u.available) st = '<span style="color:var(--err)">'+esc(u.error)+'</span>';
+      updRow = srow('Check for updates automatically', st || 'Lia checks GitHub for a newer signed release.',
+        swb(u.auto !== false, "toggle_update_check")+btn("Check now","update_check_now",[],"ghost",true));
+    }
+    var PASSES = [["summary_local_tasks_pass",false],["summary_consolidate_pass",true],["summary_task_done_pass",true],
+                  ["summary_coverage_pass",false],["summary_depth_pass",true]];
+    var passesOn = PASSES.filter(function(x){ return !!cfg(x[0], x[1]); }).length;
+    var baseOverride = !!cfg("summary_base_prompt_override","");
+    var addOverride = !!cfg("summary_cloud_addendum","");
+    function stateCur(on){ return on ? '<span class="cur warn">Manual override</span>' : '<span class="cur">Default</span>'; }
     return '<div class="content-head"><h1>Advanced</h1></div>'+
-      '<div class="page"><div class="btnrow">'+
-        btn("Restart Lia","restart_app",[],"")+
-        btn("Open log","open_log",[],"ghost")+
-        btn("Open config folder","open_config_dir",[],"ghost")+
-        btn("Report a problem…","report_problem",[],"ghost",true)+
-        '<button class="btn danger" data-quit="1">Quit Lia</button>'+
-      '</div>'+
-      '<div class="hint">Report a problem builds a diagnostic zip (log + sanitized settings - API keys and personal lists removed), shows it in Explorer, and opens the GitHub issue page. Nothing is sent automatically - you attach the file yourself.</div>'+
-      '</div>'+
-      '<div class="page"><div class="section-title">Local summaries (Gemma / Ollama only)</div>'+
-        '<div class="hint"><b>These affect the LOCAL Gemma summary only</b> - they have NO effect on '+
-        'OpenAI / Gemini summaries. The defaults are recommended.</div>'+
-        sw("Add a dedicated tasks pass (more complete task list, +15-45s)", !!cfg("summary_local_tasks_pass",false), "toggle_summary_local_tasks_pass")+
-        '<div class="hint">Runs a narrow second pass that extracts every commitment and replaces the task list; strips speaker-label owners.</div>'+
-        sw("Merge twice-discussed topics (consolidate pass)", !!cfg("summary_consolidate_pass",true), "toggle_summary_consolidate_pass")+
-        sw("Mark tasks completed during the meeting as [x]", !!cfg("summary_task_done_pass",true), "toggle_summary_task_done_pass")+
-        sw("Coverage pass (add topics the summary missed, +30-60s)", !!cfg("summary_coverage_pass",false), "toggle_summary_coverage_pass")+
-        sw("Depth pass (numbers, the why, blockers; guarded, +2min)", !!cfg("summary_depth_pass",true), "toggle_summary_depth_pass")+
-        '<div class="hint">Each enabled pass adds a narrow local Ollama call. None of these ever touch the OpenAI / Gemini summary.</div>'+
-      '</div>'+
-      '<div class="page"><div class="section-title">Meeting summary prompt (OpenAI / Gemini)</div>'+
-        '<div class="hint"><b>Affects summaries written by OpenAI and Gemini only.</b> The local Gemma 4 '+
-        'summary is <b>not</b> affected: it runs through a pipeline of passes (depth, consolidate, '+
-        'task-done) that is hardcoded at this stage and never reads this field.</div>'+
-        '<div class="subhead">Base prompt</div>'+
-        '<div class="hint">The full instructions the model receives BEFORE your rules below. Shared '+
-        'with the local Gemma summary; editing here changes OpenAI / Gemini summaries only. Locked by '+
-        'default - unlock to edit.</div>'+
-        '<textarea id="summaryBase" class="rtl-auto" dir="auto" style="min-height:220px" disabled>'+
-          esc(draftOr("summaryBase", cfg("summary_base_prompt_override","") || (S.summary_base_prompt||"")))+
-        '</textarea>'+
-        '<div class="btnrow"><button class="btn" data-unlock-base="1">&#128274; Unlock to edit</button>'+
-          '<button class="btn primary" data-save-base="1" style="display:none">Save</button>'+
-          '<button class="btn ghost" data-reset-base="1">Reset to default</button>'+
-          (cfg("summary_base_prompt_override","")?'<span class="note">manual override active</span>':'')+
+      grp('App',
+        '<div class="agrid">'+
+          arow('refresh','Restart Lia','restart_app','')+
+          arow('file','Open log','open_log','')+
+          arow('folder','Open config folder','open_config_dir','')+
+          '<button class="arow" data-call="report_problem" data-args="[]" data-slow="1"><span class="ic">'+RK.icon('download',{size:18})+'</span><span class="grow">Report a problem…</span></button>'+
+          '<button class="arow danger" data-quit="1"><span class="ic">'+RK.icon('close',{size:18})+'</span><span class="grow">Quit Lia</span></button>'+
         '</div>'+
-        '<div class="subhead">Additional rules (editable)</div>'+
-        '<div class="hint">Appended after the base prompt above. Empty, or unchanged from the default, '+
-        'keeps the built-in text.</div>'+
-        '<textarea id="summaryAddendum" class="rtl-auto" dir="auto" style="min-height:240px">'+
-          esc(draftOr("summaryAddendum", cfg("summary_cloud_addendum","") || (S.summary_addendum_default||"")))+
-        '</textarea>'+
-        '<div class="btnrow"><button class="btn primary" data-save-addendum="1">Save</button>'+
-          '<button class="btn ghost" data-reset-addendum="1">Reset to default</button>'+
-          (cfg("summary_cloud_addendum","")?'<span class="note">manual override active</span>':'')+
-        '</div>'+
-      '</div>'+
-      '<div class="page"><div class="section-title">About</div>'+
-        '<div style="font-weight:600">Lia - Local Inference Assistant</div>'+
-        '<div class="hint" style="margin-bottom:10px">The acronym explains what it does. '+
-          'The name was inspired by a little girl at home.</div>'+
-        updateBar()+
-        '<div class="kv"><span class="k">Version</span><span class="mono">'+esc(S.version||"")+'</span></div>'+
-        (function(){
-          var u = S.update || {};
-          if(u.kind === 'source')
-            return '<div class="hint">Running from a source checkout - update it with git.</div>';
-          var st = u.status === 'checking' ? 'Checking…'
-                 : (u.status === 'latest' ? 'Lia '+esc(u.current||'')+' is the latest version.' : '');
-          return '<div style="margin-top:10px">'+
-            sw("Check for updates automatically", u.auto !== false, "toggle_update_check")+'</div>'+
-            '<div class="btnrow">'+btn("Check now","update_check_now",[],"ghost",true)+
-            (st ? '<span class="note">'+st+'</span>' : '')+
-            (u.error && !u.available ? '<span class="note" style="color:var(--err)">'+esc(u.error)+'</span>' : '')+
-            '</div>';
-        })()+
-        '<div class="kv"><span class="k">Config</span><span class="rtl-auto" dir="auto">'+esc(p.config||"")+'</span></div>'+
-        '<div class="kv"><span class="k">Log</span><span class="rtl-auto" dir="auto">'+esc(p.log||"")+'</span></div>'+
-        '<div class="kv"><span class="k">Meetings</span><span class="rtl-auto" dir="auto">'+esc(p.meetings||"")+'</span></div>'+
-      '</div>'+
-      '<div class="page"><div class="section-title">Privacy &amp; data</div>'+
-        '<div class="hint">Everything Lia stores lives in the config folder above: recordings '+
-        '(WAV kept ~30 days, Opus ~2 years), transcripts, summaries, history, indexes and settings. '+
-        'Meeting transcripts are kept until you delete them; dictation history is pruned after '+
-        'the number of weeks set on the General page. The Hebrew dictionary (if downloaded) '+
-        'lives in the <span class="mono">lexicon</span> subfolder.</div>'+
-        '<div class="btnrow"><button class="btn danger" data-wipe="1">Delete all my data…</button></div>'+
-      '</div>'+
-      '<div class="page"><div class="section-title">Diagnostics</div>'+
-        sw("Keep dictation clips for tuning", !!cfg("debug_keep_dictation_clips", false), "toggle_debug_capture")+
-        '<div class="hint">Saves your last '+esc(cfg("debug_clips_ring", 100))+' dictation clips (audio + text) under '+
-        'the config folder’s <span class="mono">debug_clips</span> subfolder, for tuning punctuation / question-mark '+
-        'detection. Off by default; stays entirely on this PC and is removed by Delete all my data.</div>'+
-        '<div class="btnrow">'+btn("Open clips folder","open_debug_clips_dir",[],"ghost")+'</div>'+
-      '</div>'+
-      '<div class="page"><div class="section-title">GPU sharing</div>'+
-        sw("Share the GPU with another local app", !!cfg("gpu_lease_enabled", false), "toggle_gpu_lease")+
-        '<div class="hint">For a PC where another app of yours runs the same local AI model on this GPU. '+
-        'Both apps then take turns for heavy jobs through a small private folder '+
-        '(<span class="mono">C:\\ProgramData\\GpuLease</span>) instead of overloading the card. '+
-        'Leave it off if Lia is the only app using the GPU.</div>'+
-      '</div>';
+        '<div class="gnote">Report a problem makes a zip of the log and settings (no API keys or personal lists), shows it and opens the GitHub issue page. Nothing is sent automatically.</div>'
+      )+
+      grp('About and updates',
+        (updateBar() ? '<div class="gbody">'+updateBar()+'</div>' : '')+
+        srow('Lia - Local Inference Assistant', 'The acronym explains what it does. The name was inspired by a little girl at home.',
+          '<span class="cur mono">'+esc(S.version ? 'v'+S.version : '')+'</span>')+
+        updRow+
+        more('folders', 'Folders', 'Where Lia keeps its settings, log and meetings.',
+          '<span class="cur">Config, log, meetings</span>',
+          '<div class="kv"><span class="k">Config</span><span class="rtl-auto" dir="auto">'+esc(p.config||"")+'</span></div>'+
+          '<div class="kv"><span class="k">Log</span><span class="rtl-auto" dir="auto">'+esc(p.log||"")+'</span></div>'+
+          '<div class="kv"><span class="k">Meetings</span><span class="rtl-auto" dir="auto">'+esc(p.meetings||"")+'</span></div>')
+      )+
+      grp('Local summaries',
+        more('passes', 'Local summary passes', 'Extra local Ollama calls. Gemma only, no effect on OpenAI / Gemini. Defaults recommended.',
+          '<span class="cur">'+passesOn+' of '+PASSES.length+' on</span>',
+          srow('Dedicated tasks pass', 'A more complete task list; strips speaker-label owners. +15-45 s.',
+            swb(!!cfg("summary_local_tasks_pass",false), "toggle_summary_local_tasks_pass"))+
+          srow('Merge twice-discussed topics', 'A consolidate pass.',
+            swb(!!cfg("summary_consolidate_pass",true), "toggle_summary_consolidate_pass"))+
+          srow('Mark tasks done during the meeting as [x]', '',
+            swb(!!cfg("summary_task_done_pass",true), "toggle_summary_task_done_pass"))+
+          srow('Coverage pass', 'Adds topics the summary missed. +30-60 s.',
+            swb(!!cfg("summary_coverage_pass",false), "toggle_summary_coverage_pass"))+
+          srow('Depth pass', 'Numbers, the why, blockers; guarded. +2 min.',
+            swb(!!cfg("summary_depth_pass",true), "toggle_summary_depth_pass")))
+      )+
+      grp('Cloud summary prompt',
+        // collapsed by default (Naor 2026-10-05): long editors, rarely opened
+        more('base_prompt', 'Base prompt', 'The full instructions before your rules. Locked; unlock to edit.',
+          stateCur(baseOverride),
+          '<div class="hint" style="margin:0 0 6px">Shared with the local Gemma summary; editing here changes OpenAI / Gemini summaries only. '+
+            'The local summary runs a hardcoded pipeline of passes and never reads this field.</div>'+
+          '<textarea id="summaryBase" class="rtl-auto" dir="auto" style="min-height:220px" disabled>'+
+            esc(draftOr("summaryBase", cfg("summary_base_prompt_override","") || (S.summary_base_prompt||"")))+
+          '</textarea>'+
+          '<div class="btnrow"><button class="btn" data-unlock-base="1">&#128274; Unlock to edit</button>'+
+            '<button class="btn primary" data-save-base="1" style="display:none">Save</button>'+
+            '<button class="btn ghost" data-reset-base="1">Reset to default</button>'+
+            (baseOverride?'<span class="note">manual override active</span>':'')+
+          '</div>')+
+        more('addendum', 'Additional rules', 'Appended after the base prompt. Empty or unchanged = the built-in text.',
+          stateCur(addOverride),
+          '<textarea id="summaryAddendum" class="rtl-auto" dir="auto" style="min-height:240px">'+
+            esc(draftOr("summaryAddendum", cfg("summary_cloud_addendum","") || (S.summary_addendum_default||"")))+
+          '</textarea>'+
+          '<div class="btnrow"><button class="btn primary" data-save-addendum="1">Save</button>'+
+            '<button class="btn ghost" data-reset-addendum="1">Reset to default</button>'+
+            (addOverride?'<span class="note">manual override active</span>':'')+
+          '</div>'),
+        {sub: 'OpenAI and Gemini only'})+
+      grp('System',
+        srow('Share the GPU with another local app',
+          'Both apps take turns for heavy jobs through <span class="mono">C:\\ProgramData\\GpuLease</span>. Off if Lia is the only GPU app.',
+          swb(!!cfg("gpu_lease_enabled", false), "toggle_gpu_lease"))+
+        srow('Keep dictation clips for tuning',
+          'Your last '+esc(cfg("debug_clips_ring", 100))+' clips (audio + text) in <span class="mono">debug_clips</span>; stays on this PC.',
+          swb(!!cfg("debug_keep_dictation_clips", false), "toggle_debug_capture")+
+          btn("Open clips folder","open_debug_clips_dir",[],"ghost"))
+      )+
+      grp('Privacy and data',
+        srow('Delete all my data',
+          'Recordings (WAV ~30 days, Opus ~2 years), transcripts, summaries, history, indexes and settings in the config folder.',
+          '<button class="btn danger" data-wipe="1">Delete all my data…</button>'),
+        {tone: 'danger'});
   };
 
   // ---------- render ----------
@@ -1520,6 +1631,8 @@ APP_JS = r"""
     _flashTimer = setTimeout(function(){ setStatus(); }, 2200);
   }
 
+  var KEEP_LISTS = ["snipList", "pendingList", "droppedList", "learnedTools", "learnedList",
+                    "corrList", "oovList"];
   function render(){
     var content = $("content");
     if(!content) return;
@@ -1534,9 +1647,19 @@ APP_JS = r"""
     content.classList.toggle("home-mode", home);
     // The Home page owns its own header/status; other pages get the sticky pill.
     var pill = home ? '' :
-      '<div style="position:sticky;top:-20px;background:var(--bg);padding:2px 0 8px;z-index:4;margin:-4px 0 4px">'+
-      '<span class="status ok" id="hdrStatus"><span class="dot"></span>Ready</span></div>';
+      '<div class="hdr-pill"><span class="status ok" id="hdrStatus"><span class="dot"></span>Ready</span></div>';
+    // Lists filled on demand (snippets, vocabulary) live outside the state, so
+    // a re-render would empty them: carry the loaded nodes over as they are.
+    var kept = {};
+    KEEP_LISTS.forEach(function(id){
+      var el = $(id); if(el && el.childNodes.length && !el.hidden) kept[id] = el;
+    });
     content.innerHTML = pill + fn();
+    Object.keys(kept).forEach(function(id){ var ph = $(id); if(ph) ph.replaceWith(kept[id]); });
+    content.querySelectorAll('details[open][data-k]').forEach(function(d){
+      var f = ONOPEN[d.getAttribute('data-k')]; if(f){ d.__hooked = true; try{ f(); }catch(_){} }
+    });
+    if(ONPAGE[PAGE]){ try{ ONPAGE[PAGE](); }catch(_){} }
     setStatus();
     content.scrollTop = sc;
     document.querySelectorAll('.nav-item').forEach(function(b){
@@ -1611,31 +1734,78 @@ APP_JS = r"""
   var SEARCH_INDEX = [
     {t:"Press-to-talk hotkey", k:"hotkey shortcut key dictation קיצור מקש דיבור הכתבה", p:"general", f:"Press-to-talk hotkey"},
     {t:"Recording mode", k:"recording hold toggle מצב הקלטה", p:"general", f:"Recording mode"},
-    {t:"Paste mode", k:"paste clipboard enter הדבקה לוח", p:"general", f:"Paste"},
-    {t:"Start with Windows", k:"startup autostart boot launch הפעלה אתחול", p:"general", f:"Startup"},
-    {t:"Primary & speech languages", k:"language primary speech hebrew english שפה ראשית שפות דיבור עברית אנגלית", p:"general", f:"Languages"},
-    {t:"History retention", k:"history keep clear delete היסטוריה שמירה מחיקה", p:"general", f:"History"},
-    {t:"Invisible / silent mode", k:"invisible silent overlay waveform שקט מצב בלתי נראה", p:"general", f:"Behavior"},
-    {t:"Microphone device", k:"microphone mic input device מיקרופון התקן קלט", p:"audio", f:"microphone"},
-    {t:"System audio", k:"system audio loopback שמע מערכת", p:"audio", f:"system"},
-    {t:"Beep / sounds", k:"beep sound chime צליל ביפ", p:"audio", f:"Sounds"},
-    {t:"Dictation model", k:"dictation model engine הכתבה מודל מנוע", p:"models", f:"Dictation"},
-    {t:"Meeting model", k:"meeting model engine פגישות מודל", p:"models", f:"Meeting"},
-    {t:"Summary model", k:"summary model סיכום מודל", p:"models", f:"Summary"},
-    {t:"Local Whisper device (GPU / CPU)", k:"gpu cpu device whisper cuda מעבד כרטיס מסך", p:"models", f:"Local processing"},
-    {t:"AI cleanup style", k:"cleanup polish style proofread ניקוי סגנון עריכה הגהה", p:"cleanup", f:""},
-    {t:"OpenAI / Groq / Gemini keys", k:"api key openai groq gemini token מפתח", p:"keys", f:""},
-    {t:"Home server", k:"home server serve remote שרת בית מרוחק", p:"keys", f:"server"},
+    {t:"Paste mode", k:"paste clipboard enter הדבקה לוח", p:"general", f:"After transcription"},
+    {t:"Start with Windows", k:"startup autostart boot launch הפעלה אתחול", p:"general", f:"Start with Windows"},
+    {t:"Primary & speech languages", k:"language primary speech hebrew english שפה ראשית שפות דיבור עברית אנגלית", p:"general", f:"Primary language"},
+    {t:"History retention", k:"history keep clear delete היסטוריה שמירה מחיקה", p:"general", f:"Keep dictation history"},
+    {t:"Invisible / silent mode", k:"invisible silent overlay waveform שקט מצב בלתי נראה", p:"general", f:"Invisible mode"},
+    {t:"Microphone device", k:"microphone mic input device מיקרופון התקן קלט", p:"audio", f:"Dictation microphone"},
+    {t:"System audio", k:"system audio loopback שמע מערכת", p:"audio", f:"System audio device"},
+    {t:"Beep / sounds", k:"beep sound chime צליל ביפ", p:"audio", f:"Done beep"},
+    {t:"Dictation model", k:"dictation model engine הכתבה מודל מנוע", p:"models", f:"Dictation model"},
+    {t:"Meeting model", k:"meeting model engine פגישות מודל", p:"models", f:"Meeting transcription model"},
+    {t:"Summary model", k:"summary model סיכום מודל", p:"models", f:"Meeting summary model"},
+    {t:"Restore clipboard after paste", k:"clipboard restore paste שחזור לוח הדבקה", p:"general", f:"Restore clipboard"},
+    {t:"Press Enter after paste", k:"enter send paste אנטר שליחה", p:"general", f:"Press Enter after paste"},
+    {t:"Languages I use", k:"languages detect enabled שפות זיהוי", p:"general", f:"Languages I use"},
+    {t:"Lock to one language", k:"lock language force נעילת שפה", p:"general", f:"Lock to one language"},
+    {t:"Keyboard shortcuts", k:"shortcuts hotkeys keys קיצורי מקלדת", p:"general", f:"All shortcuts"},
+    {t:"Transcribe-file model", k:"file transcribe model קובץ תמלול מודל", p:"models", f:"Transcribe-file model"},
+    {t:"When the GPU is busy", k:"gpu busy fallback cloud כרטיס מסך תפוס ענן", p:"models", f:"When the GPU is busy"},
+    {t:"Local Whisper device (GPU / CPU)", k:"gpu cpu device whisper cuda מעבד כרטיס מסך", p:"models", f:"Local Whisper device"},
+    {t:"Meeting microphone", k:"meeting mic headset microphone מיקרופון פגישה אוזניות", p:"audio", f:"Meeting microphone"},
+    {t:"Record my microphone / system audio", k:"record source mic system מקור הקלטה", p:"audio", f:"Record my microphone"},
+    {t:"AI cleanup provider and model", k:"cleanup model provider ניקוי מודל ספק", p:"cleanup", f:"Provider and model"},
+    {t:"AI cleanup style", k:"cleanup polish style proofread ניקוי סגנון עריכה הגהה", p:"cleanup", f:"Style"},
+    {t:"OpenAI / Groq / Gemini keys", k:"api key openai groq gemini token מפתח", p:"keys", f:"OpenAI"},
+    {t:"Home server (client)", k:"home server serve remote client שרת בית מרוחק לקוח", p:"server", f:"This PC"},
     {t:"Auto-detect meetings", k:"auto detect meetings zoom teams meet זיהוי פגישות", p:"meetings", f:"Auto-detect"},
-    {t:"Live transcript interval", k:"live transcript interval chunk realtime תמלול חי מקצב מרווח", p:"meetings", f:"Live transcript"},
-    {t:"Summary template", k:"summary template technical minutes general תבנית סיכום", p:"meetings", f:"Meeting summaries"},
+    {t:"Live transcript interval", k:"live transcript interval chunk realtime תמלול חי מקצב מרווח", p:"meetings", f:"Live transcript updates"},
+    {t:"Summary template", k:"summary template technical minutes general תבנית סיכום", p:"meetings", f:"Template"},
     {t:"Summary language", k:"summary language שפת סיכום", p:"meetings", f:"Summary language"},
     {t:"Vocabulary terms", k:"vocabulary terms glossary מילון מונחים אוצר מילים", p:"vocab", f:"Manual terms"},
     {t:"Corrections", k:"corrections fix replace תיקונים", p:"vocab", f:"Corrections"},
+    {t:"Vocabulary suggestions", k:"suggestions learn terms הצעות מונחים", p:"vocab", f:"Suggestions"},
+    {t:"Learned terms", k:"learned terms hints נלמדו מונחים", p:"vocab", f:"Learned terms"},
+    {t:"Hebrew spelling guard", k:"hebrew spelling lexicon hspell plural איות עברית רבים", p:"vocab", f:"Hebrew dictionary"},
     {t:"Snippets", k:"snippets expansion abbreviation קיצורים הרחבה", p:"snippets", f:""},
+    {t:"Groq key", k:"groq key api מפתח", p:"keys", f:"Groq"},
+    {t:"Gemini key", k:"gemini google key api מפתח", p:"keys", f:"Gemini"},
+    {t:"Hugging Face token (local diarization)", k:"hugging face hf token pyannote diarization דוברים", p:"keys", f:"Local Diarization"},
+    {t:"Host a server on this GPU", k:"host serve server gpu port token אירוח שרת", p:"server", f:"This PC"},
+    {t:"Server listen address / port / token", k:"listen port token bind tailscale פורט טוקן", p:"server", f:"Listen on"},
     {t:"Transcription server (client / host)", k:"transcription server serve client host שרת תמלול", p:"server", f:""},
-    {t:"Restart / open log", k:"restart log logs quit about אתחול יומן לוג", p:"advanced", f:""},
+    {t:"Restart / open log", k:"restart log logs quit about אתחול יומן לוג", p:"advanced", f:"Restart Lia"},
+    {t:"Keep raw meeting tracks", k:"raw tracks mixdown backup safety רצועות גיבוי", p:"meetings", f:"Keep raw per-source tracks"},
+    {t:"Backup mic / auto-switch mic", k:"backup mic fallback switch מיקרופון גיבוי", p:"meetings", f:"Backup mic"},
+    {t:"Your name (speaker)", k:"name speaker self שם דובר", p:"meetings", f:"Your name"},
+    {t:"Known voices", k:"voices speakers forget קולות דוברים", p:"meetings", f:"Known voices"},
+    {t:"Voice ask answer output", k:"voice ask answer paste card שאלה קולית תשובה", p:"meetings", f:"Voice ask answer"},
+    {t:"Meeting tools (action items, rename, transcribe)", k:"tools action items rename speakers folder כלים משימות", p:"meetings", f:"Action items"},
+    {t:"Local summary passes (tasks, depth, coverage)", k:"gemma ollama depth coverage tasks pass סיכום מקומי", p:"advanced", f:"Local summary passes"},
+    {t:"Cloud summary prompt", k:"prompt base rules addendum פרומפט הנחיות", p:"advanced", f:"Base prompt"},
+    {t:"Check for updates", k:"update version upgrade עדכון גרסה", p:"advanced", f:"Check for updates"},
+    {t:"GPU sharing", k:"gpu lease share שיתוף כרטיס מסך", p:"advanced", f:"Share the GPU"},
+    {t:"Keep dictation clips", k:"debug clips diagnostics קליפים אבחון", p:"advanced", f:"Keep dictation clips"},
+    {t:"Delete all my data", k:"delete wipe data privacy מחיקה נתונים פרטיות", p:"advanced", f:"Delete all my data"},
+    {t:"Report a problem", k:"report bug problem issue דיווח תקלה", p:"advanced", f:"Report a problem"},
   ];
+
+  // Open a page's control by a short name: an API Keys provider ("groq",
+  // "openai", "gemini", "hf") opens that provider's row and focuses its key
+  // input; "remote" focuses the client Server URL.
+  function focusControl(f){
+    var el = null;
+    if(PAGE==="keys"){
+      OPENX["key_"+f] = true; render();
+      el = $("in_"+f);
+    } else if(PAGE==="server" && f==="remote"){
+      el = $("in_remote_url");
+    }
+    if(!el) return;
+    try{ el.scrollIntoView({block:'center'}); }catch(_){}
+    try{ el.focus({preventScroll:true}); }catch(_){ try{ el.focus(); }catch(__){} }
+  }
 
   function searchHide(){ var b=$("searchResults"); if(b){ b.hidden=true; b.innerHTML=''; } }
   function searchSetHi(items, idx){
@@ -1665,12 +1835,26 @@ APP_JS = r"""
     var target = null;
     if(find){
       var needle = find.toLowerCase();
-      var nodes = content.querySelectorAll('.section-title,.field-label,.field>label,.subhead,.switch,.row-inline,.rowbtn');
-      for(var i=0;i<nodes.length;i++){
-        if((nodes[i].textContent||'').toLowerCase().indexOf(needle)>=0){ target = nodes[i]; break; }
+      // row titles first (compact layout), then group labels, then the old
+      // card-era selectors for pages not yet moved to rows
+      var sels = ['.srow-t', '.grp-h', '.arow',
+                  '.section-title,.field-label,.field>label,.subhead,.switch,.row-inline,.rowbtn'];
+      for(var si=0; si<sels.length && !target; si++){
+        var nodes = content.querySelectorAll(sels[si]);
+        for(var i=0;i<nodes.length;i++){
+          if((nodes[i].textContent||'').toLowerCase().indexOf(needle)>=0){ target = nodes[i]; break; }
+        }
+      }
+      // a row inside a closed picker: open it (and remember that) first
+      var dd = target && target.closest('details');
+      while(dd){
+        if(!dd.open){ dd.open = true; var dk = dd.getAttribute('data-k'); if(dk) OPENX[dk] = true; }
+        dd = dd.parentElement && dd.parentElement.closest('details');
       }
     }
-    var card = target ? (target.closest('.page') || target) : content.firstElementChild;
+    var card = target ? (target.closest('.srow, .arow, .grp, .page') || target)
+                      : (content.querySelector('.content-head') || content.firstElementChild);
+    if(card && card.classList.contains('grp-h') && card.nextElementSibling) card = card.nextElementSibling;
     if(!card) return;
     try{ card.scrollIntoView({block:'center', behavior:'smooth'}); }catch(e){ try{ card.scrollIntoView(); }catch(_){} }
     card.classList.remove('setting-flash'); void card.offsetWidth; card.classList.add('setting-flash');
@@ -1700,7 +1884,7 @@ APP_JS = r"""
       return;
     }
     if(t==="toast"){ RK.toast(msg.msg, msg.level); return; }
-    if(t==="focus"){ if(msg.page){ go(msg.page); } return; }
+    if(t==="focus"){ if(msg.page){ go(msg.page); } if(msg.focus){ focusControl(msg.focus); } return; }
   });
 
   // ---------- event wiring (delegated, attached once) ----------
@@ -1751,8 +1935,9 @@ APP_JS = r"""
       var args = JSON.parse(cb.getAttribute('data-args')||"[]");
       var slow = cb.getAttribute('data-slow')==="1";
       // internal loaders (client-only)
-      if(m==="__load_pending"){ loadList("vocab_pending_list","pendingList","pending"); return; }
-      if(m==="__load_learned"){ loadList("vocab_learned_list","learnedList","learned"); return; }
+      if(m==="__load_pending"){ loadPending(); return; }
+      if(m==="__load_learned"){ loadLearned(); return; }
+      if(m==="__load_dropped"){ loadDropped(); return; }
       if(m==="__load_corr"){ loadCorr(); return; }
       if(m==="__scan_corr"){ busy(cb,true); call("vocab_corrections_scan",[],true).then(function(r){ unbusy(cb); renderCorr(r.data||[]); }); return; }
       if(m==="harvest_corrections_now"){ busy(cb,true); call(m,args,true).then(function(){ unbusy(cb); loadCorr(); }); return; }
@@ -1872,6 +2057,12 @@ APP_JS = r"""
       call("reset_summary_base_prompt",[]).then(function(r){ if(r.ok) delete DRAFT["summaryBase"]; }); return; }
     var va = e.target.closest('[data-vocab-apply]');
     if(va){ applyPending(); return; }
+    var vdr = e.target.closest('[data-vocab-drop-rest]');
+    if(vdr){ dropUntouched(); return; }
+    var vro = e.target.closest('[data-reopen]');
+    if(vro){ call("vocab_reopen",[[vro.getAttribute('data-reopen')]]).then(function(){ loadDropped(); loadPending(); }); return; }
+    var vlt = e.target.closest('[data-learned-tool]');
+    if(vlt){ learnedTool(vlt.getAttribute('data-learned-tool')); return; }
     var vr = e.target.closest('[data-vocab-remove]');
     if(vr){ removeLearned(); return; }
     var ac = e.target.closest('[data-add-corr]');
@@ -1932,6 +2123,8 @@ APP_JS = r"""
 
   document.addEventListener('change', function(e){
     var t = e.target;
+    if(t.matches('[data-lk]')){ LCHECK[t.getAttribute('data-lk')] = t.checked; learnedCount(); return; }
+    if(t.id==="learnedSort"){ renderLearned(); return; }
     if(t.matches('[data-toggle]')){ call(t.getAttribute('data-toggle'),[]); return; }
     if(t.matches('[data-select]')){ call(t.getAttribute('data-select'),[parseInt(t.value,10)]); return; }
     if(t.matches('[data-select-str]')){ call(t.getAttribute('data-select-str'),[t.value]); return; }
@@ -1951,6 +2144,7 @@ APP_JS = r"""
   document.addEventListener('input', function(e){
     var t = e.target;
     if(t.id==="mtgSearch"){ homeSearch = t.value; renderHomeRows(); return; }
+    if(t.id==="learnedFilter"){ renderLearned(); return; }
     if(t.id==="langFilter"){
       var q=(t.value||"").toLowerCase();
       document.querySelectorAll('#langList .lang-item').forEach(function(el){
@@ -1985,16 +2179,134 @@ APP_JS = r"""
     .map(function(x){return x.getAttribute('data-vk');}); }
   function allKeys(id){ return Array.prototype.slice.call(
     document.querySelectorAll('#'+id+' input[data-vk]')).map(function(x){return x.getAttribute('data-vk');}); }
+  // ---- Suggestions: tick = spelled right (add), typed spelling = heard wrong
+  //      (fix), untouched = stays (2026-10-05: "Apply checked / reject rest"
+  //      dropped every untouched term, also the misheard ones Naor meant to fix)
+  function loadPending(){
+    call("vocab_pending_list",[]).then(function(r){
+      var data = r.data||[], el = document.getElementById("pendingList"); if(!el) return;
+      var b = document.getElementById("pendingBadge"); if(b) b.textContent = data.length;
+      if(!data.length){ el.innerHTML='<div class="hint">None.</div>'; return; }
+      el.innerHTML = data.map(function(it){
+        var k = it.term||"";
+        return '<div class="sugg"><label class="check"><input type="checkbox" data-vk="'+esc(k)+'"><span class="box"></span>'+
+          '<span class="txt rtl-auto" dir="auto">'+esc(k)+' <small>&#215;'+(it.count_corpus||0)+'</small></span></label>'+
+          (it.sample ? '<div class="sugg-sample rtl-auto" dir="auto">&#8230;'+esc(it.sample)+'&#8230;</div>' : '')+
+          '<input type="text" class="sugg-fix" data-fix="'+esc(k)+'" placeholder="Heard wrong? Type the right spelling" autocomplete="off" spellcheck="false"></div>';
+      }).join('');
+    });
+  }
+  function pendingChoices(){
+    var approve = [], fixes = [], untouched = [];
+    document.querySelectorAll('#pendingList .sugg').forEach(function(row){
+      var cb = row.querySelector('input[data-vk]'), fx = row.querySelector('input[data-fix]');
+      var k = cb.getAttribute('data-vk'), f = (fx && fx.value || "").trim();
+      if(f) fixes.push([k, f]); else if(cb.checked) approve.push(k); else untouched.push(k);
+    });
+    return {approve:approve, fixes:fixes, untouched:untouched};
+  }
   function applyPending(){
-    var approve = checkedKeys("pendingList");
-    var all = allKeys("pendingList");
-    var reject = all.filter(function(k){ return approve.indexOf(k)<0; });
-    call("vocab_resolve",[approve,reject]).then(function(){ loadList("vocab_pending_list","pendingList","pending"); });
+    var c = pendingChoices();
+    if(!c.approve.length && !c.fixes.length){
+      RK.toast("Tick a term, or type the right spelling for one Lia heard wrong", "err"); return; }
+    var p = c.approve.length ? call("vocab_resolve",[c.approve,[]]) : Promise.resolve();
+    p.then(function(){ return c.fixes.length ? call("vocab_fix_suggestions",[c.fixes]) : null; })
+     .then(function(){ loadPending(); });
+  }
+  function dropUntouched(){
+    var c = pendingChoices();
+    if(!c.untouched.length){ RK.toast("Nothing untouched to drop", "ok"); return; }
+    if(!confirm("Drop "+c.untouched.length+" untouched suggestion(s)? You can bring any back from Show dropped suggestions.")) return;
+    call("vocab_resolve",[[],c.untouched]).then(function(){ loadPending(); });
+  }
+  function loadDropped(){
+    call("vocab_dropped_list",[]).then(function(r){
+      var data = r.data||[], el = document.getElementById("droppedList"); if(!el) return;
+      if(!data.length){ el.innerHTML='<div class="hint">No dropped suggestions.</div>'; return; }
+      el.innerHTML = '<div class="hint">Most recently dropped first.</div>'+data.map(function(it){
+        var k = it.term||"";
+        return '<div class="drop-row"><span class="txt rtl-auto" dir="auto">'+esc(k)+
+          (it.fixed_to ? ' <small>&#8594; fixed to '+esc(it.fixed_to)+'</small>' : ' <small>&#215;'+(it.count_corpus||0)+'</small>')+'</span>'+
+          '<button class="btn ghost sm" data-reopen="'+esc(k)+'">Back to suggestions</button></div>';
+      }).join('');
+    });
+  }
+  // ---- Learned terms: filter / sort / bulk checks (2026-10-05: 230 one-by-one
+  //      boxes were unworkable). Checks survive filtering and re-sorting.
+  var LEARNED = [], LCHECK = {};
+  var GENERIC = {};
+  ("cloud security network server production enterprise organization policy deployment agent "+
+   "origin infrastructure governance inference distribution template local build front control "+
+   "storage identity availability support web audit architecture central secret inbound outbound "+
+   "coding studio workspace workspaces instance token compliance visual slash link links wait billing "+
+   "findings router stack repository staging proxy incident report administrator execute target header "+
+   "internal version app basic monthly bye limit monday review scale planning level artifacts core "+
+   "capacity bucket dev pipeline workload inspection assessment teaching account accounts region regions "+
+   "data service services platform portal access user users management environment system systems "+
+   "solution project process team customer client cost costs session file files folder log logs key keys "+
+   "group groups role roles rule rules zone zones domain domains endpoint endpoints backup monitoring "+
+   "alert alerts dashboard migration integration testing test demo meeting update upgrade release feature "+
+   "features issue issues ticket task tasks design model models engine connection connector tenant "+
+   "subscription license partner vendor provider private public shared global standard premium free open "+
+   "active default custom manual automatic auto online offline mobile desktop remote hybrid primary "+
+   "secondary main center hub edge cluster node container image function layer object table query index "+
+   "schema event events message queue topic notification email phone chat video voice audio text document "+
+   "page site prod on-prem on-premise read-only real-time vibe firewall bot"
+  ).split(" ").forEach(function(w){ if(w) GENERIC[w]=1; });
+  function isGeneric(t){
+    if(!t || /\s/.test(t) || /\d/.test(t)) return false;            // phrases / F5 / D9: specific
+    if(t.length > 1 && t === t.toUpperCase()) return false;          // acronyms: API, DNS, KMS
+    return t === t.toLowerCase() || !!GENERIC[t.toLowerCase()];
+  }
+  function loadLearned(){
+    call("vocab_learned_list",[]).then(function(r){
+      LEARNED = r.data||[]; LCHECK = {};
+      var tools = document.getElementById("learnedTools"); if(tools) tools.hidden = false;
+      var b = document.getElementById("learnedBadge"); if(b) b.textContent = LEARNED.length;
+      renderLearned();
+    });
+  }
+  function learnedShown(){
+    var q = ((document.getElementById("learnedFilter")||{}).value||"").trim().toLowerCase();
+    var sort = (document.getElementById("learnedSort")||{}).value||"used";
+    var rows = LEARNED.filter(function(t){ return !q || (t.term||"").toLowerCase().indexOf(q)>=0; });
+    rows.sort(function(a,b){
+      if(sort==="az") return (a.term||"").localeCompare(b.term||"");
+      var d = (a.count_used||0)-(b.count_used||0);
+      return sort==="least" ? d : -d;
+    });
+    return rows;
+  }
+  function renderLearned(){
+    var el = document.getElementById("learnedList"); if(!el) return;
+    if(!LEARNED.length){ el.innerHTML='<div class="hint">None.</div>'; return; }
+    var rows = learnedShown();
+    el.innerHTML = rows.map(function(t){
+      var k = t.term||"";
+      return '<label class="check"><input type="checkbox" data-lk="'+esc(k)+'"'+(LCHECK[k]?' checked':'')+'><span class="box"></span>'+
+        '<span class="txt rtl-auto" dir="auto">'+esc(k)+' <small>used '+(t.count_used||0)+'</small></span></label>';
+    }).join('') || '<div class="hint">No term matches the filter.</div>';
+    learnedCount(rows.length);
+  }
+  function learnedCount(shown){
+    var n = Object.keys(LCHECK).filter(function(k){ return LCHECK[k]; }).length;
+    var c = document.getElementById("learnedCount");
+    if(c) c.textContent = (shown!=null ? shown : learnedShown().length)+" shown · "+n+" checked";
+  }
+  function learnedTool(kind){
+    if(kind==="clear"){ LCHECK = {}; }
+    else if(kind==="shown"){ learnedShown().forEach(function(t){ LCHECK[t.term] = true; }); }
+    else if(kind==="generic"){
+      var n = 0; LEARNED.forEach(function(t){ if(isGeneric(t.term)){ LCHECK[t.term] = true; n++; } });
+      RK.toast(n+" common word(s) checked - review them, then Remove checked", "ok");
+    }
+    renderLearned();
   }
   function removeLearned(){
-    var keys = checkedKeys("learnedList");
-    if(!keys.length) return;
-    call("vocab_remove_learned",[keys]).then(function(){ loadList("vocab_learned_list","learnedList","learned"); });
+    var keys = Object.keys(LCHECK).filter(function(k){ return LCHECK[k]; });
+    if(!keys.length){ RK.toast("Nothing checked", "err"); return; }
+    if(keys.length > 10 && !confirm("Remove "+keys.length+" learned term(s)? They stop being hints and the miner will not suggest them again.")) return;
+    call("vocab_remove_learned",[keys]).then(function(){ loadLearned(); });
   }
   function corrUnused(c){
     // "unused" only makes sense once an archive scan has stamped corpus_hits.
@@ -2047,6 +2359,7 @@ APP_JS = r"""
       if(!data.length){ addSnipRow("",""); } else { data.forEach(function(s){ addSnipRow(s.cue||"", s.text||""); }); }
     });
   }
+  ONPAGE.snippets = function(){ if(isEmpty("snipList")) loadSnips(); };
   function addSnipRow(cue, text){
     var tb = document.getElementById("snipTbl");
     if(!tb){ var el=document.getElementById("snipList"); if(el){ el.innerHTML='<table class="tbl" id="snipTbl"></table>'; tb=document.getElementById("snipTbl"); } }
@@ -2091,8 +2404,8 @@ APP_JS = r"""
   } else {
     RK.ready(function(){
       try{ RK.api.mark_ready(); }catch(e){}
-      if(FOCUS){ /* reserved: focus a specific control */ }
       go(PAGE);
+      if(FOCUS){ focusControl(FOCUS); }
     });
   }
 })();

@@ -38,6 +38,33 @@ def _body():
       <span class="status ok"><span class="dot"></span>Ready</span>
     </div>
 
+    <div class="grp-h">Compact rows (Settings)<span class="grp-act"><button class="btn ghost">Refresh</button></span></div>
+    <div class="grp">
+      <div class="srow"><div class="srow-l"><div class="srow-t">A switch setting</div>
+        <div class="srow-d">One line that says what it does.</div></div>
+        <div class="srow-c"><label class="switch bare"><input type="checkbox" checked><span class="track"></span></label></div></div>
+      <div class="srow"><div class="srow-l"><div class="srow-t">A short choice</div></div>
+        <div class="srow-c"><div class="seg">
+          <label class="radio on"><input type="radio" name="g1" checked><span class="box"></span><span class="txt">Hold</span></label>
+          <label class="radio"><input type="radio" name="g1"><span class="box"></span><span class="txt">Toggle</span></label>
+        </div></div></div>
+      <details class="more"><summary class="srow"><div class="srow-l"><div class="srow-t">A long list, collapsed</div>
+        <div class="srow-d">The summary shows the current value.</div></div>
+        <div class="srow-c"><span class="cur">Whisper Hebrew Local</span><span class="wb local">LOCAL</span><span class="chev">&#8250;</span></div></summary>
+        <div class="more-body">
+          <label class="radio on"><input type="radio" name="g2" checked><span class="box"></span><span class="txt">Whisper Hebrew Local</span></label>
+          <label class="radio"><input type="radio" name="g2"><span class="box"></span><span class="txt">Parakeet</span></label>
+        </div></details>
+    </div>
+    <div class="grp-h">Action grid</div>
+    <div class="grp agrid">
+      <button class="arow"><span class="grow">Open meeting folder</span></button>
+      <button class="arow"><span class="grow">Transcribe a file</span><span class="hk">ctrl+alt+t</span></button>
+      <button class="arow"><span class="grow">Edit a summary</span></button>
+      <button class="arow danger"><span class="grow">Quit</span></button>
+    </div>
+    <div style="height:16px"></div>
+
     <div class="page">
       <div class="section-title">Buttons</div>
       <div class="row-inline">

@@ -407,7 +407,7 @@ if sys.platform == "win32":
     ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
 
 # --- Configuration ---
-APP_VERSION = "1.6.12"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
+APP_VERSION = "1.6.13"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Lia")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -1977,7 +1977,9 @@ def _parse_meeting_file(text, path=""):
             head_txt = val[:k].rstrip() if k != -1 else val
             if k != -1 and head_txt and not head_txt[-1].isalnum():
                 head_txt = head_txt[:-1].rstrip()
-            info["meta_line"] = head_txt
+            # "· 165 chunks" is how Lia cut the audio, not something a summary
+            # reader needs (Naor, 2026-10-05): dropped from re-summaries too.
+            info["meta_line"] = re.sub(r"\s*·\s*\d+\s+chunks?$", "", head_txt)
         elif s.startswith("Source:"):
             info["source"] = s[len("Source:"):].strip().split(" ")[0]
         elif s.startswith("Invited:"):
@@ -14569,9 +14571,18 @@ class MeetingSession:
             self._discarded.set()
             log.info("Meeting processing discarded by user; recording kept: %s",
                      self._wav_path)
+        # "Transcript only" (2026-10-05): finish the diarized transcript, skip
+        # the summary (_write_diarized_markdown checks it).
+        _on_skip = None
+        if self.summarize:
+            self._skip_summary = threading.Event()
+
+            def _on_skip():
+                self._skip_summary.set()
+                log.info("Diarized meeting: 'Transcript only' - the summary is skipped")
         gen = ov.meeting_status_start(
             stages, title="Processing meeting", subtitle=_sub,
-            on_discard=_on_discard,
+            on_discard=_on_discard, on_skip_summary=_on_skip,
             meeting_title=(self.title or self.title_guess or "").strip())
 
         if silent:
@@ -15217,7 +15228,11 @@ class MeetingSession:
 
         # Summarise ONLY in "& Summarize" mode (gpt-5.5 over the diarized text).
         summary_md = ""
-        if self.summarize:
+        _skip = getattr(self, "_skip_summary", None)      # "Transcript only"
+        if self.summarize and _skip is not None and _skip.is_set():
+            log.info("Diarized meeting: summary skipped by the user "
+                     "(transcript only)")
+        elif self.summarize:
             if utterances:
                 plain = _diarized_summary_text(utterances)
             else:
@@ -15228,38 +15243,40 @@ class MeetingSession:
                     duration_sec, spk or None,
                     lang=lang_pack.resolve_summary_lang(self.app.config, plain))
                 _disc = getattr(self, "_discarded", None)
-                # GPU busy -> the summary waits on its card line; a Discard
-                # during the wait stops the summary like one between passes.
+                _stop = (lambda: (_disc is not None and _disc.is_set())
+                         or (_skip is not None and _skip.is_set()))
+                # GPU busy -> the summary waits on its card line. Discard or
+                # 'Transcript only' abandons it AT ONCE (a cloud summary is one
+                # HTTP call) - _summary_until_discard runs it on a helper thread.
                 _gw = _gpu_wait_var.get() or (None, None, None)
-                with gpu_wait_context(
-                        on_wait=_gw[0],
-                        should_cancel=_disc.is_set if _disc is not None else None,
-                        cancel_exc=_SummaryStopped):
-                    summary_md = self.app._run_summary(
-                        plain, mode="meeting", metadata=_meta,
-                        collect_corrections=True,
-                        should_stop=_disc.is_set if _disc is not None else None)
+                summary_md = self._summary_until_discard(
+                    plain, _meta, None, _stop, on_wait=_gw[0])
                 if _disc is not None and _disc.is_set():
                     raise _MeetingDiscarded()
-                self.last_summary = summary_md or ""
-                self._note_summary_outcome(
-                    summary_md, plain, _meta,
-                    os.path.join(MEETINGS_DIR, f"{name_part}_meeting_summary.html"),
-                    title or stamp, f"{_fmt_relative_ts(duration_sec)} · diarized")
-                # Fixes the model spotted while summarising: persist for future
-                # meetings + retro-apply to THIS transcript before it's written.
-                fresh = self.app._vocab_take_corrections(source="summary",
-                                                        transcript=plain)
-                if fresh:
-                    for u in utterances:
-                        t = (u.get("text") or "").strip()
-                        if t:
-                            u["text"] = self.app._vocab_apply_corrections(
-                                t, extra_pairs=fresh, label="diarized turn (fresh)")
-                    if not utterances and (result.get("text") or "").strip():
-                        result["text"] = self.app._vocab_apply_corrections(
-                            result["text"], extra_pairs=fresh,
-                            label="diarized transcript (fresh)")
+                if _skip is not None and _skip.is_set():
+                    summary_md = ""
+                    log.info("Diarized meeting: summary stopped by the user "
+                             "(transcript only)")
+                else:
+                    self.last_summary = summary_md or ""
+                    self._note_summary_outcome(
+                        summary_md, plain, _meta,
+                        os.path.join(MEETINGS_DIR, f"{name_part}_meeting_summary.html"),
+                        title or stamp, f"{_fmt_relative_ts(duration_sec)} · diarized")
+                    # Fixes the model spotted while summarising: persist for future
+                    # meetings + retro-apply to THIS transcript before it's written.
+                    fresh = self.app._vocab_take_corrections(source="summary",
+                                                            transcript=plain)
+                    if fresh:
+                        for u in utterances:
+                            t = (u.get("text") or "").strip()
+                            if t:
+                                u["text"] = self.app._vocab_apply_corrections(
+                                    t, extra_pairs=fresh, label="diarized turn (fresh)")
+                        if not utterances and (result.get("text") or "").strip():
+                            result["text"] = self.app._vocab_apply_corrections(
+                                result["text"], extra_pairs=fresh,
+                                label="diarized transcript (fresh)")
 
         lines = []
         # Credit the ACTUAL diarizer in the saved file (before 2026-09-02 every
@@ -15431,6 +15448,47 @@ class MeetingSession:
         return "\n".join(t for kind, _ts, *rest in self._flow_items(chunks)
                          for t in rest if kind == "text").strip()
 
+    def _summary_until_discard(self, plain, meta, card_gen, stop, on_wait=None):
+        """The chunked meeting's summary, abandoned the moment the user presses
+        Discard. A cloud summary is ONE HTTP call and a local pass can run for
+        minutes, so a Discard checked only between passes kept the card on
+        "Stopping..." that long. The call runs on a helper thread (the GPU-wait
+        context copied along); on Discard this returns "" at once and the
+        helper's late result is dropped (a local summary also stops itself at
+        its next pass via should_stop). Without a stop event it runs inline."""
+        box = {"out": "", "exc": None}
+
+        def _work():
+            try:
+                with gpu_wait_context(
+                        on_wait=on_wait or (lambda t: self.app.overlay.meeting_status_detail(
+                            "summarize", t, gen=card_gen)),
+                        should_cancel=stop, cancel_exc=_SummaryStopped):
+                    box["out"] = self.app._run_summary(
+                        plain, mode="meeting", metadata=meta,
+                        collect_corrections=True, should_stop=stop)
+            except _SummaryStopped:
+                box["out"] = ""
+            except BaseException as e:            # re-raised on the caller
+                box["exc"] = e
+
+        if stop is None:
+            _work()
+        else:
+            th = threading.Thread(target=contextvars.copy_context().run,
+                                  args=(_work,), daemon=True,
+                                  name="meeting-summary")
+            th.start()
+            while th.is_alive():
+                if stop():
+                    log.info("Meeting summary abandoned by the user (Discard / "
+                             "Transcript only); transcript + recording kept")
+                    return ""
+                th.join(0.25)
+        if box["exc"] is not None:
+            raise box["exc"]
+        return box["out"]
+
     def _write_output_file(self, duration_sec):
         """Assemble and save the meeting transcript as a plain-text
         file (.txt). Per-line RLM markers so bidi-aware editors
@@ -15471,35 +15529,43 @@ class MeetingSession:
         # app's shared summary engine; best-effort — on failure we just write
         # the transcript with no Summary section.
         summary_md = ""
-        if self.summarize and plain:
+        # Discard on the processing card (set by _stop_meeting's finalise):
+        # the summary stops, the transcript + recording are kept.
+        _disc = getattr(self, "_discarded", None)
+        _skip = getattr(self, "_skip_summary", None)      # "Transcript only"
+        _stop = None
+        if _disc is not None or _skip is not None:
+            def _stop():
+                return ((_disc is not None and _disc.is_set())
+                        or (_skip is not None and _skip.is_set()))
+        if self.summarize and plain and _stop is not None and _stop():
+            log.info("Meeting summary skipped before it started (Discard / "
+                     "Transcript only); transcript + recording kept")
+        elif self.summarize and plain:
             self.app.overlay.meeting_status_step(
                 "summarize", gen=getattr(self, "_card_gen", None))
             _meta = self._meta_for_summary(
                 duration_sec,
                 lang=lang_pack.resolve_summary_lang(self.app.config, plain))
-            _card = getattr(self, "_card_gen", None)
-            _disc = getattr(self, "_discarded", None)
-            with gpu_wait_context(
-                    on_wait=lambda t: self.app.overlay.meeting_status_detail(
-                        "summarize", t, gen=_card),
-                    should_cancel=_disc.is_set if _disc is not None else None,
-                    cancel_exc=_SummaryStopped):
-                summary_md = self.app._run_summary(
-                    plain, mode="meeting", metadata=_meta, collect_corrections=True)
-            self.last_summary = summary_md or ""
-            self._note_summary_outcome(
-                summary_md, plain, _meta,
-                os.path.join(MEETINGS_DIR, name_part + "_meeting_summary.html"),
-                title or start_dt.strftime("%Y-%m-%d %H:%M"),
-                f"{mins}m {secs}s · {len(self.chunks)} chunks")
-            # Fixes the model spotted while summarising: persist for future
-            # meetings + apply to THIS transcript before it hits the file.
-            fresh = self.app._vocab_take_corrections(source="summary",
-                                                        transcript=plain)
-            if fresh:
-                transcript_txt = self.app._vocab_apply_corrections(
-                    transcript_txt, extra_pairs=fresh,
-                    label="meeting transcript (fresh)")
+            summary_md = self._summary_until_discard(
+                plain, _meta, getattr(self, "_card_gen", None), _stop)
+            if _stop is not None and _stop():
+                summary_md = ""          # discarded mid-way: drop a late result
+            else:
+                self.last_summary = summary_md or ""
+                self._note_summary_outcome(
+                    summary_md, plain, _meta,
+                    os.path.join(MEETINGS_DIR, name_part + "_meeting_summary.html"),
+                    title or start_dt.strftime("%Y-%m-%d %H:%M"),
+                    f"{mins}m {secs}s")
+                # Fixes the model spotted while summarising: persist for future
+                # meetings + apply to THIS transcript before it hits the file.
+                fresh = self.app._vocab_take_corrections(source="summary",
+                                                            transcript=plain)
+                if fresh:
+                    transcript_txt = self.app._vocab_apply_corrections(
+                        transcript_txt, extra_pairs=fresh,
+                        label="meeting transcript (fresh)")
 
         sections = []
         sections.append(f"Meeting — {start_dt.strftime('%Y-%m-%d %H:%M')}")
@@ -15541,7 +15607,7 @@ class MeetingSession:
                     hf.write(_summary_to_html(
                         summary_md,
                         title=(title or start_dt.strftime("%Y-%m-%d %H:%M")),
-                        meta=f"{mins}m {secs}s · {len(self.chunks)} chunks"))
+                        meta=f"{mins}m {secs}s"))   # no "N chunks": an internal detail (Naor, 2026-10-05)
                 self.summary_html_path = html_path
             except Exception as e:
                 log.warning("Could not write meeting summary HTML: %s", e)
@@ -17541,18 +17607,18 @@ def _stamp_lia_launcher(exe_path):
         return False
     try:
         vi = VSVersionInfo(
-            ffi=FixedFileInfo(filevers=(1, 6, 12, 0), prodvers=(1, 6, 12, 0),
+            ffi=FixedFileInfo(filevers=(1, 6, 13, 0), prodvers=(1, 6, 13, 0),
                               mask=0x3f, flags=0x0, OS=0x40004,
                               fileType=0x1, subtype=0x0),
             kids=[
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.6.12.0'),
+                    StringStruct('FileVersion', '1.6.13.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.6.12.0'),
+                    StringStruct('ProductVersion', '1.6.13.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -21495,14 +21561,21 @@ class OverlayNotification:
             st["expanded"] = mo.get("expanded", False)
             st["minimized"] = mo.get("minimized", False)
             gen = mo.get("gen")
+            acts = []
+            if mo.get("on_skip_summary"):
+                acts.append(("Transcript only", lambda g=gen: self._mcard_skip_summary(g),
+                             False))
             if mo.get("on_discard"):
-                st["actions"] = [("Stop", lambda g=gen: self._mcard_arm_stop(g), False)]
+                acts.append(("Stop", lambda g=gen: self._mcard_arm_stop(g), False))
+            if acts:
+                st["actions"] = acts
         elif kind == "confirm_stop":
             gen = mo.get("gen")
             st["dot"] = "neutral"
             st["title"] = "Stop processing?"
-            st["message"] = ("The recording is saved. Only the transcript / "
-                             "summary work stops.")
+            st["message"] = (mo.get("stop_message")
+                             or "The recording is saved. Only the transcript / "
+                                "summary work stops.")
             st["actions"] = [
                 ("Stop processing", lambda g=gen: self._mcard_do_stop(g), True),
                 ("Keep going", lambda g=gen: self._mcard_cancel_stop(g), False),
@@ -21524,13 +21597,18 @@ class OverlayNotification:
             log.warning("MeetingCard render failed: %s", e)
 
     def meeting_status_start(self, stages, title="Processing meeting", subtitle="",
-                             on_discard=None, meeting_title=""):
+                             on_discard=None, meeting_title="", stop_message="",
+                             on_skip_summary=None):
         """Show the processing card. `stages` = ordered (key, label) list.
         `subtitle` names the engine (shown as a chip). `meeting_title`, if given,
         is the meeting's name. `on_discard` adds a Stop control (two-step
         confirm) that abandons the transcript/summary work - the recording is
-        always kept. Returns a generation token: pass it to the meeting_status_*
-        mutators so a STALE pipeline can't step/finish a NEWER card."""
+        always kept; `stop_message` replaces the confirm's default text (what
+        is kept differs per pipeline). `on_skip_summary` adds "Transcript
+        only": the transcript finishes, the summary is skipped (or abandoned if
+        it already runs). Returns a generation token: pass it to the
+        meeting_status_* mutators so a STALE pipeline can't step/finish a
+        NEWER card."""
         self._meeting_card_gen += 1
         gen = self._meeting_card_gen
         stages = list(stages or [])
@@ -21543,6 +21621,8 @@ class OverlayNotification:
                 "engine": self._engine_from_subtitle(subtitle),
                 "stages": stages, "marks": {k: "pending" for k, _ in stages},
                 "active": None, "detail": "", "on_discard": on_discard,
+                "stop_message": stop_message or "",
+                "on_skip_summary": on_skip_summary,
                 "expanded": False, "minimized": False,
                 "anchor": time.monotonic(),
             }
@@ -21652,19 +21732,25 @@ class OverlayNotification:
         self._tk_queue.put(_do)
 
     def meeting_status_discarded(self, title="Processing stopped",
-                                 on_folder=None, gen=None):
+                                 on_folder=None, gen=None,
+                                 message="Recording saved.", on_open=None,
+                                 open_label="Open transcript"):
         """Terminal neutral state after the user discarded processing. The
-        recording was kept on purpose, so this is not styled as an error."""
+        recording was kept on purpose, so this is not styled as an error.
+        `on_open` adds an open action for what was kept (a chunked meeting's
+        transcript)."""
         def _do():
             if self._card_gen_stale(gen):
                 return
             actions = []
+            if on_open:
+                actions.append((open_label, on_open, True))
             if on_folder:
                 actions.append(("Open folder", on_folder, False))
             self._mcard_model = {
                 "gen": gen, "kind": "discarded", "dot": "neutral", "title": title,
                 "meeting_title": (self._mcard_model or {}).get("meeting_title", ""),
-                "message": "Recording saved.", "actions": actions,
+                "message": message, "actions": actions,
             }
             self._mcard_render()
         self._tk_queue.put(_do)
@@ -21677,6 +21763,32 @@ class OverlayNotification:
             self._mcard_model = None
         self._tk_queue.put(_do)
 
+    def _mcard_skip_summary(self, gen):
+        """"Transcript only" (Naor, 2026-10-05): drop the Summarizing stage from
+        the card at once, then tell the pipeline (worker thread). One click, no
+        confirm: nothing is lost - the transcript and recording are saved and
+        "Summarize a meeting file" can still summarize it later."""
+        def _do():
+            if self._card_gen_stale(gen):
+                return
+            mo = self._mcard_model
+            if not mo or mo.get("kind") not in ("processing", "confirm_stop"):
+                return
+            cb = mo.get("on_skip_summary")
+            mo["on_skip_summary"] = None
+            if isinstance(mo.get("_resume"), dict):
+                mo["_resume"]["on_skip_summary"] = None
+            mo["stages"] = [(k, l) for k, l in (mo.get("stages") or []) if k != "summarize"]
+            (mo.get("marks") or {}).pop("summarize", None)
+            if mo.get("active") == "summarize":
+                mo["active"] = None
+                mo["detail"] = "Summary skipped - saving the transcript"
+            if mo.get("kind") == "processing":
+                self._mcard_render()
+            if cb:
+                threading.Thread(target=cb, daemon=True).start()
+        self._tk_queue.put(_do)
+
     # ---- discard (two-step confirm) -------------------------------------
     def _mcard_arm_stop(self, gen):
         """First Stop click: swap the processing card for a confirm."""
@@ -21687,7 +21799,8 @@ class OverlayNotification:
             if not mo or mo.get("kind") != "processing":
                 return
             mo["_resume"] = {k: mo.get(k) for k in ("active", "detail",
-                                                    "expanded", "on_discard")}
+                                                    "expanded", "on_discard",
+                                                    "on_skip_summary")}
             mo["kind"] = "confirm_stop"
             self._mcard_render()
         self._tk_queue.put(_do)
@@ -21724,6 +21837,7 @@ class OverlayNotification:
                 mo["kind"] = "processing"
                 mo["title"] = "Stopping…"
                 mo["on_discard"] = None
+                mo["on_skip_summary"] = None
                 self._mcard_render()
             if cb:
                 threading.Thread(target=cb, daemon=True).start()
@@ -31003,9 +31117,29 @@ class LiaApp:
                     cstages.append(("summarize", "Summarizing"))
                 _sub = (f"Transcribing with {session.transcribe_label}"
                         if getattr(session, "transcribe_label", "") else "")
+                # Discard (2026-10-04, Naor: the chunked card had no way out of
+                # a long summary). The transcript is already transcribed chunk
+                # by chunk, so it is kept with the recording; only the summary
+                # stops (_write_output_file / _summary_until_discard).
+                _on_discard = _on_skip = None
+                if session.summarize:
+                    session._discarded = threading.Event()
+                    session._skip_summary = threading.Event()
+
+                    def _on_discard(s=session):
+                        s._discarded.set()
+                        log.info("Meeting summary discarded by the user; "
+                                 "transcript + recording kept")
+
+                    def _on_skip(s=session):
+                        s._skip_summary.set()
+                        log.info("Meeting: 'Transcript only' - the summary is skipped")
                 session._card_gen = self.overlay.meeting_status_start(
                     cstages, title="Processing meeting", subtitle=_sub,
-                    meeting_title=(session.title or session.title_guess or "").strip())
+                    meeting_title=(session.title or session.title_guess or "").strip(),
+                    on_discard=_on_discard, on_skip_summary=_on_skip,
+                    stop_message=("The recording and the transcript are saved. "
+                                  "Only the summary stops."))
                 self.overlay.meeting_status_step("finalize", gen=session._card_gen)
             try:
                 path = session.stop(save=True)
@@ -31029,9 +31163,17 @@ class LiaApp:
             if session.diarize_mode:
                 return
             if path and os.path.exists(path):
+                _disc = getattr(session, "_discarded", None)
                 # Actionable completion card — NO file auto-opens. "Open" =
                 # the RTL summary popup (summarize mode) or the transcript .txt.
-                if session.summarize and session.last_summary:
+                if _disc is not None and _disc.is_set():
+                    self.overlay.meeting_status_discarded(
+                        "Summary stopped",
+                        message="Transcript and recording saved.",
+                        on_open=lambda p=path: os.startfile(p),
+                        on_folder=folder_cb,
+                        gen=getattr(session, "_card_gen", None))
+                elif session.summarize and session.last_summary:
                     def _open(p=path, s=session.last_summary,
                               h=session.summary_html_path):
                         if h and os.path.exists(h):
@@ -33350,8 +33492,9 @@ class LiaApp:
         self._open_settings_window(page="keys", focus="groq")
 
     def _set_remote_server(self):
-        """Home Server. Redirects to Settings -> Keys (_apply_remote_server)."""
-        self._open_settings_window(page="keys", focus="remote")
+        """Home Server. Redirects to Settings -> Transcription server, where the
+        client Server URL lives since the page split (_apply_remote_server)."""
+        self._open_settings_window(page="server", focus="remote")
 
     def _set_openai_api_key(self):
         """OpenAI API key. Redirects to Settings -> Keys (the page uses _apply_openai_key)."""
@@ -33951,6 +34094,48 @@ class LiaApp:
         n = len(approve_keys or []) + len(reject_keys or [])
         return (True, "Applied to %d term(s)." % n)
 
+    def _vocab_fix_suggestions(self, pairs):
+        """Suggestions the recognizer MISHEARD (Naor, 2026-10-05: "Ristructure"
+        was only accept-or-drop, so a misspelling vanished with no way to say
+        what it should be). Each [wrong, right]: a wrong -> right correction
+        (applied from now on) + the right spelling kept as a learned term; the
+        misspelled suggestion is dropped."""
+        st = getattr(self, "_vocab_store", None)
+        if not st:
+            return (False, "No vocabulary store")
+        done, bad = [], []
+        for p in pairs or []:
+            try:
+                wrong, right = (p[0] or "").strip(), (p[1] or "").strip()
+            except Exception:
+                continue
+            if not wrong or not right:
+                continue
+            why = vocab_learn.correction_pair_problem(wrong, right, strict=False)
+            if why:
+                bad.append("%s (%s)" % (wrong, why))
+                continue
+            st.add_corrections([{"wrong": wrong, "right": right}], source="manual",
+                               force=True)
+            st.fix_term(wrong, right)
+            done.append("%s -> %s" % (wrong, right))
+        self._push_vocabulary_live()
+        msg = "Fixed %d: %s." % (len(done), ", ".join(done)) if done else ""
+        if bad:
+            msg = (msg + " " if msg else "") + "Not fixed: %s." % ", ".join(bad)
+        return (bool(done) or not bad, msg or "Nothing to fix.")
+
+    def _vocab_dropped_list(self):
+        st = getattr(self, "_vocab_store", None)
+        return st.dropped_autos(100) if st else []
+
+    def _vocab_reopen(self, keys):
+        st = getattr(self, "_vocab_store", None)
+        if not st:
+            return (False, "No vocabulary store")
+        n = st.reopen(keys or [])
+        return (True, "%d term(s) back in Suggestions." % n)
+
     def _vocab_remove_learned(self, keys):
         st = getattr(self, "_vocab_store", None)
         if not st:
@@ -34324,9 +34509,15 @@ class LiaApp:
             return (False, str(e)[:120])
 
     # --- Home page (a landing page in the Settings shell) helpers -----------
-    def _recent_meetings(self, limit=30):
-        """The most recent saved meetings for the Home page: newest first, from
-        the meetings archive only (a listdir + stat, NO model / index run). Each:
+    # Home lists EVERY saved meeting (Naor, 2026-10-05: the old cap of 30 also
+    # limited the Home search to the last 30). Measured on his 79 meetings:
+    # 10 ms / 17 KB vs 8 ms / 6 KB for 30. The cap only guards a huge archive
+    # (the whole list rides every Settings state push).
+    HOME_MEETINGS_CAP = 1000
+
+    def _recent_meetings(self, limit=HOME_MEETINGS_CAP):
+        """The saved meetings for the Home page: newest first, from the
+        meetings archive only (a listdir + stat, NO model / index run). Each:
         {title, date, path, has_summary, diarized}. Best-effort; [] on any error."""
         import re as _re
         out = []
@@ -34636,6 +34827,9 @@ class LiaApp:
         add("vocab_resolve", self._vocab_resolve)
         add("vocab_learned_list", self._vocab_learned_list)
         add("vocab_remove_learned", self._vocab_remove_learned)
+        add("vocab_fix_suggestions", self._vocab_fix_suggestions)
+        add("vocab_dropped_list", self._vocab_dropped_list)
+        add("vocab_reopen", self._vocab_reopen)
         add("vocab_corrections_list", self._vocab_corrections_list)
         add("vocab_corrections_scan", self._vocab_corrections_scan, True)
         add("vocab_add_correction", self._vocab_add_correction)
@@ -34692,6 +34886,7 @@ class LiaApp:
     # must NOT receive a follow-up {"t":"state"} — a full-state push re-renders
     # the page and would wipe the list the getter just loaded into the DOM.
     _SETTINGS_READONLY_METHODS = {"vocab_pending_list", "vocab_learned_list",
+                                  "vocab_dropped_list",
                                   "vocab_corrections_list", "vocab_corrections_scan",
                                   "snippets_get", "capture_hotkey", "test_remote",
                                   "serve_status", "lexicon_oov_list",
@@ -34712,6 +34907,7 @@ class LiaApp:
     # briefly stale is the cosmetic "Suggestions" badge count, which reconciles
     # on the next natural render.
     _SETTINGS_LIST_MUTATION_METHODS = {"vocab_resolve", "vocab_remove_learned",
+                                       "vocab_fix_suggestions", "vocab_reopen",
                                        "vocab_add_correction",
                                        "vocab_remove_correction",
                                        "vocab_remove_corrections",
@@ -35018,9 +35214,12 @@ class LiaApp:
             "summary_templates": list(lang_pack.SUMMARY_TEMPLATE_META),
             "languages": _safe(self._settings_language_rows, {"rows": []}),
             "vocab_pending": _safe(self._vocab_pending_count, 0),
+            # counts for the collapsed Vocabulary rows (the lists load on open)
+            "vocab_learned_count": _safe(lambda: len(self._vocab_learned_list()), 0),
+            "corrections_count": _safe(lambda: len(self._vocab_corrections_list()), 0),
             "auto_start": _safe(lambda: bool(is_auto_start_enabled()), False),
             "home": {
-                "recent_meetings": _safe(lambda: self._recent_meetings(30), []),
+                "recent_meetings": _safe(lambda: self._recent_meetings(), []),
                 # WP4: known voices (name, samples, last seen) for the Meetings
                 # page list with Delete (a wrong profile poisons matching).
                 "speaker_profiles": _safe(self._speaker_profiles_state, []),
@@ -35078,7 +35277,8 @@ class LiaApp:
             "recording": False, "meeting_active": False,
             "live_transcript_available": False, "loopback_available": False,
             "whisper_device_label": "Auto", "cleanup_model_label": "",
-            "cleanup_provider": "", "vocab_pending": 0, "auto_start": False,
+            "cleanup_provider": "", "vocab_pending": 0, "vocab_learned_count": 0,
+            "corrections_count": 0, "auto_start": False,
             "summary_addendum_default": "", "summary_base_prompt": "",
             "summary_templates": list(lang_pack.SUMMARY_TEMPLATE_META),
             "languages": self._settings_language_rows(),
