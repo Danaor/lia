@@ -46,7 +46,7 @@ def demo_states(hebrew=False, longtext=False):
                  failed="עיבוד הפגישה נכשל", stopped="העיבוד הופסק")
         A = dict(start="התחל הקלטה", stop="עצור הקלטה", keep="המשך הקלטה",
                  opensum="פתח סיכום", opentr="פתח תמלול", folder="פתח תיקייה",
-                 details="פרטים")
+                 details="פרטים", close="סגור")
         msg_ended = "נראה שהשיחה הסתיימה."
         msg_silence = "10 דקות של שקט."
         msg_partial = "התמלול נשמר."
@@ -68,7 +68,7 @@ def demo_states(hebrew=False, longtext=False):
                  failed="Meeting processing failed", stopped="Processing stopped")
         A = dict(start="Start recording", stop="Stop recording", keep="Keep recording",
                  opensum="Open summary", opentr="Open transcript", folder="Open folder",
-                 details="Details")
+                 details="Details", close="Close")
         msg_ended = "The call seems to have ended."
         msg_silence = "10 min of silence."
         msg_partial = "The transcript was saved."
@@ -81,6 +81,10 @@ def demo_states(hebrew=False, longtext=False):
     def st(**kw):
         base = dict(allow_close=True)
         base.update(kw)
+        # Like the host adapter: a finished card shows a text "Close" too.
+        base.setdefault("close_button",
+                        kw.get("kind") in ("success", "error", "discarded"))
+        base.setdefault("close_label", A["close"])
         return base
 
     return [

@@ -206,48 +206,71 @@ class ActionsApi:
 def _with_csp(html):
     """The page with ui_kit's Content-Security-Policy (audit 2026-09-26 F13)."""
     import ui_kit
-    return ui_kit.with_csp(html)
+    return ui_kit.brand_html(html)
 
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  :root{ --bg:#F4F5F7; --panel:#FFFFFF; --line:#E2E5EA; --fg:#1B2430; --muted:#6B7280;
-         --accent:#22314F; --chip:#EDEFF3; --done:#9AA0AD; }
+  /* the Lia Lite language (ui_kit.brand_html adds the typeface, Lia's tokens + orb) */
+  :root{ --bg:#F6F6F3; --panel:#FFFFFF; --line:#EAEAE5; --line-2:#DADAD3; --fg:#17171E; --fg-2:#3A3C46;
+         --muted:#6D6F78; --faint:#A3A5AC; --accent:#272A4A; --chip:#F0F0EC; --done:#A3A5AC; --ok:#23845A; }
   *{ box-sizing:border-box; }
   body{ margin:0; background:var(--bg); color:var(--fg); height:100vh; display:flex; flex-direction:column;
-        font-family:"Segoe UI Variable Text","Segoe UI",Heebo,system-ui,Arial,sans-serif; }
-  header{ padding:14px 18px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:12px; }
-  header h1{ font-size:16px; margin:0; font-weight:600; }
-  header .count{ color:var(--muted); font-size:12px; }
-  .btn{ background:var(--chip); color:var(--fg); border:1px solid var(--line); border-radius:8px;
-        padding:6px 12px; font-size:13px; cursor:pointer; }
-  .btn.on{ border-color:var(--accent); color:var(--accent); }
+        font-family:"Heebo","Segoe UI Variable Text","Segoe UI",system-ui,Arial,sans-serif;
+        -webkit-font-smoothing:antialiased; }
+  header{ padding:14px 22px; display:flex; align-items:center; gap:12px;
+          background:rgba(255,255,255,.72); backdrop-filter:saturate(160%) blur(14px);
+          border-bottom:1px solid rgba(23,23,40,.06); }
+  header h1{ font-size:17px; margin:0; font-weight:750; letter-spacing:-.2px; display:flex; align-items:center; gap:10px; }
+  header h1 .orb{ width:26px; height:26px; }
+  header .count{ color:var(--faint); font-size:12px; font-variant-numeric:tabular-nums; }
+  .btn{ background:var(--panel); color:var(--fg-2); border:1px solid var(--line-2); border-radius:10px;
+        padding:6px 13px; font-size:13px; font-weight:600; font-family:inherit; cursor:pointer;
+        transition:background .16s, color .16s, border-color .16s; }
+  .btn:hover{ background:#FAFAF8; color:var(--fg); }
+  .btn.on{ background:var(--accent); border-color:var(--accent); color:#fff; }
   .spacer{ margin-inline-start:auto; }
-  .wrap{ flex:1; overflow:auto; padding:16px 18px; }
-  .grp{ margin-bottom:20px; }
-  .grp .h{ font-weight:600; font-size:14px; cursor:pointer; padding:6px 2px; border-bottom:1px solid var(--line); }
-  .grp .h:hover{ color:var(--accent); }
-  .grp .h .d{ color:var(--muted); font-weight:400; font-size:12px; margin-inline-start:8px; }
-  .it{ display:flex; align-items:flex-start; gap:10px; padding:8px 4px; }
-  .it input{ margin-top:3px; width:16px; height:16px; accent-color:var(--accent); cursor:pointer; }
-  .it .t{ font-size:14px; line-height:1.55; }
-  .it.done .t{ color:var(--done); text-decoration:line-through; }
-  .empty{ color:var(--muted); text-align:center; margin-top:48px; }
+  .wrap{ flex:1; overflow:auto; padding:20px 22px; }
+  .grp{ margin-bottom:14px; background:var(--panel); border:1px solid var(--line); border-radius:14px;
+        box-shadow:var(--shadow); overflow:hidden; animation:rise .42s var(--ease) both; }
+  .grp .h{ font-weight:650; font-size:14px; cursor:pointer; padding:11px 16px; border-bottom:1px solid var(--line);
+           display:flex; align-items:center; gap:10px; transition:background .16s; }
+  .grp .h:hover{ background:#FAFAF8; }
+  .grp .h .d{ color:var(--faint); font-weight:500; font-size:12px; margin-inline-start:auto;
+              font-variant-numeric:tabular-nums; }
+  .it{ display:flex; align-items:flex-start; gap:12px; padding:10px 16px; cursor:pointer; transition:background .16s; }
+  .it + .it{ border-top:1px solid var(--line); }
+  .it:hover{ background:#FAFAF8; }
+  .it input{ appearance:none; -webkit-appearance:none; margin:2px 0 0; width:18px; height:18px; flex:0 0 18px;
+             border:1.5px solid var(--line-2); border-radius:6px; background:var(--panel); cursor:pointer;
+             position:relative; transition:background .2s var(--ease), border-color .2s var(--ease); }
+  .it input:hover{ border-color:var(--accent); }
+  .it input:focus-visible{ outline:none; box-shadow:var(--ring); }
+  .it input:checked{ background:var(--ok); border-color:var(--ok); }
+  .it input:checked::after{ content:""; position:absolute; inset-inline-start:5px; top:1.5px; width:5px; height:9px;
+             border:solid #fff; border-width:0 2px 2px 0; transform:rotate(45deg); animation:tick .22s var(--ease); }
+  @keyframes tick{ from{ opacity:0; transform:rotate(45deg) scale(.4); } }
+  .it .t{ font-size:14px; line-height:1.55; transition:color .2s; }
+  .it.done .t{ color:var(--done); text-decoration:line-through; text-decoration-color:var(--faint); }
+  .empty{ color:var(--muted); text-align:center; margin:12vh auto 0; }
+  .empty .orb{ width:56px; height:56px; display:block; margin:0 auto 14px; }
   /* undo snackbar: survives the list refresh so completing a task in the
      open-only view (where the row vanishes) is still reversible for 8s. */
-  .snack{ position:fixed; inset-inline:0; bottom:18px; margin:0 auto; width:max-content; max-width:92vw;
-    background:var(--fg); color:#fff; border-radius:10px; padding:9px 10px 9px 16px; display:flex; align-items:center;
-    gap:14px; box-shadow:0 6px 22px rgba(0,0,0,.25); font-size:13px; z-index:50; }
-  .snack button{ background:transparent; border:0; color:#8fb0ee; font-weight:700; cursor:pointer; font-size:13px;
-    font-family:inherit; padding:5px 9px; border-radius:6px; }
-  .snack button:hover{ background:rgba(255,255,255,.12); }
-  .snack button:focus-visible{ outline:2px solid #8fb0ee; outline-offset:1px; }
+  .snack{ position:fixed; inset-inline:0; bottom:22px; margin:0 auto; width:max-content; max-width:92vw;
+    background:#1F2135; color:#fff; border-radius:999px; padding:7px 8px 7px 18px; display:flex; align-items:center;
+    gap:14px; box-shadow:0 2px 6px rgba(0,0,0,.12),0 18px 40px -14px rgba(20,18,60,.45); font-size:13px;
+    font-weight:600; z-index:50; animation:rise .3s var(--ease); }
+  .snack button{ background:rgba(255,255,255,.10); border:0; color:#fff; font-weight:700; cursor:pointer; font-size:12.5px;
+    font-family:inherit; padding:6px 14px; border-radius:999px; }
+  .snack button:hover{ background:rgba(255,255,255,.18); }
+  .snack button:focus-visible{ outline:2px solid #a99ef2; outline-offset:1px; }
   .snack[hidden]{ display:none; }
+  ::-webkit-scrollbar{ width:12px; } ::-webkit-scrollbar-thumb{ background:#D0D0C9; border-radius:8px; border:4px solid var(--bg); }
 </style></head>
 <body>
   <header>
-    <h1>📋 Action items</h1>
+    <h1><span class="orb">__LIA_ORB__</span>Action items</h1>
     <span class="count" id="count"></span>
     <span class="spacer"></span>
     <button class="btn on" id="toggle">Open only</button>
@@ -335,7 +358,7 @@ async function load(){
   var r = await API.get_items(openOnly);
   document.getElementById('count').textContent = r.open + ' open · ' + r.total + ' total';
   var wrap = document.getElementById('wrap');
-  if(!r.groups.length){ wrap.innerHTML = '<div class="empty">'+(openOnly?'No open action items 🎉':'No action items found')+'</div>'; return; }
+  if(!r.groups.length){ wrap.innerHTML = '<div class="empty"><span class="orb">__LIA_ORB__</span>'+(openOnly?'No open action items':'No action items found')+'</div>'; return; }
   wrap.innerHTML = r.groups.map(grpCard).join('');
 }
 

@@ -19,11 +19,12 @@ the monitor scale; fonts are given to Tk in POINTS so Tk's own `tk scaling`
 """
 from __future__ import annotations
 
-# python-bidi: this Tk (8.6.15) does NATIVE bidi in Label/Message, so their
-# text must stay LOGICAL (converting would double-reverse). But tk.Button does
-# NOT bidi-reorder its label, so Button text with Hebrew/Arabic must be run
-# through get_display first (measured 2026-09-17 in the preview). Same import
-# shape as lia._to_visual_rtl.
+# python-bidi: this Tk (8.6.15) does NATIVE bidi in Label/Message AND in
+# tk.Button, so all their text must stay LOGICAL (converting double-reverses).
+# The 2026-09-17 belief that Button lacks bidi was wrong: re-measured
+# 2026-10-13 (a bare tk.Button + the card's own buttons in notification_preview
+# --hebrew): get_display() printed the labels backwards. Kept importable for
+# lia._to_visual_rtl callers.
 try:
     from bidi.algorithm import get_display as _get_display
 except Exception:
@@ -40,44 +41,46 @@ def has_rtl(text) -> bool:
 
 
 def button_text(text):
-    """Visual-order text for a tk.Button label (which lacks native bidi).
-    Labels/Messages must NOT use this - they bidi natively."""
-    if _get_display and has_rtl(text):
-        try:
-            return _get_display(text)
-        except Exception:
-            return text
-    return text
+    """The text for a tk.Button label: LOGICAL order, unchanged - Tk 8.6.15
+    reorders Hebrew/Arabic in buttons natively, like in Labels (measured
+    2026-10-13; a visual-order conversion here printed them backwards). Kept
+    as the one seam every Tk button label goes through."""
+    return text or ""
 
 
 # ---- Colours (light card) ------------------------------------------------
+# The Lia Lite language (UI redesign 2026-10-13, the ui_kit tokens): warm
+# neutral ink, a deep-ink primary, Lia's colour only for "Lia is working",
+# red only for recording, failures in a calm amber (never an alarm).
 BG = "#FFFFFF"            # card surface, fully opaque
-BORDER = "#E2E5EA"        # 1px hairline border
-INK = "#1B2430"           # primary text (title, meeting name)
-SUB = "#626B7A"           # secondary / meta text
-FAINT = "#8A93A0"         # tertiary (brand name, disabled)
+BORDER = "#EAEAE5"        # 1px hairline border
+INK = "#17171E"           # primary text (title, meeting name)
+SUB = "#6D6F78"           # secondary / meta text
+FAINT = "#A3A5AC"         # tertiary (brand name, disabled)
 
-PRIMARY_BG = "#22314F"    # primary action button (dark navy)
+PRIMARY_BG = "#272A4A"    # primary action button (deep ink)
 PRIMARY_FG = "#FFFFFF"
-PRIMARY_HOVER = "#2C3E63"
+PRIMARY_HOVER = "#33375E"
 SECONDARY_BG = "#FFFFFF"  # secondary action: light, bordered
-SECONDARY_FG = "#22314F"
-SECONDARY_BORDER = "#CBD2DC"
-SECONDARY_HOVER = "#F1F3F7"
+SECONDARY_FG = "#3A3C46"
+SECONDARY_BORDER = "#DADAD3"
+SECONDARY_HOVER = "#FAFAF8"
 
 # State accents - used only on the small dot/icon, never as a card wash.
-REC = "#E5484D"           # recording (red dot)
-BUSY = "#3B6FB0"          # processing (blue spinner/activity)
-OK = "#2F8F62"            # success (green check)
-ERR = "#CE3E38"           # failure (red x)
-NEUTRAL = "#8A93A0"       # discarded / muted state dot
+REC = "#D63543"           # recording (red dot) - red is for recording only
+BUSY = "#6A5BE2"          # Lia is working (her colour; the orb when available)
+OK = "#23845A"            # success (green check)
+ERR = "#B07A22"           # failure: calm amber, never an alarm
+NEUTRAL = "#A3A5AC"       # discarded / muted state dot
 
-ROW_HOVER = "#F5F7FA"     # subtle hover on a whole clickable row
-CHIP_BG = "#EEF1F6"       # audio-source / meta chip background
-CHIP_FG = "#4A5462"
+ROW_HOVER = "#FAFAF8"     # subtle hover on a whole clickable row
+CHIP_BG = "#F0F0EC"       # audio-source / meta chip background
+CHIP_FG = "#3A3C46"
 
 # DWM rounded-corner border colour, as 0x00BBGGRR (Win11).
-DWM_BORDER_BGR = (0xE2, 0xE5, 0xEA)   # matches BORDER; converted in the widget
+DWM_BORDER_BGR = (0xEA, 0xEA, 0xE5)   # matches BORDER; converted in the widget
+ORB = 18                  # Lia's orb (the busy indicator), logical px
+FADE_MS = 180             # the card fades in when it first appears
 
 # ---- Sizes (logical px @ 96 DPI) -----------------------------------------
 WIDTH = 384

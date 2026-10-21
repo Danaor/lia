@@ -106,7 +106,7 @@ class HistoryApi:
 BODY = """
 <div class="hwrap">
   <div class="htop">
-    <h1>History</h1>
+    <h1>__ORB__History</h1>
     <span class="status ok" id="cnt"><span class="dot"></span></span>
     <span class="grow"></span>
     <input type="search" id="q" placeholder="Search transcriptions…" autocomplete="off">
@@ -114,35 +114,41 @@ BODY = """
   </div>
   <div id="list" class="list"></div>
   <div id="empty" class="empty" style="display:none">
-    <div class="big">&#128221;</div><div>No transcriptions yet</div>
+    <div class="big">__ORB_LG__</div><div>No transcriptions yet</div>
     <div class="sub">Dictate something and it will show up here.</div>
   </div>
 </div>
 """
 
+BODY = BODY.replace("__ORB__", uk.orb_svg()).replace("__ORB_LG__", uk.orb_svg())
+
 EXTRA_CSS = """
 .hwrap{display:flex; flex-direction:column; height:100vh;}
-.htop{display:flex; align-items:center; gap:var(--sp-3); padding:var(--sp-4) var(--sp-5) var(--sp-3);
-  border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); z-index:3;}
-.htop h1{margin:0; font-size:var(--fs-h1); font-weight:700;}
+.htop{display:flex; align-items:center; gap:var(--sp-3); padding:14px var(--sp-5) 12px;
+  border-bottom:1px solid rgba(23,23,40,.06); position:sticky; top:0; z-index:3;
+  background:rgba(255,255,255,.72); backdrop-filter:saturate(160%) blur(14px);}
+.htop h1{margin:0; font-size:17px; font-weight:750; letter-spacing:-.2px; display:flex; align-items:center; gap:10px;}
+.htop h1 .orb{width:26px; height:26px;}
+.empty .big .orb{width:56px; height:56px;}
 .htop #q{max-width:280px;}
+.htop .grow{flex:1 1 auto;}
 #list{overflow-y:auto; padding:var(--sp-2) var(--sp-4) var(--sp-5);}
-.h-item{border:1px solid var(--line); border-radius:var(--r-m); padding:11px 14px; margin-top:10px;
-  background:var(--card); transition:border-color var(--tr);}
-.h-item:hover{border-color:var(--line-2);}
+.h-item{border:1px solid var(--line); border-radius:var(--r-m); padding:12px 16px; margin-top:10px;
+  background:var(--card); box-shadow:var(--shadow); transition:border-color var(--tr), box-shadow var(--tr);}
+.h-item:hover{border-color:var(--line-2); box-shadow:var(--float);}
 .h-item .h-head{display:flex; align-items:center; gap:10px; margin-bottom:5px;}
 .h-item .h-ts{font-size:var(--fs-hint); color:var(--muted); font-variant-numeric:tabular-nums;}
 .h-item .h-meta{font-size:var(--fs-small); color:var(--faint); margin-inline-start:auto;}
 /* the text is freely selectable - copy is a dedicated button, not click-anywhere */
 .h-item .h-text{white-space:pre-wrap; line-height:1.6; overflow-wrap:anywhere; user-select:text;}
 .h-item .h-copy{display:inline-flex; align-items:center; gap:5px; font-size:var(--fs-small); font-weight:600;
-  color:var(--accent); background:transparent; border:1px solid var(--line); border-radius:var(--r-s);
+  color:var(--ink-2); background:var(--card); border:1px solid var(--line-2); border-radius:var(--r-pill);
   padding:3px 9px; cursor:pointer; opacity:0; transition:opacity var(--tr); font-family:inherit;}
 .h-item:hover .h-copy, .h-item:focus-within .h-copy, .h-copy:focus-visible{opacity:1;}
-.h-copy:hover{background:var(--accent-soft);}
+.h-copy:hover{background:var(--card-2); color:var(--ink);}
 .h-copy:focus-visible{outline:none; box-shadow:var(--ring); opacity:1;}
 .h-copy.ok{color:var(--ok); border-color:var(--ok);}
-mark{background:var(--hi, #FFF3BF); border-radius:2px;}
+mark{background:var(--hi, #FCEFC7); border-radius:2px;}
 """
 
 APP_JS = r"""

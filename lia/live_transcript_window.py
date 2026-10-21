@@ -49,6 +49,7 @@ class LiveApi:
         return {
             "title": self._payload.get("title") or "Live transcript - Lia",
             "started": self._payload.get("started") or "",
+            "started_at": _started_at(self._live_path),
             "chunk_seconds": int(self._payload.get("chunk_seconds") or 15),
         }
 
@@ -193,57 +194,85 @@ class LiveApi:
 
 
 
+def _started_at(live_path):
+    """The meeting's start as 'YYYY-MM-DDTHH:MM:SS' from the LIVE file name
+    ('2026-10-12_09-55-55_meeting_LIVE.txt'), for the window's clock; "" when
+    the name has no stamp (the clock then stays hidden)."""
+    import re
+    m = re.match(r"(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})_", os.path.basename(live_path or ""))
+    return ("%sT%s:%s:%s" % m.groups()) if m else ""
+
+
 def _with_csp(html):
     """The page with ui_kit's Content-Security-Policy (audit 2026-09-26 F13)."""
     import ui_kit
-    return ui_kit.with_csp(html)
+    return ui_kit.brand_html(html)
 
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  :root{ --bg:#FFFFFF; --panel:#F4F6FA; --line:#E4E7EE; --fg:#1B2430; --muted:#6B7280;
-         --accent:#2563EB; --live:#E5484D; --ok:#1a7f37; --warn:#b06a00; --ts:#8A94A6; }
+  /* the Lia Lite language (ui_kit.brand_html adds the typeface, Lia's tokens + orb) */
+  :root{ --bg:#F6F6F3; --panel:#FFFFFF; --line:#EAEAE5; --line-2:#DADAD3; --fg:#17171E; --muted:#6D6F78;
+         --faint:#A3A5AC; --accent:#5546C9; --live:#D63543; --ok:#23845A; --warn:#B07A22; --ts:#A3A5AC; }
   *{ box-sizing:border-box; }
   body{ margin:0; background:var(--bg); color:var(--fg); height:100vh; display:flex; flex-direction:column;
-        font-family:"Segoe UI Variable Text","Segoe UI",Heebo,system-ui,Arial,sans-serif; font-size:15px; }
-  header{ padding:10px 14px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:10px;
-          background:var(--panel); flex:none; }
-  header .dot{ width:9px; height:9px; border-radius:50%; background:var(--live); flex:none;
-               box-shadow:0 0 0 0 rgba(229,72,77,.6); animation:pulse 1.6s infinite; }
-  header .dot.idle{ animation:none; background:var(--muted); box-shadow:none; }
+        font-family:"Heebo","Segoe UI Variable Text","Segoe UI",system-ui,Arial,sans-serif; font-size:15px;
+        -webkit-font-smoothing:antialiased; }
+  header{ padding:12px 18px; display:flex; align-items:center; gap:12px; flex:none;
+          background:rgba(255,255,255,.72); backdrop-filter:saturate(160%) blur(14px);
+          border-bottom:1px solid rgba(23,23,40,.06); }
+  header .orb{ width:28px; height:28px; }
+  header .ttl{ display:flex; flex-direction:column; min-width:0; }
+  header .ttl-r{ display:flex; align-items:center; gap:8px; }
+  header .dot{ width:8px; height:8px; border-radius:50%; background:var(--live); flex:none;
+               animation:recPing 1.6667s steps(16) infinite; }
+  header .dot.idle{ animation:none; background:var(--faint); box-shadow:none; }
   header .dot.ok{ animation:none; background:var(--ok); box-shadow:none; }
-  @keyframes pulse{ 0%{box-shadow:0 0 0 0 rgba(229,72,77,.55);} 70%{box-shadow:0 0 0 7px rgba(229,72,77,0);}
-                    100%{box-shadow:0 0 0 0 rgba(229,72,77,0);} }
-  header h1{ font-size:14px; margin:0; font-weight:700; }
-  header .sub{ color:var(--muted); font-size:12px; margin-inline-start:auto; text-align:end; }
-  .wrap{ flex:1; overflow:auto; padding:12px 16px 22px; scroll-behavior:smooth;
+  header h1{ font-size:15px; margin:0; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  header .sub{ color:var(--faint); font-size:12px; font-variant-numeric:tabular-nums; }
+  /* the stage clock: thin, large, digits that never jump */
+  header .clock{ margin-inline-start:auto; font-size:30px; font-weight:250; letter-spacing:-.5px; line-height:1;
+                 font-variant-numeric:tabular-nums; color:var(--fg); }
+  header .clock .c{ animation:blink 2s steps(1) infinite; }
+  header .clock[hidden]{ display:none; }
+  @keyframes blink{ 50%{ opacity:.25; } }
+  .wrap{ flex:1; overflow:auto; padding:18px 22px 26px; scroll-behavior:smooth;
          user-select:text; -webkit-user-select:text; cursor:text; }
   .wrap *{ user-select:text; -webkit-user-select:text; }
-  .ln{ line-height:1.6; margin:0 0 7px; word-break:break-word; white-space:pre-wrap; }
-  .ln .ts{ color:var(--ts); font-variant-numeric:tabular-nums; font-size:12px; margin-inline-end:8px; }
-  .banner{ color:var(--muted); text-align:center; margin-top:48px; font-size:14px; line-height:1.7; padding:0 20px; }
+  .ln{ line-height:1.7; margin:0 auto 10px; word-break:break-word; white-space:pre-wrap; max-width:820px; }
+  /* one centred reading column: English starts and Hebrew ends on its edges
+     (a left-anchored column left right-aligned Hebrew floating mid-window) */
+  .ln.rise{ animation:rise .5s var(--ease) both; }
+  .ln .ts{ color:var(--accent); font-variant-numeric:tabular-nums; font-size:11.5px; font-weight:600;
+           opacity:.75; font-family:"Cascadia Code","Cascadia Mono",Consolas,monospace; }
+  .ln .tsg{ display:inline-block; width:10px; }
+  .banner{ color:var(--muted); text-align:center; margin-top:12vh; font-size:14px; line-height:1.7; padding:0 20px; }
+  .banner .orb{ width:56px; height:56px; display:block; margin:0 auto 14px; }
   .banner.ended{ color:var(--fg); }
-  .foot{ flex:none; border-top:1px solid var(--line); background:var(--panel); color:var(--muted);
-         font-size:12px; padding:8px 14px; display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
-  .foot .phase{ display:inline-flex; align-items:center; gap:6px; }
-  .foot .spin{ width:12px; height:12px; border-radius:50%; border:2px solid var(--line);
-               border-top-color:var(--accent); animation:spin .8s linear infinite; }
-  @keyframes spin{ to{ transform:rotate(360deg); } }
+  .foot{ flex:none; background:var(--panel); color:var(--muted); border-top:1px solid var(--line);
+         font-size:12.5px; padding:9px 16px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .foot .phase{ display:inline-flex; align-items:center; gap:8px; }
+  .foot .phase .orb{ width:18px; height:18px; }
+  .foot .spin{ display:none; }
   .foot .grow{ flex:1; }
-  .foot button{ appearance:none; border:1px solid var(--line); background:var(--bg); color:var(--accent);
-                cursor:pointer; font-size:12px; font-weight:600; padding:5px 10px; border-radius:8px; font-family:inherit; }
-  .foot button:hover{ background:var(--panel); }
-  .foot button.follow{ margin-inline-start:auto; border-color:transparent; background:transparent; }
+  .foot button{ appearance:none; border:1px solid var(--line-2); background:var(--panel); color:var(--fg);
+                cursor:pointer; font-size:12.5px; font-weight:600; padding:5px 12px; border-radius:999px; font-family:inherit;
+                transition:background .16s; }
+  .foot button:hover{ background:#FAFAF8; }
+  .foot button.follow{ margin-inline-start:auto; border-color:transparent; background:transparent; color:var(--accent); }
   .foot button.follow.off{ color:var(--muted); }
   .foot .err{ color:var(--warn); }
-  @media (prefers-reduced-motion: reduce){ *{ animation-duration:.001ms !important; } }
+  ::-webkit-scrollbar{ width:12px; } ::-webkit-scrollbar-thumb{ background:#D0D0C9; border-radius:8px; border:4px solid var(--bg); }
 </style></head>
 <body>
   <header>
-    <span class="dot" id="dot"></span>
-    <h1 id="title">Live transcript</h1>
-    <span class="sub" id="sub"></span>
+    <span class="orb" id="orb">__LIA_ORB__</span>
+    <div class="ttl">
+      <div class="ttl-r"><span class="dot" id="dot"></span><h1 id="title">Live transcript</h1></div>
+      <span class="sub" id="sub"></span>
+    </div>
+    <span class="clock" id="clock" hidden></span>
   </header>
   <div class="wrap" id="wrap"><div class="banner">Loading&hellip;</div></div>
   <div class="foot" id="foot"><span id="stat">&nbsp;</span></div>
@@ -256,6 +285,9 @@ var lastText = '';        // cache so the transcript stays visible after cleanup
 var follow = true;        // stick to the tail unless the user scrolls up
 var stopped = false;      // stop polling once a terminal phase is reached
 var META = {chunk_seconds:15, started:'', title:'Live transcript'};
+var ORB = '__LIA_ORB__';
+var SHOWN = -1;           // lines already on screen: newer ones rise in once
+var CLOCK = null;         // the stage clock's timer while recording
 
 function esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
   .replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
@@ -266,7 +298,7 @@ function stripHead(text){
 }
 function lineHtml(raw){
   var m = raw.match(/^\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*([\s\S]*)$/);
-  if(m){ return '<div class="ln" dir="auto"><span class="ts" dir="ltr">'+esc(m[1])+'</span>'+esc(m[2])+'</div>'; }
+  if(m){ return '<div class="ln" dir="auto"><span class="ts" dir="ltr">'+esc(m[1])+'</span><span class="tsg"></span>'+esc(m[2])+'</div>'; }
   return '<div class="ln" dir="auto">'+esc(raw)+'</div>';
 }
 function atBottom(el){ return el.scrollHeight - el.scrollTop - el.clientHeight < 40; }
@@ -285,11 +317,16 @@ function renderTranscript(body){
   pendingBody = null;
   body = (body||'').replace(/\s+$/,'');
   if(!body){
-    wrap.innerHTML = '<div class="banner">Waiting for the first chunk (~'+META.chunk_seconds+'s)&hellip;</div>';
+    wrap.innerHTML = '<div class="banner"><span class="orb">'+ORB+'</span>Waiting for the first chunk (~'+META.chunk_seconds+'s)&hellip;</div>';
     return;
   }
   var lines = body.split('\n').filter(function(l){ return l.trim().length; });
-  wrap.innerHTML = lines.map(lineHtml).join('');
+  var first = SHOWN < 0;
+  wrap.innerHTML = lines.map(function(l, i){
+    var h = lineHtml(l);
+    return (!first && i >= SHOWN) ? h.replace('<div class="ln"', '<div class="ln rise"') : h;
+  }).join('');
+  SHOWN = lines.length;
   if(follow) wrap.scrollTop = wrap.scrollHeight;
 }
 
@@ -297,18 +334,36 @@ function setDot(kind){ // 'live' | 'idle' | 'ok'
   var d = document.getElementById('dot');
   d.className = 'dot' + (kind==='idle'?' idle':(kind==='ok'?' ok':''));
   d.style.display = '';
+  if(kind==='live') startClock(); else stopClock();
 }
+function startClock(){
+  var el = document.getElementById('clock');
+  if(!el || CLOCK || !META.started_at) return;
+  var t0 = new Date(META.started_at).getTime();
+  if(isNaN(t0)) return;
+  function tick(){
+    var s = Math.max(0, Math.floor((Date.now() - t0) / 1000));
+    var h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, ss = s % 60;
+    el.innerHTML = (h ? h + '<span class="c">:</span>' + ('0'+m).slice(-2) : m) +
+                   '<span class="c">:</span>' + ('0'+ss).slice(-2);
+  }
+  tick(); el.hidden = false; CLOCK = setInterval(tick, 1000);
+}
+function stopClock(){ if(CLOCK){ clearInterval(CLOCK); CLOCK = null; } }
 
 function openBtn(which, label){
   return '<button data-open="'+which+'">'+esc(label)+'</button>';
 }
 function followBtn(){
-  return '<button class="follow'+(follow?'':' off')+'" id="followBtn">'+(follow?'▼ Following':'● Paused')+'</button>';
+  return '<button class="follow'+(follow?'':' off')+'" id="followBtn">'+(follow?'Following':'Paused')+'</button>';
 }
 
 function renderFoot(r){
   var foot = document.getElementById('foot');
   var phase = r.phase;
+  // Lia turns while the meeting is processed, rests otherwise
+  var o = document.getElementById('orb');
+  if(o) o.className = 'orb' + (phase==='processing' ? ' busy' : '');
   var html = '';
   if(phase==='recording' || phase==='waiting'){
     setDot('live');
@@ -316,7 +371,7 @@ function renderFoot(r){
     html = '<span class="phase">Updating every ~'+META.chunk_seconds+'s</span><span class="grow"></span>'+followBtn();
   } else if(phase==='processing'){
     setDot('idle');
-    html = '<span class="phase"><span class="spin"></span>Processing'+(r.summarize?' (transcribing / summarizing)':'')+'&hellip;</span>'+
+    html = '<span class="phase"><span class="orb busy">'+ORB+'</span>Processing'+(r.summarize?' (transcribing / summarizing)':'')+'&hellip;</span>'+
            '<span class="grow"></span>'+followBtn();
   } else if(phase==='done'){
     setDot('ok');
@@ -332,7 +387,7 @@ function renderFoot(r){
   } else if(phase==='failed'){
     setDot('idle');
     document.getElementById('title').textContent = 'Meeting';
-    html = '<span class="phase err">⚠ '+esc(r.error||'Something went wrong')+'</span><span class="grow"></span>'+
+    html = '<span class="phase err">'+esc(r.error||'Something went wrong')+'</span><span class="grow"></span>'+
            (r.transcript_ready?openBtn('transcript','Open transcript'):'');
   } else if(phase==='cancelled'){
     setDot('idle');
@@ -383,7 +438,7 @@ async function poll(){
 function setFollow(on){
   follow = on;
   var el = document.getElementById('followBtn');
-  if(el){ el.classList.toggle('off', !on); el.innerHTML = on ? '▼ Following' : '● Paused'; }
+  if(el){ el.classList.toggle('off', !on); el.innerHTML = on ? 'Following' : 'Paused'; }
   if(on){ var w = document.getElementById('wrap'); w.scrollTop = w.scrollHeight; }
 }
 

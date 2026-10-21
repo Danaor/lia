@@ -70,7 +70,7 @@ except Exception as e:  # pragma: no cover
 def _with_csp(html):
     """The page with ui_kit's Content-Security-Policy (audit 2026-09-26 F13)."""
     import ui_kit
-    return ui_kit.with_csp(html)
+    return ui_kit.brand_html(html)
 
 HTML = r"""<!DOCTYPE html>
 <html lang="he">
@@ -393,27 +393,36 @@ SUMMARY_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <style id="editorchrome">
+  /* the editor CHROME only (toolbar, status, focus ring) in the Lia Lite
+     language; the document's own <style> + card are untouched and are what
+     Save writes back (the file stays byte-identical outside the card). */
   html,body{height:100%;}
-  .toolbar{position:sticky;top:0;z-index:10;display:flex;gap:6px;align-items:center;
-           flex-wrap:wrap;padding:8px 12px;background:#FFFFFF;
-           border-bottom:1px solid #E2E5EA;box-shadow:0 1px 3px rgba(16,24,40,.06);}
-  .toolbar .grp{display:flex;gap:4px;align-items:center;}
+  .toolbar{position:sticky;top:0;z-index:10;display:flex;gap:8px;align-items:center;
+           flex-wrap:wrap;padding:10px 14px;background:rgba(255,255,255,.82);
+           backdrop-filter:saturate(160%) blur(14px);
+           border-bottom:1px solid rgba(23,23,40,.06);
+           font-family:"Heebo","Segoe UI Variable Text","Segoe UI",system-ui,Arial,sans-serif;}
+  .toolbar .grp{display:flex;gap:2px;align-items:center;padding:3px;border-radius:12px;background:#F0F0EC;}
+  .toolbar .grp.acts{background:transparent;gap:6px;padding:0;}
   .toolbar .sp{flex:1 1 auto;}
-  .tb{border:1px solid #E2E5EA;background:#EDEFF3;color:#1B2430;border-radius:6px;
-      padding:6px 10px;font-size:14px;cursor:pointer;min-width:34px;
-      font-family:"Segoe UI Variable Text","Segoe UI",Heebo,system-ui,Arial,sans-serif;}
-  .tb:hover{background:#D6DCE8;}
-  .tb.primary{background:#22314F;color:#FFFFFF;border-color:#22314F;font-weight:600;}
-  .tb.primary:hover{background:#2C3E63;}
+  .tb{border:0;background:transparent;color:#3A3C46;border-radius:9px;
+      padding:6px 10px;font-size:13.5px;font-weight:600;cursor:pointer;min-width:34px;
+      font-family:inherit;transition:background .16s,color .16s;}
+  .tb:hover{background:#FFFFFF;color:#17171E;box-shadow:0 1px 2px rgba(23,23,40,.06);}
+  .acts .tb{background:#FFFFFF;box-shadow:inset 0 0 0 1px #DADAD3;}
+  .acts .tb:hover{background:#FAFAF8;}
+  .tb.primary{background:#272A4A !important;color:#FFFFFF !important;box-shadow:0 1px 2px rgba(23,23,40,.18),0 8px 18px -10px rgba(39,42,74,.55) !important;}
+  .tb.primary:hover{background:#33375E !important;}
   .tb:disabled{opacity:.5;cursor:default;}
-  .status{font-size:13px;color:#6B7280;padding:6px 14px 0;min-height:20px;
-          font-family:"Segoe UI Variable Text","Segoe UI",Heebo,system-ui,Arial,sans-serif;}
-  .status.ok{color:#1a7f37;} .status.err{color:#c0263c;}
+  .tb:focus-visible{outline:none;box-shadow:0 0 0 3px rgba(106,91,226,.20);}
+  .status{font-size:12.5px;color:#6D6F78;padding:8px 16px 0;min-height:22px;
+          font-family:"Heebo","Segoe UI Variable Text","Segoe UI",system-ui,Arial,sans-serif;}
+  .status.ok{color:#23845A;} .status.err{color:#B07A22;}
   /* editing-context overrides (win over the injected doc CSS) */
   .wrap{margin:14px auto 70px !important;}
-  .card[contenteditable]{outline:none;}
-  .card[contenteditable]:focus{box-shadow:0 0 0 2px rgba(34,49,79,.18),
-        0 1px 2px rgba(16,24,40,.06),0 12px 32px rgba(16,24,40,.05);}
+  .card[contenteditable]{outline:none;transition:box-shadow .2s;}
+  .card[contenteditable]:focus{box-shadow:0 0 0 3px rgba(106,91,226,.20),
+        0 1px 2px rgba(23,23,40,.04),0 10px 28px -14px rgba(23,23,40,.12);}
 </style>
 </head>
 <body>
@@ -430,12 +439,12 @@ SUMMARY_HTML = r"""<!DOCTYPE html>
       <button class="tb" id="bRedo" title="Redo (Ctrl+Y)">&#8635;</button>
     </div>
     <div class="sp"></div>
-    <div class="grp">
+    <div class="grp acts">
       <button class="tb primary" id="bSave" title="Save (Ctrl+S)">Save</button>
       <button class="tb" id="bEmailBody"
-              title="Open a new Outlook email with the summary formatted IN the message body">&#9993; In email body</button>
+              title="Open a new Outlook email with the summary formatted IN the message body">In email body</button>
       <button class="tb" id="bEmail"
-              title="Open a new Outlook email with the summary attached as an .html file">&#128206; As attachment</button>
+              title="Open a new Outlook email with the summary attached as an .html file">As attachment</button>
       <button class="tb" id="bCopy" title="Copy as text">Copy</button>
       <button class="tb" id="bSaveAs" title="Save a separate copy">Save a copy</button>
       <button class="tb" id="bClose" title="Close">Close</button>

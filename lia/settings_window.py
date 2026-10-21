@@ -176,6 +176,7 @@ def _demo_state():
     return {
         # Advanced > cloud summary-prompt addendum editor (placeholder text: the
         # real default lives in lia.py, which this child module must not import)
+        "summary_short_prompt": False,
         "summary_addendum_default": ("כללים נוספים מחייבים:\n- (demo) כל עובדה קונקרטית "
                                      "נכנסת לתוך הבולט הרלוונטי.\n- (demo) 'דגשים מרכזיים' "
                                      "נשאר 3-6 בולטים."),
@@ -192,6 +193,7 @@ def _demo_state():
              "desc_en": "Formal minutes: participants, topics, decisions with rationale, action items, next steps."},
         ],
         "config": {
+            "speaker_self_name": "Dana",
             "hotkey": "ctrl+space", "recording_mode": "toggle",
             "paste_mode": "auto_paste", "clipboard_auto_restore": True,
             "press_enter_after_paste": False, "silent_mode": True,
@@ -387,22 +389,29 @@ def _nav_html():
 BODY = """
 <div class="shell">
   <nav class="sidebar">
-    <div class="brand"><img class="brand-full" src="__FULLLOGO_SRC__" alt="Lia"></div>
+    <div class="brand">
+      <div class="brand-live" title="Lia">__ORB__<img class="wm" src="__WORDMARK_SRC__" alt="Lia"></div>
+      <div class="brand-state" aria-live="polite"><span class="rdot" id="brandRec" hidden></span><span class="bs-t" id="brandState">Ready</span></div>
+    </div>
     <div class="nav-search">
       <span class="nav-search-ic">__SEARCH_ICON__</span>
-      <input type="text" id="settingsSearch" placeholder="Search settings…" autocomplete="off" spellcheck="false" aria-label="Search settings">
+      <input type="text" id="settingsSearch" placeholder="Search…" autocomplete="off" spellcheck="false" aria-label="Search settings">
+      <span class="nav-search-k" aria-hidden="true">Ctrl K</span>
       <div id="searchResults" class="search-results" role="listbox" hidden></div>
     </div>
     __NAV__
   </nav>
   <main class="content" id="content"></main>
 </div>
+<div id="pal"></div>
 """
 BODY = BODY.replace("__NAV__", _nav_html())
 BODY = BODY.replace("__SEARCH_ICON__", uk.icon("search", size=15))
-# Embed the full brand logo inline (CSP-safe data: URI; "" if the asset is
-# missing, so the header degrades to no image rather than a broken one).
-BODY = BODY.replace("__FULLLOGO_SRC__", uk.full_logo_data_uri())
+# The brand: Lia's live orb (ui_kit.orb_svg - it breathes, turns while she
+# works, gathers from three petals when the window is first seen) beside the
+# 'lia' wordmark (CSP-safe data: URI; "" if the asset is missing).
+BODY = BODY.replace("__ORB__", uk.orb_svg("", id_="brandOrb"))
+BODY = BODY.replace("__WORDMARK_SRC__", uk.wordmark_data_uri())
 
 EXTRA_CSS = """
 /* Maximized / wide window: center the WHOLE app (sidebar + content) as one
@@ -417,11 +426,12 @@ EXTRA_CSS = """
 /* API Keys rows: a small provider badge before the name */
 .kname{display:inline-flex; align-items:center; gap:10px;}
 .kbdg{width:26px; height:26px; border-radius:8px; display:inline-flex; align-items:center;
-  justify-content:center; font-weight:800; font-size:13px; color:var(--on-accent); flex:0 0 26px;}
-.kbdg.img{background:#fff; padding:4px; box-shadow:inset 0 0 0 1px rgba(16,24,40,.10);}
+  justify-content:center; font-weight:700; font-size:12.5px; flex:0 0 26px;
+  background:var(--sunk); color:var(--ink-2);}
+.kbdg.img{background:#fff; padding:4px; box-shadow:inset 0 0 0 1px rgba(23,23,40,.10),0 1px 2px rgba(23,23,40,.05);}
 .kbdg.img img{width:100%; height:100%; object-fit:contain; display:block;}
 .srow-c .masked{font-size:12px;}
-.keybad{margin:0 0 8px; font-size:var(--fs-hint); color:var(--err); font-weight:600;}
+.keybad{margin:0 0 8px; font-size:var(--fs-hint); color:var(--warn); font-weight:600;}
 /* segmented control made of buttons (Transcription server: Client / Server) */
 .seg button.radio{font:inherit; cursor:pointer; color:var(--ink-2);}
 /* server status LED inside a row title */
@@ -429,53 +439,75 @@ EXTRA_CSS = """
   background:var(--faint); vertical-align:middle;}
 .run-led-sm.on{background:var(--ok); box-shadow:0 0 0 3px var(--ok-soft);}
 .run-led-sm.starting{background:var(--warn); box-shadow:0 0 0 3px var(--warn-soft);}
-.srow-c .gpu-tag{margin-left:0;}
+.srow-c .gpu-tag{margin-inline-start:0;}
+/* The status lives in the sidebar now (under Lia's orb). The pill by the
+   settings only appears for a moment to confirm a save ("in place"). */
 .hdr-pill{position:sticky; top:-20px; height:0; z-index:4; text-align:end; pointer-events:none;}
-.hdr-pill .status{pointer-events:auto; position:relative; top:6px; background:var(--bg);
-  padding:2px 8px; border-radius:var(--r-pill);}
+.hdr-pill .status{pointer-events:auto; position:relative; top:8px; background:var(--card);
+  padding:4px 12px; border-radius:var(--r-pill); box-shadow:var(--float);
+  opacity:0; transform:translateY(-4px); transition:opacity .22s var(--ease), transform .22s var(--ease);}
+.hdr-pill .status.flash{opacity:1; transform:none;}
 .content.home-mode{max-width:none; margin-inline:0;
   padding:16px 22px; display:flex; flex-direction:column; gap:12px; overflow:hidden;}
 
-/* --- Home: compact header row (title + status + primary actions) --- */
-.home-head{display:flex; align-items:center; gap:12px; flex-wrap:wrap;}
-.home-head h1{margin:0; font-size:var(--fs-title); font-weight:700; color:var(--ink);}
+/* --- Home: the greeting row (greeting + overflow menu) --- */
+.home-head{display:flex; align-items:center; gap:12px; flex-wrap:wrap; min-height:40px;}
+.home-head h1{margin:0; font-size:var(--fs-title); font-weight:750; letter-spacing:-.6px;
+  line-height:1.15; color:var(--ink);}
+.home-head h1 .nm{background:linear-gradient(120deg,#6A5BE2,#4C8DF0); -webkit-background-clip:text;
+  background-clip:text; color:transparent; unicode-bidi:isolate;}
 .home-head .hh-actions{margin-inline-start:auto; display:flex; gap:8px;
   align-items:center; flex-wrap:wrap;}
 .home-menu{position:relative;}
-.home-menu-pop{position:absolute; inset-inline-end:0; top:calc(100% + 4px); z-index:20;
+.home-menu-pop{position:absolute; inset-inline-end:0; top:calc(100% + 6px); z-index:20;
   background:var(--card); border:1px solid var(--line); border-radius:var(--r-m);
-  box-shadow:var(--shadow); min-width:210px; padding:6px; display:none;}
-.home-menu.open .home-menu-pop{display:block;}
+  box-shadow:var(--float); min-width:230px; padding:6px; display:none;}
+.home-menu.open .home-menu-pop{display:block; animation:pop .2s var(--ease);}
 .home-menu-pop button{display:flex; align-items:center; gap:9px; width:100%;
   text-align:start; background:none; border:0; color:var(--ink); cursor:pointer;
   font:inherit; padding:8px 10px; border-radius:var(--r-s);}
-.home-menu-pop button:hover{background:var(--accent-soft);}
-.home-info{display:flex; flex-wrap:wrap; gap:8px; align-items:center;}
-.home-actions{display:flex; flex-wrap:wrap; gap:8px; align-items:center;}
-.home-live{display:flex; align-items:center; gap:8px; flex-wrap:wrap;
-  padding:8px 12px; border:1px solid var(--accent); border-radius:var(--r-m);
-  background:var(--accent-soft);}
-/* a newer Lia release is available (Home + Advanced > About) */
-.upd-bar{display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin:0 0 12px;
-  padding:8px 12px; border:1px solid var(--info); border-radius:var(--r-m);
-  background:var(--info-soft);}
+.home-menu-pop button:hover{background:var(--card-2);}
+.home-menu-pop button .ico-svg{color:var(--muted);}
+/* one quiet line of facts (no boxes): mic, meeting mic, source, hotkey */
+.home-info{display:flex; flex-wrap:wrap; gap:6px 18px; align-items:center; color:var(--muted);
+  font-size:13px;}
+.home-actions{display:flex; flex-wrap:wrap; gap:10px; align-items:center;}
+/* a meeting is recording: a calm card with the red dot and Lia listening */
+.home-live{display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+  padding:12px 14px 12px 16px; border:1px solid rgba(214,53,67,.18); border-radius:var(--r-l);
+  background:var(--card); box-shadow:var(--shadow);}
+.home-live .lv-t{display:flex; align-items:center; gap:10px; font-weight:700;}
+.home-live .lv-t .rdot{width:9px; height:9px; border-radius:50%; background:var(--rec);
+  animation:recPing 1.6667s steps(16) infinite; animation-delay:var(--d,0s);}
+/* a newer Lia release is available (Home + Advanced > About): a slim, quiet bar */
+.upd-bar{display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin:0 0 12px;
+  padding:7px 8px 7px 14px; border:1px solid var(--lia-line); border-radius:var(--r-pill);
+  background:var(--lia-soft); color:var(--ink-2); font-size:13px;}
+.upd-bar > .ico-svg{color:var(--lia-ink);}
 .upd-bar .grow{flex:1 1 auto;}
-.upd-bar .upd-err{color:var(--err); font-weight:600;}
+.upd-bar .btn{padding:5px 14px; font-size:12.5px; border-radius:var(--r-pill);}
+.upd-bar a{font-size:12.5px; padding-inline-end:6px;}
+.upd-bar .upd-err{color:var(--warn); font-weight:600;}
+.gbody > .upd-bar:only-child,.gbody > .upd-bar:last-child{margin-bottom:0;}
+.hchip{display:inline-flex; align-items:center; gap:6px; white-space:nowrap;}
+.hchip .ico-svg{color:var(--faint);}
+.hchip b{font-weight:500; color:var(--ink-2);}
 
 /* --- Home: meetings area fills the remaining height --- */
-.home-body{flex:1 1 auto; min-height:0; display:flex; gap:14px;}
+.home-body{flex:1 1 auto; min-height:0; display:flex; gap:16px;}
 .mtg-list{display:flex; flex-direction:column; min-height:0; flex:1 1 44%;
   border:1px solid var(--line); border-radius:var(--r-l); background:var(--card);
-  overflow:hidden;}
-.mtg-listhead{display:flex; align-items:center; gap:8px; padding:8px 10px;
+  overflow:hidden; box-shadow:var(--shadow);}
+.mtg-listhead{display:flex; align-items:center; gap:10px; padding:10px 12px;
   border-bottom:1px solid var(--line);}
 .mtg-search{flex:1 1 auto; position:relative; display:flex; align-items:center;}
-.mtg-search .ic{position:absolute; inset-inline-start:9px; color:var(--faint);
+.mtg-search .ic,.mtg-search > .ico-svg{position:absolute; inset-inline-start:10px; color:var(--faint);
   display:inline-flex; pointer-events:none;}
-.mtg-search input{width:100%; padding:7px 10px 7px 30px; border:1px solid var(--line);
-  border-radius:var(--r-s); background:var(--bg); color:var(--ink); font:inherit;}
-.mtg-search input:focus{outline:none; border-color:var(--accent); box-shadow:var(--ring);}
-.mtg-count{color:var(--muted); font-size:var(--fs-small); flex:0 0 auto;}
+.mtg-search input{width:100%; padding:7px 10px 7px 30px; border:1px solid transparent;
+  border-radius:var(--r-s); background:var(--sunk); color:var(--ink); font:inherit;}
+.mtg-search input:focus{outline:none; border-color:rgba(106,91,226,.55); box-shadow:var(--ring); background:#fff;}
+.mtg-count{color:var(--faint); font-size:12px; flex:0 0 auto; font-variant-numeric:tabular-nums;
+  padding-inline-end:4px;}
 .mtg-rows{flex:1 1 auto; overflow-y:auto; min-height:0; padding:6px;}
 /* Vocabulary: learned-term grid + tools, suggestion rows (2026-10-05) */
 .vtools{display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:10px 0 6px;}
@@ -489,37 +521,76 @@ EXTRA_CSS = """
 .sugg-fix{display:block; width:100%; max-width:380px; margin:6px 0 0 30px; box-sizing:border-box;}
 .drop-row{display:flex; gap:10px; align-items:center; padding:4px 0;}
 .drop-row .txt{flex:1;}
-.mtg-row{display:grid; grid-template-columns:1fr auto; gap:4px 10px; align-items:center;
-  width:100%; text-align:start; cursor:pointer; font:inherit; color:var(--ink);
-  background:none; border:1px solid transparent; border-radius:var(--r-s);
-  padding:8px 10px; margin-bottom:2px;}
-.mtg-row:hover{background:var(--accent-soft);}
-.mtg-row.sel{background:var(--accent-soft); border-color:var(--accent);}
-.mtg-row .rn{font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
-.mtg-row .rmeta{grid-column:1 / -1; display:flex; align-items:center; gap:8px;
-  color:var(--muted); font-size:var(--fs-small);}
-.mtg-row .rtag{font-weight:700; color:var(--accent); background:var(--accent-soft);
-  border-radius:var(--r-pill); padding:0 7px;}
+/* a meeting row: a date tile, the name (+ Lia's dot when it has a summary),
+   when it was (in words; the full date on hover), and an arrow on hover */
+.mtg-row{display:grid; grid-template-columns:auto 1fr auto; grid-template-rows:auto auto;
+  gap:1px 12px; align-items:center; width:100%; text-align:start; cursor:pointer; font:inherit;
+  color:var(--ink); background:none; border:0; border-radius:12px; position:relative;
+  padding:8px 10px; margin-bottom:2px; transition:background var(--tr);}
+.mtg-row:hover{background:var(--card-2);}
+.mtg-row.sel{background:var(--lia-soft);}
+.mtg-row .rtile{grid-row:1 / 3; width:38px; height:38px; border-radius:11px; background:var(--sunk);
+  display:flex; flex-direction:column; align-items:center; justify-content:center; line-height:1;
+  font-variant-numeric:tabular-nums; color:var(--ink-2);}
+.mtg-row.sel .rtile{background:#fff; box-shadow:0 1px 2px rgba(23,23,40,.06);}
+.mtg-row .rtile .d{font-size:15px; font-weight:700;}
+.mtg-row .rtile .m{font-size:9.5px; font-weight:700; letter-spacing:.06em; color:var(--faint);
+  text-transform:uppercase; margin-top:2px;}
+.mtg-row .rn{font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0;}
+.mtg-row .rgo{grid-row:1 / 3; grid-column:3; color:var(--faint); opacity:0; transform:translateX(-4px);
+  transition:opacity var(--tr), transform var(--tr); display:inline-flex;}
+.mtg-row:hover .rgo,.mtg-row.sel .rgo{opacity:1; transform:none;}
+.mtg-row.sel .rgo{color:var(--lia-ink);}
+.mtg-row .rmeta{grid-column:2; display:flex; align-items:center; gap:8px; min-width:0;
+  color:var(--muted); font-size:12px;}
+.mtg-row .rtag{width:7px; height:7px; border-radius:50%; background:var(--lia-grad); flex:0 0 7px;
+  display:inline-block; vertical-align:middle; margin-inline-start:7px;}
 .mtg-row .rdate{font-variant-numeric:tabular-nums;}
+.mtg-row.born{border-radius:12px;}
 .mtg-empty{color:var(--muted); padding:18px 12px; font-size:var(--fs-hint);}
+/* first run: no meetings at all - a calm centred welcome, Lia's orb resting */
+.mtg-empty.first{display:flex; flex-direction:column; align-items:center; justify-content:center;
+  gap:6px; text-align:center; padding:56px 24px; min-height:240px;}
+.mtg-empty.first .orb{width:44px; height:44px; margin-bottom:8px; opacity:.9;}
+.mtg-empty.first b{color:var(--ink); font-size:var(--fs-body); font-weight:600;}
 
 /* --- Home: preview pane (selected meeting) --- */
 .mtg-preview{flex:1 1 56%; min-height:0; overflow-y:auto;
   border:1px solid var(--line); border-radius:var(--r-l); background:var(--card);
-  padding:16px 18px;}
-.mtg-preview .pv-title{font-size:var(--fs-section); font-weight:700; margin:0 0 2px;}
-.mtg-preview .pv-sub{color:var(--muted); font-size:var(--fs-hint); margin-bottom:12px;}
-.mtg-preview .pv-actions{display:flex; flex-wrap:wrap; gap:8px; margin-bottom:14px;}
-.mtg-preview .pv-body{white-space:pre-wrap; line-height:1.5; color:var(--ink-2);
+  padding:20px 22px; box-shadow:var(--shadow);}
+.mtg-preview .pv-title{font-size:20px; font-weight:750; letter-spacing:-.3px; margin:0 0 2px;
+  line-height:1.25;}
+.mtg-preview .pv-sub{color:var(--muted); font-size:12.5px; margin-bottom:14px;
+  font-variant-numeric:tabular-nums;}
+.mtg-preview .pv-actions{display:flex; flex-wrap:wrap; gap:8px; margin-bottom:16px;
+  padding-bottom:16px; border-bottom:1px solid var(--line);}
+.mtg-preview .pv-actions .btn{padding:6px 12px; font-size:12.5px;}
+.mtg-preview .pv-body{white-space:pre-wrap; line-height:1.65; color:var(--ink-2);
   font-size:var(--fs-base);}
 .mtg-preview .pv-none{color:var(--muted);}
+/* the summary as a document */
+.pv-doc{white-space:normal !important;}
+.pv-doc h4{margin:16px 0 6px; font-size:13px; font-weight:700; color:var(--ink); letter-spacing:.1px;
+  unicode-bidi:plaintext; text-align:start;}
+.pv-doc h4:first-child{margin-top:0;}
+.pv-doc p{margin:0 0 8px; unicode-bidi:plaintext; text-align:start;}
+.pv-doc ul{margin:0 0 8px; padding:0; list-style:none;}
+.pv-doc li{position:relative; padding-inline-start:16px; margin:0 0 5px; unicode-bidi:plaintext; text-align:start;}
+.pv-doc li::before{content:""; position:absolute; inset-inline-start:3px; top:.62em; width:5px; height:5px;
+  border-radius:50%; background:var(--faint);}
+.pv-doc li.task{padding-inline-start:24px;}
+.pv-doc li.task::before{display:none;}
+.pv-doc li.task .tb{position:absolute; inset-inline-start:0; top:.25em; width:15px; height:15px; border-radius:5px;
+  border:1.5px solid var(--line-2); background:var(--card);}
+.pv-doc li.task.done{color:var(--muted); text-decoration:line-through; text-decoration-color:var(--faint);}
+.pv-doc li.task.done .tb{background:var(--ok); border-color:var(--ok);}
 .mtg-preview.empty{display:flex; align-items:center; justify-content:center;
   color:var(--faint); text-align:center;}
 /* Normal / narrow window: one column, the preview drops (selecting opens the
    editor instead). Wide window: list + preview side by side. */
 @media (max-width: 980px){
   .home-body{flex-direction:column;}
-  .mtg-preview{display:none;}
+  .mtg-preview,.mtg-preview.empty{display:none;}
   .mtg-list{flex:1 1 auto;}
 }
 .kv{display:flex; gap:8px; flex-wrap:wrap; font-size:var(--fs-hint); color:var(--muted);}
@@ -538,35 +609,38 @@ EXTRA_CSS = """
 .note{color:var(--warn); font-size:var(--fs-hint); margin-inline-start:8px;}
 .rowbtn{display:flex; align-items:center; gap:10px; padding:9px 12px; border:1px solid var(--line);
   border-radius:var(--r-s); margin-bottom:8px; cursor:pointer; transition:background var(--tr),border-color var(--tr);}
-.rowbtn:hover{background:var(--accent-soft); border-color:var(--accent);}
+.rowbtn:hover{background:var(--card-2); border-color:var(--line-2);}
 .rowbtn .ic{display:inline-flex; align-items:center; justify-content:center; width:20px; flex:0 0 20px; color:var(--muted);}
-.rowbtn:hover .ic{color:var(--accent);}
+.rowbtn:hover .ic{color:var(--lia-ink);}
 
 /* --- settings search (sidebar) ----------------------------------------- */
-.nav-search{position:relative; margin:0 6px 8px; display:flex; align-items:center;}
-.nav-search-ic{position:absolute; inset-inline-start:9px; display:inline-flex; color:var(--faint); pointer-events:none;}
-.nav-search input{width:100%; padding:8px 10px 8px 30px; border:1px solid var(--line);
-  border-radius:var(--r-s); background:var(--card); color:var(--ink); font-size:var(--fs-hint);}
-.nav-search input:focus{outline:none; border-color:var(--accent); box-shadow:var(--ring);}
-.search-results{position:absolute; top:calc(100% + 4px); inset-inline:0; z-index:20;
+.nav-search{position:relative; margin:2px 6px 10px; display:flex; align-items:center;}
+.nav-search-ic{position:absolute; inset-inline-start:10px; display:inline-flex; color:var(--faint); pointer-events:none;}
+.nav-search input{width:100%; padding:8px 52px 8px 31px; border:1px solid var(--line);
+  border-radius:var(--r-s); background:var(--card); color:var(--ink); font-size:var(--fs-hint);
+  box-shadow:0 1px 2px rgba(23,23,40,.04);}
+.nav-search input:focus{outline:none; border-color:rgba(106,91,226,.55); box-shadow:var(--ring);}
+.nav-search-k{position:absolute; inset-inline-end:7px; pointer-events:none; font-family:var(--mono);
+  font-size:10.5px; color:var(--faint); border:1px solid var(--line-2); border-bottom-width:2px;
+  border-radius:5px; padding:0 5px; background:var(--card-2);}
+.nav-search input:focus ~ .nav-search-k{opacity:0;}
+.search-results{position:absolute; top:calc(100% + 6px); inset-inline:0; z-index:20;
   background:var(--card); border:1px solid var(--line); border-radius:var(--r-m);
-  box-shadow:var(--shadow); max-height:320px; overflow:auto; padding:4px;}
+  box-shadow:var(--float); max-height:320px; overflow:auto; padding:4px; width:300px;}
 .search-results .sr{display:block; width:100%; text-align:start; border:0; background:transparent;
   cursor:pointer; padding:7px 9px; border-radius:var(--r-s); color:var(--ink); font-family:inherit; font-size:var(--fs-hint);}
-.search-results .sr:hover,.search-results .sr.hi{background:var(--accent-soft);}
+.search-results .sr:hover,.search-results .sr.hi{background:var(--lia-soft);}
 .search-results .sr .sr-page{display:block; font-size:var(--fs-small); color:var(--muted); margin-top:1px;}
 .search-results .sr-none{padding:10px 9px; color:var(--muted); font-size:var(--fs-hint); text-align:center;}
 /* flash a jumped-to setting so the eye lands on it */
-@keyframes settingFlash{0%{background:var(--accent-soft);}100%{background:transparent;}}
+@keyframes settingFlash{0%{background:var(--lia-soft);}100%{background:transparent;}}
 .setting-flash{animation:settingFlash 1.3s ease-out;}
 
 
 /* --- Home landing page -------------------------------------------------- */
 .hchips{display:flex; flex-wrap:wrap; gap:8px;}
-.hchip{font-size:var(--fs-hint); color:var(--ink-2); background:var(--card-2); border:1px solid var(--line);
-  border-radius:var(--r-pill); padding:4px 11px;}
 .home-hero{display:flex; flex-direction:column; align-items:flex-start; gap:10px;}
-.home-hero.live{border-color:var(--accent);}
+.home-hero.live{border-color:var(--lia-line);}
 .home-hero .hero-title{font-size:var(--fs-section); font-weight:700; display:flex; align-items:center; gap:8px;}
 .btn.big{font-size:15px; padding:11px 20px; display:inline-flex; align-items:center; gap:9px;}
 .home-acts{display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px;}
@@ -574,19 +648,19 @@ EXTRA_CSS = """
   display:flex; align-items:center; gap:10px; padding:12px 14px; border:1px solid var(--line);
   border-radius:var(--r-m); background:var(--card); color:var(--ink); font-size:var(--fs-base); font-weight:500;
   transition:border-color var(--tr),background var(--tr);}
-.home-act:hover{border-color:var(--accent); background:var(--accent-soft);}
+.home-act:hover{border-color:var(--line-2); background:var(--card-2);}
 .home-act:focus-visible{outline:none; box-shadow:var(--ring);}
 .home-act .ha-ic{color:var(--muted); display:inline-flex;}
-.home-act:hover .ha-ic{color:var(--accent);}
+.home-act:hover .ha-ic{color:var(--lia-ink);}
 .recent-row{appearance:none; cursor:pointer; font-family:inherit; width:100%; text-align:start;
   display:flex; align-items:center; gap:10px; padding:9px 12px; border:1px solid var(--line);
   border-radius:var(--r-s); background:var(--card); color:var(--ink); margin-top:8px; font-size:var(--fs-base);
   transition:border-color var(--tr),background var(--tr);}
-.recent-row:hover{border-color:var(--accent); background:var(--accent-soft);}
+.recent-row:hover{border-color:var(--line-2); background:var(--card-2);}
 .recent-row:focus-visible{outline:none; box-shadow:var(--ring);}
 .recent-row .rr-ic{color:var(--muted); display:inline-flex; flex:0 0 auto;}
 .recent-row .rr-title{flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
-.recent-row .rr-tag{font-size:var(--fs-small); font-weight:700; color:var(--accent); background:var(--accent-soft);
+.recent-row .rr-tag{font-size:var(--fs-small); font-weight:700; color:var(--lia-ink); background:var(--lia-soft);
   border-radius:var(--r-pill); padding:1px 8px; flex:0 0 auto;}
 .recent-row .rr-date{font-size:var(--fs-small); color:var(--muted); font-variant-numeric:tabular-nums; flex:0 0 auto;}
 /* Recent meetings: a scroll area so the last ~30 are reachable without the Home
@@ -676,7 +750,7 @@ APP_JS = r"""
       '<input type="checkbox" data-toggle="'+esc(method)+'"'+(checked?' checked':'')+
       (disabled?' disabled':'')+'><span class="track"></span><span>'+esc(label)+'</span></label>';
   }
-  var WB_TEXT = {local:'🖥️ LOCAL', cloud:'CLOUD',
+  var WB_TEXT = {local:'LOCAL', cloud:'CLOUD',
                  remote:'REMOTE LOCAL GPU'};
   var WB_SUB = {remote:'Use a GPU on another PC in your local network'};
   function radio(name, method, arg, argtype, label, checked, enabled, note, where, wnote, noicon){
@@ -804,64 +878,112 @@ APP_JS = r"""
   }
   function homeIsNarrow(){ return window.matchMedia('(max-width: 980px)').matches; }
 
+  // The greeting: by the hour, with the name from Settings > Meetings > Your name.
+  function greeting(){
+    var hr = new Date().getHours();
+    var g = hr < 5 ? 'Good evening' : hr < 12 ? 'Good morning' : hr < 18 ? 'Good afternoon' : 'Good evening';
+    var nm = (cfg("speaker_self_name","")||"").trim();
+    return esc(g) + (nm ? ', <span class="nm" dir="auto">'+esc(nm)+'</span>' : '');
+  }
+  // "2026-09-16 09:00" -> a Date (local), or null
+  function parseWhen(s){
+    var m = /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2}):(\d{2}))?/.exec(s||"");
+    return m ? new Date(+m[1], +m[2]-1, +m[3], +(m[4]||0), +(m[5]||0)) : null;
+  }
+  var MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  var WDAY = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+  // when it was, in words: "Today, 09:32" / "Yesterday, 14:01" / "Monday, 10:00" / "16 Sep" / "16 Sep 2025"
+  function whenWords(s){
+    var d = parseWhen(s); if(!d) return esc(s||"");
+    var now = new Date(), day0 = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    var dd = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    var days = Math.round((day0 - dd) / 86400000);
+    var hm = ('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2);
+    if(days === 0) return 'Today, '+hm;
+    if(days === 1) return 'Yesterday, '+hm;
+    if(days > 1 && days < 7) return WDAY[d.getDay()]+', '+hm;
+    return WDAY[d.getDay()].slice(0,3)+', '+hm+(d.getFullYear()!==now.getFullYear() ? ' · '+d.getFullYear() : '');
+  }
+  // the full form for the preview: "Wednesday, 16 Sep 2026 · 09:00"
+  function whenFull(s){
+    var d = parseWhen(s); if(!d) return esc(s||"");
+    return WDAY[d.getDay()]+', '+d.getDate()+' '+MON[d.getMonth()]+' '+d.getFullYear()+
+      ' · '+('0'+d.getHours()).slice(-2)+':'+('0'+d.getMinutes()).slice(-2);
+  }
+  // A meeting that appears while this window is open is "born" (once): the
+  // first list this window sees only marks what is there.
+  var MTG_SEEN = null, MTG_BORN = {};
+  function markMeetingsSeen(list){
+    if(MTG_SEEN === null){ MTG_SEEN = {}; (list||[]).forEach(function(m){ MTG_SEEN[m.path] = 1; }); return; }
+    (list||[]).forEach(function(m){ if(RK.once(MTG_SEEN, m.path) && !RK.reduce) MTG_BORN[m.path] = Date.now(); });
+  }
+  var MTG_ROSE = false;
+  function mtgRow(m, i, noRise){
+    var d = parseWhen(m.date), cls = 'mtg-row'+(m.path===homeSel?' sel':''), st = '';
+    var bornAt = MTG_BORN[m.path] ? Date.now() - MTG_BORN[m.path] : -1;
+    if(bornAt >= 0 && bornAt < 2600){ cls += ' born'; st = ' style="--bd:-'+bornAt+'ms"'; }
+    else if(!MTG_ROSE && !noRise && !RK.reduce && i < 14){ cls += ' rise'; st = ' style="--rd:'+(i*30)+'ms"'; }
+    var tile = d ? '<span class="rtile" aria-hidden="true"><span class="d">'+d.getDate()+'</span><span class="m">'+MON[d.getMonth()]+'</span></span>'
+                 : '<span class="rtile" aria-hidden="true">'+RK.icon('meetings',{size:16})+'</span>';
+    return '<button class="'+cls+'"'+st+' data-mtg="'+esc(m.path)+'">'+tile+
+      '<span class="rn rtl-auto" dir="auto">'+esc(m.title)+
+        (m.has_summary?'<span class="rtag" title="Has a summary"></span>':'')+'</span>'+
+      '<span class="rgo" aria-hidden="true">'+RK.icon('chevron-right',{size:16})+'</span>'+
+      '<span class="rmeta"><span class="rdate" title="'+esc(m.date)+'">'+whenWords(m.date)+'</span>'+
+        (m.diarized?'<span>· speakers</span>':'')+'</span>'+
+    '</button>';
+  }
+
   PAGES.home = function(){
     var h = S.home || {}, hk = S.hotkeys || {};
     var active = !!S.meeting_active;
 
     // --- compact header: title + status + overflow menu (primary actions sit
     //     UNDER the info line, per Naor 2026-09-16) ---
-    var statusPill = '<span class="status ok"><span class="dot"></span>'+
-      esc(S.status_line||'Ready')+'</span>';
     var menu = '<div class="home-menu" id="homeMenu">'+
-      '<button class="btn iconbtn" id="homeMenuBtn" aria-label="More actions" title="More">⋯</button>'+
+      '<button class="btn icon ghost" id="homeMenuBtn" aria-label="More actions" title="More">'+RK.icon('more',{size:18})+'</button>'+
       '<div class="home-menu-pop">'+
         '<button data-call="show_history" data-args="[]">'+RK.icon('history',{size:16})+' History</button>'+
         '<button data-call="open_meetings_folder" data-args="[]">'+RK.icon('folder',{size:16})+' Open meetings folder</button>'+
         '<button data-call="summarize_text_dialog" data-args="[]">'+RK.icon('summarize',{size:16})+' Summarize a meeting file</button>'+
       '</div></div>';
-    var head = '<div class="home-head"><h1>Home</h1>'+statusPill+
+    var head = '<div class="home-head"><h1 class="greet">'+greeting()+'</h1>'+
       '<div class="hh-actions">'+menu+'</div></div>';
 
     // --- info line + primary actions, OR the live bar while a meeting runs ---
     var info;
     if(active){
-      info = '<div class="home-live">'+RK.icon('mic',{size:18})+
-        '<span class="grow"><b>Meeting in progress</b></span>'+
+      info = '<div class="home-live">'+RK.orb('sm busy')+
+        '<span class="grow lv-t"><span class="rdot" style="--d:'+RK.ad(1.6667)+'"></span>Meeting in progress</span>'+
         (S.live_transcript_available ? '<button class="btn" data-call="open_live_transcript" data-args="[]">Open live transcript</button>':'')+
-        '<button class="btn primary" data-call="home_stop_meeting" data-args="[true]">End &amp; summarize</button>'+
+        '<button class="btn lia" style="--d:'+RK.ad(4.8)+'" data-call="home_stop_meeting" data-args="[true]">End &amp; summarize</button>'+
         '<button class="btn" data-call="home_stop_meeting" data-args="[false]">End</button>'+
         '<button class="btn danger" data-call="cancel_meeting" data-args="[]">Discard</button>'+
         '</div>';
     } else {
       var src = h.recording_source;
       var srcTxt = src==='both'?'Mic + system audio':(src==='stereo_mix'?'System audio':'Microphone');
-      function chip(t){ return '<span class="hchip">'+esc(t)+'</span>'; }
-      info = '<div class="home-info">'+
-        chip('Mic: '+(h.mic_name||'Default'))+
-        (h.meeting_mic_name?chip('Meeting mic: '+h.meeting_mic_name):'')+
-        chip(srcTxt)+ chip('Hotkey '+(hk.main||'ctrl+space'))+'</div>'+
-        '<div class="home-actions">'+
-          '<button class="btn primary" data-call="home_start_meeting" data-args="[]">'+
-            RK.icon('meetings',{size:16})+' Start meeting</button>'+
+      function chip(ic, k, v){ return '<span class="hchip" title="'+esc(k)+'">'+RK.icon(ic,{size:15})+
+        '<b>'+esc(v)+'</b></span>'; }
+      info = '<div class="home-actions">'+
+          '<button class="btn rec" data-call="home_start_meeting" data-args="[]">'+
+            '<span class="rdot" style="--d:'+RK.ad(2.2)+'"></span>Start meeting</button>'+
           '<button class="btn" data-call="transcribe_file" data-args="[]">'+
-            RK.icon('mic',{size:16})+' Transcribe file</button>'+
-        '</div>';
+            RK.icon('file',{size:16})+' Transcribe file</button>'+
+        '</div>'+
+        '<div class="home-info">'+
+        chip('mic','Dictation microphone', h.mic_name||'Default mic')+
+        (h.meeting_mic_name?chip('audio','Meeting microphone', h.meeting_mic_name):'')+
+        chip('meetings','Recording source', srcTxt)+
+        chip('keyboard','Press-to-talk hotkey', hk.main||'ctrl+space')+'</div>';
     }
 
     // --- meetings list (the main content) ---
     var all = homeMeetings(), rows = homeFiltered();
     if(rows.length && (homeSel==null || !rows.some(function(m){return m.path===homeSel;})))
       homeSel = rows[0].path;
-    var rowsHtml = rows.length ? rows.map(function(m){
-      return '<button class="mtg-row'+(m.path===homeSel?' sel':'')+'" data-mtg="'+esc(m.path)+'">'+
-        '<span class="rn rtl-auto" dir="auto">'+esc(m.title)+'</span>'+
-        (m.has_summary?'<span class="rtag">summary</span>':'<span></span>')+
-        '<span class="rmeta"><span class="rdate">'+esc(m.date)+'</span>'+
-          (m.diarized?'<span>· speakers</span>':'')+'</span>'+
-      '</button>';
-    }).join('') : (all.length
-        ? '<div class="mtg-empty">No meetings match “'+esc(homeSearch)+'”.</div>'
-        : '<div class="mtg-empty">No meetings yet. Start one above - it appears here once saved.</div>');
+    markMeetingsSeen(all);
+    var rowsHtml = rows.length ? rows.map(function(m, i){ return mtgRow(m, i); }).join('') : mtgEmptyHtml(all);
     var list = '<div class="mtg-list">'+
       '<div class="mtg-listhead">'+
         '<div class="mtg-search">'+RK.icon('search',{size:14})+
@@ -1159,7 +1281,7 @@ APP_JS = r"""
     {svc:"hf", key:"hf_token", name:"Local Diarization", badge:"H", color:"#b08900",
      sub:"100% local speaker labels on your GPU (pyannote + ivrit.ai).",
      save:"Save & Download", url:"https://huggingface.co/settings/tokens", slow:true, noun:"token"},
-    {svc:"groq", key:"groq_api_key", name:"Groq", badge:"G", color:"#d97706",
+    {svc:"groq", key:"groq_api_key", name:"Groq", badge:"G", color:"#d97706", img:"__GROQ_LOGO__",
      sub:"Free, fast cloud dictation (Whisper v3 Turbo).",
      save:"Save & Verify", url:"https://console.groq.com/keys", slow:true}
     // AssemblyAI (paid cloud diarization) card removed 2026-09-01 - local
@@ -1174,13 +1296,13 @@ APP_JS = r"""
     var rows = KEYCARDS.map(function(c){
       var noun = c.noun||"key";
       var bad = has[c.key] && rejected[c.key];
-      var cur = bad ? '<span class="cur err">Rejected</span>'
+      var cur = bad ? '<span class="cur warn">Rejected</span>'
               : (has[c.key] ? '<span class="cur ok">Set</span> <span class="masked">'+esc(secrets[c.key]||"")+'</span>'
                             : '<span class="cur muted">Not set</span>');
       var iid = "in_"+c.svc;
       var bdg = (c.img && c.img.indexOf("data:")===0)
         ? '<span class="kbdg img"><img src="'+c.img+'" alt=""></span>'
-        : '<span class="kbdg" style="background:'+c.color+'">'+esc(c.badge)+'</span>';
+        : '<span class="kbdg">'+esc(c.badge)+'</span>';
       var title = '<span class="kname">'+bdg+'<span>'+esc(c.name)+'</span></span>';
       var body =
         (bad ? '<div class="keybad">'+esc(c.name)+' rejected this '+esc(noun)+
@@ -1573,8 +1695,11 @@ APP_JS = r"""
         // collapsed by default (Naor 2026-10-05): long editors, rarely opened
         more('base_prompt', 'Base prompt', 'The full instructions before your rules. Locked; unlock to edit.',
           stateCur(baseOverride),
-          '<div class="hint" style="margin:0 0 6px">Shared with the local Gemma summary; editing here changes OpenAI / Gemini summaries only. '+
-            'The local summary runs a hardcoded pipeline of passes and never reads this field.</div>'+
+          '<div class="hint" style="margin:0 0 6px">'+(S.summary_short_prompt
+            ? 'The compact prompt for OpenAI models (one prompt, the rules below included). Gemini and the local summary keep the full prompt; '+
+              'editing here replaces it for OpenAI / Gemini summaries only.'
+            : 'Shared with the local Gemma summary; editing here changes OpenAI / Gemini summaries only. '+
+              'The local summary runs a hardcoded pipeline of passes and never reads this field.')+'</div>'+
           '<textarea id="summaryBase" class="rtl-auto" dir="auto" style="min-height:220px" disabled>'+
             esc(draftOr("summaryBase", cfg("summary_base_prompt_override","") || (S.summary_base_prompt||"")))+
           '</textarea>'+
@@ -1611,10 +1736,18 @@ APP_JS = r"""
 
   // ---------- render ----------
   function setStatus(){
+    var rec = !!(S.recording || S.meeting_active), busy = !!S.busy;
+    var bs = $("brandState"); if(bs) bs.textContent = S.status_line || "Ready";
+    var rd = $("brandRec");
+    if(rd){ rd.hidden = !rec; if(rec && !rd.style.getPropertyValue("--d")) rd.style.setProperty("--d", RK.ad(1.6667)); }
+    var orb = $("brandOrb");
+    if(orb && orb.classList.contains("busy") !== busy){
+      if(busy) orb.style.setProperty("--d", RK.ad(14));
+      orb.classList.toggle("busy", busy);
+    }
     var el = $("hdrStatus");
-    if(!el) return;
-    var busy = S.recording || S.meeting_active;
-    el.className = "status " + (busy ? "busy" : "ok");
+    if(!el || el.classList.contains("flash")) return;
+    el.className = "status " + (rec || busy ? "busy" : "ok");
     el.innerHTML = '<span class="dot"></span>'+esc(S.status_line||"Ready");
   }
 
@@ -1625,10 +1758,10 @@ APP_JS = r"""
   var _flashTimer = null;
   function flashStatus(msg, ok){
     var el = $("hdrStatus"); if(!el || !msg) return;
-    el.className = "status " + (ok ? "ok" : "err");
-    el.innerHTML = '<span class="dot"></span>' + (ok ? '✓ ' : '⚠ ') + esc(msg);
+    el.className = "status flash " + (ok ? "ok" : "warn");
+    el.innerHTML = '<span class="dot"></span>' + (ok ? '✓ ' : '') + esc(msg);
     if(_flashTimer) clearTimeout(_flashTimer);
-    _flashTimer = setTimeout(function(){ setStatus(); }, 2200);
+    _flashTimer = setTimeout(function(){ el.classList.remove("flash"); setStatus(); }, 2200);
   }
 
   var KEEP_LISTS = ["snipList", "pendingList", "droppedList", "learnedTools", "learnedList",
@@ -1661,6 +1794,7 @@ APP_JS = r"""
     });
     if(ONPAGE[PAGE]){ try{ ONPAGE[PAGE](); }catch(_){} }
     setStatus();
+    RK.segThumbs(content);
     content.scrollTop = sc;
     document.querySelectorAll('.nav-item').forEach(function(b){
       b.classList.toggle('on', b.getAttribute('data-page')===PAGE);
@@ -1669,6 +1803,30 @@ APP_JS = r"""
       if(asel && re.setSelectionRange) re.setSelectionRange(asel[0],asel[1]); }catch(e){} } }
     // Home: load the selected meeting's summary into the side preview (wide only).
     if(home && !S.meeting_active && homeSel && !homeIsNarrow()) loadHomePreview(homeSel);
+    if(home) MTG_ROSE = true;
+  }
+
+  // A meeting summary (markdown) as safe HTML for the preview: every line is
+  // escaped FIRST; "## x" -> a heading, "- [ ] x" / "- [x] x" -> a task,
+  // "- x" -> a bullet, **x** -> bold. Nothing else is interpreted.
+  function summaryHtml(md){
+    var out = [], list = false;
+    function close(){ if(list){ out.push('</ul>'); list = false; } }
+    function inl(t){ return esc(t).replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>'); }
+    String(md||'').split(/\r?\n/).forEach(function(line){
+      var l = line.trim(), m;
+      if(!l){ close(); return; }
+      if((m = /^#{1,4}\s+(.*)$/.exec(l))){ close(); out.push('<h4 dir="auto">'+inl(m[1])+'</h4>'); return; }
+      if((m = /^[-*]\s+\[( |x|X)\]\s+(.*)$/.exec(l))){
+        if(!list){ out.push('<ul>'); list = true; }
+        out.push('<li class="task'+(m[1]===' '?'':' done')+'" dir="auto"><span class="tb" aria-hidden="true"></span>'+inl(m[2])+'</li>'); return; }
+      if((m = /^[-*•]\s+(.*)$/.exec(l))){
+        if(!list){ out.push('<ul>'); list = true; }
+        out.push('<li dir="auto">'+inl(m[1])+'</li>'); return; }
+      close(); out.push('<p dir="auto">'+inl(l)+'</p>');
+    });
+    close();
+    return out.join('');
   }
 
   // ---- Home: meetings preview (wide window) ----
@@ -1694,10 +1852,10 @@ APP_JS = r"""
         acts += '<button class="btn" data-call="rename_speakers_for" data-args=\''+esc(pj)+'\'>'+RK.icon('meetings',{size:15})+' Rename speakers</button>';
       acts += '</div>';
       var bodyHtml = d.has_summary
-        ? '<div class="pv-body rtl-auto" dir="auto">'+esc(d.summary_text||"")+'</div>'
+        ? '<div class="pv-body pv-doc">'+summaryHtml(d.summary_text||"")+'</div>'
         : '<div class="pv-body pv-none">No summary for this meeting - transcript only. Use Open transcript to read it.</div>';
       pv.innerHTML = '<div class="pv-title rtl-auto" dir="auto">'+esc(title)+'</div>'+
-        '<div class="pv-sub">'+esc(d.date||(m&&m.date)||"")+(d.diarized?' · speakers':'')+'</div>'+
+        '<div class="pv-sub">'+whenFull(d.date||(m&&m.date)||"")+(d.diarized?' · speakers':'')+'</div>'+
         acts + bodyHtml;
     });
   }
@@ -1709,22 +1867,23 @@ APP_JS = r"""
     if(rows.length && (homeSel==null || !rows.some(function(m){return m.path===homeSel;})))
       homeSel = rows[0].path;
     var cnt = $("mtgCount"); if(cnt) cnt.textContent = rows.length;
-    box.innerHTML = rows.length ? rows.map(function(m){
-      return '<button class="mtg-row'+(m.path===homeSel?' sel':'')+'" data-mtg="'+esc(m.path)+'">'+
-        '<span class="rn rtl-auto" dir="auto">'+esc(m.title)+'</span>'+
-        (m.has_summary?'<span class="rtag">summary</span>':'<span></span>')+
-        '<span class="rmeta"><span class="rdate">'+esc(m.date)+'</span>'+
-          (m.diarized?'<span>· speakers</span>':'')+'</span>'+
-      '</button>';
-    }).join('') : (all.length
-        ? '<div class="mtg-empty">No meetings match “'+esc(homeSearch)+'”.</div>'
-        : '<div class="mtg-empty">No meetings yet.</div>');
+    box.innerHTML = rows.length ? rows.map(function(m, i){ return mtgRow(m, i, true); }).join('') : mtgEmptyHtml(all);
     if(homeSel && !homeIsNarrow()) loadHomePreview(homeSel);
+  }
+
+  // ---- Home: no rows - nothing matched the search, or a first run ----
+  function mtgEmptyHtml(all){
+    if(all.length) return '<div class="mtg-empty">No meetings match “'+esc(homeSearch)+'”.</div>';
+    return '<div class="mtg-empty first">'+RK.orb('')+'<b>No meetings yet</b>'+
+      '<span>Start one above - it appears here once saved.</span></div>';
   }
 
   function go(page){ PAGE = page; render(); }
 
   // ---------- settings search (local, offline; no field values indexed) -----
+  var NAV_ICON = {general:'general', audio:'audio', meetings:'meetings', models:'models',
+    cleanup:'cleanup', vocab:'vocabulary', snippets:'snippets', keys:'keys', server:'server',
+    advanced:'advanced', home:'home'};
   var PAGE_LABEL = {general:'General', audio:'Audio', meetings:'Meetings',
     models:'Models', cleanup:'AI Cleanup', vocab:'Vocabulary', snippets:'Snippets',
     keys:'API Keys', server:'Transcription server', advanced:'Advanced'};
@@ -1862,6 +2021,105 @@ APP_JS = r"""
     if(focusable){ try{ focusable.focus({preventScroll:true}); }catch(e){ try{ focusable.focus(); }catch(_){} } }
   }
 
+  // ---------- Ctrl+K command palette ----------
+  // Groups: Actions (existing data-call methods only), Pages (the sidebar),
+  // Settings (SEARCH_INDEX + jumpTo), Meetings (the Home list). Max 12 results.
+  var PAL = null;   // {q, sel}
+  var PAL_ACTIONS = [
+    {ic:'meetings', t:'Start meeting', m:'home_start_meeting', when:function(){ return !S.meeting_active; }},
+    {ic:'file', t:'Transcribe a file', m:'transcribe_file'},
+    {ic:'summarize', t:'Summarize a meeting file', m:'summarize_text_dialog'},
+    {ic:'history', t:'Dictation history', m:'show_history'},
+    {ic:'folder', t:'Open meetings folder', m:'open_meetings_folder'}
+  ];
+  function palMatch(hay, toks){ hay = (hay||'').toLowerCase();
+    return toks.every(function(t){ return hay.indexOf(t) >= 0; }); }
+  function palItems(){
+    var q = ((PAL && PAL.q) || '').trim().toLowerCase(), toks = q ? q.split(/\s+/) : [], out = [];
+    PAL_ACTIONS.forEach(function(a){
+      if((!a.when || a.when()) && palMatch(a.t, toks))
+        out.push({g:'Actions', ic:a.ic, t:a.t, go:function(){ call(a.m, []); }});
+    });
+    var pages = [['home','home','Home']].concat(Object.keys(PAGE_LABEL).map(function(k){
+      return [k, NAV_ICON[k] || 'settings', PAGE_LABEL[k]]; }));
+    pages.forEach(function(pg){
+      if(toks.length && palMatch(pg[2], toks))
+        out.push({g:'Pages', ic:pg[1], t:pg[2], go:function(){ go(pg[0]); }});
+    });
+    if(toks.length){
+      SEARCH_INDEX.forEach(function(e){
+        if(palMatch(e.t+' '+e.k+' '+(PAGE_LABEL[e.p]||''), toks))
+          out.push({g:'Settings', ic:NAV_ICON[e.p] || 'settings', t:e.t, sub:PAGE_LABEL[e.p]||e.p,
+                    go:function(){ jumpTo(e.p, e.f); }});
+      });
+      homeMeetings().forEach(function(m){
+        if(palMatch(m.title, toks))
+          out.push({g:'Meetings', ic:'meetings', t:m.title, sub:whenWords(m.date), rtl:true,
+                    go:function(){ homeSel = m.path; homeSearch = ''; go('home'); }});
+      });
+    }
+    return out.slice(0, 12);
+  }
+  function palRender(keepInput){
+    var host = $("pal"); if(!host) return;
+    if(!PAL){ host.innerHTML = ''; return; }
+    var items = palItems(), last = '';
+    PAL.sel = Math.max(0, Math.min(PAL.sel, items.length-1));
+    var list = items.map(function(it, i){
+      var head = it.g !== last ? '<li class="pal-group" role="presentation">'+esc(it.g)+'</li>' : '';
+      last = it.g;
+      return head + '<li class="pi'+(i===PAL.sel?' on':'')+'" role="option" data-pi="'+i+'">'+
+        '<span class="pic">'+RK.icon(it.ic,{size:16})+'</span>'+
+        '<span class="pt"'+(it.rtl?' dir="auto"':'')+'>'+esc(it.t)+'</span>'+
+        (it.sub ? '<span class="ps">'+esc(it.sub)+'</span>' : '')+'</li>';
+    }).join('');
+    if(!items.length) list = '<li class="pal-empty">Nothing found</li>';
+    if(keepInput && host.querySelector('.pal-list')){ host.querySelector('.pal-list').innerHTML = list; return; }
+    host.innerHTML = '<div class="pal-bg"><div class="pal" role="dialog" aria-label="Go to">'+
+      '<div class="pal-in">'+RK.icon('search',{size:18})+
+      '<input type="text" id="palIn" dir="auto" autocomplete="off" spellcheck="false" '+
+      'placeholder="Search actions, settings and meetings" value="'+esc(PAL.q||'')+'">'+
+      '<span class="kbd">Esc</span></div><ul class="pal-list" role="listbox">'+list+'</ul></div></div>';
+    var inp = $("palIn"); if(inp){ inp.focus(); try{ inp.setSelectionRange(inp.value.length, inp.value.length); }catch(_){} }
+  }
+  function palOpen(){ searchHide(); PAL = {q:'', sel:0}; palRender(); }
+  function palClose(){ PAL = null; palRender(); }
+  function palGo(i){ var it = palItems()[i]; palClose(); if(it) it.go(); }
+  document.addEventListener('keydown', function(e){
+    if((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && (e.code==='KeyK' || e.key==='k' || e.key==='K')){
+      e.preventDefault(); if(PAL) palClose(); else palOpen(); return; }
+    if(!PAL) return;
+    if(e.key==='Escape'){ e.preventDefault(); e.stopPropagation(); palClose(); return; }
+    if(e.key==='ArrowDown' || e.key==='ArrowUp'){ e.preventDefault(); e.stopPropagation();
+      PAL.sel += (e.key==='ArrowDown' ? 1 : -1); palRender(true);
+      var on = document.querySelector('.pal-list li.on'); if(on) on.scrollIntoView({block:'nearest'}); return; }
+    if(e.key==='Enter'){ e.preventDefault(); e.stopPropagation(); palGo(PAL.sel); }
+  }, true);
+  document.addEventListener('input', function(e){
+    if(PAL && e.target.id==='palIn'){ PAL.q = e.target.value; PAL.sel = 0; palRender(true); } }, true);
+  document.addEventListener('mousedown', function(e){
+    if(!PAL) return;
+    var li = e.target.closest('.pal-list li.pi'); if(li){ e.preventDefault(); palGo(+li.getAttribute('data-pi')); return; }
+    if(!e.target.closest('.pal')) palClose();
+  }, true);
+
+  // ---------- Lia arrives: the orb gathers from three petals the first time
+  //            this window is actually SEEN (a pre-warmed window is hidden) ----
+  var ARRIVED = false;
+  function arrive(){
+    if(ARRIVED || document.hidden) return;
+    ARRIVED = true;
+    var o = $("brandOrb"); if(!o || RK.reduce) return;
+    o.classList.add("arrive");
+    setTimeout(function(){ o.classList.remove("arrive"); }, 1400);
+  }
+  document.addEventListener("visibilitychange", arrive);
+  // not the active window -> the orb and the recording dot rest (ui_kit:
+  // html.blurred); a Settings window left open behind other apps costs ~0
+  function syncBlurred(){ document.documentElement.classList.toggle("blurred", !document.hasFocus()); }
+  window.addEventListener("focus", syncBlurred); window.addEventListener("blur", syncBlurred);
+  syncBlurred();
+
   // ---------- push handling ----------
   RK.onPush(function(msg){
     var t = msg.t;
@@ -1870,6 +2128,7 @@ APP_JS = r"""
       var meetingChanged = (S.meeting_active !== msg.meeting_active);
       S.status_line = msg.status_line; S.recording = msg.recording;
       S.meeting_active = msg.meeting_active; S.live_transcript_available = msg.live_transcript_available;
+      if("busy" in msg) S.busy = msg.busy;
       setStatus();
       // the Meetings page shows a live-transcript affordance; the Home page shows
       // the whole meeting-active hero + actions - re-render either when relevant.
@@ -2400,11 +2659,11 @@ APP_JS = r"""
   // ---------- boot ----------
   if(window.__LIA_DEMO__){
     // Static QA render (browser / no pywebview): render immediately.
-    go(PAGE);
+    go(PAGE); arrive();
   } else {
     RK.ready(function(){
       try{ RK.api.mark_ready(); }catch(e){}
-      go(PAGE);
+      go(PAGE); arrive();
       if(FOCUS){ focusControl(FOCUS); }
     });
   }

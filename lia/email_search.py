@@ -327,7 +327,7 @@ class SearchApi:
                             self._writeback_entry(msg_id, neid, nsid, nfolder)
                 if item is None:
                     result["error"] = ("Message not found in Outlook (it may have been "
-                                       "permanently deleted or moved). Try ⟳ to refresh.")
+                                       "permanently deleted or moved). Try Refresh.")
                     return
                 a = (action or "open").lower()
                 if a == "reply":
@@ -517,47 +517,50 @@ class SearchApi:
 def _with_csp(html):
     """The page with ui_kit's Content-Security-Policy (audit 2026-09-26 F13)."""
     import ui_kit
-    return ui_kit.with_csp(html)
+    return ui_kit.brand_html(html)
 
 HTML = r"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <style>
+  /* the Lia Lite language (ui_kit.brand_html adds the typeface, Lia's tokens + orb) */
   :root{
-    --accent:#22314F; --accent-d:#2C3E63; --accent-soft:#EDEFF3; --accent-line:#D6DCE8;
-    --ink:#1B2430; --ink-soft:#2A3342; --muted:#6B7280; --faint:#9AA0AD;
-    --line:#E2E5EA; --line-2:#CDD3DC; --bg:#FFFFFF; --hover:#F0F1F4;
-    --sel:#EDEFF3; --hi:#FFF3BF; --chip:#EDEFF3;
-    --shadow:0 1px 2px rgba(16,24,40,.04),0 1px 3px rgba(16,24,40,.06);
+    --accent:#272A4A; --accent-d:#33375E; --accent-soft:#F2F0FD; --accent-line:rgba(106,91,226,.30);
+    --ink:#17171E; --ink-soft:#3A3C46; --muted:#6D6F78; --faint:#A3A5AC;
+    --line:#EAEAE5; --line-2:#DADAD3; --bg:#FFFFFF; --hover:#FAFAF8;
+    --sel:#F2F0FD; --hi:#FCEFC7; --chip:#F0F0EC;
+    --shadow:0 1px 2px rgba(23,23,40,.04),0 1px 3px rgba(23,23,40,.06);
   }
   *{box-sizing:border-box;}
   html,body{height:100%;margin:0;}
   body{background:var(--bg);color:var(--ink);font-size:14px;
-       font-family:"Segoe UI Variable Text","Segoe UI",Heebo,system-ui,Arial,sans-serif;
+       font-family:"Heebo","Segoe UI Variable Text","Segoe UI",system-ui,Arial,sans-serif;
        display:flex;flex-direction:column;-webkit-font-smoothing:antialiased;}
 
   /* ---- top toolbar ---- */
-  .top{flex:none;background:var(--bg);border-bottom:1px solid var(--line-2);
-       padding:11px 16px 10px;z-index:6;}
+  .top{flex:none;background:rgba(246,246,243,.85);backdrop-filter:saturate(160%) blur(14px);
+       border-bottom:1px solid rgba(23,23,40,.06);padding:12px 18px 10px;z-index:6;}
   .searchrow{display:flex;gap:9px;align-items:center;}
   .qwrap{flex:1;position:relative;display:flex;align-items:center;}
-  .qwrap .ic{position:absolute;inset-inline-start:12px;color:var(--faint);font-size:15px;pointer-events:none;}
+  .qwrap .ic{position:absolute;inset-inline-start:13px;color:var(--faint);display:inline-flex;pointer-events:none;}
   #q{flex:1;width:100%;font-size:15px;padding:11px 38px;border:1px solid var(--line-2);
-     border-radius:11px;outline:none;background:#F4F5F7;color:var(--ink);transition:border-color .12s,box-shadow .12s,background .12s;}
+     border-radius:12px;outline:none;background:#FFFFFF;color:var(--ink);font-family:inherit;
+     box-shadow:0 1px 2px rgba(23,23,40,.04);transition:border-color .16s,box-shadow .16s,background .16s;}
   #q::placeholder{color:var(--faint);}
-  #q:focus{background:#FFFFFF;border-color:var(--accent);box-shadow:0 0 0 3px rgba(34,49,79,.13);}
+  #q:focus{background:#FFFFFF;border-color:rgba(106,91,226,.55);box-shadow:var(--ring);}
   .qclear{position:absolute;inset-inline-end:10px;color:var(--faint);cursor:pointer;font-size:16px;
           width:20px;height:20px;line-height:20px;text-align:center;border-radius:50%;display:none;}
   .qclear:hover{background:var(--chip);color:var(--ink);}
-  .btn{border:1px solid var(--line-2);background:#fff;border-radius:10px;padding:10px 13px;
-       cursor:pointer;font-size:14px;white-space:nowrap;color:var(--ink-soft);transition:background .12s,border-color .12s,box-shadow .12s;}
+  .btn{border:1px solid var(--line-2);background:#fff;border-radius:10px;padding:10px 14px;
+       cursor:pointer;font-size:13.5px;font-weight:600;font-family:inherit;white-space:nowrap;color:var(--ink-soft);
+       display:inline-flex;align-items:center;gap:6px;transition:background .16s,border-color .16s,box-shadow .16s;}
   .btn:hover{background:var(--hover);border-color:var(--line-2);}
   .btn:active{transform:translateY(.5px);}
   .btn.primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600;box-shadow:0 1px 2px rgba(34,49,79,.25);}
   .btn.primary:hover{background:var(--accent-d);border-color:var(--accent-d);}
-  .btn.icon{padding:10px 12px;font-size:16px;line-height:1;}
+  .btn.icon{padding:10px 11px;line-height:1;}
   select{padding:9px 10px;border:1px solid var(--line-2);border-radius:10px;background:#fff;
          font-size:13px;color:var(--ink-soft);cursor:pointer;outline:none;}
-  select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(34,49,79,.12);}
+  select:focus{border-color:rgba(106,91,226,.55);box-shadow:var(--ring);}
   #model{max-width:170px;}
 
   .filters{display:flex;gap:7px;align-items:center;margin-top:9px;flex-wrap:wrap;
@@ -565,16 +568,19 @@ HTML = r"""<!DOCTYPE html>
   .filters .seg{display:flex;background:var(--chip);border-radius:10px;padding:3px;gap:2px;}
   .filters .seg button{border:0;background:transparent;color:var(--muted);font-size:12.5px;
         padding:6px 12px;border-radius:8px;cursor:pointer;font-weight:600;transition:background .1s,color .1s;}
-  .filters .seg button.on{background:#fff;color:var(--accent);box-shadow:var(--shadow);}
+  .filters .seg button.on{background:#fff;color:var(--ink);box-shadow:var(--shadow);}
   .filters label{display:flex;gap:5px;align-items:center;color:var(--muted);}
   .filters input,.filters select{font-size:12.5px;padding:6px 8px;border-radius:8px;}
-  .filters input[type=date]{color:var(--ink-soft);}
+  .filters input[type=date]{color:var(--ink-soft);border:1px solid var(--line-2);background:#fff;
+    font-family:inherit;outline:none;}
+  .filters input[type=date]:focus{border-color:rgba(106,91,226,.55);box-shadow:var(--ring);}
+  .filters input[type=checkbox]{accent-color:#272A4A;}
   .spacer{flex:1;}
 
   /* ---- answer (ask) ---- */
   .answer{flex:none;margin:12px 16px 0;padding:14px 16px;background:var(--accent-soft);
           border:1px solid var(--accent-line);border-radius:13px;line-height:1.75;display:none;}
-  .ans-head{display:flex;align-items:center;gap:8px;font-weight:700;color:var(--accent);
+  .ans-head{display:flex;align-items:center;gap:8px;font-weight:700;color:var(--lia-ink);
             font-size:13px;margin-bottom:6px;}
   .ans-sub{font-weight:500;color:var(--muted);font-size:12px;}
   .ans-body{color:var(--ink);white-space:pre-wrap;line-height:1.8;
@@ -582,9 +588,9 @@ HTML = r"""<!DOCTYPE html>
   .ans-hint{color:var(--muted);font-size:13px;}
   .ans-card{background:var(--accent-soft);border:1px solid var(--accent-line);
             border-radius:12px;padding:14px 16px;line-height:1.75;}
-  .cite{color:var(--accent);cursor:pointer;font-weight:800;text-decoration:none;}
+  .cite{color:var(--lia-ink);cursor:pointer;font-weight:800;text-decoration:none;}
   .cite:hover{text-decoration:underline;}
-  .spin{width:14px;height:14px;border:2px solid var(--accent-line);border-top-color:var(--accent);
+  .spin{width:14px;height:14px;border:2px solid var(--lia-soft);border-top-color:var(--lia);
         border-radius:50%;display:inline-block;animation:sp .7s linear infinite;}
   @keyframes sp{to{transform:rotate(360deg);}}
 
@@ -604,9 +610,10 @@ HTML = r"""<!DOCTYPE html>
        transition:background .08s;}
   .row:hover{background:var(--hover);}
   .row.sel{background:var(--sel);}
-  .row.sel::before{content:"";position:absolute;inset-inline-start:0;top:0;bottom:0;width:3px;background:var(--accent);}
+  .row.sel::before{content:"";position:absolute;inset-inline-start:0;top:0;bottom:0;width:3px;background:var(--lia-grad);}
   .row .r1{display:flex;justify-content:space-between;gap:8px;align-items:baseline;}
   .row .who{font-weight:650;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .row .att{color:var(--faint);display:inline-flex;vertical-align:-1px;margin-inline-start:4px;}
   .row .dt{color:var(--faint);font-size:11.5px;flex:none;font-variant-numeric:tabular-nums;}
   .row .subj{color:var(--ink-soft);margin:3px 0 2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .row .snip{color:var(--muted);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
@@ -625,61 +632,62 @@ HTML = r"""<!DOCTYPE html>
   .pv-meta{color:var(--muted);font-size:calc(12.5px*var(--z));margin-bottom:16px;line-height:1.85;overflow-wrap:anywhere;}
   .pv-meta b{color:var(--ink-soft);}
   .pv-from{display:flex;align-items:center;gap:9px;margin-bottom:6px;}
-  .avatar{width:34px;height:34px;border-radius:50%;background:var(--accent-soft);color:var(--accent);
+  .avatar{width:34px;height:34px;border-radius:50%;background:linear-gradient(135deg,#F3F1FC,#E9EEFB);color:var(--lia-ink);
           font-weight:700;font-size:14px;display:flex;align-items:center;justify-content:center;flex:none;}
   .chip{display:inline-block;font-size:11px;background:var(--chip);color:var(--ink-soft);
         border-radius:20px;padding:2px 9px;margin-inline-start:6px;}
-  .chip.acc{background:var(--accent-soft);color:var(--accent);}
+  .chip.acc{background:var(--lia-soft);color:var(--lia-ink);}
   .pv-divider{height:1px;background:var(--line);margin:0 0 16px;}
   .pv-body{white-space:pre-wrap;line-height:1.8;color:var(--ink-soft);font-size:calc(14px*var(--z));overflow-wrap:anywhere;}
 
   .empty{color:var(--muted);padding:54px 24px;text-align:center;display:flex;flex-direction:column;
          align-items:center;gap:10px;}
-  .empty .big{font-size:34px;opacity:.55;}
+  .empty .big{color:var(--faint);display:inline-flex;}
+  .empty .orb{width:48px;height:48px;}
   .empty .sub{font-size:12.5px;color:var(--faint);max-width:280px;line-height:1.6;}
 
   /* ---- status bar ---- */
   .status{flex:none;font-size:12px;color:var(--muted);padding:7px 16px;border-top:1px solid var(--line-2);
-          background:#F4F5F7;display:flex;justify-content:space-between;align-items:center;gap:10px;}
-  .status .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#22c55e;margin-inline-end:6px;}
-  .status .dot.warn{background:#b06a00;} .status .dot.err{background:#c0263c;} .status .dot.busy{background:var(--accent);animation:pulse 1s infinite;}
+          background:#F6F6F3;display:flex;justify-content:space-between;align-items:center;gap:10px;}
+  .status .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#23845A;margin-inline-end:6px;}
+  .status .dot.warn{background:#B07A22;} .status .dot.err{background:#B4424E;} .status .dot.busy{background:var(--lia);animation:pulse 1s infinite;}
   @keyframes pulse{50%{opacity:.35;}}
   ::-webkit-scrollbar{width:11px;height:11px;}
-  ::-webkit-scrollbar-thumb{background:#CDD3DC;border-radius:8px;border:3px solid var(--bg);}
-  ::-webkit-scrollbar-thumb:hover{background:#9AA0AD;}
+  ::-webkit-scrollbar-thumb{background:#D0D0C9;border-radius:8px;border:3px solid var(--bg);}
+  ::-webkit-scrollbar-thumb:hover{background:#B8B8B0;}
 </style></head>
 <body>
   <div class="top">
     <div class="searchrow">
       <div class="qwrap">
-        <span class="ic">🔍</span>
+        <span class="ic"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6"/><line x1="15" y1="15" x2="20" y2="20"/></svg></span>
         <input id="q" autocomplete="off" spellcheck="false"
                dir="auto" placeholder="Search your email…  (try from: / after:2026/06/01 / has:attachment)" />
         <span class="qclear" id="qclear" title="Clear">✕</span>
       </div>
-      <button class="btn primary" id="askBtn" title="Ctrl+Enter">💬 Ask</button>
-      <button class="btn" id="ansBtn" title="Show the last answer again" style="display:none">💬 Answer</button>
+      <button class="btn lia-btn" id="askBtn" title="Ctrl+Enter" style="border-color:transparent">Ask</button>
+      <button class="btn" id="ansBtn" title="Show the last answer again" style="display:none">Answer</button>
       <select id="model" title="Answer model"></select>
-      <button class="btn icon" id="refresh" title="Refresh the index (Outlook must be open)">⟳</button>
+      <button class="btn icon" id="refresh" title="Refresh the index (Outlook must be open)" aria-label="Refresh the index"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8 8 0 1 0-1.6 4.5"/><path d="M20 5v6h-6"/></svg></button>
     </div>
     <div class="filters">
       <div class="seg" id="accSeg"></div>
       <label>Folder <select id="fFolder"><option value="">All</option></select></label>
       <label>From <input type="date" id="fAfter"></label>
       <label>To <input type="date" id="fBefore"></label>
-      <label><input type="checkbox" id="fAttach"> 📎 Attachment</label>
+      <label><input type="checkbox" id="fAttach"> Attachment</label>
       <span class="spacer"></span>
     </div>
   </div>
 
   <div class="main" id="main">
     <div class="results" id="results">
-      <div class="empty"><span class="big">✉️</span><div>Type to search</div>
+      <div class="empty"><span class="big"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M4 7l8 6 8-6"/></svg></span><div>Type to search</div>
         <div class="sub">Instant search across all your mail. Double-click a message to open it in Outlook.</div></div>
     </div>
     <div class="splitter" id="splitter"></div>
     <div class="preview" id="preview">
-      <div class="empty"><span class="big">📭</span><div>Select a message to preview</div>
+      <div class="empty"><span class="big"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M4 7l8 6 8-6"/></svg></span><div>Select a message to preview</div>
         <div class="sub">The preview shows here. Double-click to open it in Outlook and reply.</div></div>
     </div>
   </div>
@@ -691,6 +699,8 @@ HTML = r"""<!DOCTYPE html>
 
 <script>
 var api, results=[], sel=-1, model="", debounce=null, account="";
+var ORB = '__LIA_ORB__';
+var I_MAIL = '<svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M4 7l8 6 8-6"/></svg>', I_SEARCH = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6"/><line x1="15" y1="15" x2="20" y2="20"/></svg>', I_CLIP = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.5 12.5l-8.1 8.1a5.2 5.2 0 0 1-7.4-7.4l8.7-8.7a3.5 3.5 0 0 1 5 5l-8.7 8.7a1.7 1.7 0 0 1-2.4-2.4l8.1-8.1"/></svg>';
 var lastPrewarmed="", prewarmTimer=null, flashTimer=null, refreshTimer=null, refreshPreMsgs=0;
 var lastStatus={}, refreshPreTs=0, baseStat="", statusSeq=0, askedModels={}, pvZoom=1;
 var lastRefreshKick=0, askActive=false, lastAns=null;
@@ -724,14 +734,14 @@ function flashStat(msg){
 
 function clearPreview(){
   window._pv=null;
-  $('preview').innerHTML='<div class="empty"><span class="big">📭</span><div>Select a message to preview</div>'
+  $('preview').innerHTML='<div class="empty"><span class="big">'+I_MAIL+'</span><div>Select a message to preview</div>'
     +'<div class="sub">The preview shows here. Double-click to open it in Outlook and reply.</div></div>';
 }
 
 function renderResults(){
   var el=$('results');
   if(!results.length){
-    el.innerHTML='<div class="empty"><span class="big">🔎</span><div>No results</div>'
+    el.innerHTML='<div class="empty"><span class="big">'+I_SEARCH+'</span><div>No results</div>'
       +'<div class="sub">Try different wording, or clear the filters.</div></div>'; return;
   }
   var head='<div class="listhead"><span>'+results.length+' results</span><span></span></div>';
@@ -740,10 +750,10 @@ function renderResults(){
     var sentish = r.folder==='Sent'||r.folder==='Sent Items';
     var who = meet ? ('Meeting · '+esc(r.sender_name||''))
             : (sentish ? ('To: '+esc(r.to_recips)) : esc(r.sender_name||r.sender_email));
-    var subj = (meet?'📅 ':'')+esc(r.subject||'(no subject)');
+    var subj = esc(r.subject||'(no subject)');
     var cls = 'row'+(i===sel?' sel':'')+(r.unread?' unread':'');
     return '<div class="'+cls+'" data-i="'+i+'">'
-      +'<div class="r1"><span class="who">'+who+(r.has_attach?' 📎':'')+'</span><span class="dt">'+esc(r.date_str)+'</span></div>'
+      +'<div class="r1"><span class="who">'+who+(r.has_attach?' <span class="att">'+I_CLIP+'</span>':'')+'</span><span class="dt">'+esc(r.date_str)+'</span></div>'
       +'<div class="subj">'+subj+'</div>'
       +'<div class="snip">'+hl(r.snippet)+'</div></div>';
   }).join('');
@@ -763,23 +773,23 @@ async function select(i){
   var row=$('results').querySelector('.row[data-i="'+i+'"]'); if(row) row.scrollIntoView({block:'nearest'});
   var r=results[i];
   var pv=await api.preview(r.id);
-  if(pv.error){ $('preview').innerHTML='<div class="empty"><span class="big">⚠️</span><div>'+esc(pv.error)+'</div></div>'; return; }
+  if(pv.error){ $('preview').innerHTML='<div class="empty"><span class="big">'+I_MAIL+'</span><div>'+esc(pv.error)+'</div></div>'; return; }
   var cc = pv.cc_recips?('<br>Cc: '+esc(pv.cc_recips)):'';
   var bodyHtml = (pv.body && pv.body.trim())
     ? esc(pv.body)
     : '<span style="color:var(--faint)">- no text content'+(pv.has_attach?' (it is probably in the attachment - open in Outlook)':' (the message may be HTML/image only)')+' -</span>';
   var meet = pv.kind==='meeting';
-  var olBtns = '<button class="btn primary" onclick="olAct(\'open\')">↪ Open</button>';
+  var olBtns = '<button class="btn primary" onclick="olAct(\'open\')">Open in Outlook</button>';
   if(!meet){
-    olBtns += '<button class="btn" onclick="olAct(\'reply\')">↩ Reply</button>'
-            + '<button class="btn" onclick="olAct(\'replyall\')">↩ Reply All</button>'
-            + '<button class="btn" onclick="olAct(\'forward\')">→ Forward</button>';
+    olBtns += '<button class="btn" onclick="olAct(\'reply\')">Reply</button>'
+            + '<button class="btn" onclick="olAct(\'replyall\')">Reply all</button>'
+            + '<button class="btn" onclick="olAct(\'forward\')">Forward</button>';
   }
   $('preview').innerHTML =
     '<div class="pv" style="--z:'+pvZoom+'">'
     +'<div class="pv-actions">'
       + olBtns
-      +'<button class="btn" onclick="copyBody()">⧉ Copy</button>'
+      +'<button class="btn" onclick="copyBody()">Copy</button>'
       +'<span class="zoomgrp"><button class="btn zoom" onclick="zoomPv(-1)" title="Smaller text">A−</button>'
       +'<button class="btn zoom" onclick="zoomPv(1)" title="Larger text">A+</button></span>'
     +'</div>'
@@ -790,9 +800,9 @@ async function select(i){
         +(pv.sender_email?(' &lt;'+esc(pv.sender_email)+'&gt;'):'')+' · '+esc(pv.date_str)
         +'<br>To: '+esc(pv.to_recips)+cc+'</div>'
     +'</div>'
-    +'<div style="margin-bottom:14px">'+(pv.kind==='meeting'?'<span class="chip acc">📅 Meeting</span>':'')
+    +'<div style="margin-bottom:14px">'+(pv.kind==='meeting'?'<span class="chip acc">Meeting</span>':'')
       +'<span class="chip acc">'+esc(acctLabel(pv.account))+'</span>'
-      +'<span class="chip">'+esc(pv.folder)+'</span>'+(pv.has_attach?'<span class="chip">📎 Attachment</span>':'')+'</div>'
+      +'<span class="chip">'+esc(pv.folder)+'</span>'+(pv.has_attach?'<span class="chip">Attachment</span>':'')+'</div>'
     +'<div class="pv-divider"></div>'
     +'<div class="pv-body" dir="auto" id="pvbody">'+bodyHtml+'</div>'
     +'</div>';
@@ -802,7 +812,7 @@ async function openOut(i){
   var r=results[i]; if(!r) return;
   flashStat('Opening in Outlook…');
   var res; try{ res=await api.open_in_outlook(r.entry_id, r.store_id||"", r.subject||"", r.id); }catch(e){ res={ok:false,error:''+e}; }
-  if(res && res.ok){ flashStat('Opened in Outlook ✓'); }
+  if(res && res.ok){ flashStat('Opened in Outlook'); }
   else { setStat('Could not open in Outlook'+((res&&res.error)?(' - '+esc(res.error)):' (is Outlook running?)'),'err'); }
 }
 async function olAct(action){
@@ -810,7 +820,7 @@ async function olAct(action){
   var labels={open:'Opening',reply:'Reply',replyall:'Reply All',forward:'Forward'};
   flashStat((labels[action]||'Opening')+' in Outlook…');
   var res; try{ res=await api.outlook_action(r.entry_id, r.store_id||"", action, r.id); }catch(e){ res={ok:false,error:''+e}; }
-  if(res && res.ok){ flashStat('Opened in Outlook ✓'); }
+  if(res && res.ok){ flashStat('Opened in Outlook'); }
   else { setStat('Could not open in Outlook'+((res&&res.error)?(' - '+esc(res.error)):' (is Outlook running?)'),'err'); }
 }
 function copyBody(){ if(window._pv) api.copy((window._pv.subject||'')+'\n\n'+(window._pv.body||'')); }
@@ -834,24 +844,24 @@ function pvAnswer(inner){ $('preview').innerHTML='<div class="pv"><div class="an
 /* "GPU busy - ..." while a local answer waits for the GPU (ollama_gate) */
 window.__gpuWait=function(t){
   var h=document.querySelector('#preview .ans-head');
-  if(h && h.querySelector('.spin')){ h.innerHTML='<span class="spin"></span> '+esc(t); }
+  if(h && h.querySelector('.spin')){ h.innerHTML='<span class="spin" style="display:none"></span><span class="orb sm busy">'+ORB+'</span> '+esc(t); }
 };
 
 async function doAsk(){
   var q=$('q').value.trim();
   if(!q){
-    pvAnswer('<div class="ans-head">💬 Ask your email</div>'
+    pvAnswer('<div class="ans-head"><span class="orb sm">'+ORB+'</span>Ask your email</div>'
       +'<div class="ans-hint">Type a question in the search box (for example "who at acme.co did we talk to about architecture?") and press Ask, or Ctrl+Enter.</div>');
     $('q').focus(); return;
   }
   var mlabel = $('model').options[$('model').selectedIndex] ? $('model').options[$('model').selectedIndex].text : model;
   var warm = !!askedModels[model] || model===lastPrewarmed;
   var sub = warm ? '' : ' <span class="ans-sub">('+esc(mlabel)+' · loading the model for the first time, ~20-40s)</span>';
-  pvAnswer('<div class="ans-head"><span class="spin"></span> Thinking…'+sub+'</div>');
+  pvAnswer('<div class="ans-head"><span class="spin" style="display:none"></span><span class="orb sm busy">'+ORB+'</span> Thinking…'+sub+'</div>');
   try{
     var r=await api.ask(q, model, filters());
     if(!r || r.error){
-      pvAnswer('<div class="ans-head">⚠️ Error</div><div class="ans-hint">'+esc((r&&r.error)||'No answer returned')+'</div>');
+      pvAnswer('<div class="ans-head" style="color:var(--calm)">Could not answer</div><div class="ans-hint">'+esc((r&&r.error)||'No answer returned')+'</div>');
       return;
     }
     askedModels[model]=true;
@@ -862,7 +872,7 @@ async function doAsk(){
     $('ansBtn').style.display='';
     showAnswer();   // right pane = answer; list = its sources (citations stay valid)
   }catch(e){
-    pvAnswer('<div class="ans-head">⚠️ Error</div><div class="ans-hint">'+esc(''+e)+'</div>');
+    pvAnswer('<div class="ans-head" style="color:var(--calm)">Could not answer</div><div class="ans-hint">'+esc(''+e)+'</div>');
   }
 }
 
@@ -877,13 +887,13 @@ function showAnswer(){
   $('preview').innerHTML =
     '<div class="pv" style="--z:'+pvZoom+'">'
     +'<div class="pv-actions">'
-      +'<button class="btn" onclick="copyAns()">⧉ Copy answer</button>'
+      +'<button class="btn" onclick="copyAns()">Copy answer</button>'
       +'<span class="pv-tip">Click a [number] to jump to the source email</span>'
       +'<span class="zoomgrp"><button class="btn zoom" onclick="zoomPv(-1)" title="Smaller text">A−</button>'
       +'<button class="btn zoom" onclick="zoomPv(1)" title="Larger text">A+</button></span>'
     +'</div>'
     +'<div class="ans-card">'
-      +'<div class="ans-head">💬 Answer <span class="ans-sub">'+esc(lastAns.model||'')+'</span></div>'
+      +'<div class="ans-head"><span class="orb sm">'+ORB+'</span>Answer <span class="ans-sub">'+esc(lastAns.model||'')+'</span></div>'
       +'<div class="ans-body" dir="auto">'+lastAns.html+'</div>'
     +'</div></div>';
   Array.prototype.forEach.call($('preview').querySelectorAll('.cite'), function(c){
@@ -911,7 +921,7 @@ function pollRefresh(n, startMs){
     if(fresh && s.state==='error'){
       var com=(s.error||'').toLowerCase();
       if(com.indexOf('com_error')>=0||com.indexOf('server execution')>=0||com.indexOf('-2146959355')>=0||com.indexOf('rejected by callee')>=0)
-        setStat('Refresh failed - open Outlook and press ⟳ again','err');
+        setStat('Refresh failed - open Outlook and press Refresh again','err');
       else setStat('Refresh failed: '+esc(s.error||''),'err');
       return;
     }

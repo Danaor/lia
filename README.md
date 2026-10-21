@@ -225,6 +225,7 @@ Lia's code is MIT licensed. It stands on the shoulders of excellent open models 
 - [Gemma](https://ai.google.dev/gemma) via [Ollama](https://ollama.com) - local summaries
 - [hspell Hebrew word list](http://hspell.ivrix.org.il/) via [dictionary-he](https://github.com/wooorm/dictionaries/tree/main/dictionaries/he) - AGPL-3.0, downloaded on demand for the Hebrew spelling fix, never bundled
 - [PyAudioWPatch](https://github.com/s0d3s/PyAudioWPatch) - recording the call audio (WASAPI loopback)
+- [Heebo](https://github.com/OdedEzer/heebo) typeface - SIL Open Font License 1.1 (`lia/fonts/HEEBO_OFL.txt`), embedded in Lia's windows
 
 ---
 

@@ -58,6 +58,18 @@ class MeetingCard:
         self._t0 = None                   # time.monotonic at (re)build
         self._spin = 0
         self._rtl = False
+        # Lia's orb (orb_art, PIL) replaces the text spinner once its frames
+        # exist; they are drawn off the Tk thread so a card never waits.
+        self._orb_px = self._m.px(ns.ORB)
+        self._orb_imgs = None
+        self._orb_i = 0
+        try:
+            import threading
+            import orb_art
+            threading.Thread(target=orb_art.busy_frames, args=(self._orb_px, 36),
+                             daemon=True, name="orb-frames").start()
+        except Exception:
+            pass
         self._reduced = ns.is_reduced_motion()
         # The user's Minimize / Details choice for the CURRENT card (same
         # `anchor`). The host re-renders on every stage change from its own
@@ -102,8 +114,36 @@ class MeetingCard:
         self._teardown()
 
     # ---- build -----------------------------------------------------------
+    def _orb_images(self):
+        """The orb's frames as Tk images, or None until orb_art has drawn
+        them (then the text spinner stands in). Tk-thread only."""
+        if self._orb_imgs is not None:
+            return self._orb_imgs or None
+        try:
+            import orb_art
+            frames = orb_art._CACHE.get((self._orb_px, 36))
+            if not frames:
+                return None
+            from PIL import ImageTk
+            self._orb_imgs = [ImageTk.PhotoImage(f, master=self._root) for f in frames]
+        except Exception:
+            self._orb_imgs = []
+        return self._orb_imgs or None
+
+    def _busy_widget(self, tk, row, font):
+        """Lia working: her turning orb (or the text spinner until it exists)."""
+        imgs = self._orb_images()
+        if imgs:
+            w = tk.Label(row, image=imgs[self._orb_i % len(imgs)], bg=ns.BG, bd=0)
+            self._widgets["orb"] = w
+        else:
+            w = tk.Label(row, text=_SPIN[0], bg=ns.BG, fg=_dot_color("busy"), font=font)
+            self._widgets["spin"] = w
+        return w
+
     def _build(self, c):
         import tkinter as tk
+        first_show = self._top is None        # a NEW card fades in; a re-render does not
         self._teardown(keep_state=True)
         self._state = c
         # Whole-card direction from its visible text. Label/Message bidi
@@ -152,8 +192,33 @@ class MeetingCard:
         self._position()
         self._round()
         self._refresh_dynamic()
+        if first_show and not self._reduced:
+            self._fade_in(top)
         if c.get("dot") in ("busy", "rec") and not self._reduced:
             self._tick()
+
+    def _fade_in(self, top, steps=6):
+        """A short opacity ramp when a card first appears (ns.FADE_MS). Any
+        failure leaves the card simply shown - never half-transparent."""
+        try:
+            top.attributes("-alpha", 0.0)
+        except Exception:
+            return
+        dt = max(10, ns.FADE_MS // steps)
+
+        def step(i):
+            try:
+                if self._top is not top:
+                    return
+                top.attributes("-alpha", min(1.0, i / steps))
+                if i < steps:
+                    top.after(dt, step, i + 1)
+            except Exception:
+                try:
+                    top.attributes("-alpha", 1.0)
+                except Exception:
+                    pass
+        step(1)
 
     def _build_brand(self, tk, parent, c):
         m = self._m
@@ -161,9 +226,12 @@ class MeetingCard:
         trail = "left" if self._rtl else "right"   # controls side
         row = tk.Frame(parent, bg=ns.BG)
         row.pack(fill="x")
-        if self._logo is not None:
-            tk.Label(row, image=self._logo, bg=ns.BG).pack(side=lead)
-        gap = (m.px(6) if self._logo is not None else 0, 0)
+        # while Lia works her turning orb leads the title row, so the static
+        # mark steps aside (one orb per card)
+        mark = self._logo if c.get("dot") != "busy" else None
+        if mark is not None:
+            tk.Label(row, image=mark, bg=ns.BG).pack(side=lead)
+        gap = (m.px(6) if mark is not None else 0, 0)
         if self._wordmark is not None:
             tk.Label(row, image=self._wordmark, bg=ns.BG).pack(side=lead, padx=gap)
         else:
@@ -190,9 +258,7 @@ class MeetingCard:
         if col:
             # A small round dot (busy uses a spinner glyph instead of a disc).
             if dot == "busy":
-                d = tk.Label(row, text=_SPIN[0], bg=ns.BG, fg=col,
-                             font=m.font(ns.PT_BODY))
-                self._widgets["spin"] = d
+                d = self._busy_widget(tk, row, m.font(ns.PT_BODY))
             elif dot in ("ok", "err", "neutral"):
                 glyph = {"ok": "✓", "err": "✕", "neutral": "⊘"}[dot]
                 d = tk.Label(row, text=glyph, bg=ns.BG, fg=col,
@@ -222,10 +288,7 @@ class MeetingCard:
         lead = "right" if self._rtl else "left"
         trail = "left" if self._rtl else "right"
         if c.get("dot") == "busy":
-            self._widgets["spin"] = tk.Label(
-                row, text=_SPIN[0], bg=ns.BG, fg=_dot_color("busy"),
-                font=m.font(ns.PT_META))
-            self._widgets["spin"].pack(side=lead, padx=(0, m.px(6)))
+            self._busy_widget(tk, row, m.font(ns.PT_META)).pack(side=lead, padx=(0, m.px(6)))
         tk.Label(row, text=c.get("title", ""), bg=ns.BG, fg=ns.INK,
                  font=m.font(ns.PT_META, semibold=True)).pack(side=lead)
         self._widgets["elapsed"] = tk.Label(
@@ -306,6 +369,10 @@ class MeetingCard:
         if c.get("stages") and c.get("dot") == "busy":
             lbl = "Hide details" if c.get("expanded") else "Details"
             actions = actions + [(lbl, self._on_toggle_details, False)]
+        # A text "Close" next to the actions (Naor, 2026-10-07): the same path
+        # as the X, so an on_close policy still runs. Last = the leading edge.
+        if c.get("close_button") and c.get("allow_close", True):
+            actions = actions + [(c.get("close_label") or "Close", self._on_close, False)]
         if not actions:
             return
         row = tk.Frame(parent, bg=ns.BG)
@@ -419,11 +486,21 @@ class MeetingCard:
         if not self._top or not self._state:
             return
         try:
-            if "spin" in self._widgets:
+            delay = 180
+            if "orb" in self._widgets and self._orb_imgs:
+                self._orb_i = (self._orb_i + 1) % len(self._orb_imgs)
+                self._widgets["orb"].configure(image=self._orb_imgs[self._orb_i])
+                delay = 100                   # 36 frames = one 3.6 s turn
+            elif "spin" in self._widgets:
                 self._spin = (self._spin + 1) % len(_SPIN)
                 self._widgets["spin"].configure(text=_SPIN[self._spin])
+                # the orb's frames arrived: swap them in at the next render
+                if self._orb_images():
+                    w = self._widgets.pop("spin")
+                    w.configure(image=self._orb_imgs[0], text="")
+                    self._widgets["orb"] = w
             self._refresh_dynamic()
-            self._anim_id = self._top.after(180, self._tick)
+            self._anim_id = self._top.after(delay, self._tick)
         except Exception:
             return
 

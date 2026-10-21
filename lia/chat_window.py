@@ -287,54 +287,57 @@ class ChatApi:
 def _with_csp(html):
     """The page with ui_kit's Content-Security-Policy (audit 2026-09-26 F13)."""
     import ui_kit
-    return ui_kit.with_csp(html)
+    return ui_kit.brand_html(html)
 
 HTML = r"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <style>
+  /* the Lia Lite language (ui_kit.brand_html adds the typeface, Lia's tokens + orb) */
   :root{
-    --accent:#22314F; --accent-d:#2C3E63; --accent-soft:#EDEFF3; --accent-line:#D6DCE8;
-    --ink:#1B2430; --ink-soft:#2A3342; --muted:#6B7280; --faint:#9AA0AD;
-    --line:#E2E5EA; --line-2:#CDD3DC; --bg:#ffffff; --panel:#F0F1F4;
-    --user:#22314F; --bot:#f4f4f8; --code:#1e2233;
-    --shadow:0 1px 2px rgba(16,24,40,.05),0 6px 22px rgba(16,24,40,.06);
+    --accent:#272A4A; --accent-d:#33375E; --accent-soft:#F0F0EC; --accent-line:#DADAD3;
+    --ink:#17171E; --ink-soft:#3A3C46; --muted:#6D6F78; --faint:#A3A5AC;
+    --line:#EAEAE5; --line-2:#DADAD3; --bg:#F6F6F3; --panel:#F0F0EC;
+    --user:#272A4A; --bot:#FFFFFF; --code:#1F2135;
+    --shadow:0 1px 2px rgba(23,23,40,.04),0 10px 28px -14px rgba(23,23,40,.12);
   }
   *{box-sizing:border-box;}
   html,body{height:100%;margin:0;}
   body{background:var(--bg);color:var(--ink);font-size:15px;
-       font-family:"Segoe UI Variable Text","Segoe UI",Heebo,system-ui,Arial,sans-serif;
+       font-family:"Heebo","Segoe UI Variable Text","Segoe UI",system-ui,Arial,sans-serif;
        display:flex;flex-direction:column;-webkit-font-smoothing:antialiased;}
 
-  .top{flex:none;display:flex;align-items:center;gap:12px;padding:12px 18px;
-       border-bottom:1px solid var(--line-2);background:var(--bg);z-index:5;}
-  .brand{font-weight:800;font-size:16px;display:flex;align-items:center;gap:8px;}
-  .brand .dot{width:8px;height:8px;border-radius:50%;background:#22c55e;box-shadow:0 0 0 3px #22c55e22;}
-  .brand small{color:var(--muted);font-weight:500;font-size:12px;margin-inline-start:2px;}
+  .top{flex:none;display:flex;align-items:center;gap:12px;padding:12px 20px;z-index:5;
+       background:rgba(255,255,255,.72);backdrop-filter:saturate(160%) blur(14px);
+       border-bottom:1px solid rgba(23,23,40,.06);}
+  .brand{font-weight:750;font-size:17px;letter-spacing:-.2px;display:flex;align-items:center;gap:10px;}
+  .brand .orb{width:26px;height:26px;}
+  .brand small{color:var(--faint);font-weight:500;font-size:12px;margin-inline-start:2px;letter-spacing:0;}
   .spacer{flex:1;}
   select{padding:8px 11px;border:1px solid var(--line-2);border-radius:10px;background:#fff;
          font-size:13px;color:var(--ink-soft);cursor:pointer;outline:none;}
-  select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(34,49,79,.14);}
+  select:focus{border-color:rgba(106,91,226,.55);box-shadow:var(--ring);}
   .btn{border:1px solid var(--line-2);background:#fff;border-radius:10px;padding:8px 13px;
-       cursor:pointer;font-size:13.5px;color:var(--ink-soft);white-space:nowrap;
-       transition:background .12s,border-color .12s,transform .05s;}
-  .btn:hover{background:var(--panel);}
+       cursor:pointer;font-size:13px;font-weight:600;font-family:inherit;color:var(--ink-soft);white-space:nowrap;
+       transition:background .16s,border-color .16s,transform .05s;}
+  .btn:hover{background:#FAFAF8;color:var(--ink);}
   .btn:active{transform:translateY(.5px);}
 
   /* messages */
   .scroll{flex:1;overflow:auto;padding:22px 0;}
   .wrap{max-width:820px;margin:0 auto;padding:0 20px;display:flex;flex-direction:column;gap:16px;}
-  .msg{display:flex;gap:11px;align-items:flex-start;}
+  .msg{display:flex;gap:11px;align-items:flex-start;animation:rise .36s var(--ease) both;}
   .msg .av{width:30px;height:30px;border-radius:50%;flex:none;display:flex;align-items:center;
-           justify-content:center;font-size:15px;font-weight:700;margin-top:2px;}
+           justify-content:center;font-size:11px;font-weight:700;margin-top:2px;}
   .msg.user{flex-direction:row-reverse;}
-  .msg.user .av{background:var(--accent);color:#fff;}
-  .msg.bot  .av{background:var(--accent-soft);color:var(--accent);}
+  .msg.user .av{background:var(--panel);color:var(--ink-soft);}
+  .msg.bot  .av{background:transparent;}
+  .msg.bot  .av .orb{width:28px;height:28px;}
   .bubble{padding:12px 15px;border-radius:15px;line-height:1.75;max-width:76%;
           overflow-wrap:anywhere;position:relative;
           user-select:text;-webkit-user-select:text;cursor:text;}
   .msg.user .bubble{background:var(--user);color:#fff;border-top-right-radius:5px;}
   .msg.bot  .bubble{background:var(--bot);color:var(--ink);border:1px solid var(--line);
-                    border-top-left-radius:5px;}
+                    border-top-left-radius:5px;box-shadow:var(--shadow);}
   .bubble p{margin:0 0 8px;} .bubble p:last-child{margin:0;}
   .bubble strong{font-weight:700;}
   .bubble code{background:#0000000f;padding:1px 5px;border-radius:5px;font-size:.9em;
@@ -344,50 +347,50 @@ HTML = r"""<!DOCTYPE html>
                    overflow:auto;margin:8px 0;direction:ltr;text-align:left;}
   .bubble pre.code code{background:none;padding:0;color:inherit;font-size:12.5px;line-height:1.6;}
   .bubble ul{margin:6px 0;padding-inline-start:22px;} .bubble li{margin:2px 0;}
-  .cursor{display:inline-block;width:7px;height:16px;background:var(--accent);border-radius:2px;
+  .cursor{display:inline-block;width:7px;height:16px;background:var(--lia-grad);border-radius:2px;
           margin-inline-start:2px;vertical-align:-2px;animation:bl 1s steps(2) infinite;}
   @keyframes bl{50%{opacity:0;}}
   .tools{display:flex;gap:6px;margin-top:7px;opacity:.75;transition:opacity .12s;}
   .msg.bot:hover .tools{opacity:1;}
   .tools button{border:1px solid var(--line-2);background:#fff;color:var(--ink-soft);cursor:pointer;
-                font-size:12px;padding:4px 10px;border-radius:8px;user-select:none;}
-  .tools button:hover{background:var(--panel);border-color:var(--accent);color:var(--accent);}
+                font-size:12px;font-family:inherit;padding:4px 11px;border-radius:999px;user-select:none;}
+  .tools button:hover{background:#FAFAF8;color:var(--ink);}
 
   .empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
          gap:12px;color:var(--muted);text-align:center;}
-  .empty .big{font-size:46px;}
-  .empty h2{margin:0;color:var(--ink);font-size:22px;font-weight:800;}
+  .empty .orb{width:72px;height:72px;margin-bottom:4px;}
+  .empty h2{margin:0;color:var(--ink);font-size:26px;font-weight:750;letter-spacing:-.5px;}
   .empty .subs{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;max-width:560px;margin-top:6px;}
-  .chip{border:1px solid var(--line-2);background:var(--panel);border-radius:20px;padding:7px 13px;
-        font-size:12.5px;color:var(--ink-soft);cursor:pointer;transition:background .12s,border-color .12s;}
-  .chip:hover{background:#fff;border-color:var(--accent);color:var(--accent);}
+  .chip{border:1px solid var(--line-2);background:#fff;border-radius:999px;padding:8px 14px;
+        font-size:13px;color:var(--ink-soft);cursor:pointer;transition:background .16s,border-color .16s,transform .16s;}
+  .chip:hover{background:#FAFAF8;color:var(--ink);transform:translateY(-1px);}
 
   /* composer */
-  .composer{flex:none;border-top:1px solid var(--line-2);background:var(--bg);padding:12px 20px 16px;}
+  .composer{flex:none;background:var(--bg);padding:10px 20px 16px;}
   .cbox{max-width:820px;margin:0 auto;display:flex;gap:10px;align-items:flex-end;
         border:1px solid var(--line-2);border-radius:16px;padding:8px 8px 8px 14px;background:#fff;
         box-shadow:var(--shadow);transition:border-color .12s,box-shadow .12s;}
-  .cbox:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px rgba(34,49,79,.13),var(--shadow);}
+  .cbox:focus-within{border-color:rgba(106,91,226,.55);box-shadow:var(--ring),var(--shadow);}
   #inp{flex:1;border:0;outline:none;resize:none;font-size:15px;line-height:1.6;background:transparent;
        color:var(--ink);max-height:200px;font-family:inherit;padding:6px 0;}
   #inp::placeholder{color:var(--faint);}
   .send{flex:none;width:40px;height:40px;border-radius:12px;border:0;cursor:pointer;
-        background:var(--accent);color:#fff;font-size:17px;display:flex;align-items:center;
-        justify-content:center;transition:background .12s,transform .05s;}
-  .send:hover{background:var(--accent-d);} .send:active{transform:translateY(.5px);}
-  .send:disabled{background:var(--line-2);color:var(--faint);cursor:default;}
-  .send.stop{background:#c0263c;} .send.stop:hover{background:#9f1f32;}
+        color:#fff;font-size:16px;display:flex;align-items:center;justify-content:center;}
+  .send:active{transform:translateY(.5px);}
+  .send:disabled{background:var(--line-2) !important;color:var(--faint) !important;cursor:default;box-shadow:none;}
+  /* Stop is not an alarm: red is for recording only */
+  .send.stop{background:var(--accent) !important;} .send.stop::after{display:none;}
   .hint{max-width:820px;margin:7px auto 0;color:var(--faint);font-size:11.5px;text-align:center;}
 
-  ::-webkit-scrollbar{width:11px;} ::-webkit-scrollbar-thumb{background:#CDD3DC;border-radius:8px;border:3px solid var(--bg);}
-  ::-webkit-scrollbar-thumb:hover{background:#9AA0AD;}
+  ::-webkit-scrollbar{width:12px;} ::-webkit-scrollbar-thumb{background:#D0D0C9;border-radius:8px;border:4px solid var(--bg);}
+  ::-webkit-scrollbar-thumb:hover{background:#B8B8B0;}
 </style></head>
 <body>
   <div class="top">
-    <div class="brand"><span class="dot"></span>Chat <small id="sub">local · private</small></div>
+    <div class="brand"><span class="orb">__LIA_ORB__</span>Chat <small id="sub">local · private</small></div>
     <span class="spacer"></span>
     <select id="model" title="Choose a model"></select>
-    <button class="btn" id="newBtn" title="New conversation">🗑 New</button>
+    <button class="btn" id="newBtn" title="New conversation">New chat</button>
   </div>
 
   <div class="scroll" id="scroll">
@@ -397,13 +400,14 @@ HTML = r"""<!DOCTYPE html>
   <div class="composer">
     <div class="cbox">
       <textarea id="inp" rows="1" dir="auto" placeholder="Type a message…  (Enter to send · Shift+Enter for a new line)"></textarea>
-      <button class="send" id="send" title="Send">➤</button>
+      <button class="send lia-btn" id="send" title="Send">➤</button>
     </div>
     <div class="hint">Runs on your own local models · the conversation is saved automatically</div>
   </div>
 
 <script>
 var api, msgs=[], model="", streaming=false, curBot=null, curText="";
+var ORB = '__LIA_ORB__';
 function $(id){return document.getElementById(id);}
 function esc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
   .replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
@@ -441,7 +445,7 @@ function renderAll(){
   var w=$('wrap');
   if(!msgs.length){
     w.innerHTML='';
-    $('scroll').innerHTML='<div class="empty"><div class="big">💬</div>'
+    $('scroll').innerHTML='<div class="empty"><span class="orb">'+ORB+'</span>'
       +'<h2>How can I help?</h2>'
       +'<div class="subs">'
       +'<span class="chip" onclick="quick(this)">Write an email to…</span>'
@@ -458,8 +462,8 @@ function renderAll(){
   scrollDown(true);
 }
 function bubbleHtml(role, inner, i){
-  var av = role==='user' ? 'You' : '✦';
-  var tools = role==='bot' ? '<div class="tools"><button data-copy="'+i+'">⧉ Copy</button></div>' : '';
+  var av = role==='user' ? 'You' : '<span class="orb">'+ORB+'</span>';
+  var tools = role==='bot' ? '<div class="tools"><button data-copy="'+i+'">Copy</button></div>' : '';
   return '<div class="msg '+role+'"><div class="av">'+av+'</div>'
     +'<div><div class="bubble" dir="auto">'+inner+'</div>'+tools+'</div></div>';
 }
@@ -467,7 +471,7 @@ function quick(el){ $('inp').value=el.textContent+' '; $('inp').focus(); autg();
 function copyMsg(i, btn){
   if(!msgs[i]) return;
   api.copy(msgs[i].content);
-  if(btn){ var o=btn.textContent; btn.textContent='✓ Copied'; setTimeout(function(){ btn.textContent=o; }, 1300); }
+  if(btn){ var o=btn.textContent; btn.textContent='Copied'; setTimeout(function(){ btn.textContent=o; }, 1300); }
 }
 // Copy buttons carry the message index in data-copy (no interpolated inline
 // handlers); one delegated listener on the scroll container routes them.
@@ -498,7 +502,7 @@ async function send(){
   // assistant placeholder
   curText='';
   w.insertAdjacentHTML('beforeend',
-    '<div class="msg bot"><div class="av">✦</div><div><div class="bubble" id="live" dir="auto"><span class="cursor"></span></div></div></div>');
+    '<div class="msg bot"><div class="av"><span class="orb busy">'+ORB+'</span></div><div><div class="bubble" id="live" dir="auto"><span class="cursor"></span></div></div></div>');
   curBot=$('live'); scrollDown(true);
   setStreaming(true);
   var hist = msgs.map(function(m){ return {role:(m.role==='bot'?'assistant':'user'), content:m.content}; });
@@ -513,7 +517,7 @@ window.__chat = function(kind, gen, a){
     if(curBot){ curBot.innerHTML = md(curText)+'<span class="cursor"></span>'; scrollDown(false); }
   } else if(kind==='wait'){
     // "GPU busy - ..." until the first token (a local model waiting for the GPU)
-    if(curBot && !curText){ curBot.innerHTML = '<span style="color:#8a5a00">'+esc(a)+'</span><span class="cursor"></span>'; }
+    if(curBot && !curText){ curBot.innerHTML = '<span style="color:var(--calm)">'+esc(a)+'</span><span class="cursor"></span>'; }
   } else if(kind==='done'){
     finishBot(a || curText);
   } else if(kind==='err'){
@@ -523,12 +527,13 @@ window.__chat = function(kind, gen, a){
 function finishBot(finalText){
   if(!curBot){ setStreaming(false); return; }   // stale (new-chat / superseded) — no phantom push
   var txt = finalText || curText;
+  liaRest(curBot);
   curBot.removeAttribute('id');
   curBot.innerHTML = md(txt);
   // add copy tool (idx = this bot msg's index once pushed below)
   var holder=curBot.parentNode;
   if(holder && !holder.querySelector('.tools')){
-    holder.insertAdjacentHTML('beforeend','<div class="tools"><button data-copy="'+msgs.length+'">⧉ Copy</button></div>');
+    holder.insertAdjacentHTML('beforeend','<div class="tools"><button data-copy="'+msgs.length+'">Copy</button></div>');
   }
   msgs.push({role:'bot', content:txt});
   curBot=null; curText='';
@@ -536,10 +541,17 @@ function finishBot(finalText){
   api.save_state(msgs, model);
   scrollDown(false);
 }
+// Lia stops turning in a finished (or failed) reply
+function liaRest(bubble){
+  var msg = bubble && bubble.closest ? bubble.closest('.msg') : null;
+  var o = msg ? msg.querySelector('.av .orb') : null;
+  if(o) o.classList.remove('busy');
+}
 function onErr(m){
   if(curBot){
+    liaRest(curBot);
     curBot.removeAttribute('id');
-    curBot.innerHTML = '<span style="color:#c0263c">⚠ '+esc(m)+'</span>';
+    curBot.innerHTML = '<span style="color:var(--calm)">'+esc(m)+'</span>';
   }
   curBot=null; curText='';
   setStreaming(false);

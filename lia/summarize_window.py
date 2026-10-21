@@ -97,7 +97,7 @@ class SummarizeApi:
 BODY = """
 <div class="swrap">
   <div class="stop">
-    <h1>Summarize a meeting</h1>
+    <h1>__ORB__Summarize a meeting</h1>
     <div class="sub">Load a meeting you saved without a summary (or paste a transcript). It is
       summarized like a live meeting: your summary model and meeting template. A meeting from
       your meetings folder gets the summary saved with it.</div>
@@ -109,18 +109,22 @@ BODY = """
     <button class="btn ghost" id="clear">Clear</button>
     <span class="grow"></span>
     <button class="btn ghost" id="cancel">Cancel</button>
-    <button class="btn primary" id="go">Summarize</button>
+    <button class="btn lia" id="go">Summarize</button>
   </div>
 </div>
 """
 
+BODY = BODY.replace("__ORB__", uk.orb_svg())
+
 EXTRA_CSS = """
 .swrap{display:flex; flex-direction:column; height:100vh;
   padding:var(--sp-5) var(--sp-5) var(--sp-4);}
-.stop h1{margin:0; font-size:var(--fs-h1); font-weight:700;}
+.stop h1{margin:0; font-size:20px; font-weight:750; letter-spacing:-.3px; display:flex; align-items:center; gap:10px;}
+.stop h1 .orb{width:28px; height:28px;}
 .stop .sub{color:var(--muted); font-size:var(--fs-hint); margin-top:2px;}
 .src{flex:1 1 auto; margin:var(--sp-4) 0; min-height:180px; resize:none;
-  line-height:1.6; font-size:var(--fs-base);}
+  line-height:1.65; font-size:var(--fs-base); border-radius:var(--r-l); padding:14px 16px;
+  box-shadow:var(--shadow);}
 .sfoot{display:flex; align-items:center; gap:var(--sp-2);}
 .sfoot .grow{flex:1 1 auto;}
 """

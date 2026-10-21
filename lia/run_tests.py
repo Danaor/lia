@@ -3722,8 +3722,9 @@ def t_meeting_status_card_api():
     # The light card (2026-09-17 redesign) + its tokens import cleanly.
     import notification_style as _ns, meeting_notifications as _mn
     assert hasattr(_mn, "MeetingCard") and _ns.WIDTH >= 340
-    # tk.Button lacks native bidi, so button_text must reorder Hebrew.
-    assert _ns.button_text("שלום") != "שלום"
+    # Tk 8.6.15 bidis button labels natively (re-measured 2026-10-13):
+    # button_text keeps Hebrew LOGICAL - a reorder printed it backwards.
+    assert _ns.button_text("שלום") == "שלום"
     assert _ns.button_text("Open") == "Open"
 
 
@@ -3831,10 +3832,11 @@ def t_notification_style_tokens():
     assert m1.px(16) == 16 and m2.px(16) == 32
     assert m1.px(1) == 1 and m2.px(1) == 2      # 1px border never disappears
     assert m1.font(ns.PT_TITLE, semibold=True)[2] == "bold"
-    # RTL detection + Button bidi (Label bidis natively; Button does not).
+    # RTL detection; Label AND Button bidi natively (Tk 8.6.15, 2026-10-13),
+    # so a button label stays logical.
     assert ns.has_rtl("עברית") and not ns.has_rtl("hello")
     assert ns.button_text("Open") == "Open"
-    assert ns.button_text("שלום") != "שלום"
+    assert ns.button_text("שלום") == "שלום"
     assert ns.WIDTH >= ns.WIDTH_MIN >= 320
     # notification_style must not import tkinter at module load (cheap tokens).
     import sys
@@ -6446,9 +6448,17 @@ def t_gpu_busy_shed_own_models():
         app._serve = Serve(owned)
         R = w.BilingualRouterTranscriber
         r = R.__new__(R)
-        r.general = types.SimpleNamespace(
-            model=object() if gen_on_gpu else None, _batched_model=None,
-            active_device="cuda", _infer_lock=_th.Lock())
+
+        class Gen:
+            model = object() if gen_on_gpu else None
+            _batched_model = None
+            active_device = "cuda"
+            _infer_lock = _th.Lock()
+            def demote_to_cpu(self):   # 2026-10-12: the general moves to the CPU
+                calls.append("general.cpu")
+                self.model, self.active_device = "cpu-model", "cpu"
+                return True
+        r.general = Gen()
         r._general_dead_logged = True
         r._load_general = lambda: calls.append("general.load")
         app._local_transcriber = r
@@ -6458,7 +6468,8 @@ def t_gpu_busy_shed_own_models():
     # the gap is closable by Lia's own two models (2 x 1330) -> both released
     app, r = make()
     assert app._gpu_shed_own_models(2000, "summary") == 2660
-    assert calls == ["serve.stop", "watch"] and r.general.model is None, calls
+    assert calls == ["serve.stop", "general.cpu", "watch"], calls
+    assert r.general.model == "cpu-model" and r.general.active_device == "cpu"
     # restore: both back, on the GPU (waits for room, never the CPU)
     calls.clear()
     saved = w._wait_for_gpu
@@ -7582,6 +7593,139 @@ _test("meeting card: Minimize works and survives stage updates",
       t_meeting_card_minimize_sticky)
 
 
+def t_meeting_card_close_button():
+    """A finished card has a text "Close" beside its actions (Naor,
+    2026-10-07), doing what the X does. The host adapter turns it on for
+    success / error / discarded, never while a card is still working. A REAL
+    Tk card: the Close button is last (leading edge), runs the card's own
+    _on_close (an on_close policy still fires) and the card goes away."""
+    import time as _t
+    import types
+    import lia as w
+    import notification_preview as npv
+    adapter = types.SimpleNamespace()
+    for kind, want in (("success", True), ("error", True), ("discarded", True),
+                       ("note", False), ("processing", False),
+                       ("confirm_stop", False)):
+        adapter._mcard_model = {"kind": kind, "title": "t", "actions": [],
+                                "stages": [], "gen": 1}
+        st = w.OverlayNotification._mcard_state(adapter)
+        assert bool(st.get("close_button")) is want, (kind, st)
+    host = npv._PreviewHost()
+    try:
+        def pump(sec=0.4):
+            end = _t.time() + sec
+            while _t.time() < end:
+                host.root.update()
+                _t.sleep(0.02)
+
+        def buttons():
+            import tkinter as tk
+            out, stack = [], [host.card._top]
+            while stack:
+                n = stack.pop()
+                if isinstance(n, tk.Button):
+                    out.append(n)
+                stack.extend(n.winfo_children())
+            return out
+        fired = []
+        st = {"kind": "success", "title": "Transcript ready",
+              "meeting_title": "Weekly sync", "allow_close": True,
+              "anchor": _t.monotonic(), "dot": "ok", "close_button": True,
+              "on_close": lambda: fired.append(1),
+              "actions": [("Open", lambda: None, True),
+                          ("Open folder", lambda: None, False)]}
+        host.card.render(dict(st)); pump()
+        labels = [b.cget("text") for b in buttons()]
+        assert labels.count("Close") == 1, labels
+        host.card.render(dict(st, close_button=False,
+                              anchor=_t.monotonic())); pump()
+        assert "Close" not in [b.cget("text") for b in buttons()]
+        host.card.render(dict(st, anchor=_t.monotonic())); pump()
+        close = [b for b in buttons() if b.cget("text") == "Close"][0]
+        close.invoke(); pump()
+        assert host.card._top is None, "Close did not dismiss the card"
+        assert fired == [1], "Close skipped the X's on_close path"
+    finally:
+        host.root.destroy()
+
+
+_test("meeting card: a finished card has a Close button like the X",
+      t_meeting_card_close_button)
+
+
+def t_claude_cloud_check():
+    """Claude vs Cloud in Hebrew dictation (Naor, 2026-10-07). Measured: the
+    vocabulary prompt makes ivrit turbo write "Cloud" for both words; without
+    it the model writes קלוד (Claude) vs קלאוד (Cloud). A bare "Cloud" in a
+    prompted LOCAL decode gets one plain decode and the Hebrew spelling
+    decides; tokens are aligned by order and a disagreement keeps the text."""
+    import types
+    import lia as w
+    R = w.resolve_claude_cloud
+    assert R("אני עובד עם Cloud כל יום", "אני עובד עם קלוד כל יום") == \
+        ("אני עובד עם Claude כל יום", 1)
+    # a real Cloud stays Cloud; order decides per token
+    assert R("שמרנו ב-Cloud Storage", "שמרנו בקלאוד סטורג'")[1] == 0
+    assert R("Cloud אמר ש-Cloud יקר", "קלוד אמר שקלאוד יקר") == \
+        ("Claude אמר ש-Cloud יקר", 1)
+    # Cloudflare is an anchor, never replaced; it keeps the order aligned
+    assert R("Cloudflare ו-Cloud", "Cloudflare וקלוד") == \
+        ("Cloudflare ו-Claude", 1)
+    # the decodes disagree on how many such words -> unchanged
+    assert R("Cloud ו-Cloud", "קלוד") == ("Cloud ו-Cloud", 0)
+    assert R("", "קלוד") == ("", 0) and R("Cloud", "") == ("Cloud", 0)
+    H = w.hebrew_claude_to_latin
+    assert H("תשאל את קלוד") == "תשאל את Claude"
+    assert H("עברתי לקלוד היום") == "עברתי ל-Claude היום"
+    assert H("קלוד קוד עובד") == "Claude Code עובד"
+    for keep in ("בקלאוד", "לקלוט את זה", "וורקלוד", "Cloudflare"):
+        assert H(keep) == keep, keep
+    assert w.has_bare_cloud("ל-Cloud,") and w.has_bare_cloud("Cloud")
+    assert not w.has_bare_cloud("Cloudflare CloudFront") and not w.has_bare_cloud("")
+    assert w.DEFAULT_CONFIG["dictation_claude_check"] is True
+
+    # the app hook: when the second decode runs and when it must not
+    class Tr:
+        def __init__(self, plain, boom=False):
+            self.calls, self.plain, self.boom = [], plain, boom
+
+        def transcribe(self, audio, **kw):
+            self.calls.append(kw)
+            if self.boom:
+                raise RuntimeError("gpu")
+            return self.plain
+
+    def run(text, local=True, bias_ok=True, vocab="Claude", plain="היי קלוד",
+            boom=False, task="transcribe"):
+        tr = Tr(plain, boom)
+        app = types.SimpleNamespace(transcriber=tr, config={},
+                                    _composed_vocabulary=lambda: vocab)
+        kw = dict(language="he", beam_size=3, task=task, bias_ok=bias_ok)
+        out = w.LiaApp._claude_cloud_check(app, text, None, kw, local)
+        return out, tr.calls
+    out, calls = run("היי Cloud")
+    assert out == "היי Claude" and len(calls) == 1
+    assert calls[0]["bias_ok"] is False and calls[0]["language"] == "he"
+    assert run("היי Cloudflare")[1] == []              # no bare Cloud
+    assert run("hey Cloud")[1] == []                    # English: not measured
+    assert run("היי Cloud", local=False) == ("היי Cloud", [])   # a cloud backend
+    assert run("היי Cloud", bias_ok=False)[1] == []     # no prompt was used
+    assert run("היי Cloud", vocab="")[1] == []
+    assert run("היי Cloud", task="translate")[1] == []
+    assert run("היי Cloud", boom=True)[0] == "היי Cloud"   # never raises
+    assert run("היי לקלוד", local=False)[0] == "היי ל-Claude"  # any backend
+    src = open(w.__file__, encoding="utf-8").read()
+    i = src.index("def _transcribe_with_fallback")
+    body = src[i:src.index("def _wait_for_local_ready", i)]
+    assert "if gpu_offload and text and self.config.get(\"dictation_claude_check\"" \
+        in body, "the check must stay on the dictation-only path"
+
+
+_test("dictation: Claude vs Cloud decided by a no-prompt decode",
+      t_claude_cloud_check)
+
+
 def t_meeting_card_hebrew_font():
     """A Hebrew meeting name came out scrambled on the card ("תפעילו" for
     "פעילות", 2026-09-23): Segoe UI Variable has no full Hebrew and Tk's
@@ -7938,6 +8082,186 @@ def t_meeting_late_and_failed_chunks():
 
 _test("meeting 3.3: progress-based wait at Stop + one retry for a failed "
       "speech chunk + honest marker", t_meeting_late_and_failed_chunks)
+
+
+def t_meeting_failed_chunk_noise_vs_lost():
+    """2026-10-12 ("transcription failed" x7 in one meeting). Re-run on the
+    recordings: Parakeet returned EMPTY on loud, confident English speech
+    (deterministic, so the same-engine retry failed too) - the general Whisper
+    recovers it; and most "failed" chunks were noise (detection ~0.61) that
+    only passed the RMS bar. Now (1) the router falls back from an empty
+    Parakeet to Whisper on confident English, and (2) the chunk worker calls
+    a chunk lost only when the detection was confident (no detection = the
+    old rule). Real router + real _submit_chunk worker, fake models."""
+    import threading as _th, time as _t
+    import numpy as np
+    import lia as w
+
+    speech = (np.sin(np.linspace(0, 3000, 16000 * 5)) * 0.2).astype(np.float32)
+    quiet = (np.sin(np.linspace(0, 3000, 16000 * 5)) * 0.003).astype(np.float32)
+
+    class Model:
+        def __init__(self, lang, p): self.lang, self.p = lang, p
+        def detect_language(self, **k):
+            return self.lang, self.p, [(self.lang, self.p), ("fr", 1.0 - self.p)]
+
+    class Child:
+        def __init__(self, out, model=None):
+            self.out, self.calls = out, []
+            self.model = model or object()
+            self._infer_lock = _th.Lock()
+        def transcribe(self, audio, **k):
+            self.calls.append(k)
+            return self.out
+
+    def router(p_en, pk_out="", lang="en"):
+        he, gen, pk = Child("עברית"), Child("recovered by whisper"), Child(pk_out)
+        gen.model = Model(lang, p_en)
+        return w.BilingualRouterTranscriber(he, gen, pk), he, gen, pk
+
+    r, he, gen, pk = router(1.00)                       # the chunk-57 case
+    assert r.transcribe(speech) == "recovered by whisper"
+    assert len(pk.calls) == 1 and gen.calls[0]["language"] == "en"
+    assert r.last_detection() == 1.00
+    r, he, gen, pk = router(0.70)                       # en route, not confident
+    assert r.transcribe(speech) == "" and gen.calls == []
+    r, he, gen, pk = router(1.00, pk_out="parakeet text")
+    assert r.transcribe(speech) == "parakeet text" and gen.calls == []
+    r, he, gen, pk = router(1.00)                       # quiet: no fallback
+    assert r.transcribe(quiet) == "" and gen.calls == []
+    r, he, gen, pk = router(0.99)                       # explicit language: no detection
+    r.transcribe(speech, language="en")
+    assert r.last_detection() is None and gen.calls == []
+    # the general model released for another app's GPU job (10:35): no
+    # detector, all to ivrit; ivrit empty on sound -> Parakeet (CPU)
+    r, he, gen, pk = router(0.99, pk_out="english on the cpu")
+    he.out, gen.model = "", None
+    assert r.transcribe(speech) == "english on the cpu" and len(pk.calls) == 1
+    assert r.last_detection() is None
+    assert r.transcribe(quiet) == "" and len(pk.calls) == 1   # quiet: no
+    r, he, gen, pk = router(0.99, pk_out="english on the cpu", lang="he")
+    he.out = ""                       # a detector said Hebrew: never Parakeet
+    assert r.transcribe(speech) == "" and pk.calls == []
+
+    class App:
+        config = {}
+        def _allowed_scripts(self): return None
+        def _vocab_apply_corrections(self, t, **k): return t
+        def _vocab_observe(self, t): pass
+
+    class EmptyRouter:                  # a router-like chunk transcriber
+        def __init__(self, det): self.det, self.n = det, 0
+        def transcribe(self, audio, **k):
+            self.n += 1
+            return ""
+        def last_detection(self): return self.det
+
+    def chunk(tr):
+        m = w.MeetingSession.__new__(w.MeetingSession)
+        m.app = App(); m._cancelled = False; m._wav_writer = None
+        m.diarize_mode = False; m._chunks_lock = _th.Lock(); m.chunks = []
+        m._next_chunk_index = 0; m.start_time = _t.time()
+        m._pending_lock = _th.Lock(); m._pending_jobs = []
+        m._chunk_transcriber = tr; m._chunk_language = None
+        m._write_live_file = lambda: None
+        m._submit_chunk(speech, blocking=True)
+        return m.chunks[0]["status"]
+    orig_sleep = w.time.sleep
+    w.time.sleep = lambda s_: None
+    try:
+        tr = EmptyRouter(0.61)          # noise: empty, no retry, no marker
+        assert chunk(tr) == "empty" and tr.n == 1
+        tr = EmptyRouter(0.99)          # confident speech lost: retry + marker
+        assert chunk(tr) == "failed" and tr.n == 2
+        tr = EmptyRouter(None)          # no detection (cloud): the old rule
+        assert chunk(tr) == "failed" and tr.n == 2
+    finally:
+        w.time.sleep = orig_sleep
+    assert w.MeetingSession.CHUNK_SPEECH_MIN_DETECT == 0.8
+    assert w.BilingualRouterTranscriber.PARAKEET_FALLBACK_MIN_P_EN == 0.85
+
+
+_test("meeting: Parakeet-empty falls back to Whisper; noise is not a failed chunk",
+      t_meeting_failed_chunk_noise_vs_lost)
+
+
+def t_lost_chunk_root_causes():
+    """2026-10-12, the three root causes behind "[transcription failed]" on
+    real meetings, each with its fix: (1) Parakeet's int8 TDT decoder emits
+    only blanks on some loud English windows (the state never leaves its start
+    state) - three cheap input variants are tried, 6/6 recovered offline;
+    (2) forced-Hebrew ivrit with the vocabulary prompt yields ZERO segments
+    on English speech (3/9 live windows, 0/63 on a Hebrew meeting) - one
+    decode without the prompt; (3) the router's general model shed for a
+    peer's GPU job left NO language detector for 20+ minutes, so a live
+    English meeting was decoded by the Hebrew model - the general now moves
+    to a CPU copy (demote_to_cpu) instead of vanishing."""
+    import threading as _th
+    import numpy as np
+    import lia as w
+
+    speech = (np.sin(np.linspace(0, 3000, 16000 * 5)) * 0.2).astype(np.float32)
+    quiet = (np.sin(np.linspace(0, 3000, 16000 * 5)) * 0.003).astype(np.float32)
+
+    # (1) Parakeet all-blank retry
+    class PkModel:
+        def __init__(self, ok_len):
+            self.ok_len, self.calls = ok_len, []
+        def recognize(self, audio, sample_rate=16000):
+            self.calls.append(len(audio))
+            return "recovered text" if len(audio) in self.ok_len else ""
+    pk = w.ParakeetTranscriber.__new__(w.ParakeetTranscriber)
+    pk._infer_lock = _th.Lock(); pk.threads = 8
+    pk.model = PkModel({len(speech) - 4000})          # only head-0.25s works
+    assert pk._recognize(speech) == "recovered text"
+    assert pk.model.calls == [len(speech), len(speech) - 1600, len(speech) - 4000]
+    pk.model = PkModel(set())                           # nothing works: 4 tries, ""
+    assert pk._recognize(speech) == "" and len(pk.model.calls) == 4
+    pk.model = PkModel(set())
+    assert pk._recognize(quiet) == "" and len(pk.model.calls) == 1   # quiet: no retry
+    pk.model = PkModel({len(speech)})
+    assert pk._recognize(speech) == "recovered text" and len(pk.model.calls) == 1
+
+    # (2) Whisper: zero segments with the prompt -> one plain decode
+    class Seg:
+        def __init__(self, t): self.text = t; self.temperature = 0.0
+        avg_logprob = -0.5; no_speech_prob = 0.0; compression_ratio = 1.0
+    class Info:
+        language = "he"
+    class WModel:
+        def __init__(self): self.calls = []
+        def transcribe(self, audio, **kw):
+            self.calls.append(kw.get("initial_prompt"))
+            segs = [] if kw.get("initial_prompt") else [Seg("המערכת עובדת היום")]
+            return iter(segs), Info()
+    t = w.FasterWhisperTranscriber(model_size="tiny", cpu_threads=2, device="cpu")
+    t.model = WModel(); t.custom_vocabulary = "Claude, AWS"
+    out = t.transcribe(speech, language="he", beam_size=1)
+    assert "המערכת עובדת היום" in out, out
+    assert t.model.calls == ["Common terms: Claude, AWS", None], t.model.calls
+    t.model = WModel()
+    assert t.transcribe(quiet, language="he", beam_size=1) == ""   # quiet: no retry
+    assert len(t.model.calls) == 1
+    t.model = WModel(); t.custom_vocabulary = ""
+    assert "המערכת עובדת היום" in t.transcribe(speech, language="he", beam_size=1)
+    assert t.model.calls == [None]            # no prompt: one decode, nothing to drop
+
+    # (3) demote_to_cpu: the GPU copy goes, a CPU copy serves; a failed CPU
+    # build leaves the model gone (the old behaviour), never raises
+    t = w.FasterWhisperTranscriber(model_size="tiny", cpu_threads=2, device="cuda")
+    t.model, t.active_device = "gpu-model", "cuda"
+    built = []
+    t._build_model = lambda WM, device, ct: built.append((device, ct)) or "cpu-model"
+    assert t.demote_to_cpu() is True
+    assert t.model == "cpu-model" and t.active_device == "cpu" and built == [("cpu", "int8")]
+    t.model, t.active_device = "gpu-model", "cuda"
+    def boom(WM, device, ct): raise RuntimeError("no RAM")
+    t._build_model = boom
+    assert t.demote_to_cpu() is False and t.model is None and t.active_device is None
+
+
+_test("lost chunks: Parakeet all-blank retry, no-prompt redecode, general on the CPU",
+      t_lost_chunk_root_causes)
 
 def t_meeting_status_always_terminal():
     """Phase 3.4 (2026-09-23): _run_diarize_job returned early on a missing
@@ -11682,6 +12006,370 @@ _test("ui_kit: local SVG icon set (Python + JS) replaces nav emoji",
       t_ui_kit_icons)
 
 
+def t_ui_redesign_foundations():
+    """UI redesign 2026-10-13 (plans/UI_REDESIGN_PLAN_2026-10-13.md), stage 1:
+    the Lia Lite design language in ui_kit - the warm tokens with Lia's own
+    colour, Heebo embedded as data: URIs (CSP: no network), Lia's orb as a
+    shared SVG with its gradients once per page, and the motion helpers that
+    keep animations right through a re-render (clock, once, keepFocus,
+    sliding segment tiles) and stop them while a window is hidden."""
+    import os, re
+    import ui_kit as uk
+    here = os.path.dirname(os.path.abspath(uk.__file__))
+    for f in ("heebo-hebrew.woff2", "heebo-latin.woff2", "HEEBO_OFL.txt"):
+        assert os.path.exists(os.path.join(here, "fonts", f)), "missing font asset " + f
+    for t in ("--lia:", "--lia-grad:", "--rec:", "--sunk:", "--float:", "--ease:", "--calm:"):
+        assert t in uk.CSS_TOKENS, "token missing " + t
+    assert '"Heebo"' in uk.CSS_TOKENS.split("--font:")[1].split(";")[0]
+    fc = uk.font_css()
+    assert fc.count("@font-face") == 2 and "data:font/woff2;base64," in fc
+    assert "http" not in fc.replace("data:font/woff2", "")
+    html = uk.page("t", "<div>x</div>")
+    assert html.count("@font-face") == 2, "the font must be inlined once per page"
+    assert html.count('id="liaOrbA"') == 1, "the orb gradients must be defined once"
+    assert "Content-Security-Policy" in html and "font-src data:" in html
+    orb = uk.orb_svg("busy", id_="o1")
+    assert orb.startswith('<span class="orb busy" id="o1">') and orb.count('class="petal ') == 3
+    assert 'aria-hidden="true"' in orb
+    js = uk.JS_BASE
+    for tok in ("RK.ORB = ", "RK.orb = function", "function ad(period)", "function once(map, key)",
+                "function keepFocus(fn)", "function segThumbs(root, instant)", "loadingdone", "visibilitychange",
+                'classList.toggle("paused"'):
+        assert tok in js, "JS_BASE missing " + tok
+    css = uk.CSS_BASE
+    for tok in ("html.paused *", ".orb.busy .petals", ".btn.lia", ".btn.rec", ".seg .seg-ind",
+                ".pal-bg", ".overlay .box", "@keyframes born", "details.more::details-content"):
+        assert tok in css, "CSS_BASE missing " + tok
+    rm = css[css.index("@media (prefers-reduced-motion: reduce)"):]
+    assert ".orb .petals" in rm and ".btn.lia::after" in rm, "reduced motion must stop Lia's loops"
+    assert "1.75" in uk.icon("home") and uk.ICONS["settings"] != uk.ICONS["general"]
+    # no em-dash in the new UI text (house rule)
+    assert "—" not in uk.CSS_BASE + uk.JS_BASE
+
+
+_test("ui redesign: Lia Lite tokens, Heebo, the orb, motion helpers (stage 1)",
+      t_ui_redesign_foundations)
+
+
+def t_settings_redesign_shell():
+    """UI redesign stage 2: the Settings sidebar carries Lia's live orb and the
+    status line (persistent, never re-rendered), Home greets by Your name and
+    starts a meeting with the record button, meetings are 'born' once, and the
+    Ctrl+K palette only calls actions the pages already call (all allowlisted).
+    The parent sends one new key, `busy` (_meeting_busy), in the state and tick."""
+    import inspect, os, re
+    import lia as w
+    import settings_window as sw
+    App = w.LiaApp
+    assert 'id="brandOrb"' in sw.BODY and 'id="brandState"' in sw.BODY and 'id="brandRec"' in sw.BODY
+    assert '<div id="pal"></div>' in sw.BODY and "Ctrl K" in sw.BODY
+    js = sw.APP_JS
+    for tok in ("function palOpen()", "e.code==='KeyK'", "function arrive()", "RK.segThumbs(content)",
+                "function greeting()", 'cfg("speaker_self_name","")', "function markMeetingsSeen",
+                "function summaryHtml(md)", 'class="btn rec"', 'if("busy" in msg) S.busy = msg.busy'):
+        assert tok in js, "settings_window missing " + tok
+    # the palette's actions are existing, allowlisted methods - no new action
+    acts = re.findall(r"m:'([a-z_]+)'", js[js.index("var PAL_ACTIONS"):js.index("function palMatch")])
+    amap = App._settings_action_map(App.__new__(App))
+    assert acts and all(a in amap for a in acts), acts
+    # summaryHtml escapes before it marks up
+    i = js.index("function summaryHtml(md)")
+    assert "esc(t)" in js[i:i + 900], "summaryHtml must escape every line first"
+    # the parent: one new key, in the state and in the tick
+    assert '"busy": _safe(self._meeting_busy, False)' in inspect.getsource(App._settings_state)
+    assert '"busy": bool(self._meeting_busy())' in inspect.getsource(App._settings_pusher)
+
+
+_test("ui redesign: Settings shell - live orb, status line, Home, Ctrl+K (stage 2)",
+      t_settings_redesign_shell)
+
+
+def t_windows_redesign_brand():
+    """UI redesign stage 4: the windows that build their own page (Ask your
+    meetings, Action items, Chat, Email search, Live transcript, the summary
+    editor) all pass through ui_kit.brand_html - the CSP stays, the typeface,
+    Lia's tokens, the orb and the motion rules come in once, and __LIA_ORB__
+    never reaches the page unreplaced. Red is for recording only (Chat's Stop
+    is not red); the live window's clock reads its start from the LIVE name."""
+    import importlib
+    import ui_kit as uk
+    for name in ("meetings_search", "action_items", "chat_window", "email_search",
+                 "live_transcript_window", "compose_editor"):
+        mod = importlib.import_module(name)
+        pages = [mod.HTML] + ([mod.SUMMARY_HTML] if hasattr(mod, "SUMMARY_HTML") else [])
+        for page in pages:
+            html = mod._with_csp(page)
+            assert "Content-Security-Policy" in html, name + ": CSP lost"
+            assert 'id="lia-brand"' in html and html.count("@font-face") == 2, name + ": no brand css"
+            assert html.count('id="liaOrbA"') == 1, name + ": orb gradients not defined once"
+            assert "__LIA_ORB__" not in html, name + ": orb placeholder left in the page"
+            assert 'classList.toggle("paused"' in html, name + ": animations not paused when hidden"
+            assert html.index('id="lia-brand"') < html.index("<style>", html.index('id="lia-brand"') + 10) \
+                or "<style>" not in html[html.index('id="lia-brand"') + 10:], name
+    assert uk.brand_html(uk.brand_html("<html><head></head><body></body></html>")).count('id="lia-brand"') == 1
+    import chat_window as cw
+    assert ".send.stop{background:var(--accent) !important;}" in cw.HTML, "Chat Stop must not be red"
+    import live_transcript_window as lt
+    assert lt._started_at("C:/m/2026-10-12_09-55-55_meeting_LIVE.txt") == "2026-10-12T09:55:55"
+    assert lt._started_at("") == "" and lt._started_at("x_meeting_LIVE.txt") == ""
+    assert "function startClock()" in lt.HTML and '"started_at": _started_at(self._live_path)' in \
+        open(lt.__file__, encoding="utf-8").read()
+
+
+_test("ui redesign: standalone windows on brand_html (font, orb, motion; stage 4)",
+      t_windows_redesign_brand)
+
+
+def t_meeting_card_orb_and_fade():
+    """UI redesign stage 5 (Tk): the meeting card's "Lia is working" indicator
+    is her orb (orb_art draws the ui_kit geometry with PIL, off the Tk thread;
+    the text spinner stands in until the frames exist), it turns on the tick,
+    the static mark steps aside while she works, a NEW card fades in while a
+    re-render does not, and the tokens are the calm palette (amber failures).
+    A REAL Tk card from the preview host."""
+    import time as _t
+    import notification_style as ns
+    import notification_preview as npv
+    import orb_art
+    fr = orb_art.busy_frames(24, 36)
+    assert len(fr) == 36 and fr[0].size == (24, 24) and fr[0].mode == "RGBA"
+    assert fr[0].getpixel((0, 0))[3] == 0, "the orb's corners must be transparent"
+    assert orb_art.busy_frames(24, 36) is fr, "frames are cached per size"
+    assert ns.ERR == "#B07A22" and ns.REC == "#D63543" and ns.BUSY == "#6A5BE2"
+    host = npv._PreviewHost()
+    try:
+        def pump(sec=0.3):
+            end = _t.time() + sec
+            while _t.time() < end:
+                host.root.update()
+                _t.sleep(0.02)
+        card = host.card
+        orb_art.busy_frames(card._orb_px, 36)          # the frames are ready
+        st = {"kind": "processing", "title": "Processing meeting", "meeting_title": "Weekly sync",
+              "allow_close": True, "anchor": _t.monotonic(), "dot": "busy", "stage_label": "Transcribing",
+              "stages": [("t", "Transcribing", "active")], "allow_min": True}
+        card._reduced = False
+        card.render(dict(st))
+        host.root.update()
+        assert float(card._top.attributes("-alpha")) < 1.0, "a new card must start its fade-in"
+        pump(0.5)
+        assert float(card._top.attributes("-alpha")) == 1.0, "the fade ends fully opaque"
+        assert "orb" in card._widgets and "spin" not in card._widgets, "the orb replaces the spinner"
+        i0 = card._orb_i
+        pump(0.35)
+        assert card._orb_i != i0, "the orb turns on the tick"
+        card.render(dict(st, stage_label="Summarizing"))   # a re-render: no fade
+        host.root.update()
+        assert float(card._top.attributes("-alpha")) == 1.0, "a re-render must not fade again"
+    finally:
+        host.root.destroy()
+
+
+_test("ui redesign: meeting card - Lia's orb, fade on first show, calm palette (stage 5)",
+      t_meeting_card_orb_and_fade)
+
+
+def t_dialogs_webview_and_tray():
+    """UI redesign stage 6: the summary popup, Rename speakers and Name this
+    meeting open dialog_window.py (pywebview on ui_kit); a failed launch or the
+    ui_webview_dialogs=False switch keeps the old Tk dialog. The window only
+    reports allowlisted actions; the title prompt still fires on_done exactly
+    once. Dead Tk dialogs are gone; the tray icons are Lia's petals in the same
+    six state colours."""
+    import inspect, os
+    import lia as w
+    import dialog_window as dw
+    src = open(dw.__file__, encoding="utf-8").read()
+    assert not any(ln.startswith(("import webview", "from webview")) for ln in src.splitlines()), \
+        "webview is imported lazily, never at module level"
+    api = dw.DialogApi({"mode": "title"})
+    seen = []
+    saved = dw._emit
+    dw._emit = lambda o: seen.append(o)
+    try:
+        assert api.action("done", "x") is True and api.action("rm_rf", None) is False
+    finally:
+        dw._emit = saved
+    assert seen == [{"t": "action", "a": "done", "data": "x"}]
+    js = dw.APP_JS
+    i = js.index("function summaryHtml(md)")
+    assert "esc(t)" in js[i:i + 700], "the summary is escaped before it is marked up"
+    assert 'startswith("lia_dlg_")' in src and "os.remove(sys.argv[1])" in src, "payload deleted on read"
+    # the launcher: the switch off = nothing launched (the caller shows Tk)
+    old = w._WEBVIEW_DIALOGS[0]
+    w._WEBVIEW_DIALOGS[0] = False
+    try:
+        assert w._spawn_dialog_window({"mode": "title"}) is False
+    finally:
+        w._WEBVIEW_DIALOGS[0] = old
+    assert w.DEFAULT_CONFIG["ui_webview_dialogs"] is True
+    O = w.OverlayNotification
+    for name, tk_builder in (("show_summary", "_create_summary_toplevel"),
+                             ("show_speaker_rename", "_create_speaker_rename_toplevel"),
+                             ("show_meeting_title_prompt", "_create_title_prompt_toplevel")):
+        body = inspect.getsource(getattr(O, name))
+        assert "_spawn_dialog_window(" in body and tk_builder in body, name + ": webview first, Tk fallback"
+    assert "rc in (2, 3)" in inspect.getsource(O.show_summary), "a window that never opened falls back"
+    assert 'on_closed=lambda rc: _fire_once("")' in inspect.getsource(O.show_meeting_title_prompt)
+    for gone in ("show_vocabulary_editor", "show_text_editor", "show_recording_pill",
+                 "_create_vocabulary_toplevel", "_create_text_editor_toplevel", "_create_recording_pill"):
+        assert not hasattr(O, gone), "dead Tk dialog still present: " + gone
+    assert not hasattr(w, "_style_tk_titlebar_dark")
+    from PIL import Image
+    here = os.path.dirname(os.path.abspath(w.__file__))
+    for st in ("idle", "recording", "processing", "loading", "error", "meeting"):
+        im = Image.open(os.path.join(here, "tray_icons", "tray_%s.png" % st)).convert("RGBA")
+        assert im.size == (256, 256) and im.getpixel((2, 2))[3] == 0, st
+
+
+_test("ui redesign: webview dialogs with a Tk fallback, dead Tk code gone, petal tray icons (stage 6)",
+      t_dialogs_webview_and_tray)
+
+
+def t_ui_motion_budget():
+    """UI redesign stage 7: in WebView2 an every-frame animation costs ~15-25%
+    of a core while the window is shown (measured with hidden_cpu.py). So the
+    ambient motion (orb, recording dots) is STEPPED on one 1/12 s grid, the
+    Start-meeting ring wakes only on hover/focus, the Lia-button sheen is
+    finite, and Settings rests its ambient motion when it is not the active
+    window (html.blurred). Hidden/minimised windows pause everything."""
+    import re
+    import ui_kit as uk
+    import settings_window as sw
+    css = uk.CSS_BASE
+    tick = 1 / 12.0
+
+    def on_grid(sec):
+        return abs(sec / tick - round(sec / tick)) < 0.01
+
+    for sel, name in ((".orb .petals", "lwSpin"), (".orb .breath", "orbBreath"),
+                      (".orb.busy .petal", "lwBreathe"), (".orb.busy .halo", "haloPulse")):
+        m = re.search(re.escape(sel) + r"\{[^}]*animation:" + name + r" ([\d.]+)s steps\((\d+)\) infinite", css)
+        assert m, sel + ": stepped, not every frame"
+        dur, steps = float(m.group(1)), int(m.group(2))
+        segs = max(1, len(re.findall(r"[\d.]+%\{", re.search(r"@keyframes " + name + r"\{.*?\}\}", css).group(0))) - 1)
+        assert on_grid(dur / (steps * segs)), "%s: one step = 1/12 s (%.4f s)" % (name, dur / (steps * segs))
+    for d in re.findall(r"\.orb\.busy \.petal\.[bc]\{animation-delay:(-?[\d.]+)s;\}", css):
+        assert on_grid(abs(float(d))), "petal stagger on the grid: " + d
+    assert "steps(16) infinite" in css and "recPing 1.6667s" in sw.EXTRA_CSS
+    # no ambient animation runs every frame (spinners/loading pulses are transient)
+    for rule in re.findall(r"[^{}]+\{[^}]*infinite[^}]*\}", css):
+        if "steps(" in rule or ".spin" in rule or ".busy .dot" in rule or ":hover" in rule:
+            continue
+        raise AssertionError("an every-frame infinite animation: " + rule.strip()[:120])
+    assert re.search(r"\.btn\.rec \.rdot::after\{[^}]*opacity:0;\}", css), "the ring rests at rest"
+    assert ".btn.rec:hover .rdot::after,.btn.rec:focus-visible .rdot::after{animation:ring" in css
+    assert "liaSheen 4.8s var(--ease) 3;" in css and "liaSheen 4.8s var(--ease) 3;" in uk.LIA_BTN_CSS
+    assert "html.blurred .orb .petals" in css and "html.paused *" in css
+    assert 'classList.toggle("blurred", !document.hasFocus())' in sw.APP_JS
+    assert "Math.round(((Date.now()/1000) % period) * 12) / 12" in uk.JS_BASE, "RK.ad snaps to the grid"
+
+
+_test("ui redesign: motion budget - stepped 12 fps ambient motion, ring on hover, Settings rests when inactive",
+      t_ui_motion_budget)
+
+
+def t_summary_cloud_short_prompt():
+    """The SHORT cloud summary prompt (2026-10-21, measured, plans/ab_cloud_prompt_2026-10-21):
+    OpenAI-compatible cloud models get ONE compact prompt instead of the technical
+    base + addendum, for Hebrew + the technical template + no manual base override.
+    Gemini keeps the full pair; a manual addendum is still appended; the local Gemma
+    path never sees it; Settings > Advanced shows what the model really receives."""
+    import inspect
+    import lia as w
+    sp = w._p_summary_cloud_short("he")
+    assert w._p_summary_cloud_short("en") == "" and w._p_summary_cloud_short("fr") == ""
+    assert 5000 < len(sp) < 8000 and "«" not in sp, len(sp)       # rendered, compact
+    for h in ("## כותרת הדיון", "## תקציר", "## דגשים מרכזיים", "## סטטוס פרויקטים",
+              "## בוצע בפגישה", "## משימות"):
+        assert h in sp, h
+    assert "NOT CONTENT" in sp and "examples from OTHER organizations" in sp   # the measured fix
+    assert w.DEFAULT_CONFIG["summary_cloud_short_prompt"] is True
+    sent = []
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"choices": [{"message": {"content": "## תקציר\nגוף\n\n## משימות\n- [ ] משימה\n"}}]}
+
+    class _Sess:
+        def post(self, url, headers=None, json=None, timeout=None):
+            sent.append(json)
+            return _Resp()
+    orig = w.OpenAILLMCleaner._ensure_session
+    w.OpenAILLMCleaner._ensure_session = lambda self: _Sess()
+    try:
+        c = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-6.1-sol")
+        kw = dict(meeting_meta="Duration: 30", cloud_parity=True, lang="he", template="technical")
+        c.summarize("טקסט", "TECH-SYS", vocab="ACMEWIDGET", cloud_short=True, **kw)
+        p1 = sent[-1]["messages"][0]["content"]
+        assert p1.startswith(sp) and "TECH-SYS" not in p1, p1[:80]
+        assert "ACMEWIDGET" in p1, "the vocabulary suffix survives"
+        assert "כללים נוספים מחייבים" not in p1, "the built-in addendum is folded in, not appended"
+        # the switch off = the full pair, byte-for-byte the old behaviour
+        c.summarize("טקסט", "TECH-SYS", cloud_short=False, **kw)
+        p0 = sent[-1]["messages"][0]["content"]
+        assert p0.startswith("TECH-SYS") and p0.endswith(w._SUMMARY_CLOUD_PARITY_ADDENDUM), p0[:60]
+        # English, another template, or a manual base override: not the short one
+        c.summarize("text", "TECH-SYS", meeting_meta="Duration: 30", cloud_parity=True, lang="en",
+                    template="technical", cloud_short=True)
+        assert sent[-1]["messages"][0]["content"].startswith("TECH-SYS")
+        c.summarize("טקסט", "TECH-SYS", meeting_meta="Duration: 30", cloud_parity=True, lang="he",
+                    template="general", cloud_short=True)
+        assert "## דגשים מרכזיים" in sent[-1]["messages"][0]["content"] and sp not in sent[-1]["messages"][0]["content"]
+        c2 = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-6.1-sol",
+                                log_cfg={"summary_base_prompt_override": "MY BASE"})
+        c2.summarize("טקסט", "TECH-SYS", cloud_short=True, **kw)
+        assert sent[-1]["messages"][0]["content"].startswith("MY BASE")
+        # a manual addendum = the user's own rules: appended after the short prompt
+        c3 = w.OpenAILLMCleaner(api_key="sk-test", model="gpt-6.1-sol",
+                                log_cfg={"summary_cloud_addendum": " כלל שלי "})
+        c3.summarize("טקסט", "TECH-SYS", cloud_short=True, **kw)
+        p3 = sent[-1]["messages"][0]["content"]
+        assert p3.startswith(sp) and p3.endswith("\n\nכלל שלי"), p3[-40:]
+        # Gemini keeps the full pair
+        c4 = w.OpenAILLMCleaner(api_key="AQ.test", model="gemini-3.8-flash",
+                                chat_url="https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+        c4.summarize("טקסט", "TECH-SYS", cloud_short=True, **kw)
+        p4 = sent[-1]["messages"][0]["content"]
+        assert p4.startswith("TECH-SYS") and p4.endswith(w._SUMMARY_CLOUD_PARITY_ADDENDUM)
+        # the general (non-meeting) tool never sees it
+        c.summarize("טקסט", "GEN", meeting_meta=None, cloud_parity=True, cloud_short=True)
+        assert sent[-1]["messages"][0]["content"] == "GEN"
+    finally:
+        w.OpenAILLMCleaner._ensure_session = orig
+    # the app passes the switch from the config; the local path has no such branch
+    src = inspect.getsource(w.LiaApp._run_summary)
+    assert 'cloud_short=bool(self.config.get("summary_cloud_short_prompt", True))' in src
+    loc = inspect.getsource(w.GroqLLMCleaner.summarize)
+    assert loc.index("_p_summary_cloud_short(lang)") > loc.index("# --- Cloud (OpenAI-compatible) path"), \
+        "the short prompt lives on the cloud branch only"
+    # Settings > Advanced: the editor shows what the model receives
+    class _App:
+        config = {"summary_model": "gpt-6.1-sol", "summary_base_url": "", "summary_language": "primary",
+                  "primary_language": "he", "summary_template": "technical", "enabled_languages": ["he", "en"]}
+    a = _App()
+    for n in ("_summary_cloud_short_active", "_summary_base_prompt", "_summary_addendum_default",
+              "_summary_effective_lang", "_summary_template_id"):
+        setattr(a, n, getattr(w.LiaApp, n).__get__(a))
+    assert a._summary_cloud_short_active() is True
+    assert a._summary_base_prompt() == sp and a._summary_addendum_default() == ""
+    a.config["summary_base_url"] = "https://generativelanguage.googleapis.com/v1beta/openai/"
+    assert a._summary_cloud_short_active() is False
+    assert a._summary_base_prompt() == w._p_summary_meeting("he", "technical")
+    a.config["summary_base_url"] = ""
+    a.config["summary_cloud_short_prompt"] = False
+    assert a._summary_cloud_short_active() is False
+    a.config["summary_cloud_short_prompt"] = True
+    a.config["summary_base_prompt_override"] = "x"
+    assert a._summary_cloud_short_active() is False
+
+
+_test("summary: the short cloud prompt for frontier models (OpenAI he/technical only; Gemini + local keep the full prompt)",
+      t_summary_cloud_short_prompt)
+
+
 def t_settings_search():
     """Settings search (Phase 2): a static local index with he+en aliases, a
     jumpTo that navigates + flashes + focuses, an empty state, and NO personal
@@ -14026,7 +14714,10 @@ def t_summary_addendum_setting():
     import lia as w
     App = w.LiaApp
     app = App.__new__(App)
-    app.config = {"primary_language": "he", "summary_language": "primary"}
+    # the FULL base + addendum view (the short cloud prompt, default on since
+    # 2026-10-21, is covered by t_summary_cloud_short_prompt)
+    app.config = {"primary_language": "he", "summary_language": "primary",
+                  "summary_cloud_short_prompt": False}
     saved = []
     orig = w.save_config
     w.save_config = lambda cfg: saved.append(dict(cfg))
