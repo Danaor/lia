@@ -227,6 +227,7 @@ import secret_store
 import gpu_lease
 import ollama_gate
 import updater
+import ui_i18n
 
 # Enable per-monitor DPI awareness BEFORE any tkinter window is created.
 # Without this, Windows bilinear-stretches the overlay window by the user's
@@ -378,7 +379,7 @@ if sys.platform == "win32":
     ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
 
 # --- Configuration ---
-APP_VERSION = "1.6.14"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
+APP_VERSION = "1.6.15"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Lia")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -399,6 +400,10 @@ DEFAULT_CONFIG = {
     # "multilingual" profile (see lang_pack.language_profile / _language_profile).
     # Managed on Settings > General ("Languages" + "Lock to one language").
     "enabled_languages": ["he", "en"],
+    # The language of Lia's own windows, menus and cards ("en" / "he" =
+    # right-to-left). Independent of the speech / summary languages above.
+    # A first run takes Hebrew when Windows itself is in Hebrew (ui_i18n).
+    "ui_language": "en",
     # Language meeting + standalone summaries are WRITTEN in:
     #   "primary" = the user's primary_language (today's "summary is for the
     #               READER" semantics, parameterized - he keeps ALWAYS-Hebrew)
@@ -3112,6 +3117,8 @@ def load_config():
         0x16: "pt", 0x0C: "fr", 0x07: "de", 0x19: "ru", 0x11: "ja", 0x12: "ko",
         0x10: "it",
     }
+    if "ui_language" not in seed:
+        cfg["ui_language"] = ui_i18n.windows_default()
     if "primary_language" not in seed:
         try:
             import ctypes
@@ -17954,18 +17961,18 @@ def _stamp_lia_launcher(exe_path):
         return False
     try:
         vi = VSVersionInfo(
-            ffi=FixedFileInfo(filevers=(1, 6, 14, 0), prodvers=(1, 6, 14, 0),
+            ffi=FixedFileInfo(filevers=(1, 6, 15, 0), prodvers=(1, 6, 15, 0),
                               mask=0x3f, flags=0x0, OS=0x40004,
                               fileType=0x1, subtype=0x0),
             kids=[
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.6.14.0'),
+                    StringStruct('FileVersion', '1.6.15.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.6.14.0'),
+                    StringStruct('ProductVersion', '1.6.15.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -18964,6 +18971,60 @@ def _set_menu_item_bitmap(hmenu, contains, hbitmap):
         return False
 
 
+def _menu_items_right_order(hmenu):
+    """Mark every item of `hmenu` MFT_RIGHTORDER: Hebrew text right-aligned in
+    right-to-left reading order (measured 2026-10-26 on a DWM capture; adding
+    TPM_LAYOUTRTL on top of it broke the paint, so this is the one switch)."""
+    import ctypes
+    from ctypes import wintypes
+    user = ctypes.windll.user32
+    MIIM_FTYPE, MFT_RIGHTORDER = 0x00000100, 0x00002000
+
+    class MENUITEMINFOW(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.UINT), ("fMask", wintypes.UINT),
+                    ("fType", wintypes.UINT), ("fState", wintypes.UINT),
+                    ("wID", wintypes.UINT), ("hSubMenu", wintypes.HMENU),
+                    ("hbmpChecked", wintypes.HBITMAP),
+                    ("hbmpUnchecked", wintypes.HBITMAP),
+                    ("dwItemData", ctypes.c_void_p),
+                    ("dwTypeData", wintypes.LPWSTR), ("cch", wintypes.UINT),
+                    ("hbmpItem", wintypes.HBITMAP)]
+    for i in range(max(0, user.GetMenuItemCount(hmenu))):
+        info = MENUITEMINFOW()
+        info.cbSize = ctypes.sizeof(MENUITEMINFOW)
+        info.fMask = MIIM_FTYPE
+        if not user.GetMenuItemInfoW(hmenu, i, True, ctypes.byref(info)):
+            continue
+        if not info.fType & MFT_RIGHTORDER:
+            info.fType |= MFT_RIGHTORDER
+            user.SetMenuItemInfoW(hmenu, i, True, ctypes.byref(info))
+
+
+def _install_rtl_tray_menu():
+    """Hebrew interface: the tray menu reads right-to-left (text right-aligned,
+    punctuation in Hebrew order). pystray rebuilds the native menu often and
+    opens it with fixed flags, so its TrackPopupMenuEx is wrapped once and the
+    items are marked just before every open; the language is read each time.
+    Defensive: on any failure the menu stays left-to-right."""
+    try:
+        from pystray._util import win32 as _pw
+        orig = _pw.TrackPopupMenuEx
+        if getattr(orig, "_lia_rtl", False):
+            return
+
+        def track(hmenu, flags, x, y, hwnd, params):
+            if ui_i18n.is_rtl():
+                try:
+                    _menu_items_right_order(hmenu)
+                except Exception:
+                    pass
+            return orig(hmenu, flags, x, y, hwnd, params)
+        track._lia_rtl = True
+        _pw.TrackPopupMenuEx = track
+    except Exception as e:
+        log.debug("RTL tray menu unavailable: %s", e)
+
+
 def _menu_icon_size():
     """The pixel size for a menu-item icon (small-icon metric), fallback 16."""
     try:
@@ -19322,6 +19383,10 @@ class OverlayNotification:
         # Font size in points — tk's scaling factor (set above) converts
         # to physical pixels correctly on any DPI.
         self._font = tkfont.Font(family=family, size=11, weight="normal")
+        # Segoe UI Variable has no Hebrew: Tk then falls back glyph by glyph
+        # and the pill printed "מתמללת" scrambled (Naor, 2026-10-27). A pill
+        # with Hebrew text uses a face that covers it.
+        self._font_rtl = tkfont.Font(family="Segoe UI", size=11, weight="normal")
 
         self._canvas = tk.Canvas(
             self._root,
@@ -19603,6 +19668,7 @@ class OverlayNotification:
         """Show a pill-shaped notification. duration=0 stays until hidden."""
         if self.silent:
             return
+        text = ui_i18n.t(text)
         def _do():
             if not self._root or not self._canvas or not self._font:
                 return
@@ -19614,8 +19680,10 @@ class OverlayNotification:
 
             start, end = self._resolve_gradient(bg_color)
             fg = fg_color or self.TEXT_COLOR
+            import notification_style as _ns
+            font = (getattr(self, "_font_rtl", None) or self._font) if _ns.has_rtl(text) else self._font
 
-            text_w = self._font.measure(text)
+            text_w = font.measure(text)
             h = self.CANVAS_HEIGHT
             pill_h = h - 2 * self.PILL_MARGIN
             min_pill_w = pill_h + 16   # keep caps from collapsing into each other
@@ -19625,8 +19693,8 @@ class OverlayNotification:
 
             px1, py1, px2, py2 = self._pill_rect(w, h)
             self._canvas.create_text(
-                (px1 + px2) // 2, (py1 + py2) // 2, text=text,
-                fill=fg, font=self._font, tags="text",
+                (px1 + px2) // 2, (py1 + py2) // 2, text=_ns.rtl_text(text),
+                fill=fg, font=font, tags="text",
             )
 
             screen_w = self._root.winfo_screenwidth()
@@ -20373,7 +20441,7 @@ class OverlayNotification:
 
     def show_error(self, msg="Error"):
         self.hide_waveform()
-        self.show(f"✕  {msg}", bg_color="#6b0f1a", duration=2200)
+        self.show(f"✕  {ui_i18n.t(msg)}", bg_color="#6b0f1a", duration=2200)
 
     def show_prompt(self, header, body, button_label, on_action,
                     on_dismiss=None, duration_ms=30000, on_timeout=None,
@@ -20392,6 +20460,9 @@ class OverlayNotification:
         Tk-thread-safe via the overlay queue. ALWAYS bypasses silent_mode -
         a prompt the user can't see would wedge the caller's state machine.
         """
+        header, body = ui_i18n.t(header), ui_i18n.t(body)
+        button_label = ui_i18n.t(button_label)
+        secondary_label = ui_i18n.t(secondary_label) if secondary_label else secondary_label
         # Tk-dead fallback: if the overlay root never came up, the queued
         # builder would never run and the CALLER's state machine (the meeting
         # detector) would wedge forever waiting for a callback that can't fire.
@@ -20431,7 +20502,10 @@ class OverlayNotification:
         import notification_style as ns
         m = ns.Metrics(_DPI_SCALE)
         pad = m.px(ns.PAD)
-        rtl = ns.has_rtl(header) or ns.has_rtl(body)
+        rtl = ui_i18n.is_rtl() or ns.has_rtl(header) or ns.has_rtl(body)
+        # Hebrew needs a face that covers it: with the Latin face Tk falls back
+        # per glyph and the line came out in reverse (seen 2026-10-27)
+        m.rtl = rtl
         lead = 'right' if rtl else 'left'
         trail = 'left' if rtl else 'right'
 
@@ -20501,14 +20575,17 @@ class OverlayNotification:
         _icon(brand, '✕', lambda: _close_and(on_dismiss)).pack(side=trail)
 
         # Title
-        tk.Label(outer, text=header, bg=ns.BG, fg=ns.INK,
+        tk.Label(outer, text=ns.rtl_text(header), bg=ns.BG, fg=ns.INK,
                  font=m.font(ns.PT_TITLE, semibold=True),
                  anchor='e' if rtl else 'w', justify='right' if rtl else 'left'
                  ).pack(fill='x', pady=(m.px(ns.GAP_SM), 0))
 
         # Body
         if body:
-            tk.Label(outer, text=body, bg=ns.BG, fg=ns.SUB,
+            _mf = m.font(ns.PT_META)
+            tk.Label(outer, text=ns.wrap_rtl(body, lambda s: int(outer.tk.call("font", "measure", _mf, s)),
+                                             m.px(ns.WIDTH - 2 * ns.PAD)) or body,
+                     bg=ns.BG, fg=ns.SUB,
                      font=m.font(ns.PT_META),
                      anchor='e' if rtl else 'w', justify='right' if rtl else 'left',
                      wraplength=m.px(ns.WIDTH - 2 * ns.PAD)
@@ -20535,6 +20612,7 @@ class OverlayNotification:
         top.geometry(f'{w}x{h}+{x}+{y}')
         self._prompt_round(top)
         self._prompt_no_activate(top)
+        ns.HoverOpacity(top)        # rests dimmed, full under the pointer
 
         top.after(duration_ms,
                   lambda: _close_and(on_timeout if on_timeout is not None
@@ -22512,6 +22590,9 @@ class ServeController:
 class LiaApp:
     def __init__(self):
         self.config = load_config()
+        # Every window, card and menu reads the interface language from here
+        # (children inherit LIA_UI_LANG).
+        ui_i18n.set_process_lang(self.config.get("ui_language", "en"))
         # Serve mode HOST controller (spawns `lia.py --serve` when enabled).
         self._serve = ServeController(self.config)
         # GPU-busy policy: Lia's own heavy jobs may release Lia's own resident
@@ -23030,6 +23111,12 @@ class LiaApp:
             "\U0001F4DD", _menu_icon_size())
         start_meeting_label = ("Start Meeting" if self._meeting_menu_hbitmap
                                else "\U0001F4DD  Start Meeting")
+
+        def _tr(text):
+            # a caption pystray re-reads on every menu rebuild: the interface
+            # language applies the moment it changes
+            return lambda item: ui_i18n.t(text)
+        _install_rtl_tray_menu()
         menu = pystray.Menu(
             # Lean tray (2026-08-15 makeover): a status line + the daily-use
             # capture/meeting actions + History, then a single Settings entry
@@ -23037,25 +23124,25 @@ class LiaApp:
             # everything that used to live in the nested submenus.
             # Double-clicking the tray icon (default=True) opens Settings too.
             pystray.MenuItem(
-                lambda item: "●  " + self._settings_status_line(), None,
+                lambda item: "●  " + ui_i18n.t(self._settings_status_line()), None,
                 enabled=False),
             # Only while a newer release is known (_check_for_update).
             pystray.MenuItem(
-                lambda item: "⬆  Update Lia to %s" % (
-                    (self._update_info().get("release") or {}).get("version", "")),
+                lambda item: ui_i18n.t("⬆  Update Lia to %s" % (
+                    (self._update_info().get("release") or {}).get("version", ""))),
                 lambda: self._tray_update_now(),
                 visible=lambda item: bool(self._update_info().get("release"))),
             pystray.Menu.SEPARATOR,
             # One-click capture toggles. Mic = my side (default). System audio =
             # the other side. Detailed device/model picker lives in Settings.
             pystray.MenuItem(
-                "Record my microphone",
+                _tr("Record my microphone"),
                 lambda: self._toggle_record_mic(),
                 checked=lambda item: self.config.get("recording_source", "microphone")
                 in ("microphone", "both"),
             ),
             pystray.MenuItem(
-                "Record system audio",
+                _tr("Record system audio"),
                 lambda: self._toggle_record_system(),
                 checked=lambda item: self.config.get("recording_source", "microphone")
                 in ("stereo_mix", "both"),
@@ -23063,7 +23150,7 @@ class LiaApp:
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
-                start_meeting_label,
+                _tr(start_meeting_label),
                 lambda: self._toggle_meeting(summarize=True),
                 visible=lambda item: not self._is_meeting_active(),
             ),
@@ -23072,34 +23159,34 @@ class LiaApp:
             # Plain label (no emoji + double space) so its text aligns with the
             # other rows instead of sitting indented further right.
             pystray.MenuItem(
-                "Transcribe a file…",
+                _tr("Transcribe a file…"),
                 lambda: self._transcribe_file(),
             ),
             # While a meeting runs, the summarize decision moves to STOP time
             # (2026-08-29, Naor's ask): you know at the END whether the
             # meeting deserved a summary.
             pystray.MenuItem(
-                "⏹  End Meeting & Summarize",
+                _tr("⏹  End Meeting & Summarize"),
                 lambda: self._stop_meeting(summarize=True),
                 visible=lambda item: self._is_meeting_active(),
             ),
             pystray.MenuItem(
-                "⏹  End Meeting (no summary)",
+                _tr("⏹  End Meeting (no summary)"),
                 lambda: self._stop_meeting(summarize=False),
                 visible=lambda item: self._is_meeting_active(),
             ),
             pystray.MenuItem(
-                "📄  Live Transcript",
+                _tr("📄  Live Transcript"),
                 lambda: self._open_live_transcript(),
                 visible=lambda item: self._live_transcript_available(),
             ),
             pystray.MenuItem(
-                "🗑  Cancel Meeting (discard)",
+                _tr("🗑  Cancel Meeting (discard)"),
                 lambda: self._cancel_meeting(),
                 visible=lambda item: self._is_meeting_active(),
             ),
             # History lives here (under the Start Meeting group) per user layout.
-            pystray.MenuItem("History", lambda: self._show_history()),
+            pystray.MenuItem(_tr("History"), lambda: self._show_history()),
             pystray.Menu.SEPARATOR,
             # Open Lia -> the Home landing page (status + Start Meeting + recent
             # meetings). default=True => double-clicking the tray icon opens Home;
@@ -23109,15 +23196,24 @@ class LiaApp:
             pystray.MenuItem("Open Lia", lambda: self._open_settings_window(page="home"),
                              default=True, visible=False),
             # Everything configurable lives in the same window under the nav.
-            pystray.MenuItem("Settings…", lambda: self._open_settings_window()),
+            pystray.MenuItem(_tr("Settings…"), lambda: self._open_settings_window()),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Quit", self._quit_requested),
+            pystray.MenuItem(_tr("Quit"), self._quit_requested),
         )
 
         # Tooltip changes dynamically with state — even in silent_mode, hovering
         # the tray icon tells the user what Lia is doing right now.
         self.tray_icon = pystray.Icon("Lia", icon_image,
-                                       "Lia - Loading model...", menu)
+                                       "Lia - " + ui_i18n.t("Loading model..."), menu)
+        try:
+            _orig_notify = self.tray_icon.notify
+
+            def _notify(message, title=None):
+                return _orig_notify(ui_i18n.t(message),
+                                    ui_i18n.t(title) if title else title)
+            self.tray_icon.notify = _notify
+        except Exception as e:
+            log.debug("balloon translation hook failed: %s", e)
 
         # Re-apply the color menu icon after every menu (re)build. pystray
         # rebuilds the native HMENU on the first show (_mark_ready -> update_menu)
@@ -23680,7 +23776,7 @@ class LiaApp:
             # Show blue icon while loading
             if self.tray_icon:
                 self.tray_icon.icon = self._create_icon("loading")
-                self.tray_icon.title = "Lia - Loading model..."
+                self._set_title("Lia - Loading model...")
             model_label = MODELS.get(self.config["model_size"], self.config["model_size"])
             self.overlay.show(f"  🔄  Loading: {model_label}  ", bg_color="#1e64c8")
 
@@ -24937,7 +25033,7 @@ class LiaApp:
         self.overlay.show_recording()
         if self.tray_icon:
             self.tray_icon.icon = self._create_icon("recording")
-            self.tray_icon.title = "Lia - Recording..."
+            self._set_title("Lia - Recording...")
 
         # Wrap recorder starts so a failure doesn't leave is_recording=True stuck.
         # Loopback failure is non-fatal (we can still record mic); mic failure IS fatal.
@@ -26076,7 +26172,7 @@ class LiaApp:
         self.overlay.show_processing()
         if self.tray_icon:
             self.tray_icon.icon = self._create_icon("processing")
-            self.tray_icon.title = "Lia - Transcribing..."
+            self._set_title("Lia - Transcribing...")
 
         # Stop streaming worker - wait for it to finish so we can use its result
         self._streaming_stop_event.set()
@@ -27344,7 +27440,7 @@ class LiaApp:
                 or self._voice_ask_active)
         if self.tray_icon and not busy:
             self.tray_icon.icon = self._create_icon("processing")
-            self.tray_icon.title = "Lia - Summarizing…"
+            self._set_title("Lia - Summarizing…")
         self._force_show_notice_overlay(
             "Summarizing the meeting%s…" % ((" - " + title) if title else ""),
             duration=5000)
@@ -27495,7 +27591,7 @@ class LiaApp:
         threading.Thread(target=_compose_waveform_loop, daemon=True).start()
         if self.tray_icon:
             self.tray_icon.icon = self._create_icon("recording")
-            self.tray_icon.title = "Lia - Compose: recording draft…"
+            self._set_title("Lia - Compose: recording draft…")
             try:
                 self.tray_icon.update_menu()
             except Exception as e:
@@ -27529,7 +27625,7 @@ class LiaApp:
         self.overlay.show_processing()
         if self.tray_icon:
             self.tray_icon.icon = self._create_icon("processing")
-            self.tray_icon.title = "Lia - Compose: generating…"
+            self._set_title("Lia - Compose: generating…")
             try:
                 self.tray_icon.update_menu()
             except Exception as e:
@@ -27583,6 +27679,9 @@ class LiaApp:
             return
         try:
             t = str(text or "")
+            # "Lia - <state>": the state part in the interface language
+            if t.startswith("Lia - "):
+                t = "Lia - " + ui_i18n.t(t[len("Lia - "):])
             if len(t) > 120:
                 t = t[:119] + "…"
             self.tray_icon.title = t
@@ -27606,10 +27705,10 @@ class LiaApp:
                     self, "_meeting_tray_title", "Lia - Meeting recording..."))
             elif self._compose_active:
                 self.tray_icon.icon = self._create_icon("recording")
-                self.tray_icon.title = "Lia - Compose: recording draft…"
+                self._set_title("Lia - Compose: recording draft…")
             elif self.is_recording or self._compose_instr_active or self._voice_ask_active:
                 self.tray_icon.icon = self._create_icon("recording")
-                self.tray_icon.title = "Lia - Recording..."
+                self._set_title("Lia - Recording...")
             elif not self.model_loaded:
                 # Not ready: paint the TRUTH (blue only while a load is actually
                 # running; red X with a what-to-do title otherwise). Green used
@@ -27622,7 +27721,7 @@ class LiaApp:
                 self._set_title("Lia - " + text)
             else:
                 self.tray_icon.icon = self._create_icon("idle")
-                self.tray_icon.title = "Lia - Ready"
+                self._set_title("Lia - Ready")
             if update_menu:
                 self.tray_icon.update_menu()
         except Exception as e:
@@ -27813,7 +27912,7 @@ class LiaApp:
         try:
             self._refresh_tray()               # arbiter: _voice_ask_active -> recording icon
             if self.tray_icon:
-                self.tray_icon.title = "Lia - Listening (voice ask)..."
+                self._set_title("Lia - Listening (voice ask)...")
         except Exception:
             pass
         threading.Thread(target=self._voice_ask_autostop, daemon=True).start()
@@ -27852,7 +27951,7 @@ class LiaApp:
         try:
             if self.tray_icon:
                 self.tray_icon.icon = self._create_icon("processing")
-                self.tray_icon.title = "Lia - Answering..."
+                self._set_title("Lia - Answering...")
         except Exception:
             pass
 
@@ -29257,6 +29356,27 @@ class LiaApp:
         labels = {"auto_paste": "Auto-Paste", "clipboard_only": "Clipboard Only", "direct_type": "Direct Type"}
         log.info("Paste mode set to: %s", labels.get(mode, mode))
 
+    def _set_ui_language(self, lang):
+        """The interface language (English / Hebrew = right-to-left). Speech
+        and summary languages are not touched. Settings reopens on the same
+        page in the new language; the tray menu follows at once; other open
+        windows switch the next time they open."""
+        lang = ui_i18n.normalize(lang)
+        if ui_i18n.normalize(self.config.get("ui_language")) == lang:
+            return (True, "")
+        self.config["ui_language"] = lang
+        save_config(self.config)
+        ui_i18n.set_process_lang(lang)
+        log.info("Interface language set to %s", lang)
+        self._refresh_tray()
+
+        def reopen():
+            self._close_settings_window()
+            time.sleep(0.3)
+            self._open_settings_window(page="general")
+        threading.Timer(0.4, reopen).start()
+        return (True, "")
+
     def _set_recording_mode(self, mode):
         self.config["recording_mode"] = mode
         save_config(self.config)
@@ -30553,7 +30673,7 @@ class LiaApp:
         if not handle:
             return
         try:
-            _set_menu_item_bitmap(handle[0], "Start Meeting", hb)
+            _set_menu_item_bitmap(handle[0], ui_i18n.t("Start Meeting"), hb)
         except Exception:
             pass
 
@@ -31248,7 +31368,7 @@ class LiaApp:
             self.overlay.hide_recording_pill()
             if self.tray_icon:
                 self.tray_icon.icon = self._create_icon("processing")
-                self.tray_icon.title = "Lia - Discarding meeting..."
+                self._set_title("Lia - Discarding meeting...")
                 try:
                     self.tray_icon.update_menu()
                 except Exception:
@@ -31313,7 +31433,7 @@ class LiaApp:
 
         if self.tray_icon:
             self.tray_icon.icon = self._create_icon("processing")
-            self.tray_icon.title = "Lia - Finalising meeting..."
+            self._set_title("Lia - Finalising meeting...")
             # Flip the menu label back to 'Start Meeting' now that
             # _active_meeting is None (else it stays a stale '⏹ Stop Meeting').
             try:
@@ -34993,6 +35113,7 @@ class LiaApp:
         add("set_recording_mode", self._set_recording_mode)
         add("set_paste_mode", self._set_paste_mode)
         add("set_primary_language", self._set_primary_language)
+        add("set_ui_language", self._set_ui_language)
         add("set_enabled_languages", self._set_enabled_languages)
         add("toggle_clipboard_auto_restore", self._toggle_clipboard_auto_restore)
         add("toggle_press_enter_after_paste", self._toggle_press_enter_after_paste)

@@ -20,8 +20,9 @@ blocks. This module is the single source of truth that replaces them:
 Design rules baked in here (so windows can't drift):
   * Light theme, warm neutral surfaces, a deep-ink primary (#272A4A); Lia's
     own colour (--lia, the gradient) only on Lia: her orb, her one button.
-  * Chrome is English; user CONTENT uses dir="auto" (Hebrew renders RTL, Latin
-    LTR) - so the page is `lang="en" dir="ltr"` and only content nodes flip.
+  * Chrome follows the interface language (ui_i18n: English ltr, or Hebrew
+    rtl translated at render time); user CONTENT uses dir="auto" (Hebrew
+    renders RTL, Latin LTR) in both and is never translated.
   * Logical properties only (margin-inline-*, padding-inline-*, inset-inline-*),
     never left/right, so RTL content lays out correctly.
   * Everything is inline + self-contained: no external fonts, CSS, or scripts
@@ -35,6 +36,8 @@ import json
 import os
 import sys
 import tempfile
+
+import ui_i18n  # stdlib-only, cheap: the interface language (en / he)
 
 
 def _warn(msg):
@@ -611,6 +614,7 @@ input:disabled,select:disabled,textarea:disabled{opacity:.55; cursor:default;}
 
 /* --- content that may be Hebrew: let the browser pick direction --------- */
 .rtl-auto,[dir=auto]{unicode-bidi:plaintext;}
+[dir=rtl] .ico-svg.dirflip{transform:scaleX(-1);}
 
 /* --- scrollbar ---------------------------------------------------------- */
 ::-webkit-scrollbar{width:12px; height:12px;}
@@ -779,6 +783,11 @@ ICONS = {
 }
 
 
+# Icons that point along the reading direction: mirrored in a right-to-left
+# window (CSS .dirflip). A mic, a check or the logo never flip.
+DIR_ICONS = ("arrow-right", "chevron-right")
+
+
 def icon(name, *, size=18, cls="", title=None, stroke=1.75):
     """Inline SVG for `name` (currentColor). Pass `title` for an accessible name
     on a standalone/meaningful icon; without it the icon is aria-hidden (decorative,
@@ -787,6 +796,8 @@ def icon(name, *, size=18, cls="", title=None, stroke=1.75):
     body = ICONS.get(name)
     if not body:
         return ""
+    if name in DIR_ICONS:
+        cls = (cls + " dirflip").strip()
     cls_attr = (' ' + _h(cls)) if cls else ''
     if title:
         a11y = 'role="img" aria-label="%s"' % _h(title)
@@ -912,16 +923,38 @@ PAUSED_JS = ('<script>(function(){function s(){document.documentElement.classLis
              '!!document.hidden);}document.addEventListener("visibilitychange",s);s();})();</script>')
 
 
+def _html_lang(html, lang, direction):
+    """The window's own <html ...> tag with lang/dir set to the interface
+    language (only the FIRST tag - an editor may carry a document template)."""
+    import re as _re
+    m = _re.search(r"<html\b[^>]*>", html, _re.I)
+    if not m:
+        return html
+    tag = _re.sub(r'\s(lang|dir)="[^"]*"', "", m.group(0))
+    tag = tag[:5] + ' lang="%s" dir="%s"' % (lang, direction) + tag[5:]
+    return html[:m.start()] + tag + html[m.end():]
+
+
+def i18n_head(lang=None):
+    """The <script> that translates a window into the interface language
+    (ui_i18n). Goes in <head>, before every window script."""
+    return ("<style>[dir=rtl] .ico-svg.dirflip{transform:scaleX(-1);}</style>\n"
+            "<script>\n" + ui_i18n.page_js(lang) + "\n</script>\n")
+
+
 def brand_html(html):
     """`html` (a window's own full page) with the CSP, the typeface, Lia's
-    tokens + orb + motion rules, and __LIA_ORB__ replaced by the orb's inner
+    tokens + orb + motion rules, the interface language (lang/dir on <html> +
+    ui_i18n's translator), and __LIA_ORB__ replaced by the orb's inner
     markup (safe inside a single-quoted JS string: it has no single quote).
     Idempotent."""
     html = with_csp(html)
     if 'id="lia-brand"' in html:
         return html
+    lang, direction = ui_i18n.html_attrs()
+    html = _html_lang(html, lang, direction)
     style = ('<style id="lia-brand">\n' + font_css() + BRAND_VARS + LIA_MOTION_CSS + LIA_BTN_CSS
-             + "</style>\n")
+             + "</style>\n" + i18n_head(lang))
     i = html.find("Content-Security-Policy")
     j = html.find(">", i) + 1 if i >= 0 else -1
     if j > 0:
@@ -1020,7 +1053,11 @@ window.RK = (function(){
       if(!on){ if(ind) ind.style.opacity = "0"; return; }
       if(!ind){ ind = el("span", {"class":"seg-ind", "aria-hidden":"true"}); seg.insertBefore(ind, seg.firstChild); }
       seg.classList.add("thumbed");
-      var to = {l: on.offsetLeft, w: on.offsetWidth}, from = key && SEGPOS[key];
+      // fractional box (offsetLeft rounds to a whole pixel: at 150% in a
+      // right-to-left track the tile poked 0.7px into the padding)
+      var sr = seg.getBoundingClientRect(), orr = on.getBoundingClientRect();
+      var to = {l: Math.round((orr.left - sr.left - seg.clientLeft) * 100) / 100,
+                w: Math.round(orr.width * 100) / 100}, from = key && SEGPOS[key];
       if(from && !reduce && !instant && (from.l !== to.l || from.w !== to.w)){
         ind.classList.add("still"); ind.style.left = from.l + "px"; ind.style.width = from.w + "px";
         void ind.offsetWidth; ind.classList.remove("still");
@@ -1063,10 +1100,11 @@ window.RK = (function(){
 # after JS_BASE so RK exists.
 JS_BASE = JS_BASE + (
     "\nRK.ICONS = " + json.dumps(ICONS, ensure_ascii=True) + ";\n"
+    "RK.DIR_ICONS = " + json.dumps(list(DIR_ICONS)) + ";\n"
     "RK.icon = function(name, opts){ opts = opts || {};\n"
     "  var body = RK.ICONS[name]; if(!body) return '';\n"
     "  var size = opts.size || 18, stroke = opts.stroke || 1.75;\n"
-    "  var cls = opts.cls ? (' ' + RK.esc(opts.cls)) : '';\n"
+    "  var cls = (opts.cls ? (' ' + RK.esc(opts.cls)) : '') + (RK.DIR_ICONS.indexOf(name) >= 0 ? ' dirflip' : '');\n"
     "  var a11y, inner;\n"
     "  if(opts.title){ a11y = 'role=\"img\" aria-label=\"' + RK.esc(opts.title) + '\"';\n"
     "    inner = '<title>' + RK.esc(opts.title) + '</title>' + body; }\n"
@@ -1108,7 +1146,7 @@ def with_csp(html):
     return html[:i] + "\n" + CSP_META + html[i:]
 
 
-def page(title, body_html, *, extra_css="", extra_js="", lang="en", direction="ltr",
+def page(title, body_html, *, extra_css="", extra_js="", lang=None, direction=None,
          head_extra="", theme=None):
     """Return a complete, self-contained HTML document string.
 
@@ -1116,15 +1154,18 @@ def page(title, body_html, *, extra_css="", extra_js="", lang="en", direction="l
     body_html  - the page body (no <html>/<head>/<body> wrappers).
     extra_css  - window-specific CSS appended after the shared base.
     extra_js   - window-specific JS appended after RK (RK is available).
-    lang/dir   - document language/direction (chrome is en/ltr; content nodes
-                 use dir="auto"). Do not set dir="rtl" on the doc - it flips the
-                 whole chrome; use dir="auto" on individual content nodes.
+    lang/dir   - document language/direction; default = the interface
+                 language (ui_i18n: en/ltr, or he/rtl = the whole chrome
+                 flips). User content nodes keep dir="auto" either way.
     head_extra - raw extra <head> markup (rare).
     theme      - "dark" stamps data-theme="dark" on <html> (CSS_TOKENS carries the
                  dark palette); anything else = the default light. Only windows
                  built purely on ui_kit tokens (Settings, History) are dark-ready.
     """
     theme_attr = ' data-theme="dark"' if theme == "dark" else ""
+    ui_lang, ui_dir = ui_i18n.html_attrs()
+    lang = lang or ui_lang
+    direction = direction or ui_dir
     return (
         "<!DOCTYPE html>\n"
         '<html lang="' + lang + '" dir="' + direction + '"' + theme_attr + '>\n'
@@ -1132,8 +1173,8 @@ def page(title, body_html, *, extra_css="", extra_js="", lang="en", direction="l
         '<meta charset="utf-8">\n'
         + CSP_META +
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
-        "<title>" + _h(title) + "</title>\n"
-        + head_extra +
+        "<title>" + _h(ui_i18n.t(title, lang)) + "</title>\n"
+        + head_extra + i18n_head(lang) +
         "<style>\n" + font_css() + CSS_TOKENS + CSS_BASE + "\n" + extra_css + "\n</style>\n"
         "</head>\n"
         "<body>\n"

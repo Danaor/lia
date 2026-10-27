@@ -406,9 +406,10 @@ def main():
             sys.stderr.write("action_items: bad payload: %r\n" % (e,))
 
     api = ActionsApi(payload)
+    import ui_i18n  # the interface language (window title)
     try:
         webview.create_window(
-            payload.get("title", "Action items"), html=_with_csp(HTML), js_api=api,
+            ui_i18n.t(payload.get("title", "Action items")), html=_with_csp(HTML), js_api=api,
             width=820, height=760, min_size=(520, 460))
         import ui_kit as uk  # Lia window icon
         uk.webview_start(webview)

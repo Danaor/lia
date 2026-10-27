@@ -28,6 +28,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ui_i18n  # noqa: E402  the interface language (window title)
 
 _TERMINAL = ("done", "ended_no_summary", "failed", "cancelled")
 
@@ -269,7 +270,7 @@ HTML = r"""<!DOCTYPE html>
   <header>
     <span class="orb" id="orb">__LIA_ORB__</span>
     <div class="ttl">
-      <div class="ttl-r"><span class="dot" id="dot"></span><h1 id="title">Live transcript</h1></div>
+      <div class="ttl-r"><span class="dot" id="dot"></span><h1 id="title" dir="auto">Live transcript</h1></div>
       <span class="sub" id="sub"></span>
     </div>
     <span class="clock" id="clock" hidden></span>
@@ -367,7 +368,7 @@ function renderFoot(r){
   var html = '';
   if(phase==='recording' || phase==='waiting'){
     setDot('live');
-    document.getElementById('title').textContent = META.title || 'Live transcript';
+    document.getElementById('title').textContent = META.title || T('Live transcript');
     html = '<span class="phase">Updating every ~'+META.chunk_seconds+'s</span><span class="grow"></span>'+followBtn();
   } else if(phase==='processing'){
     setDot('idle');
@@ -375,27 +376,27 @@ function renderFoot(r){
            '<span class="grow"></span>'+followBtn();
   } else if(phase==='done'){
     setDot('ok');
-    document.getElementById('title').textContent = 'Meeting saved';
+    document.getElementById('title').textContent = T('Meeting saved');
     html = '<span class="phase">✓ Saved</span><span class="grow"></span>'+
            (r.transcript_ready?openBtn('transcript','Open transcript'):'')+
            (r.summary_ready?openBtn('summary','Open summary'):'');
   } else if(phase==='ended_no_summary'){
     setDot('ok');
-    document.getElementById('title').textContent = 'Transcript saved';
+    document.getElementById('title').textContent = T('Transcript saved');
     html = '<span class="phase">✓ Transcript saved (no summary requested)</span><span class="grow"></span>'+
            (r.transcript_ready?openBtn('transcript','Open transcript'):'');
   } else if(phase==='failed'){
     setDot('idle');
-    document.getElementById('title').textContent = 'Meeting';
+    document.getElementById('title').textContent = T('Meeting');
     html = '<span class="phase err">'+esc(r.error||'Something went wrong')+'</span><span class="grow"></span>'+
            (r.transcript_ready?openBtn('transcript','Open transcript'):'');
   } else if(phase==='cancelled'){
     setDot('idle');
-    document.getElementById('title').textContent = 'Meeting discarded';
+    document.getElementById('title').textContent = T('Meeting discarded');
     html = '<span class="phase">Discarded - no transcript saved</span>';
   } else { // legacy 'ended'
     setDot('ok');
-    document.getElementById('title').textContent = 'Meeting ended';
+    document.getElementById('title').textContent = T('Meeting ended');
     html = '<span class="phase">✓ Saved</span>';
   }
   if(phase!=='cancelled' && lastText)
@@ -490,7 +491,7 @@ window.addEventListener('pywebviewready', async function(){
   if(!API) API = window.pywebview.api;
   try{
     META = await API.meta();
-    document.getElementById('title').textContent = META.title || 'Live transcript';
+    document.getElementById('title').textContent = META.title || T('Live transcript');
     document.getElementById('sub').textContent = META.started ? ('Started ' + META.started) : '';
   }catch(e){}
   lastVer = await API.version();
@@ -533,7 +534,7 @@ def main():
     try:
         # text_select=True: pywebview's default (False) injects user-select:none
         # into the WHOLE window - the live transcript could not be copied.
-        win = webview.create_window(payload.get("title", "Live transcript - Lia"),
+        win = webview.create_window(ui_i18n.t(payload.get("title", "Live transcript - Lia")),
                                     html=_with_csp(HTML), js_api=api, text_select=True, **kw)
         if uk is not None:
             uk.attach_geometry_memory(win, "livetranscript")

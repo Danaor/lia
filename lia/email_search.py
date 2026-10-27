@@ -21,6 +21,7 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ui_i18n  # noqa: E402  the interface language (window title)
 import email_index as ei
 
 try:
@@ -598,6 +599,8 @@ HTML = r"""<!DOCTYPE html>
   .main{flex:1;display:flex;direction:ltr;min-height:0;}      /* ltr layout: first child = left */
   .results{width:42%;overflow:auto;direction:rtl;
            border-right:1px solid var(--line-2);background:var(--bg);}
+  [dir=rtl] .main{direction:rtl;}
+  [dir=rtl] .results{border-right:0;border-left:1px solid var(--line-2);}
   .splitter{flex:none;width:6px;cursor:col-resize;background:transparent;position:relative;}
   .splitter::after{content:"";position:absolute;inset:0 2px;border-radius:3px;background:transparent;transition:background .12s;}
   .splitter:hover::after,.splitter.drag::after{background:var(--accent-line);}
@@ -748,14 +751,15 @@ function renderResults(){
   el.innerHTML = head + results.map(function(r,i){
     var meet = r.kind==='meeting';
     var sentish = r.folder==='Sent'||r.folder==='Sent Items';
-    var who = meet ? ('Meeting · '+esc(r.sender_name||''))
-            : (sentish ? ('To: '+esc(r.to_recips)) : esc(r.sender_name||r.sender_email));
-    var subj = esc(r.subject||'(no subject)');
+    var who = meet ? ('<span>Meeting</span> · <span dir="auto">'+esc(r.sender_name||'')+'</span>')
+            : (sentish ? ('<span>To:</span> <span dir="auto">'+esc(r.to_recips)+'</span>')
+                       : '<span dir="auto">'+esc(r.sender_name||r.sender_email)+'</span>');
+    var subj = r.subject ? '<span dir="auto">'+esc(r.subject)+'</span>' : '(no subject)';
     var cls = 'row'+(i===sel?' sel':'')+(r.unread?' unread':'');
     return '<div class="'+cls+'" data-i="'+i+'">'
       +'<div class="r1"><span class="who">'+who+(r.has_attach?' <span class="att">'+I_CLIP+'</span>':'')+'</span><span class="dt">'+esc(r.date_str)+'</span></div>'
       +'<div class="subj">'+subj+'</div>'
-      +'<div class="snip">'+hl(r.snippet)+'</div></div>';
+      +'<div class="snip" dir="auto">'+hl(r.snippet)+'</div></div>';
   }).join('');
   Array.prototype.forEach.call(el.querySelectorAll('.row'), function(rw){
     var i=+rw.dataset.i;
@@ -774,10 +778,10 @@ async function select(i){
   var r=results[i];
   var pv=await api.preview(r.id);
   if(pv.error){ $('preview').innerHTML='<div class="empty"><span class="big">'+I_MAIL+'</span><div>'+esc(pv.error)+'</div></div>'; return; }
-  var cc = pv.cc_recips?('<br>Cc: '+esc(pv.cc_recips)):'';
+  var cc = pv.cc_recips?('<br><span class="i18n">Cc:</span> '+esc(pv.cc_recips)):'';
   var bodyHtml = (pv.body && pv.body.trim())
     ? esc(pv.body)
-    : '<span style="color:var(--faint)">- no text content'+(pv.has_attach?' (it is probably in the attachment - open in Outlook)':' (the message may be HTML/image only)')+' -</span>';
+    : '<span class="i18n" style="color:var(--faint)">- no text content'+(pv.has_attach?' (it is probably in the attachment - open in Outlook)':' (the message may be HTML/image only)')+' -</span>';
   var meet = pv.kind==='meeting';
   var olBtns = '<button class="btn primary" onclick="olAct(\'open\')">Open in Outlook</button>';
   if(!meet){
@@ -793,16 +797,16 @@ async function select(i){
       +'<span class="zoomgrp"><button class="btn zoom" onclick="zoomPv(-1)" title="Smaller text">A−</button>'
       +'<button class="btn zoom" onclick="zoomPv(1)" title="Larger text">A+</button></span>'
     +'</div>'
-    +'<div class="pv-h" dir="auto">'+esc(pv.subject||'(no subject)')+'</div>'
+    +'<div class="pv-h" dir="auto">'+(pv.subject ? esc(pv.subject) : '<span class="i18n">(no subject)</span>')+'</div>'
     +'<div class="pv-from">'
-      +'<span class="avatar">'+esc(initials(pv.sender_name||pv.sender_email))+'</span>'
+      +'<span class="avatar no-i18n">'+esc(initials(pv.sender_name||pv.sender_email))+'</span>'
       +'<div class="pv-meta" dir="auto" style="margin:0"><b>'+esc(pv.sender_name||pv.sender_email)+'</b>'
         +(pv.sender_email?(' &lt;'+esc(pv.sender_email)+'&gt;'):'')+' · '+esc(pv.date_str)
-        +'<br>To: '+esc(pv.to_recips)+cc+'</div>'
+        +'<br><span class="i18n">To:</span> '+esc(pv.to_recips)+cc+'</div>'
     +'</div>'
     +'<div style="margin-bottom:14px">'+(pv.kind==='meeting'?'<span class="chip acc">Meeting</span>':'')
-      +'<span class="chip acc">'+esc(acctLabel(pv.account))+'</span>'
-      +'<span class="chip">'+esc(pv.folder)+'</span>'+(pv.has_attach?'<span class="chip">Attachment</span>':'')+'</div>'
+      +'<span class="chip acc no-i18n">'+esc(T.quiet(acctLabel(pv.account)))+'</span>'
+      +'<span class="chip no-i18n">'+esc(pv.folder)+'</span>'+(pv.has_attach?'<span class="chip">Attachment</span>':'')+'</div>'
     +'<div class="pv-divider"></div>'
     +'<div class="pv-body" dir="auto" id="pvbody">'+bodyHtml+'</div>'
     +'</div>';
@@ -1016,7 +1020,8 @@ function initSplitter(prefs){
   document.addEventListener('mousemove', function(e){
     if(!dragging) return;
     var rect=main.getBoundingClientRect();
-    res.style.width=clampW(e.clientX-rect.left, rect.width)+'px';   /* list on the LEFT */
+    var rtl=document.documentElement.dir==='rtl';                  /* list on the RIGHT in Hebrew */
+    res.style.width=clampW(rtl ? rect.right-e.clientX : e.clientX-rect.left, rect.width)+'px';
   });
   document.addEventListener('mouseup', function(){
     if(!dragging) return; dragging=false; sp.classList.remove('drag');
@@ -1029,7 +1034,7 @@ function buildAccountSeg(accounts, current){
   var seg=$('accSeg');
   var opts=[['','All']].concat((accounts||[]).map(function(a){ return [a, acctLabel(a)]; }));
   seg.innerHTML=opts.map(function(o){
-    return '<button data-a="'+esc(o[0])+'"'+(o[0]===current?' class="on"':'')+'>'+esc(o[1])+'</button>';
+    return '<button data-a="'+esc(o[0])+'"'+(o[0]===current?' class="on"':'')+(o[0]?' data-noi18n':'')+'>'+esc(o[1])+'</button>';
   }).join('');
   Array.prototype.forEach.call(seg.querySelectorAll('button'), function(b){
     b.addEventListener('click', function(){
@@ -1066,7 +1071,7 @@ window.addEventListener('pywebviewready', async function(){
 
   account = prefs.last_account || '';
   buildAccountSeg(d.accounts, account);
-  (d.folders||[]).forEach(function(f){ var o=document.createElement('option'); o.value=f;o.textContent=f; $('fFolder').appendChild(o); });
+  (d.folders||[]).forEach(function(f){ var o=document.createElement('option'); o.value=f;o.textContent=f; o.className='no-i18n'; $('fFolder').appendChild(o); });
 
   var s=d.status||{}; lastStatus=s; refreshPreTs=s.last_sync||0;
   setBase(s); setStat(baseStat, s.state==='error'?'warn':'ok');
@@ -1105,7 +1110,7 @@ def main():
 
     api = SearchApi(payload)
     try:
-        win = webview.create_window(payload.get("title", "Email search"),
+        win = webview.create_window(ui_i18n.t(payload.get("title", "Email search")),
                                     html=_with_csp(HTML), js_api=api,
                                     width=1180, height=780, min_size=(820, 560))
         import ollama_gate

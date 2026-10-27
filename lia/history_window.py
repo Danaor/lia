@@ -170,7 +170,7 @@ APP_JS = r"""
         '<div class="h-head"><span class="h-ts">'+esc(e.ts)+'</span>'+
         '<button class="h-copy" data-copy type="button" title="Copy this transcription">'+
           RK.icon('copy',{size:14})+'<span class="h-copy-lbl">Copy</span></button>'+
-        '<span class="h-meta">'+esc(e.meta)+'</span></div>'+
+        '<span class="h-meta no-i18n">'+esc(e.meta)+'</span></div>'+
         '<div class="h-text rtl-auto" dir="auto">'+t+'</div></div>';
     }).join('');
   }
@@ -234,7 +234,7 @@ def build_window(webview, payload):
     if "x" in geo:
         kw["x"] = geo["x"]
         kw["y"] = geo["y"]
-    win = webview.create_window("Lia History", html=html, js_api=api, **kw)
+    win = webview.create_window(uk.ui_i18n.t("Lia History"), html=html, js_api=api, **kw)
     uk.attach_geometry_memory(win, "history")
     return win
 

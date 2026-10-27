@@ -218,7 +218,7 @@ HTML = r"""<!DOCTYPE html>
   <header>
     <h1><span class="orb">__LIA_ORB__</span>Ask your meetings</h1>
     <span class="count" id="count"></span>
-    <span class="hint">Filters: after:2026-08-01 · speaker:"Speaker A"</span>
+    <span class="hint">Filters: <bdi dir="ltr" class="no-i18n">after:2026-08-01 · speaker:"Speaker A"</bdi></span>
     <select id="model"></select>
     <button class="clr" id="clr" title="New conversation">Clear</button>
   </header>
@@ -266,7 +266,7 @@ function srcCard(s){
   var ts = s.ts ? (' · <span class="ts">~'+esc(s.ts)+'</span>') : '';
   return '<div class="src" id="src-'+s.n+'" data-eid="'+esc(s.entry_id)+'">'
     + '<div class="t" dir="auto"><span class="num">['+s.n+']</span>'+esc(s.title)+'</div>'
-    + '<div class="m">'+esc(s.date)+ts+(s.speakers?(' · '+esc(s.speakers)):'')+' · '+esc(s.kind)+'</div></div>';
+    + '<div class="m"><span dir="auto">'+esc(s.date)+ts+(s.speakers?(' · '+esc(s.speakers)):'')+'</span> · <span>'+esc(s.kind)+'</span></div></div>';
 }
 document.getElementById('wrap').addEventListener('click', function(ev){
   var cite = ev.target.closest('.cite');
@@ -369,9 +369,10 @@ def main():
             pass                     # the parent's timed cleanup is the fallback
 
     api = MeetingsApi(payload)
+    import ui_i18n  # the interface language (window title)
     try:
         _WINDOW = webview.create_window(
-            payload.get("title", "Ask your meetings"), html=_with_csp(HTML), js_api=api,
+            ui_i18n.t(payload.get("title", "Ask your meetings")), html=_with_csp(HTML), js_api=api,
             width=900, height=780, min_size=(560, 480))
         import ollama_gate
         ollama_gate.UI["on_wait"] = lambda t: _WINDOW.evaluate_js(

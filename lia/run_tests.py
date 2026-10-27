@@ -3723,8 +3723,10 @@ def t_meeting_status_card_api():
     import notification_style as _ns, meeting_notifications as _mn
     assert hasattr(_mn, "MeetingCard") and _ns.WIDTH >= 340
     # Tk 8.6.15 bidis button labels natively (re-measured 2026-10-13):
-    # button_text keeps Hebrew LOGICAL - a reorder printed it backwards.
-    assert _ns.button_text("שלום") == "שלום"
+    # button_text keeps Hebrew LOGICAL (a visual reorder printed it backwards)
+    # inside an RTL embedding per line (Tk laid a mixed line out left-to-right,
+    # measured 2026-10-27); Latin text is untouched.
+    assert _ns.button_text("שלום") == "\u202bשלום\u202c"
     assert _ns.button_text("Open") == "Open"
 
 
@@ -3836,7 +3838,12 @@ def t_notification_style_tokens():
     # so a button label stays logical.
     assert ns.has_rtl("עברית") and not ns.has_rtl("hello")
     assert ns.button_text("Open") == "Open"
-    assert ns.button_text("שלום") == "שלום"
+    assert ns.button_text("שלום") == "\u202bשלום\u202c"
+    # each Hebrew line gets its own embedding; a Latin line stays plain
+    assert ns.rtl_text("זוהתה פגישת Zoom\nWeekly sync") == "\u202bזוהתה פגישת Zoom\u202c\nWeekly sync"
+    assert ns.rtl_text("") == "" and ns.wrap_rtl("Weekly sync", len, 10) == "Weekly sync"
+    # wrap by width, each wrapped Hebrew line embedded on its own
+    assert ns.wrap_rtl("אחת שתיים שלוש", len, 9) == "\u202bאחת שתיים\u202c\n\u202bשלוש\u202c"
     assert ns.WIDTH >= ns.WIDTH_MIN >= 320
     # notification_style must not import tkinter at module load (cheap tokens).
     import sys
@@ -7591,6 +7598,138 @@ def t_meeting_card_minimize_sticky():
 
 _test("meeting card: Minimize works and survives stage updates",
       t_meeting_card_minimize_sticky)
+
+
+def t_meeting_card_auto_fold():
+    """A processing card folds itself to one line after AUTO_COLLAPSE_MS
+    (Naor 2026-10-27: the open card in the corner was distracting), a stage
+    update keeps it folded, hovering opens it and leaving folds it again, a
+    user's Restore stops the automatic behaviour, and the finished card
+    (same anchor, no allow_min) is always open. A REAL Tk card."""
+    import time as _t
+    import notification_preview as npv
+    import notification_style as ns
+    old = ns.AUTO_COLLAPSE_MS, ns.HOVER_CLOSE_MS
+    ns.AUTO_COLLAPSE_MS, ns.HOVER_CLOSE_MS = 300, 50
+    host = npv._PreviewHost()
+    try:
+        def pump(sec=0.5):
+            end = _t.time() + sec
+            while _t.time() < end:
+                host.root.update()
+                _t.sleep(0.02)
+
+        def height():
+            host.card._top.update_idletasks()
+            return host.card._top.winfo_height()
+        card = host.card
+        card._pointer_inside = lambda: False        # the pointer is elsewhere
+        anchor = _t.monotonic()
+        st = {"kind": "processing", "title": "Processing meeting",
+              "meeting_title": "Weekly sync", "allow_close": True,
+              "anchor": anchor, "dot": "busy", "chips": ["engine"],
+              "stage_label": "Diarizing", "allow_min": True,
+              "stages": [("diarize", "Diarizing", "active")],
+              "actions": [("Stop", lambda: None, False)]}
+        card.render(dict(st)); pump(0.1)
+        h_open = height()
+        pump(0.6)
+        h_fold = height()
+        assert h_fold < h_open * 0.7 and card._auto, (h_open, h_fold)
+        card.render(dict(st, stage_label="Transcribing")); pump(0.1)
+        assert height() == h_fold, "a stage update re-opened the folded card"
+        card._peek_open(); pump(0.1)
+        assert height() == h_open and card._peek, "hover must open the folded card"
+        card.render(dict(st, stage_label="Summarizing")); pump(0.1)
+        assert height() == h_open, "an update while hovered must keep it open"
+        card._peek_leave(); pump(0.3)
+        assert height() == h_fold and not card._peek, "leaving must fold it again"
+        # the finished card (same anchor) is never folded
+        card.render({"kind": "success", "title": "Summary ready", "meeting_title": "Weekly sync",
+                     "allow_close": True, "anchor": anchor, "dot": "ok",
+                     "actions": [("Open", lambda: None, True)], "close_button": True}); pump(0.1)
+        assert height() > h_fold * 1.3, "the finished card must open in full"
+        # a user's Restore ends the automatic fold for that card
+        card.render(dict(st, anchor=_t.monotonic())); pump(0.6)
+        assert card._auto
+        card._widgets["min_btn"].invoke(); pump(0.6)
+        assert not card._auto and height() > h_fold * 1.3, "Restore must stay open"
+    finally:
+        ns.AUTO_COLLAPSE_MS, ns.HOVER_CLOSE_MS = old
+        host.card.hide()
+        host.root.destroy()
+
+
+_test("meeting card: processing card folds itself, opens on hover, finished card opens",
+      t_meeting_card_auto_fold)
+
+
+def t_meeting_card_hover_opacity():
+    """The bottom-right cards rest at REST_ALPHA (Naor 2026-10-27: still too
+    loud) and come to full opacity while the pointer is over them; moving
+    between child widgets never dims them; an error card stays opaque; a card
+    built under the pointer starts full; the meeting prompt card does the
+    same. A REAL Tk card, the alpha read back from the window."""
+    import time as _t
+    import lia as w
+    import notification_preview as npv
+    import notification_style as ns
+    assert ns.REST_ALPHA == 0.65 and ns.FULL_ALPHA == 1.0
+    old_ptr, old_leave = ns.pointer_over, ns.HOVER_LEAVE_MS
+    inside = {"v": False}
+    ns.pointer_over = lambda top: inside["v"]
+    ns.HOVER_LEAVE_MS = 30
+    host = npv._PreviewHost()
+    try:
+        def pump(sec=0.4):
+            end = _t.time() + sec
+            while _t.time() < end:
+                host.root.update()
+                _t.sleep(0.02)
+
+        def alpha():
+            return round(float(host.card._top.attributes("-alpha")), 2)
+        card = host.card
+        st = {"kind": "processing", "title": "Processing meeting",
+              "meeting_title": "Weekly sync", "anchor": _t.monotonic(), "dot": "busy",
+              "stage_label": "Diarizing", "allow_close": True,
+              "actions": [("Stop", lambda: None, False)]}
+        card.render(dict(st)); pump()             # fades in to the rest level
+        assert alpha() == 0.65, alpha()
+        inside["v"] = True
+        card._top.event_generate("<Enter>"); pump(0.1)
+        assert alpha() == 1.0, "hover must bring it to full opacity"
+        card._top.event_generate("<Leave>"); pump(0.1)
+        assert alpha() == 1.0, "a Leave into a child widget must not dim it"
+        inside["v"] = False
+        card._top.event_generate("<Leave>"); pump(0.1)
+        assert alpha() == 0.65, "leaving must dim it again"
+        inside["v"] = True                         # rebuilt under the pointer
+        card.render(dict(st, stage_label="Transcribing")); pump(0.1)
+        assert alpha() == 1.0, alpha()
+        inside["v"] = False
+        card.render(dict(st, anchor=_t.monotonic(), dot="error", kind="error",
+                         title="Summary failed")); pump()
+        assert alpha() == 1.0, "an error card must stay opaque"
+        # the meeting prompt card
+        ov = w.OverlayNotification.__new__(w.OverlayNotification)
+        ov._root = host.root
+        ov._brand_image = lambda *a, **k: None
+        ov._create_prompt_toplevel("Meeting detected", "Start recording?", "Start",
+                                   None, None, 60000)
+        pump(0.1)
+        tops = [t for t in host.root.winfo_children()
+                if t.winfo_class() == "Toplevel" and t is not card._top]
+        assert tops and round(float(tops[-1].attributes("-alpha")), 2) == 0.65
+        tops[-1].destroy()
+    finally:
+        ns.pointer_over, ns.HOVER_LEAVE_MS = old_ptr, old_leave
+        host.card.hide()
+        host.root.destroy()
+
+
+_test("meeting card + prompt: rest at 65% opacity, full under the pointer",
+      t_meeting_card_hover_opacity)
 
 
 def t_meeting_card_close_button():
@@ -11973,6 +12112,115 @@ _test("ui_kit: design tokens, page() assembler, bridge-defer discipline",
       t_ui_kit_tokens)
 
 
+def t_ui_i18n_core():
+    """The interface language (Hebrew UI, 2026-10-26): resolution order,
+    exact + template lookup, numeric placeholders never swallow words, the
+    surrounding whitespace survives, English is a pass-through."""
+    import ui_i18n as u
+    old = os.environ.pop(u.ENV_KEY, None)
+    try:
+        assert u.normalize("HE") == "he" and u.normalize("fr") == "en" and u.normalize(None) == "en"
+        assert u.resolve({"ui_language": "he"}) == "he", "an explicit config wins"
+        os.environ[u.ENV_KEY] = "he"
+        assert u.resolve() == "he" and u.is_rtl(), "the exported LIA_UI_LANG is read"
+        assert u.t("Save") == "שמירה"
+        assert u.t("  Save ") == "  שמירה ", "surrounding whitespace is kept"
+        assert u.t("12 terms") == "12 מונחים", "a numeric template fills in the number"
+        assert u.t("Learned terms") == "מונחים שנלמדו", "an exact key beats a template"
+        assert u.lookup("Some terms") is None, "{n} matches numbers only"
+        assert u.t("Hotkey set to ctrl+space.") == "קיצור המקשים הוגדר ל-ctrl+space."
+        assert u.t("Not a known phrase") == "Not a known phrase", "an unknown text stays as it is"
+        assert u.t("Saved {n} snippet(s).", n=3) == "נשמרו 3 קטעים.", "kwargs fill after translating"
+        os.environ[u.ENV_KEY] = "en"
+        assert u.t("Save") == "Save" and not u.is_rtl(), "English is a pass-through"
+    finally:
+        os.environ.pop(u.ENV_KEY, None)
+        if old is not None:
+            os.environ[u.ENV_KEY] = old
+
+
+_test("i18n: interface language resolve + t() exact/template/numeric/whitespace",
+      t_ui_i18n_core)
+
+
+def t_ui_he_dictionary_hygiene():
+    """ui_he.STRINGS: every placeholder survives into the Hebrew (a lost {n}
+    shows a raw brace or drops the number), no em-dash (Naor's rule), a value
+    is Hebrew unless it is a deliberate as-is entry (brand / model / key)."""
+    import re
+    import ui_he
+    ph = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
+    bad = []
+    for k, v in ui_he.STRINGS.items():
+        if sorted(ph.findall(k)) != sorted(ph.findall(v)):
+            bad.append("placeholders differ: %r -> %r" % (k, v))
+        if "—" in v:
+            bad.append("em-dash in the Hebrew: %r" % k)
+        if v != k and not re.search("[֐-׿]", v):
+            bad.append("not Hebrew and not as-is: %r -> %r" % (k, v))
+    assert not bad, "\n".join(bad[:10])
+    assert len(ui_he.STRINGS) > 900, "the dictionary looks truncated (%d)" % len(ui_he.STRINGS)
+
+
+_test("i18n: Hebrew dictionary hygiene (placeholders kept, no em-dash, Hebrew values)",
+      t_ui_he_dictionary_hygiene)
+
+
+def t_ui_i18n_wiring():
+    """Every surface follows the interface language: page()/brand_html() set
+    lang/dir and carry the runtime, editable / user content is never
+    translated, the setting is wired, the tray menu + tooltips + balloons +
+    overlay + meeting card translate at their chokepoint, the tray menu items
+    read right-to-left in Hebrew."""
+    import inspect
+    import lia as w
+    import ui_i18n as u
+    import ui_kit as uk
+    import meeting_notifications as mn
+    old = os.environ.pop(u.ENV_KEY, None)
+    try:
+        os.environ[u.ENV_KEY] = "he"
+        html = uk.page("Lia History", "<div>x</div>")
+        assert 'lang="he"' in html and 'dir="rtl"' in html, "page() must follow the interface language"
+        assert "<title>היסטוריה - Lia</title>" in html, "the document title is translated"
+        assert "window.LIA_I18N" in html and "MutationObserver" in html, "page() carries the runtime"
+        b = uk.brand_html('<!DOCTYPE html><html lang="en"><head></head><body></body></html>')
+        assert '<html lang="he" dir="rtl">' in b and "window.LIA_I18N" in b, "brand_html() too"
+        js = u.page_js("he")
+        for sel in ("[contenteditable]", "[dir=auto]", "textarea", ".masked", "[data-noi18n]"):
+            assert sel in js, "user content must be skipped: " + sel
+        os.environ[u.ENV_KEY] = "en"
+        assert 'lang="en" dir="ltr"' in uk.page("T", "x"), "English stays en/ltr"
+    finally:
+        os.environ.pop(u.ENV_KEY, None)
+        if old is not None:
+            os.environ[u.ENV_KEY] = old
+    assert w.DEFAULT_CONFIG.get("ui_language") == "en", "existing users keep English until they switch"
+    src = inspect.getsource(w)
+    assert 'add("set_ui_language", self._set_ui_language)' in src
+    assert "ui_i18n.set_process_lang(self.config.get(\"ui_language\"" in src, "children inherit the language"
+    assert "_menu_items_right_order(hmenu)" in src and "_install_rtl_tray_menu()" in src
+    assert "text = ui_i18n.t(text)" in inspect.getsource(w.OverlayNotification.show)
+    # the pill's Latin-only face scrambled Hebrew (2026-10-27): RTL text gets a Hebrew face
+    assert "_font_rtl" in inspect.getsource(w.OverlayNotification.show)
+    assert 'return lambda item: ui_i18n.t(text)' in src, "tray captions re-read the language"
+    assert '"Lia - " + ui_i18n.t(t[len("Lia - "):])' in inspect.getsource(w.LiaApp._set_title)
+    assert "_orig_notify(ui_i18n.t(message)" in src, "balloons are translated"
+    assert "self.tray_icon.title = \"Lia - " not in src, "every tooltip goes through _set_title"
+    c = mn._localized({"title": "Summary ready", "stages": [("s", "Summarizing", "active")],
+                       "actions": [("Open folder", None, False)], "meeting_title": "Summary ready"})
+    os.environ[u.ENV_KEY] = "en"
+    assert c["meeting_title"] == "Summary ready", "the meeting name is the user's"
+    os.environ.pop(u.ENV_KEY, None)
+    sw = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)), "settings_window.py"),
+              encoding="utf-8").read()
+    assert '"set_ui_language"' in sw and 'Interface language' in sw
+
+
+_test("i18n: every surface follows the interface language (pages, tray RTL, overlay, card, setting)",
+      t_ui_i18n_wiring)
+
+
 def t_ui_kit_icons():
     """Local SVG icon set (Phase 1): icon() + RK.icon share ONE ICONS map, render
     inline currentColor SVGs, carry an accessible name when meaningful (decorative
@@ -12153,14 +12401,17 @@ def t_meeting_card_orb_and_fade():
         host.root.update()
         assert float(card._top.attributes("-alpha")) < 1.0, "a new card must start its fade-in"
         pump(0.5)
-        assert float(card._top.attributes("-alpha")) == 1.0, "the fade ends fully opaque"
+        want = 1.0 if ns.pointer_over(card._top) else ns.REST_ALPHA
+        assert round(float(card._top.attributes("-alpha")), 2) == want, (
+            "the fade ends at the resting opacity (full under the pointer)")
         assert "orb" in card._widgets and "spin" not in card._widgets, "the orb replaces the spinner"
         i0 = card._orb_i
         pump(0.35)
         assert card._orb_i != i0, "the orb turns on the tick"
         card.render(dict(st, stage_label="Summarizing"))   # a re-render: no fade
         host.root.update()
-        assert float(card._top.attributes("-alpha")) == 1.0, "a re-render must not fade again"
+        assert round(float(card._top.attributes("-alpha")), 2) == card._hover.alpha(), (
+            "a re-render must not fade again")
     finally:
         host.root.destroy()
 
@@ -15063,7 +15314,7 @@ def t_meeting_busy_through_processing():
         assert "_meeting_busy()" in src and "_is_meeting_active()" not in src, fn
     assert "_is_meeting_active()" in inspect.getsource(App._hotkey_listener)
     tray = inspect.getsource(App.run)
-    assert '"Quit", self._quit_requested' in tray
+    assert '_tr("Quit"), self._quit_requested' in tray
 
 
 _test("meeting: processing after Stop blocks restarts / jobs / silent quit",

@@ -27,6 +27,7 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ui_i18n  # noqa: E402  the interface language (window title)
 import email_index as ei  # reused for _ollama_root + paths (no heavy deps)
 import secret_store       # DPAPI unprotect for the payload's API key
 
@@ -335,9 +336,9 @@ HTML = r"""<!DOCTYPE html>
   .bubble{padding:12px 15px;border-radius:15px;line-height:1.75;max-width:76%;
           overflow-wrap:anywhere;position:relative;
           user-select:text;-webkit-user-select:text;cursor:text;}
-  .msg.user .bubble{background:var(--user);color:#fff;border-top-right-radius:5px;}
+  .msg.user .bubble{background:var(--user);color:#fff;border-start-end-radius:5px;}
   .msg.bot  .bubble{background:var(--bot);color:var(--ink);border:1px solid var(--line);
-                    border-top-left-radius:5px;box-shadow:var(--shadow);}
+                    border-start-start-radius:5px;box-shadow:var(--shadow);}
   .bubble p{margin:0 0 8px;} .bubble p:last-child{margin:0;}
   .bubble strong{font-weight:700;}
   .bubble code{background:#0000000f;padding:1px 5px;border-radius:5px;font-size:.9em;
@@ -377,6 +378,7 @@ HTML = r"""<!DOCTYPE html>
   .send{flex:none;width:40px;height:40px;border-radius:12px;border:0;cursor:pointer;
         color:#fff;font-size:16px;display:flex;align-items:center;justify-content:center;}
   .send:active{transform:translateY(.5px);}
+  [dir=rtl] .send:not(.stop){transform:scaleX(-1);}   /* the arrow points the way text runs */
   .send:disabled{background:var(--line-2) !important;color:var(--faint) !important;cursor:default;box-shadow:none;}
   /* Stop is not an alarm: red is for recording only */
   .send.stop{background:var(--accent) !important;} .send.stop::after{display:none;}
@@ -623,7 +625,7 @@ def main():
     api = ChatApi(payload)
     try:
         _WINDOW = webview.create_window(
-            payload.get("title", "Chat"), html=_with_csp(HTML), js_api=api,
+            ui_i18n.t(payload.get("title", "Chat")), html=_with_csp(HTML), js_api=api,
             width=880, height=760, min_size=(560, 480))
         import ui_kit as uk  # Lia window icon
         uk.webview_start(webview)

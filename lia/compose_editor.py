@@ -40,6 +40,7 @@ import json
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
+import ui_i18n  # noqa: E402  the interface language (window title)
 
 try:
     import webview
@@ -90,6 +91,7 @@ HTML = r"""<!DOCTYPE html>
   .nav { color:var(--sub); font-size:14px; display:flex; gap:6px; align-items:center; }
   .nav .arr { cursor:pointer; font-weight:700; color:var(--ink); user-select:none; padding:0 2px; }
   .nav .arr.off { color:#9AA0AD; cursor:default; }
+  [dir=rtl] .nav .arr { display:inline-block; transform:scaleX(-1); }  /* back = right in Hebrew */
   .page { flex:1 1 auto; border:1px solid var(--border); border-radius:8px;
           padding:14px 16px; font-size:16px; line-height:1.7; overflow-y:auto;
           outline:none; min-height:180px; }
@@ -112,7 +114,7 @@ HTML = r"""<!DOCTYPE html>
   .btn:hover { background:var(--sec-h); }
   .btn.primary { background:var(--accent); color:#FFFFFF; font-weight:600; }
   .btn.primary:hover { background:var(--accent2); }
-  .btn.spacer { margin-left:auto; }
+  .btn.spacer { margin-inline-start:auto; }
   .btn:disabled, .chip:disabled { opacity:.5; cursor:default; }
 </style>
 </head>
@@ -620,9 +622,12 @@ SUMMARY_HTML = r"""<!DOCTYPE html>
     card=$('card'); statusEl=$('status');
     wire();
     var d = await api.get_initial();
-    document.title = d.title || 'Edit summary';
+    document.title = T(d.title || 'Edit summary');
     document.documentElement.dir = d.dir || 'rtl';
     document.documentElement.lang = d.lang || 'he';
+    // the page takes the SUMMARY's direction; the toolbar follows the interface
+    var tb = document.querySelector('.toolbar');
+    if(tb) tb.dir = (window.LIA_I18N && LIA_I18N.rtl) ? 'rtl' : 'ltr';
     // Inject the document's OWN css first so the card looks identical to the file.
     var s=document.createElement('style'); s.textContent=d.css||'';
     document.head.insertBefore(s, document.head.firstChild);
@@ -1074,7 +1079,7 @@ def _run_summary_editor(payload):
         sys.exit(3)  # parent treats non-zero as failure -> os.startfile fallback
 
     try:
-        win = webview.create_window(payload.get("title", "Edit summary"),
+        win = webview.create_window(ui_i18n.t(payload.get("title", "Edit summary")),
                                     html=_with_csp(SUMMARY_HTML), js_api=api,
                                     width=900, height=860, min_size=(560, 520))
 
@@ -1166,7 +1171,7 @@ def main():
             sys.stderr.write("compose_editor: cleaner init failed: %r\n" % (e,))
 
     api = Api(payload, cleaner)
-    win = webview.create_window(payload.get("title", "Compose"), html=_with_csp(HTML),
+    win = webview.create_window(ui_i18n.t(payload.get("title", "Compose")), html=_with_csp(HTML),
                                 js_api=api, width=880, height=820,
                                 min_size=(560, 480))
 

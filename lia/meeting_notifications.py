@@ -26,6 +26,37 @@ from __future__ import annotations
 import time
 
 import notification_style as ns
+import ui_i18n
+
+
+def _measure(widget, font):
+    """A pixel-width function for `font` (Tk thread; for ns.wrap_rtl). Asks
+    the interpreter directly: a tkinter Font object would `font delete`
+    itself on garbage collection, after a torn-down root = a Tcl bgerror."""
+    return lambda s: int(widget.tk.call("font", "measure", font, s))
+
+
+def _localized(c):
+    """The card's own words in the interface language (ui_i18n). The meeting
+    name is the user's and stays as it is; model names pass through untouched
+    (they have no entry). One-line texts get their RTL embedding here
+    (ns.rtl_text); the wrapped ones (meeting name, message) at their Label,
+    buttons in ns.button_text."""
+    t = ui_i18n.t
+    c = dict(c)
+    for k in ("title", "message", "stage_label", "close_label"):
+        if c.get(k):
+            c[k] = t(c[k])
+    for k in ("title", "stage_label"):
+        if c.get(k):
+            c[k] = ns.rtl_text(c[k])
+    if c.get("stages"):
+        c["stages"] = [(k, ns.rtl_text(t(lab)), st) for k, lab, st in c["stages"]]
+    if c.get("actions"):
+        c["actions"] = [(t(a[0]),) + tuple(a[1:]) for a in c["actions"]]
+    if c.get("chips"):
+        c["chips"] = [ns.rtl_text(t(x)) for x in c["chips"]]
+    return c
 
 # Small vector-ish glyphs drawn as text in the state dot slot. Kept to plain
 # marks (not emoji) so they render in one colour and align on the baseline.
@@ -76,6 +107,19 @@ class MeetingCard:
         # model, which does not know the choice: without this the card popped
         # back open on the next update (2026-09-23: "it won't minimize").
         self._ui = {}
+        # Auto-fold (ns.AUTO_COLLAPSE_MS): `_auto` = this card was folded by
+        # Lia, not by the user; `_peek` = it is open only while the pointer
+        # is over it.
+        self._auto = False
+        self._peek = False
+        self._timers = set()              # pending fold / peek after() ids
+        # a Tk root torn down with a fold still pending (an app restart of
+        # the overlay, a test host) must not call back into a dead interpreter
+        try:
+            self._root.bind("<Destroy>", lambda e: self._cancel_timers()
+                            if str(e.widget) == str(self._root) else None, add="+")
+        except Exception:
+            pass
 
     # ---- thread hop ------------------------------------------------------
     def post(self, fn):
@@ -92,11 +136,18 @@ class MeetingCard:
             return
         st = dict(state or {})
         prev = self._state or {}
-        if st.get("anchor") is not None and st.get("anchor") == prev.get("anchor"):
+        same = st.get("anchor") is not None and st.get("anchor") == prev.get("anchor")
+        if same:
             st.update(self._ui)           # same card: keep the user's choice
+            if self._peek:
+                st["minimized"] = False   # hovered open: an update keeps it open
         else:
             self._ui = {}                 # a new card starts open
+            self._auto = self._peek = False
         self._build(st)
+        if not same and self._foldable(st):
+            a = st.get("anchor")
+            self._later(ns.AUTO_COLLAPSE_MS, lambda a=a: self._auto_fold(a))
 
     def update_meta(self, *, elapsed_seconds=None, stage_label=None):
         """Cheap in-place refresh of elapsed / active-stage text. Tk-thread."""
@@ -111,7 +162,32 @@ class MeetingCard:
 
     def hide(self):
         """Destroy the card. Tk-thread only."""
+        self._cancel_timers()
         self._teardown()
+
+    def _later(self, ms, fn):
+        """root.after that hide() can cancel (no callback into a dead Tk)."""
+        box = []
+
+        def run():
+            self._timers.discard(box[0])
+            fn()
+        box.append(self._root.after(ms, run))
+        self._timers.add(box[0])
+
+    def _cancel_timers(self):
+        if self._anim_id:                 # the orb / spinner tick too (the id
+            try:                          # is interpreter-wide; the card may be gone)
+                self._root.after_cancel(self._anim_id)
+            except Exception:
+                pass
+            self._anim_id = None
+        for t in list(self._timers):
+            try:
+                self._root.after_cancel(t)
+            except Exception:
+                pass
+        self._timers.clear()
 
     # ---- build -----------------------------------------------------------
     def _orb_images(self):
@@ -146,10 +222,12 @@ class MeetingCard:
         first_show = self._top is None        # a NEW card fades in; a re-render does not
         self._teardown(keep_state=True)
         self._state = c
+        c = _localized(c)
         # Whole-card direction from its visible text. Label/Message bidi
         # natively (keep text logical); we only flip anchors so Hebrew reads
         # from the right. Buttons are handled per-widget via ns.button_text.
-        self._rtl = (ns.has_rtl(c.get("title")) or ns.has_rtl(c.get("meeting_title"))
+        self._rtl = (ui_i18n.is_rtl()
+                     or ns.has_rtl(c.get("title")) or ns.has_rtl(c.get("meeting_title"))
                      or ns.has_rtl(c.get("message")))
         m = self._m
         m.rtl = self._rtl            # Hebrew needs a face that covers it
@@ -185,6 +263,13 @@ class MeetingCard:
                 self._build_stages(tk, body, c)
             self._build_actions(tk, body, c)
 
+        # An auto-folded card opens while the pointer is over it (bindings on
+        # the Toplevel fire for every child too; _peek_leave re-checks the
+        # pointer, so moving between children never folds it).
+        if self._auto and self._foldable(c):
+            top.bind("<Enter>", self._peek_open, add="+")
+            top.bind("<Leave>", self._peek_leave, add="+")
+
         # `anchor` (a time.monotonic reference) lets elapsed survive rebuilds
         # so a stage change or Details toggle doesn't reset the timer.
         self._t0 = c.get("anchor") if c.get("anchor") is not None else time.monotonic()
@@ -192,14 +277,24 @@ class MeetingCard:
         self._position()
         self._round()
         self._refresh_dynamic()
-        if first_show and not self._reduced:
+        fade = first_show and not self._reduced
+        # Rests at ns.REST_ALPHA, full while the pointer is over it (a card
+        # rebuilt under the pointer starts full). An error stays opaque.
+        self._hover = ns.HoverOpacity(
+            top, rest=ns.FULL_ALPHA if c.get("dot") == "error" else ns.REST_ALPHA,
+            apply=not fade)
+        if fade:
             self._fade_in(top)
         if c.get("dot") in ("busy", "rec") and not self._reduced:
             self._tick()
 
+    def _target_alpha(self):
+        h = getattr(self, "_hover", None)
+        return h.alpha() if h else 1.0
+
     def _fade_in(self, top, steps=6):
-        """A short opacity ramp when a card first appears (ns.FADE_MS). Any
-        failure leaves the card simply shown - never half-transparent."""
+        """A short opacity ramp when a card first appears (ns.FADE_MS), up to
+        its resting opacity. Any failure leaves the card at that opacity."""
         try:
             top.attributes("-alpha", 0.0)
         except Exception:
@@ -210,12 +305,12 @@ class MeetingCard:
             try:
                 if self._top is not top:
                     return
-                top.attributes("-alpha", min(1.0, i / steps))
+                top.attributes("-alpha", self._target_alpha() * min(1.0, i / steps))
                 if i < steps:
-                    top.after(dt, step, i + 1)
+                    self._later(dt, lambda: step(i + 1))
             except Exception:
                 try:
-                    top.attributes("-alpha", 1.0)
+                    top.attributes("-alpha", self._target_alpha())
                 except Exception:
                     pass
         step(1)
@@ -300,7 +395,9 @@ class MeetingCard:
         name = (c.get("meeting_title") or "").strip()
         if not name:
             return
-        lbl = tk.Label(parent, text=name, bg=ns.BG, fg=ns.INK,
+        lbl = tk.Label(parent, text=ns.wrap_rtl(name, _measure(parent, m.font(ns.PT_NAME)),
+                                                m.px(ns.WIDTH - 2 * ns.PAD)) or name,
+                       bg=ns.BG, fg=ns.INK,
                        font=m.font(ns.PT_NAME),
                        anchor="e" if self._rtl else "w",
                        justify="right" if self._rtl else "left",
@@ -337,7 +434,9 @@ class MeetingCard:
                 anchor="w" if self._rtl else "e")
             self._widgets["elapsed"].pack(side=trail)
         elif msg:
-            tk.Label(row, text=msg, bg=ns.BG, fg=ns.SUB, font=m.font(ns.PT_META),
+            tk.Label(row, text=ns.wrap_rtl(msg, _measure(row, m.font(ns.PT_META)),
+                                           m.px(ns.WIDTH - 2 * ns.PAD)) or msg,
+                     bg=ns.BG, fg=ns.SUB, font=m.font(ns.PT_META),
                      anchor="e" if self._rtl else "w",
                      justify="right" if self._rtl else "left",
                      wraplength=m.px(ns.WIDTH - 2 * ns.PAD)).pack(fill="x")
@@ -367,12 +466,12 @@ class MeetingCard:
         actions = list(c.get("actions") or [])
         # A Details toggle for processing cards with hidden stages.
         if c.get("stages") and c.get("dot") == "busy":
-            lbl = "Hide details" if c.get("expanded") else "Details"
+            lbl = ui_i18n.t("Hide details" if c.get("expanded") else "Details")
             actions = actions + [(lbl, self._on_toggle_details, False)]
         # A text "Close" next to the actions (Naor, 2026-10-07): the same path
         # as the X, so an on_close policy still runs. Last = the leading edge.
         if c.get("close_button") and c.get("allow_close", True):
-            actions = actions + [(c.get("close_label") or "Close", self._on_close, False)]
+            actions = actions + [(c.get("close_label") or ui_i18n.t("Close"), self._on_close, False)]
         if not actions:
             return
         row = tk.Frame(parent, bg=ns.BG)
@@ -464,7 +563,57 @@ class MeetingCard:
         self.post(_do)
 
     def _on_min(self):
+        self._auto = self._peek = False   # the user decides from here on
         self._toggle_ui("minimized")
+
+    # ---- auto-fold + hover peek ------------------------------------------
+    @staticmethod
+    def _foldable(c):
+        return bool(c and c.get("allow_min") and c.get("dot") == "busy")
+
+    def _pointer_inside(self):
+        return bool(self._top) and ns.pointer_over(self._top)
+
+    def _auto_fold(self, anchor):
+        """Fold the processing card to one line (Tk thread, via after)."""
+        c = self._state
+        if (not c or c.get("anchor") != anchor or not self._top or not self._foldable(c)
+                or "minimized" in self._ui or c.get("expanded")):
+            return                        # gone, finished, or the user chose
+        if self._pointer_inside():        # being read right now: try later
+            self._later(3000, lambda: self._auto_fold(anchor))
+            return
+        self._ui["minimized"] = True
+        self._auto = True
+        c["minimized"] = True
+        self._build(c)
+
+    def _peek_open(self, _e=None):
+        if not self._auto or self._peek:
+            return
+        c = self._state
+        if not c or not self._foldable(c):
+            return
+        self._peek = True
+        c["minimized"] = False
+        self._build(c)
+
+    def _peek_leave(self, _e=None):
+        if not self._peek:
+            return
+        def check():
+            if not self._peek or self._pointer_inside():
+                return
+            self._peek = False
+            c = self._state
+            if c and c.get("expanded"):
+                self._auto = False        # Details opened while hovering: keep it
+                self._ui["minimized"] = False
+                return
+            if c and self._foldable(c) and self._auto:
+                c["minimized"] = True
+                self._build(c)
+        self._later(ns.HOVER_CLOSE_MS, check)
 
     def _on_toggle_details(self):
         self._toggle_ui("expanded")
@@ -479,7 +628,7 @@ class MeetingCard:
         if "elapsed" in w and el is not None:
             w["elapsed"].configure(text=_fmt_elapsed(el))
         if "stage" in w:
-            sl = (c.get("stage_label") or "").strip()
+            sl = ns.rtl_text(ui_i18n.t((c.get("stage_label") or "").strip()))
             w["stage"].configure(text=sl)
 
     def _tick(self):

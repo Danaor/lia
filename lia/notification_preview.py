@@ -173,6 +173,11 @@ class _PreviewHost:
             except Exception:
                 pass
         self.queue = _q.Queue()
+        self._pump_id = None
+        # a host torn down mid-loop (the test suite) must not leave its pump
+        # firing into a dead interpreter
+        self.root.bind("<Destroy>", lambda e: self._stop_pump()
+                       if str(e.widget) == str(self.root) else None, add="+")
         self._pump()
         self.card = mn.MeetingCard(self.root, self.queue, dpi_scale=self.dpi,
                                    logo_image=None, log=None)
@@ -188,7 +193,15 @@ class _PreviewHost:
                     pass
         except Exception:
             pass
-        self.root.after(30, self._pump)
+        self._pump_id = self.root.after(30, self._pump)
+
+    def _stop_pump(self):
+        if self._pump_id:
+            try:
+                self.root.after_cancel(self._pump_id)
+            except Exception:
+                pass
+            self._pump_id = None
 
     def set_backdrop(self, dark):
         self.root.configure(bg="#11151c" if dark else "#eef1f5")

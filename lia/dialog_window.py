@@ -89,7 +89,7 @@ class DialogApi:
 
 BODY = """
 <div class="dwrap" id="dwrap">
-  <div class="dtop"><h1 id="dtitle">__ORB__<span id="dttl"></span></h1>
+  <div class="dtop"><h1 id="dtitle">__ORB__<span id="dttl" dir="auto"></span></h1>
     <span class="grow"></span><span class="dsub" id="dsub"></span></div>
   <div class="dbody" id="dbody"></div>
   <div class="dfoot" id="dfoot"></div>
@@ -179,7 +179,7 @@ APP_JS = r"""
   }
 
   function renderSummary(){
-    $("dttl").textContent = D.title || "Summary";
+    $("dttl").textContent = D.title || T("Summary");
     $("dbody").innerHTML = '<div class="sdoc" id="sdoc">'+summaryHtml(D.text)+'</div>';
     var f = '<button class="btn ghost sm" id="bDir" title="Switch the text direction">RTL / LTR</button>'+
             '<span class="grow"></span>'+
@@ -200,7 +200,7 @@ APP_JS = r"""
   }
 
   function renderRename(){
-    $("dttl").textContent = "Rename speakers";
+    $("dttl").textContent = T("Rename speakers");
     var sp = D.speakers || [];
     var h = '<p class="lead">Give each speaker a name. Leave a field empty to keep it as is.</p>';
     sp.forEach(function(s, i){
@@ -244,7 +244,7 @@ APP_JS = r"""
   }
 
   function renderTitle(){
-    $("dttl").textContent = "Name this meeting";
+    $("dttl").textContent = T("Name this meeting");
     $("dbody").innerHTML = '<div class="tbox"><p class="lead">Used for the transcript file name. Skip to keep the date.</p>'+
       '<input type="text" id="tIn" dir="auto" autocomplete="off" spellcheck="false" placeholder="Meeting name"></div>';
     $("dfoot").innerHTML = '<span class="tcount" id="tCount"></span><span class="grow"></span>'+
@@ -299,7 +299,7 @@ def build_window(webview, payload):
     kw = {"width": geo.get("width", w), "height": geo.get("height", h), "min_size": mn}
     if "x" in geo:
         kw["x"], kw["y"] = geo["x"], geo["y"]
-    win = webview.create_window(payload.get("title") or "Lia", html=html, js_api=api,
+    win = webview.create_window(uk.ui_i18n.t(payload.get("title") or "Lia"), html=html, js_api=api,
                                 text_select=True, **kw)
     uk.attach_geometry_memory(win, key)
 

@@ -176,7 +176,7 @@ def build_window(webview, payload):
     if "x" in geo:
         kw["x"] = geo["x"]
         kw["y"] = geo["y"]
-    win = webview.create_window("Summarize a meeting", html=html,
+    win = webview.create_window(uk.ui_i18n.t("Summarize a meeting"), html=html,
                                 js_api=SummarizeApi(), **kw)
     uk.attach_geometry_memory(win, "summarize")
     return win
