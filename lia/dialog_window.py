@@ -244,15 +244,19 @@ APP_JS = r"""
   }
 
   function renderTitle(){
-    $("dttl").textContent = T("Name this meeting");
-    $("dbody").innerHTML = '<div class="tbox"><p class="lead">Used for the transcript file name. Skip to keep the date.</p>'+
+    var ren = !!D.rename;            // Home's "Rename": no auto-skip, Cancel
+    $("dttl").textContent = T(ren ? "Rename meeting" : "Name this meeting");
+    $("dbody").innerHTML = '<div class="tbox"><p class="lead">'+(ren
+        ? 'The new name is used for the meeting files.'
+        : 'Used for the transcript file name. Skip to keep the date.')+'</p>'+
       '<input type="text" id="tIn" dir="auto" autocomplete="off" spellcheck="false" placeholder="Meeting name"></div>';
     $("dfoot").innerHTML = '<span class="tcount" id="tCount"></span><span class="grow"></span>'+
-      '<button class="btn" id="bSkip">Skip</button><button class="btn primary" id="bSave">Save</button>';
+      '<button class="btn" id="bSkip">'+(ren ? 'Cancel' : 'Skip')+'</button><button class="btn primary" id="bSave">Save</button>';
     var inp = $("tIn"); inp.value = D.default || "";
     function fire(v){ if(done) return; done = true; act("done", v); setTimeout(closeWin, 120); }
     // auto-skip after 30 s, but every keystroke restarts the countdown
-    function arm(){ if(autoskip) clearTimeout(autoskip); autoskip = setTimeout(function(){ fire(""); }, 30000); }
+    function arm(){ if(ren) return;
+      if(autoskip) clearTimeout(autoskip); autoskip = setTimeout(function(){ fire(""); }, 30000); }
     $("bSave").onclick = function(){ fire(inp.value); };
     $("bSkip").onclick = function(){ fire(""); };
     inp.addEventListener("keydown", function(e){

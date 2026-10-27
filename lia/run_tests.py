@@ -10200,11 +10200,15 @@ def t_self_update():
         orig_wb = webbrowser.open
         webbrowser.open = lambda url: opened.append(url)
         try:
+            # a portable copy whose release has no Portable zip -> the page
+            # (with one it updates itself since 1.6.16: t_portable_self_update)
             app._update["kind"] = "portable"
+            app._update["release"] = dict(p, portable=None)
             ok, msg = App._update_now(app)
             assert ok and opened == [p["url"]] and "download page" in msg
         finally:
             webbrowser.open = orig_wb
+            app._update["release"] = p
         app._update["kind"] = "installer"
         app._meeting_busy = lambda: True
         ok, msg = App._update_now(app)
@@ -13210,9 +13214,12 @@ def t_meeting_mic_silence_check():
     class FakeApp:
         def __init__(self):
             self.shown = []
+            self.notices = []
             self.config = {}
         def _force_show_error_overlay(self, msg):
             self.shown.append(msg)
+        def _force_show_notice_overlay(self, msg, **k):
+            self.notices.append(msg)
 
     def fresh(mic, loop):
         s = w.MeetingSession.__new__(w.MeetingSession)
@@ -13262,14 +13269,24 @@ def t_meeting_mic_silence_check():
         s5._drain_audio_inner()
     assert not hits(s5), "backup silent too -> user not speaking -> must NOT nudge"
     # The backup HEARING the user while the meeting mic is silent is the real
-    # muted/wrong-headset case and still nudges after 3 drains.
-    s6 = fresh(silent, live)
+    # wrong-headset case and still nudges after 3 drains. A wrong device hums
+    # (quiet, not exact zeros)...
+    hum = (np.random.default_rng(1).standard_normal(16000) * 0.0005).astype(np.float32)
+    s6 = fresh(hum, live)
     s6._backup_recorder = FakeRec(live)
     s6.app.config["meeting_mic_auto_fallback"] = False   # fallback would otherwise swap first
     s6._drain_audio_inner(); s6._drain_audio_inner()
     assert not hits(s6)
     s6._drain_audio_inner()
     assert len(hits(s6)) == 1, "backup hears the user + silent mic -> nudge once"
+    # ...while exact zeros with the desk mic hearing the user = a MUTED headset
+    # (2026-10-27): one calm notice, never the red wrong-device error.
+    s8 = fresh(silent, live)
+    s8._backup_recorder = FakeRec(live)
+    s8.app.config["meeting_mic_auto_fallback"] = False
+    for _ in range(5):
+        s8._drain_audio_inner()
+    assert not hits(s8) and len([m for m in s8.app.notices if "muted" in m]) == 1
     # No backup recorder at all -> the original loopback-only heuristic (s above).
     s7 = fresh(silent, live)
     s7._backup_recorder = None
@@ -13428,11 +13445,13 @@ def t_meeting_mic_auto_fallback():
         s._backup_recorder = FakeRec(backup, "backup") if backup is not None else None
         return s
 
-    silent = np.zeros(16000, dtype=np.float32)
+    silent = np.zeros(16000, dtype=np.float32)      # exact zeros = a MUTED device
+    # a wrong device (a silent HDMI input...) still hums: quiet, never exact zeros
+    hum = np.random.default_rng(0).normal(0, 0.0005, 16000).astype(np.float32)
     live = (np.sin(np.linspace(0, 200, 16000)) * 0.2).astype(np.float32)
-    # silent meeting mic + backup hears the user -> promoted, once - after
-    # MIC_FALLBACK_WINDOWS windows in a row, not one (Phase 3.2)
-    s = fresh(silent, live, live)
+    # wrong (humming) meeting mic + backup hears the user -> promoted, once -
+    # after MIC_FALLBACK_WINDOWS windows in a row, not one (Phase 3.2)
+    s = fresh(hum, live, live)
     old_mic = s._mic_recorder
     s._drain_audio_inner()
     assert s._mic_recorder.tag == "mic", "one window is not enough evidence"
@@ -13457,19 +13476,36 @@ def t_meeting_mic_auto_fallback():
     sm._mic_recorder.arr = silent             # ...then muted
     for _ in range(4):
         sm._drain_audio_inner()
-    assert sm._mic_recorder.tag == "mic" and not sm.app.notices
+    assert sm._mic_recorder.tag == "mic" and not sm.app.shown
+    assert all("muted" in m for m in sm.app.notices), "at most the calm 'muted' notice"
     # user silent on BOTH mics -> no evidence, no switch
     s2 = fresh(silent, live, silent)
     s2._drain_audio_inner()
     assert s2._mic_recorder.tag == "mic" and s2._backup_recorder is not None
+    # 2026-10-27 (option A): a meeting mic MUTED from the start (exact zeros:
+    # the call's mute on a Teams headset) is respected - no switch, the desk
+    # mic's audio stays out of the transcript, and after the nudge window one
+    # calm notice says it is muted (not the red "wrong device" error).
+    call = (np.sin(np.linspace(0, 77, 16000)) * 0.1).astype(np.float32)
+    sx = fresh(silent, call, live)
+    for _ in range(4):
+        out = sx._drain_audio_inner()
+    assert sx._mic_recorder.tag == "mic" and sx._backup_recorder is not None, (
+        "a muted meeting mic must never be switched to the desk mic")
+    assert out is not None and np.allclose(out, w.mix_audio(silent, call)), (
+        "only the call audio reaches the mix while muted (no desk-mic audio)")
+    assert not sx.app.shown, "a mute is not an error"
+    assert any("muted" in m for m in sx.app.notices), "one calm 'muted' notice"
+    assert w.MeetingSession._mic_is_muted(silent) and not w.MeetingSession._mic_is_muted(hum)
+    assert not w.MeetingSession._mic_is_muted(live) and not w.MeetingSession._mic_is_muted(None)
     # config off -> no switch (the 3-drain nudge remains)
-    s3 = fresh(silent, live, live, fallback=False)
+    s3 = fresh(hum, live, live, fallback=False)
     for _ in range(3):
         s3._drain_audio_inner()
     assert s3._mic_recorder.tag == "mic"
     assert any("NOT being captured" in m for m in s3.app.shown)
     # no backup at all -> untouched
-    s4 = fresh(silent, live, None)
+    s4 = fresh(hum, live, None)
     s4._drain_audio_inner()
     assert s4._mic_recorder.tag == "mic"
     # wiring
@@ -13485,6 +13521,320 @@ def t_meeting_mic_auto_fallback():
 
 _test("meeting: silent-mic auto-fallback to the dictation (backup) mic",
       t_meeting_mic_auto_fallback)
+
+
+def t_meeting_rename_and_no_stop_prompt():
+    """2026-10-27 (Naor): no 'name this meeting' box on stop (it held the
+    transcript file until answered and was easy to miss) - the default is
+    off and an old saved True is migrated once; Home > Rename names a meeting
+    afterwards. The rename moves the transcript, summary (+ backups) and the
+    speakers sidecar to <stamp>_<name>, leaves the stamp-named recordings,
+    carries ticked action items over, refuses a clash, and is all or nothing."""
+    import inspect
+    import tempfile
+    import action_items
+    import lia as w
+    assert w.DEFAULT_CONFIG["meeting_title_prompt_on_stop"] is False
+    src = inspect.getsource(w.load_config)
+    assert "_title_prompt_off_migrated" in src and 'cfg["meeting_title_prompt_on_stop"] = False' in src
+    d = tempfile.mkdtemp()
+    old_dir, old_store = w.MEETINGS_DIR, action_items.STORE_PATH
+    w.MEETINGS_DIR = d
+    action_items.STORE_PATH = os.path.join(d, "action_items.json")
+    try:
+        stamp = "2026-10-27_10-26-16"
+        txt = os.path.join(d, stamp + "_meeting.txt")
+        with open(txt, "w", encoding="utf-8") as f:
+            f.write("Meeting\n\nמשימות\n- [ ] לשלוח את המסמך\n")
+        own = [stamp + s for s in ("_meeting_summary.html", "_meeting_speakers.json",
+                                   "_meeting_summary.20261027-1100.bak.html")]
+        keep = [stamp + s for s in ("_meeting_audio.wav", "_meeting_mic.opus",
+                                    "_meeting_LIVE.txt.status.json")]
+        for n in own + keep:
+            open(os.path.join(d, n), "w").close()
+        task = action_items.parse_action_items(txt)[0]
+        action_items.save_store({action_items._task_id(os.path.basename(txt), task):
+                                 {"done": True, "ts": 1}})
+        app = w.LiaApp.__new__(w.LiaApp)
+        app._kick_meetings_indexer_bg = lambda: None
+        assert app._meeting_name_parts(txt) == (stamp, "", stamp)
+        ok, _msg, new = app._rename_meeting_files(txt, "סנכרון שבועי")
+        assert ok and os.path.basename(new) == stamp + "_סנכרון שבועי_meeting.txt", new
+        names = set(os.listdir(d))
+        for n in own:
+            assert n not in names and n.replace(stamp, stamp + "_סנכרון שבועי", 1) in names, n
+        for n in keep:
+            assert n in names, "a recording moved: " + n
+        st = action_items.load_store()
+        assert st.get(action_items._task_id(os.path.basename(new), task), {}).get("done"), \
+            "a ticked action item must follow the rename"
+        assert app._meeting_name_parts(new)[1] == "סנכרון שבועי"
+        # renamed again (name -> name); a clash is refused and nothing moves
+        ok, _m, new2 = app._rename_meeting_files(new, "Weekly sync")
+        assert ok and new2.endswith("_Weekly sync_meeting.txt")
+        open(os.path.join(d, "2026-10-27_10-26-16_Other_meeting.txt"), "w").close()
+        before = set(os.listdir(d))
+        ok, msg, _n = app._rename_meeting_files(new2, "Other")
+        assert not ok and "already exists" in msg and set(os.listdir(d)) == before
+        # Home: the Rename button, its action, and the dialog's rename mode
+        assert "rename_meeting_for" in w.LiaApp._settings_action_map(app)
+        base = os.path.dirname(os.path.abspath(w.__file__))
+        sw = open(os.path.join(base, "settings_window.py"), encoding="utf-8").read()
+        dw = open(os.path.join(base, "dialog_window.py"), encoding="utf-8").read()
+        assert 'data-call="rename_meeting_for"' in sw and "h.select" in sw
+        assert "D.rename" in dw and "if(ren) return;" in dw, "a rename never auto-skips"
+    finally:
+        w.MEETINGS_DIR, action_items.STORE_PATH = old_dir, old_store
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+_test("meetings: no name box on stop; Home > Rename moves the named files + ticks",
+      t_meeting_rename_and_no_stop_prompt)
+
+
+def t_meeting_windows_hidden():
+    """2026-10-27 (Naor: people sharing his screen should not see that a
+    meeting is recorded or done): "Hide meeting windows" - no meeting card,
+    no automatic start/stop prompt, no meeting notice or balloon, the summary
+    does not open by itself; the tray item + the Settings switch toggle it.
+    Off (the default) = every surface as before."""
+    import inspect
+    import threading
+    import lia as w
+    assert w.DEFAULT_CONFIG["meeting_windows_hidden"] is False
+
+    class Card:
+        def __init__(self):
+            self.calls = []
+        def hide(self):
+            self.calls.append("hide")
+        def render(self, st):
+            self.calls.append("render")
+
+    # the card: one render point, hidden -> hide, never render
+    ov = w.OverlayNotification.__new__(w.OverlayNotification)
+    ov._mcard = Card()
+    ov._mcard_model = {"kind": "processing", "stages": []}
+    ov._ensure_mcard = lambda: ov._mcard
+    ov.meeting_hidden = lambda: True
+    ov._mcard_render()
+    assert ov._mcard.calls == ["hide"]
+    ov.meeting_hidden = lambda: False
+    ov._mcard_render()
+    assert ov._mcard.calls[-1] == "render"
+
+    class Overlay:
+        def __init__(self):
+            self.prompts = []
+        def show_prompt(self, *a, **k):
+            self.prompts.append(k.get("header") or a[0])
+
+    class Tray:
+        def __init__(self):
+            self.notes = []
+        def notify(self, *a):
+            self.notes.append(a)
+
+    def app(hidden):
+        a = w.LiaApp.__new__(w.LiaApp)
+        a.config = {"meeting_windows_hidden": hidden}
+        a.overlay, a.tray_icon = Overlay(), Tray()
+        a._meeting_detect_lock = threading.Lock()
+        a._meeting_detect_state = "running"
+        a._meeting_detect_dismissed_kinds = set()
+        a._stop_offer_count = 0
+        return a
+    a = app(True)
+    a._meeting_detect_state = "idle"
+    a._show_meeting_start_prompt("teams", "x")
+    assert not a.overlay.prompts and "teams" in a._meeting_detect_dismissed_kinds
+    assert a._meeting_detect_state == "idle"
+    a._meeting_detect_state = "running"
+    a._show_meeting_stop_prompt("call-end")
+    assert not a.overlay.prompts and not a.tray_icon.notes
+    assert a._meeting_detect_state == "running"
+    a._meeting_nudge("Meeting auto-stopped", force=True)
+    assert not a.tray_icon.notes
+    b = app(False)
+    b._show_meeting_stop_prompt("call-end")
+    assert b.overlay.prompts == ["Call ended"], "off = the prompt as before"
+
+    # the session's own notices
+    class SApp:
+        def __init__(self, hidden):
+            self.hidden, self.shown = hidden, []
+        def _meeting_windows_hidden(self):
+            return self.hidden
+        def _force_show_notice_overlay(self, m, **k):
+            self.shown.append(m)
+        def _force_show_error_overlay(self, m):
+            self.shown.append(m)
+    s = w.MeetingSession.__new__(w.MeetingSession)
+    s.app = SApp(True)
+    s._notice("x"); s._notice("y", error=True)
+    assert not s.app.shown
+    s.app.hidden = False
+    s._notice("x")
+    assert s.app.shown == ["x"]
+
+    # the summary does not open by itself; the switches exist
+    src = inspect.getsource(w.LiaApp._stop_meeting)
+    assert "not self._meeting_windows_hidden()" in src
+    assert "self.app._meeting_windows_hidden()" in inspect.getsource(w.MeetingSession)
+    assert "toggle_meeting_windows_hidden" in w.LiaApp._settings_action_map(w.LiaApp.__new__(w.LiaApp))
+    assert '_tr("Hide meeting windows")' in inspect.getsource(w.LiaApp)
+    base = os.path.dirname(os.path.abspath(w.__file__))
+    sw = open(os.path.join(base, "settings_window.py"), encoding="utf-8").read()
+    assert '"toggle_meeting_windows_hidden"' in sw
+
+
+_test("meetings: Hide meeting windows (card, auto prompts, notices, auto-open)",
+      t_meeting_windows_hidden)
+
+
+def t_portable_self_update():
+    """2026-10-27 (Naor: a colleague runs the Portable zip and it must keep
+    itself up to date): a portable copy now updates in place. The Portable zip
+    must be signed like the Setup; it is staged in <root>\\_update\\new (paths
+    kept inside, the right version, the path limit checked first); a cmd script
+    swaps runtime\\ + app\\ and starts Lia (the previous Lia on failure); the
+    next start cleans up. The real swap is exercised end to end by
+    plans/release_tools/portable_update_test.py."""
+    import inspect
+    import secrets
+    import tempfile
+    import zipfile
+    import lia_ed25519 as ed
+    import updater as U
+    import lia as w
+    seed = secrets.token_bytes(32)
+    pub = ed.public_key(seed).hex()
+    zsha = "cd" * 32
+    sums = ("%s  Lia-Setup-9.9.9.exe\n%s  Lia-Portable-9.9.9.zip\n" % ("ab" * 32, zsha)).encode()
+    base = "https://github.com/Danaor/lia/releases/download/v9.9.9/"
+    files = {base + "SHA256SUMS.txt": sums,
+             base + "SHA256SUMS.txt.sig": ed.sign(seed, sums).hex().encode()}
+
+    class _R:
+        def __init__(self, data): self.data = data
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def raise_for_status(self): pass
+        def iter_content(self, chunk_size=1): yield self.data
+
+    class _S:
+        def get(self, url, **k): return _R(files[url])
+
+    def rel(sha=zsha):
+        return {"version": "9.9.9", "tag": "v9.9.9",
+                "portable": {"name": "Lia-Portable-9.9.9.zip",
+                             "url": base + "Lia-Portable-9.9.9.zip", "sha256": sha},
+                "sums": {"name": "SHA256SUMS.txt", "url": base + "SHA256SUMS.txt"},
+                "sums_sig": {"name": "SHA256SUMS.txt.sig", "url": base + "SHA256SUMS.txt.sig"}}
+    assert U.authorize(rel(), session=_S(), public_key_hex=pub, asset="portable") == zsha
+    for bad in (rel("ef" * 32), dict(rel(), portable=None)):
+        try:
+            U.authorize(bad, session=_S(), public_key_hex=pub, asset="portable")
+            raise AssertionError("an unsigned / different portable zip must be refused")
+        except U.VerifyError:
+            pass
+
+    d = tempfile.mkdtemp()
+    try:
+        def mkzip(name, members):
+            p = os.path.join(d, name)
+            with zipfile.ZipFile(p, "w") as z:
+                for n, data in members.items():
+                    z.writestr(n, data)
+            return p
+        good = mkzip("good.zip", {"runtime/Lia.exe": "x", "app/lia.py": 'APP_VERSION = "9.9.9"\n',
+                                  "Lia.bat": "@echo off\n"})
+        root = os.path.join(d, "Lia Portable")
+        os.makedirs(root)
+        new = U.stage_portable(good, root, "9.9.9")
+        assert new == os.path.join(root, "_update", "new") and os.path.isfile(
+            os.path.join(new, "app", "lia.py"))
+        for z, why in ((good, "not Lia 1.0.0"),
+                       (mkzip("evil.zip", {"../evil.txt": "x"}), "outside"),
+                       (mkzip("half.zip", {"app/lia.py": 'APP_VERSION = "9.9.9"\n'}), "not a Lia folder"),
+                       (mkzip("deep.zip", {"runtime/" + "d" * 250 + "/x.py": "x"}), "too long")):
+            try:
+                U.stage_portable(z, root, "1.0.0" if why == "not Lia 1.0.0" else "9.9.9")
+                raise AssertionError("must refuse: " + why)
+            except U.VerifyError as e:
+                assert why in str(e), (why, str(e))
+        script = U.portable_swap_script(root, new, ["C:/a/Lia.exe", "x.py"], root,
+                                        ["C:/a/Lia.exe", "x.py", "--restart-reason=update-failed"], root,
+                                        pid=4321)
+        for must in ('set "ROOT=%s"' % root, 'move "%ROOT%\\runtime" "%OLD%\\runtime"',
+                     ':fail_none', '--restart-reason=update-failed', 'chcp 65001',
+                     'tasklist /FI "PID eq 4321" /NH', 'find " 4321 "',
+                     'copy /y "%NEW%\\Lia (Work PC).bat"'):
+            assert must in script, must
+        try:
+            U.portable_swap_script(os.path.join(d, "50%off"), new, ["a"], None, ["b"], None, 1)
+            raise AssertionError("a % in the path must be refused")
+        except U.VerifyError:
+            pass
+        assert U.portable_writable(root)
+        open(os.path.join(root, "_update", "swapped.txt"), "w").close()
+        assert U.portable_cleanup(root) == "swapped" and not os.path.exists(
+            os.path.join(root, "_update"))
+        assert U.portable_cleanup(root) is None
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+    # Lia: a portable copy with a Portable asset updates itself (Update now),
+    # the worker runs authorize -> download -> stage -> swap script -> quit
+    app = w.LiaApp.__new__(w.LiaApp)
+    app._update = {"release": None, "status": "idle", "progress": 0, "error": "",
+                   "kind": "portable"}
+    assert app._can_self_update({"portable": {"name": "x"}}) is True
+    assert app._can_self_update({"portable": None, "setup": {"name": "s"}}) is False
+    app._update["kind"] = "installer"
+    assert app._can_self_update({"setup": {"name": "s"}}) is True
+    app._update["kind"] = "portable"
+    calls = []
+    saved = {k: getattr(U, k) for k in ("authorize", "download_verified", "stage_portable",
+                                        "write_portable_swap")}
+    import subprocess as _sp
+    saved_popen = _sp.Popen
+    try:
+        U.authorize = lambda r, **k: calls.append(("authorize", k.get("asset")))
+        U.download_verified = lambda a, dd, **k: calls.append(("download", a["name"])) or os.path.join(dd, "z.zip")
+        U.stage_portable = lambda z, r, v: calls.append(("stage", v)) or os.path.join(r, "_update", "new")
+        U.write_portable_swap = lambda *a: calls.append(("script",)) or ("s.cmd", ["cmd.exe", "/c", "s.cmd"])
+        _sp.Popen = lambda line, **k: calls.append(("popen", line[-1]))
+        app._settings_push_state = lambda: None
+        app._meeting_busy = lambda: False
+        app._force_show_notice_overlay = lambda *a, **k: None
+        app._force_show_error_overlay = lambda *a, **k: calls.append(("error",))
+        app._quit = lambda: calls.append(("quit",))
+        orig_admin, w.is_user_admin = w.is_user_admin, lambda: False
+        orig_sleep, w.time.sleep = w.time.sleep, lambda s: None
+        try:
+            app._update_worker({"version": "9.9.9", "portable": {"name": "Lia-Portable-9.9.9.zip"}})
+        finally:
+            w.is_user_admin, w.time.sleep = orig_admin, orig_sleep
+    finally:
+        for k, v in saved.items():
+            setattr(U, k, v)
+        _sp.Popen = saved_popen
+    names = [c[0] for c in calls]
+    assert names == ["authorize", "download", "stage", "script", "popen", "quit"], calls
+    assert calls[0][1] == "portable"
+    src = inspect.getsource(w.LiaApp._update_watchdog)
+    assert "portable_cleanup" in src
+    assert "updated" in w._RESTART_NOTICES
+    base_dir = os.path.dirname(os.path.abspath(w.__file__))
+    sw = open(os.path.join(base_dir, "settings_window.py"), encoding="utf-8").read()
+    assert "u.self_update ? 'Update now'" in sw
+
+
+_test("update: a portable copy updates itself in place (signed zip, swap, rollback)",
+      t_portable_self_update)
 
 
 def t_meeting_chunk_foreign_script_strip():

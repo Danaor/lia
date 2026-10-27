@@ -379,7 +379,7 @@ if sys.platform == "win32":
     ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
 
 # --- Configuration ---
-APP_VERSION = "1.6.15"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
+APP_VERSION = "1.6.16"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Lia")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -1028,10 +1028,16 @@ DEFAULT_CONFIG = {
     "meeting_reminder_first_min": 65,  # first "still recording" reminder after this many min
     "meeting_reminder_every_min": 60,  # repeat the reminder every this many min after the first (→ 65, 125, 185…)
     "meeting_max_duration_min": 240,   # HARD cap: auto-stop + finalize a meeting at this age (0 disables)
-    # Auto-title: meetings are named from the call's window title when possible;
-    # if that's empty/generic, pop a quick 'name this meeting' box on stop
-    # (Skip = keep the date). Set False to never prompt.
-    "meeting_title_prompt_on_stop": True,
+    # Auto-title: meetings are named from the call's window title when possible,
+    # else they keep the date; Home > Rename names one afterwards. True = the old
+    # 'name this meeting' box on stop (off since 2026-10-27, Naor: it held the
+    # transcript file until answered and was easy to miss).
+    "meeting_title_prompt_on_stop": False,
+    # Hide meeting windows (2026-10-27, Naor: people sharing his screen should
+    # not see that a meeting is recorded or done). True = no meeting card, no
+    # automatic start/stop prompts, no meeting notices or balloons, and the
+    # summary does not open by itself; the tray runs the meeting.
+    "meeting_windows_hidden": False,
     # Diarized-meeting hybrid quality upgrade: after AssemblyAI returns
     # speaker-labelled utterances, re-transcribe each utterance's audio
     # slice via OpenAI gpt-4o-transcribe for much better Hebrew text.
@@ -3066,6 +3072,14 @@ def load_config():
         # gemma4:31b is the method - SOL-class and ~10x faster; the ensemble was a
         # workaround for Ollama infra bugs long fixed). Drop the stale opt-in key
         # so a config that had it enabled no longer looks like it does anything.
+        # The stop-time 'name this meeting' box is off by default (2026-10-27);
+        # configs saved before carry the old True. One-time: turn it off.
+        if not cfg.get("_title_prompt_off_migrated"):
+            cfg["_title_prompt_off_migrated"] = True
+            if cfg.get("meeting_title_prompt_on_stop"):
+                log.info("Meetings: the stop-time name box is off now (Home > Rename "
+                         "names a meeting)")
+            cfg["meeting_title_prompt_on_stop"] = False
         if "summary_local_ensemble" in cfg:
             if cfg.get("summary_local_ensemble"):
                 log.info("Summary: the 3-phase ensemble was retired; using the "
@@ -14012,11 +14026,7 @@ class MeetingSession:
             if self._consec_empty_drains == 3 and not getattr(self, "_dead_audio_nudged", False):
                 self._dead_audio_nudged = True
                 log.error("Meeting: 3 consecutive empty drains — audio looks DEAD")
-                try:
-                    self.app._force_show_error_overlay(
-                        "Meeting audio appears dead — check the mic!")
-                except Exception:
-                    pass
+                self._notice("Meeting audio appears dead — check the mic!", error=True)
 
         # Per-CHANNEL silent-mic check (2026-09-14). The dead-audio nudge above
         # fires only when BOTH channels are empty. When the meeting mic points
@@ -14131,8 +14141,36 @@ class MeetingSession:
             log.info("%s safety-net tracks %s: %s", label,
                      "kept" if keep else "deleted", ", ".join(writers))
 
+    def _notice(self, msg, error=False):
+        """An on-screen meeting notice, unless "Hide meeting windows" is on
+        (then only the log has it)."""
+        hidden = getattr(self.app, "_meeting_windows_hidden", None)
+        try:
+            if hidden is not None and hidden():
+                log.info("Meeting notice (hidden): %s", msg)
+                return
+            if error:
+                self.app._force_show_error_overlay(msg)
+            else:
+                self.app._force_show_notice_overlay(msg)
+        except Exception:
+            pass
+
     MIC_SILENT_RMS = 0.003      # the floor the dictation path treats as "mic silent"
     MIC_FALLBACK_WINDOWS = 2    # consecutive silent-mic/loud-backup windows to switch
+    # A window this much exact-zero = a muted device (measured 2026-10-27: a
+    # muted Jabra 99-100%; the same Jabra live 4%, idle behind its noise gate
+    # 12-61%).
+    MIC_MUTED_ZERO_SHARE = 0.98
+
+    @classmethod
+    def _mic_is_muted(cls, audio):
+        """True when a mic window is (almost) all exact zeros - a hardware or
+        call mute, not a quiet room or a wrong device."""
+        if audio is None or len(audio) == 0:
+            return False
+        a = np.asarray(audio)
+        return (len(a) - np.count_nonzero(a)) / len(a) >= cls.MIC_MUTED_ZERO_SHARE
     # Nudge after ~2 min of a silent mic channel; the actual drain count is
     # derived per session from the chunk cadence (self._mic_silent_drains).
 
@@ -14164,6 +14202,21 @@ class MeetingSession:
                 self._mic_had_signal = True
             if getattr(self, "_mic_had_signal", False):
                 self._mic_fallback_streak = 0
+                return mic_audio, backup_audio
+            # A MUTED headset sends exact digital zeros - the call's mute button
+            # on a Teams headset mutes the device itself (Naor 2026-10-27: the
+            # Jabra sent zeros at every meeting start while he was muted in the
+            # call, and Lia moved the WHOLE meeting to the desk mic). A mute is
+            # the user's choice: respect it, never switch on it. A wrong device
+            # still hums a little and keeps the rescue below.
+            if self._mic_is_muted(mic_audio):
+                self._mic_fallback_streak = 0
+                if (backup_rms >= 2.0 * self.MIC_SILENT_RMS
+                        and not getattr(self, "_mic_muted_logged", False)):
+                    self._mic_muted_logged = True
+                    log.info("Meeting: the meeting mic is muted (digital silence) while "
+                             "the dictation mic hears speech (rms=%.5f) - respecting "
+                             "the mute, no switch", backup_rms)
                 return mic_audio, backup_audio
             # clear margin: the backup must be well above the silence floor
             if not (mic_rms < self.MIC_SILENT_RMS
@@ -14197,11 +14250,7 @@ class MeetingSession:
                         "the dictation mic hears you (rms=%.5f) - switched the meeting "
                         "mic to the dictation mic (device %s)",
                         old_idx, mic_rms, backup_rms, self._input_device_index)
-            try:
-                self.app._force_show_notice_overlay(
-                    "🎤  Using your dictation mic for this meeting")
-            except Exception:
-                pass
+            self._notice("🎤  Using your dictation mic for this meeting")
             # this window: the backup audio IS the user's side now
             return backup_audio, None
         except Exception as e:
@@ -14255,15 +14304,20 @@ class MeetingSession:
             if (self._consec_mic_silent >= self._mic_silent_drains
                     and not getattr(self, "_mic_silent_nudged", False)):
                 self._mic_silent_nudged = True
+                if has_backup and self._mic_is_muted(mic_audio):
+                    # muted while the desk mic hears the user: not broken, say
+                    # so calmly (2026-10-27). One mic only -> the old nudge.
+                    log.info("Meeting: mic channel muted for %d rotations while the "
+                             "dictation mic hears speech - told the user once",
+                             self._consec_mic_silent)
+                    self._notice("Your meeting mic is muted - Lia records what the call hears")
+                    return
                 log.error("Meeting: mic channel silent for %d rotations while system "
                           "audio has signal (mic rms=%.5f, loop rms=%.5f) - the meeting "
                           "mic is probably the WRONG device",
                           self._consec_mic_silent, mic_rms, loop_rms)
-                try:
-                    self.app._force_show_error_overlay(
-                        "Your mic is NOT being captured - check the Meeting microphone!")
-                except Exception:
-                    pass
+                self._notice("Your mic is NOT being captured - check the Meeting microphone!",
+                             error=True)
         except Exception as e:
             log.debug("mic-channel silence check failed: %s", e)
 
@@ -15092,7 +15146,8 @@ class MeetingSession:
                     gen=gen)
                 # Auto-open the summary in the editor (the deliverable), off the
                 # completion thread so it never blocks finalisation.
-                if self.summary_html_path and os.path.exists(self.summary_html_path):
+                if (self.summary_html_path and os.path.exists(self.summary_html_path)
+                        and not self.app._meeting_windows_hidden()):
                     threading.Thread(
                         target=lambda h=self.summary_html_path:
                             self.app._open_summary_editor(h),
@@ -17562,6 +17617,11 @@ _RESTART_NOTICES = {
         "Lia repaired its hotkey",
         "Windows had silently dropped Lia's keyboard hook. Lia restarted "
         "itself to reinstall it before you needed it - nothing was lost."),
+    # a portable copy updated itself and started the new version
+    "updated": (
+        "Lia was updated",
+        "Lia updated itself to the latest version. Your settings and meetings "
+        "are unchanged."),
     # the in-app update's installer failed; cmd started the previous version
     "update-failed": (
         "The Lia update was not installed",
@@ -17961,18 +18021,18 @@ def _stamp_lia_launcher(exe_path):
         return False
     try:
         vi = VSVersionInfo(
-            ffi=FixedFileInfo(filevers=(1, 6, 15, 0), prodvers=(1, 6, 15, 0),
+            ffi=FixedFileInfo(filevers=(1, 6, 16, 0), prodvers=(1, 6, 16, 0),
                               mask=0x3f, flags=0x0, OS=0x40004,
                               fileType=0x1, subtype=0x0),
             kids=[
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.6.15.0'),
+                    StringStruct('FileVersion', '1.6.16.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.6.15.0'),
+                    StringStruct('ProductVersion', '1.6.16.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -19239,6 +19299,9 @@ class OverlayNotification:
         self._wave_anim_running = False  # guard: is the self-driving tick live
         self._hide_after_id = None   # pending auto-hide Tk timer id
         self.silent = False          # when True, show_* methods no-op
+        # LiaApp sets this to its "Hide meeting windows" check: the meeting
+        # card stays hidden while it returns True
+        self.meeting_hidden = lambda: False
         self._tk_queue = queue.Queue()
         # Tk-thread self-healing. The mainloop can die on a Tcl fault after long
         # uptime + display sleep/wake + DPI churn; under pythonw (stderr=None) that
@@ -21408,10 +21471,11 @@ class OverlayNotification:
                 pass
         top.after(120, _focus)
 
-    def show_meeting_title_prompt(self, default_text, on_done):
-        """Small single-line 'Name this meeting' box shown on stop. Calls
-        on_done(name) on Save, on_done('') on Skip / Esc / close / 30s auto-skip.
-        Fires on_done EXACTLY once. Tk-thread-safe."""
+    def show_meeting_title_prompt(self, default_text, on_done, rename=False):
+        """Small single-line 'Name this meeting' box. Calls on_done(name) on
+        Save, on_done('') on Skip / Esc / close / 30s auto-skip. rename=True =
+        Home's "Rename" (its own title, Cancel, no auto-skip). Fires on_done
+        EXACTLY once. Tk-thread-safe."""
         done = {"fired": False}
         lock = threading.Lock()
 
@@ -21425,8 +21489,9 @@ class OverlayNotification:
             except Exception as e:
                 log.warning("title on_done failed: %s", e)
 
-        if _spawn_dialog_window({"mode": "title", "title": "Name this meeting",
-                                 "default": default_text or ""},
+        if _spawn_dialog_window({"mode": "title",
+                                 "title": "Rename meeting" if rename else "Name this meeting",
+                                 "default": default_text or "", "rename": bool(rename)},
                                 on_action=lambda a, d: _fire_once(str(d or "")) if a == "done" else None,
                                 on_closed=lambda rc: _fire_once("")):
             return
@@ -21854,7 +21919,19 @@ class OverlayNotification:
         return st
 
     def _mcard_render(self):
-        """(Re)render the card from the model. Tk-thread only."""
+        """(Re)render the card from the model. Tk-thread only. With "Hide
+        meeting windows" on the model still updates, the card just never shows."""
+        try:
+            hidden = bool(self.meeting_hidden())
+        except Exception:
+            hidden = False
+        if hidden:
+            if self._mcard is not None:
+                try:
+                    self._mcard.hide()
+                except Exception:
+                    pass
+            return
         card = self._ensure_mcard()
         if not card:
             return
@@ -22977,6 +23054,7 @@ class LiaApp:
         # only remaining fix (same philosophy as the PortAudio watchdogs).
         self.overlay.on_wedged = self._on_overlay_wedged
         self.overlay.silent = bool(self.config.get("silent_mode", False))
+        self.overlay.meeting_hidden = self._meeting_windows_hidden
 
         # Streaming transcription state
         self._streaming_thread = None
@@ -23184,6 +23262,12 @@ class LiaApp:
                 _tr("🗑  Cancel Meeting (discard)"),
                 lambda: self._cancel_meeting(),
                 visible=lambda item: self._is_meeting_active(),
+            ),
+            # Discreet mode: no meeting windows on screen (screen sharing)
+            pystray.MenuItem(
+                _tr("Hide meeting windows"),
+                lambda: self._toggle_meeting_windows_hidden(),
+                checked=lambda item: self._meeting_windows_hidden(),
             ),
             # History lives here (under the Start Meeting group) per user layout.
             pystray.MenuItem(_tr("History"), lambda: self._show_history()),
@@ -29271,6 +29355,31 @@ class LiaApp:
         log.info("Meeting backup mic: %s",
                  "on" if self.config["meeting_backup_mic"] else "off")
 
+    def _meeting_windows_hidden(self):
+        """"Hide meeting windows" (Settings > Meetings + the tray)."""
+        try:
+            return bool(self.config.get("meeting_windows_hidden", False))
+        except Exception:
+            return False
+
+    def _toggle_meeting_windows_hidden(self):
+        """Settings / tray: hide every meeting window (card, automatic prompts,
+        notices, the summary opening by itself). Live: a card on screen goes
+        away at once and comes back on the next update after turning it off."""
+        self.config["meeting_windows_hidden"] = not self._meeting_windows_hidden()
+        save_config(self.config)
+        hidden = self.config["meeting_windows_hidden"]
+        log.info("Meeting windows: %s", "hidden" if hidden else "shown")
+        try:
+            ov = self.overlay
+            ov._tk_queue.put(ov._mcard_render)
+        except Exception:
+            pass
+        try:
+            self.tray_icon.update_menu()
+        except Exception:
+            pass
+
     def _toggle_meeting_mic_auto_fallback(self):
         """Settings: auto-switch the meeting mic to the dictation mic when the
         meeting mic is silent but the backup hears the user. Applies from the
@@ -30265,6 +30374,17 @@ class LiaApp:
         if self._update_kind() == "source":
             log.info("Update check: running from a source checkout - skipped")
             return
+        if self._update_kind() == "portable":
+            # the staging folder of the last portable update (the previous
+            # version kept for the swap) is no longer needed
+            try:
+                res = updater.portable_cleanup(
+                    updater.portable_root(os.path.dirname(os.path.abspath(__file__))))
+                if res:
+                    log.info("Portable update: last swap %s (Lia %s now); staging removed",
+                             res, APP_VERSION)
+            except Exception as e:
+                log.warning("Portable update cleanup failed: %s", e)
         time.sleep(self._UPDATE_FIRST_DELAY_S)
         while not getattr(self, "_shutting_down", False):
             if self.config.get("update_check", True):
@@ -30318,20 +30438,37 @@ class LiaApp:
         rel = st.get("release") or {}
         return {"available": bool(rel), "version": rel.get("version", ""),
                 "current": APP_VERSION, "kind": self._update_kind(),
+                "self_update": self._can_self_update(rel),
                 "url": rel.get("url", ""), "status": st["status"],
                 "progress": st["progress"], "error": st["error"],
                 "auto": bool(self.config.get("update_check", True))}
 
+    def _can_self_update(self, rel):
+        """This copy can install `rel` by itself: an installed copy with a
+        Setup in the release, or (since 1.6.16) a portable copy with a
+        Portable zip and a folder this user can write to."""
+        if not rel:
+            return False
+        kind = self._update_kind()
+        if kind == "installer":
+            return bool(rel.get("setup"))
+        if kind == "portable" and rel.get("portable"):
+            return updater.portable_writable(
+                updater.portable_root(os.path.dirname(os.path.abspath(__file__))))
+        return False
+
     def _update_now(self):
         """The user's "Update now". Installed copy: download the new Setup,
         verify it against GitHub's digest, run it silently and quit (the
-        installer relaunches Lia). Portable copy: open the download page.
-        Never during a recording or a meeting (incl. its processing)."""
+        installer relaunches Lia). Portable copy: download the signed zip,
+        stage it in the portable folder, quit and let a swap script replace
+        runtime\\ + app\\ and start Lia again. Anything else: open the download
+        page. Never during a recording or a meeting (incl. its processing)."""
         st = self._update_info()
         rel = st.get("release")
         if not rel:
             return (False, "No update available.")
-        if self._update_kind() != "installer" or not rel.get("setup"):
+        if not self._can_self_update(rel):
             try:
                 import webbrowser
                 webbrowser.open(rel.get("url") or updater.RELEASES_PAGE)
@@ -30349,6 +30486,8 @@ class LiaApp:
         return (True, "Downloading Lia %s..." % rel["version"])
 
     def _update_worker(self, rel):
+        if self._update_kind() == "portable":
+            return self._update_worker_portable(rel)
         st = self._update_info()
         last = [0.0]
 
@@ -30413,6 +30552,68 @@ class LiaApp:
             self._settings_push_state()
             return
         self._force_show_notice_overlay("Installing Lia %s - it restarts in a moment"
+                                        % rel["version"], bg_color="#1f4e9a")
+        time.sleep(1.5)
+        self._quit()
+
+    def _update_worker_portable(self, rel):
+        """Portable copy (2026-10-27): the signed zip -> <root>\\_update\\new ->
+        quit -> apply-update.cmd swaps runtime\\ + app\\ and starts Lia again
+        (the previous Lia on any failure). See updater.portable_swap_script."""
+        st = self._update_info()
+        last = [0.0]
+
+        def progress(done, total):
+            if total:
+                st["progress"] = int(done * 100 / total)
+            if time.time() - last[0] > 1.0:
+                last[0] = time.time()
+                self._settings_push_state()
+
+        def fail(msg):
+            log.warning("Portable update: %s", msg)
+            st["status"], st["error"] = "error", msg[:200]
+            self._settings_push_state()
+            self._force_show_error_overlay("Lia update failed - see Settings")
+        root = updater.portable_root(os.path.dirname(os.path.abspath(__file__)))
+        stage = os.path.join(root, updater.PORTABLE_STAGE)
+        try:
+            updater.authorize(rel, asset="portable")
+            import shutil
+            shutil.rmtree(stage, ignore_errors=True)
+            path = updater.download_verified(rel["portable"], stage, progress=progress)
+            st["status"] = "installing"
+            self._settings_push_state()
+            new_dir = updater.stage_portable(path, root, rel["version"])
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        except Exception as e:
+            return fail("Download failed: %s" % e)
+        if self._meeting_busy() or getattr(self, "is_recording", False):
+            st["status"], st["error"] = "error", "A meeting started - update again when it ends."
+            self._settings_push_state()
+            return
+        try:
+            again, again_cwd = _restart_command("updated")
+            back, back_cwd = _restart_command("update-failed")
+            script, line = updater.write_portable_swap(root, new_dir, again, again_cwd,
+                                                       back, back_cwd)
+        except Exception as e:
+            return fail("Update refused: %s" % e)
+        log.info("Update: portable swap to Lia %s staged in %s - quitting", rel["version"], stage)
+        try:
+            import subprocess
+            flags = 0x08000000 | 0x00000200          # CREATE_NO_WINDOW | NEW_GROUP
+            if is_user_admin():
+                spawn_deelevated(None, creationflags=flags, cwd=stage,
+                                 cmdline=subprocess.list2cmdline(line))
+            else:
+                subprocess.Popen(line, cwd=stage, close_fds=True, creationflags=flags)
+        except Exception as e:
+            return fail("Could not start the update: %s" % e)
+        self._force_show_notice_overlay("Updating Lia to %s - it restarts in a moment"
                                         % rel["version"], bg_color="#1f4e9a")
         time.sleep(1.5)
         self._quit()
@@ -31018,7 +31219,8 @@ class LiaApp:
         overlay_msg = (f"  🎤  Diarized meeting recording started{suffix}  "
                        if is_diarized else
                        f"  🎙  Meeting recording started{suffix}  ")
-        self.overlay.show(overlay_msg, bg_color="#581C87", duration=2500)
+        if not self._meeting_windows_hidden():
+            self.overlay.show(overlay_msg, bg_color="#581C87", duration=2500)
         # The persistent top-right Stop pill was removed per user
         # request — distracting during long meetings. The tray icon
         # turns purple while a meeting is active and exposes Stop
@@ -31531,8 +31733,10 @@ class LiaApp:
                         title="Summary ready", on_open=_open,
                         on_folder=folder_cb,
                         gen=getattr(session, "_card_gen", None))
-                    # Auto-open the summary in the editor (off-thread).
-                    if session.summary_html_path and os.path.exists(session.summary_html_path):
+                    # Auto-open the summary in the editor (off-thread) - not
+                    # while meeting windows are hidden.
+                    if (session.summary_html_path and os.path.exists(session.summary_html_path)
+                            and not self._meeting_windows_hidden()):
                         threading.Thread(
                             target=lambda h=session.summary_html_path:
                                 self._open_summary_editor(h),
@@ -32435,7 +32639,11 @@ class LiaApp:
         overlay toast. `force=True` bypasses silent_mode for the overlay toast —
         the AUTO-STOP notice ("your meeting was just stopped") is important
         enough that an Invisible-Mode user must see it (the plain show() is
-        silenced, leaving only the balloon, itself suppressed by Focus Assist)."""
+        silenced, leaving only the balloon, itself suppressed by Focus Assist).
+        "Hide meeting windows" wins over both: the log keeps it."""
+        if self._meeting_windows_hidden():
+            log.info("Meeting notice (hidden): %s", msg)
+            return
         try:
             if self.tray_icon:
                 self.tray_icon.notify(msg, "Lia")
@@ -32684,6 +32892,15 @@ class LiaApp:
 
     def _show_meeting_start_prompt(self, kind, title):
         """Transition to prompting_start and show the clickable overlay."""
+        if self._meeting_windows_hidden():
+            # no card on screen: the call is left alone (as if dismissed);
+            # the tray starts a meeting
+            with self._meeting_detect_lock:
+                if kind not in self._meeting_detect_dismissed_kinds:
+                    log.info("Meeting detected (%s) - no prompt: meeting windows "
+                             "are hidden", kind)
+                self._meeting_detect_dismissed_kinds.add(kind)
+            return
         with self._meeting_detect_lock:
             if self._meeting_detect_state != 'idle':
                 return
@@ -32770,6 +32987,14 @@ class LiaApp:
         # this, on_timeout re-armed the call-end offer every ~2 min (a card AND
         # a tray balloon each) for the rest of the meeting → dozens of pop-ups.
         if getattr(self, "_stop_offer_count", 0) >= 3:
+            return
+        if self._meeting_windows_hidden():
+            # no card, no balloon: the tray stops the meeting; the silence
+            # auto-stop and the hard cap still protect a forgotten one
+            if not getattr(self, "_stop_prompt_hidden_logged", False):
+                self._stop_prompt_hidden_logged = True
+                log.info("Meeting looks over (%s) - no prompt: meeting windows "
+                         "are hidden", reason)
             return
         with self._meeting_detect_lock:
             st = self._meeting_detect_state
@@ -35024,6 +35249,115 @@ class LiaApp:
                          daemon=True).start()
         return (True, "Opening speaker rename…")
 
+    # A saved meeting's own files carry its name: <stamp>[_<name>]<suffix>.
+    # The recordings are named by the stamp alone and never move.
+    _MEETING_NAMED_SUFFIXES = ("_meeting.txt", "_meeting_diarized.txt",
+                               "_meeting_summary.html", "_meeting_speakers.json")
+    _MEETING_TXT_RE = re.compile(
+        r"^(\d{4}-\d\d-\d\d(?:_\d\d-\d\d(?:-\d\d)?)?)(?:_(.*?))?(_meeting(?:_diarized)?\.txt)$")
+
+    @classmethod
+    def _meeting_name_parts(cls, txt_full):
+        """(stamp, current name, prefix) of a meeting transcript, or None."""
+        m = cls._MEETING_TXT_RE.match(os.path.basename(txt_full or ""))
+        if not m:
+            return None
+        name = (m.group(2) or "").replace("_", " ").strip()
+        return m.group(1), name, os.path.basename(txt_full)[:-len(m.group(3))]
+
+    def _rename_meeting_files(self, txt_full, new_name):
+        """Rename one saved meeting: its transcript, summary (+ backups) and
+        speakers sidecar move to <stamp>_<new name>; the recordings keep their
+        stamp names. Ticked action items follow the new file name. All or
+        nothing. Returns (ok, message, new transcript path)."""
+        parts = self._meeting_name_parts(txt_full)
+        if not parts:
+            return (False, "Not a meeting transcript", None)
+        stamp, _old, old_prefix = parts
+        slug = _slug_title(new_name)
+        new_prefix = f"{stamp}_{slug}" if slug else stamp
+        if new_prefix == old_prefix:
+            return (True, "", txt_full)
+        moves = []
+        for n in os.listdir(MEETINGS_DIR):
+            if not n.startswith(old_prefix + "_meeting"):
+                continue
+            rest = n[len(old_prefix):]
+            if not (rest in self._MEETING_NAMED_SUFFIXES
+                    or (rest.startswith("_meeting_summary.") and rest.endswith(".bak.html"))):
+                continue
+            moves.append((os.path.join(MEETINGS_DIR, n),
+                          os.path.join(MEETINGS_DIR, new_prefix + rest)))
+        if any(os.path.exists(dst) for _src, dst in moves):
+            return (False, "A meeting with that name already exists", None)
+        old_items = []
+        try:
+            import action_items
+            old_items = action_items.parse_action_items(txt_full) or []
+        except Exception as e:
+            log.debug("rename: action items not read: %s", e)
+        done = []
+        try:
+            for src, dst in moves:
+                os.rename(src, dst)
+                done.append((src, dst))
+        except OSError as e:
+            for src, dst in reversed(done):          # all or nothing
+                try:
+                    os.rename(dst, src)
+                except OSError:
+                    pass
+            log.warning("Meeting rename failed: %s", e)
+            return (False, "The meeting files are in use - close them and try again", None)
+        new_txt = os.path.join(MEETINGS_DIR, new_prefix + os.path.basename(txt_full)[len(old_prefix):])
+        if old_items:
+            try:
+                store = action_items.load_store()
+                old_id, new_id = os.path.basename(txt_full), os.path.basename(new_txt)
+                moved = 0
+                for t in old_items:
+                    st = store.pop(action_items._task_id(old_id, t), None)
+                    if st is not None:
+                        store[action_items._task_id(new_id, t)] = st
+                        moved += 1
+                if moved:
+                    action_items.save_store(store)
+            except Exception as e:
+                log.warning("rename: action-item ticks not carried over: %s", e)
+        log.info("Meeting renamed: %d file(s) -> %s", len(moves), _priv(slug or stamp))
+        try:
+            self._kick_meetings_indexer_bg()
+        except Exception:
+            pass
+        return (True, "Meeting renamed", new_txt)
+
+    def _rename_meeting_for(self, path):
+        """Home preview: rename a saved meeting (its name lives in its file
+        names). Opens the name box; the rename runs when it is saved."""
+        full = self._meeting_in_dir(path)
+        if not full or not self._meeting_name_parts(full):
+            return (False, "That meeting is gone")
+        current = self._meeting_name_parts(full)[1]
+
+        def on_done(name):
+            name = (name or "").strip()
+            if not name or name == current:
+                return
+            ok, msg, new = self._rename_meeting_files(full, name)
+            if ok:
+                self._settings_home_select = new
+            try:
+                self._settings_push_state()
+            except Exception:
+                pass
+            if not ok:
+                try:
+                    self.overlay.show_error(msg)
+                except Exception:
+                    pass
+        self.overlay.show_meeting_title_prompt(current, on_done, rename=True)
+        return (True, "")
+
     def _copy_meeting_summary(self, path):
         """Home preview: copy the meeting's summary text to the clipboard."""
         full = self._meeting_in_dir(path)
@@ -35173,6 +35507,7 @@ class LiaApp:
         add("toggle_keep_meeting_tracks", self._toggle_keep_meeting_tracks)
         add("toggle_meeting_backup_mic", self._toggle_meeting_backup_mic)
         add("toggle_meeting_mic_auto_fallback", self._toggle_meeting_mic_auto_fallback)
+        add("toggle_meeting_windows_hidden", self._toggle_meeting_windows_hidden)
         add("open_meetings_ask", self._open_meetings_ask)
         add("voice_ask_now", self._voice_ask_toggle)
         add("set_voice_ask_output", self._set_voice_ask_output)
@@ -35237,6 +35572,7 @@ class LiaApp:
         add("get_meeting_details", self._get_meeting_details)
         add("open_meeting_transcript", self._open_meeting_transcript)
         add("rename_speakers_for", self._rename_speakers_for)
+        add("rename_meeting_for", self._rename_meeting_for)
         add("delete_speaker_profile", self._delete_speaker_profile)
         add("copy_meeting_summary", self._copy_meeting_summary)
         return A
@@ -35589,6 +35925,8 @@ class LiaApp:
             "auto_start": _safe(lambda: bool(is_auto_start_enabled()), False),
             "home": {
                 "recent_meetings": _safe(lambda: self._recent_meetings(), []),
+                # a meeting just renamed: Home keeps it selected under its new path
+                "select": self.__dict__.pop("_settings_home_select", None),
                 # WP4: known voices (name, samples, last seen) for the Meetings
                 # page list with Delete (a wrong profile poisons matching).
                 "speaker_profiles": _safe(self._speaker_profiles_state, []),

@@ -860,7 +860,7 @@ APP_JS = r"""
       txt = 'Installing Lia '+esc(u.version)+' - Lia restarts in a moment';
     } else {
       txt = T('<b>Lia '+esc(u.version)+' is available</b> (you have '+esc(u.current)+')');
-      acts = btn(u.kind === 'installer' ? 'Update now' : 'Download', 'update_now', [], 'primary', true);
+      acts = btn(u.self_update ? 'Update now' : 'Download', 'update_now', [], 'primary', true);
     }
     return '<div class="upd-bar">'+RK.icon('download',{size:16})+'<span class="grow">'+txt+
       (u.error ? ' <span class="upd-err">'+esc(u.error)+'</span>' : '')+'</span>'+acts+
@@ -872,7 +872,11 @@ APP_JS = r"""
 
   // Home page state: the meetings search query + the selected meeting path
   // (survive re-renders; the preview loads that meeting's summary on the side).
-  function homeMeetings(){ return ((S.home||{}).recent_meetings)||[]; }
+  function homeMeetings(){
+    var h = S.home||{};
+    if(h.select){ homeSel = h.select; h.select = null; }   // a meeting just renamed
+    return h.recent_meetings||[];
+  }
   function homeFiltered(){
     var q = (homeSearch||'').toLowerCase();
     return homeMeetings().filter(function(m){
@@ -1483,6 +1487,8 @@ APP_JS = r"""
       grp('Recording',
         srow('Auto-detect Zoom / Teams / Meet calls', 'Offers to record when a call starts.',
           swb(!!cfg("auto_detect_meetings",false), "toggle_auto_detect_meetings"))+
+        srow('Hide meeting windows', 'No meeting cards, prompts or notices on screen, and the summary does not open by itself. Run meetings from the tray.',
+          swb(!!cfg("meeting_windows_hidden",false), "toggle_meeting_windows_hidden"))+
         srow('Live transcript updates every',
           'Lower = snappier, more transcription calls. A running meeting keeps its interval until it ends.',
           '<select data-select="set_meeting_chunk_seconds" style="max-width:200px">'+
@@ -1860,6 +1866,7 @@ APP_JS = r"""
                 '<button class="btn" data-call="copy_meeting_summary" data-args=\''+esc(pj)+'\'>'+RK.icon('copy',{size:15})+' Copy summary</button>';
       }
       acts += '<button class="btn" data-call="open_meeting_transcript" data-args=\''+esc(pj)+'\'>'+RK.icon('file',{size:15})+' Open transcript</button>';
+      acts += '<button class="btn" data-call="rename_meeting_for" data-args=\''+esc(pj)+'\'>'+RK.icon('edit',{size:15})+' Rename</button>';
       if(d.diarized)
         acts += '<button class="btn" data-call="rename_speakers_for" data-args=\''+esc(pj)+'\'>'+RK.icon('meetings',{size:15})+' Rename speakers</button>';
       acts += '</div>';

@@ -130,16 +130,18 @@ def _get_small(url, session=None, cap=64 * 1024, timeout=20):
         return data
 
 
-def authorize(rel, session=None, public_key_hex=None):
-    """Check that `rel`'s Setup is one the release key signed, BEFORE it is
-    downloaded: SHA256SUMS.txt + .sig from the SAME release, the Ed25519
-    signature valid for the pinned key, the Setup's line in that list equal to
-    GitHub's digest, and every URL under this repo's download path for the
-    release's tag. Returns the expected SHA-256; raises VerifyError."""
+def authorize(rel, session=None, public_key_hex=None, asset="setup"):
+    """Check that `rel`'s Setup (or, asset="portable", its Portable zip) is one
+    the release key signed, BEFORE it is downloaded: SHA256SUMS.txt + .sig from
+    the SAME release, the Ed25519 signature valid for the pinned key, the
+    file's line in that list equal to GitHub's digest, and every URL under
+    this repo's download path for the release's tag. Returns the expected
+    SHA-256; raises VerifyError."""
     import lia_ed25519
-    setup, sums, sig = rel.get("setup"), rel.get("sums"), rel.get("sums_sig")
+    setup, sums, sig = rel.get(asset), rel.get("sums"), rel.get("sums_sig")
     if not setup or not setup.get("sha256"):
-        raise VerifyError("the release has no verifiable installer")
+        raise VerifyError("the release has no verifiable %s" % (
+            "installer" if asset == "setup" else "portable zip"))
     if not sums or not sig:
         raise VerifyError("the release is not signed (no %s.sig)" % SUMS_NAME)
     prefix = "%s%s/" % (DOWNLOAD_PREFIX, rel.get("tag") or ("v" + rel.get("version", "")))
@@ -313,3 +315,175 @@ def update_launch_line(setup_cmd, fallback_cmd, fallback_cwd=None):
     back = 'start "" ' + ('/D %s ' % _q(fallback_cwd) if fallback_cwd else "") + \
         " ".join(_q(a) for a in fallback_cmd)
     return '%s /d /s /c "%s & if errorlevel 1 %s"' % (_q(comspec), run, back)
+
+
+# ---- Portable copy (2026-10-27) --------------------------------------------
+# A portable copy updates in place, inside its own folder (a managed PC that
+# allows Lia's folder may block programs and scripts under %TEMP%): the signed
+# Portable zip is extracted to <root>\_update\new, Lia quits, and a small
+# cmd script swaps runtime\ and app\ once nothing holds them, then starts Lia
+# from the same place. Any failure puts the previous folders back and starts
+# the previous Lia. Settings and meetings live in %APPDATA%, never here.
+PORTABLE_STAGE = "_update"
+PORTABLE_ROOT_FILES = ("Lia.bat", "Lia (Work PC).bat", "README.md", "LICENSE")
+
+
+def portable_root(app_dir):
+    return os.path.dirname(os.path.abspath(app_dir))
+
+
+def portable_writable(root):
+    """True when this user can write next to runtime\\ and app\\ (the swap
+    renames them)."""
+    probe = os.path.join(root, ".lia-write-test")
+    try:
+        with open(probe, "w") as f:
+            f.write("x")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def stage_portable(zip_path, root, version):
+    """Extract the verified Portable zip to <root>\\_update\\new and check it is
+    a whole Lia `version` folder. Returns that folder; raises VerifyError."""
+    import shutil
+    import zipfile
+    new = os.path.join(root, PORTABLE_STAGE, "new")
+    shutil.rmtree(new, ignore_errors=True)
+    base = os.path.abspath(new)
+    with zipfile.ZipFile(zip_path) as z:
+        names = z.namelist()
+        for n in names:
+            t = os.path.abspath(os.path.join(base, n))
+            if os.path.commonpath([t, base]) != base:
+                raise VerifyError("the portable zip has a path outside its folder")
+        # Windows' 260-character path limit (long paths are off on most PCs):
+        # the deepest file is ~126 characters inside the folder
+        if len(base) + 1 + max((len(n) for n in names), default=0) > 255:
+            raise VerifyError("the Lia folder's path is too long to update in place - "
+                              "move the folder somewhere shorter (e.g. C:\\Lia)")
+        z.extractall(base)
+    lia_py = os.path.join(new, "app", "lia.py")
+    if not (os.path.isfile(os.path.join(new, "runtime", "Lia.exe")) and os.path.isfile(lia_py)):
+        raise VerifyError("the portable zip is not a Lia folder")
+    with open(lia_py, encoding="utf-8", errors="replace") as f:
+        m = re.search(r'^APP_VERSION = "([0-9.]+)"', f.read(), re.M)
+    if not m or m.group(1) != version:
+        raise VerifyError("the portable zip is not Lia %s" % version)
+    return new
+
+
+def _cmd_path(p):
+    """A path safe inside a generated .cmd (cmd expands %, quotes end the
+    string)."""
+    p = str(p)
+    if "%" in p or '"' in p:
+        raise VerifyError("a path with %% or a quote cannot be used: %s" % p)
+    return p
+
+
+_SWAP_CMD = r"""@echo off
+chcp 65001 >nul
+setlocal EnableExtensions DisableDelayedExpansion
+set "ROOT=@ROOT@"
+set "NEW=@NEW@"
+set "STAGE=@STAGE@"
+set "OLD=@OLD@"
+set N=0
+:wait_lia
+tasklist /FI "PID eq @PID@" /NH 2>nul | find " @PID@ " >nul || goto lia_gone
+set /a N+=1
+if %N% geq 90 goto fail_none
+ping -n 2 127.0.0.1 >nul
+goto wait_lia
+:lia_gone
+if exist "%OLD%" rd /s /q "%OLD%"
+mkdir "%OLD%"
+set N=0
+:wait_runtime
+move "%ROOT%\runtime" "%OLD%\runtime" >nul 2>&1 && goto runtime_out
+set /a N+=1
+if %N% geq @TRIES@ goto fail_none
+ping -n 2 127.0.0.1 >nul
+goto wait_runtime
+:runtime_out
+set N=0
+:wait_app
+move "%ROOT%\app" "%OLD%\app" >nul 2>&1 && goto app_out
+set /a N+=1
+if %N% geq 30 goto fail_runtime
+ping -n 2 127.0.0.1 >nul
+goto wait_app
+:app_out
+move "%NEW%\runtime" "%ROOT%\runtime" >nul 2>&1 || goto fail_app
+move "%NEW%\app" "%ROOT%\app" >nul 2>&1 || goto fail_new_runtime
+@COPIES@
+echo ok> "%STAGE%\swapped.txt"
+@RELAUNCH@
+exit /b 0
+:fail_new_runtime
+move "%ROOT%\runtime" "%NEW%\runtime" >nul 2>&1
+:fail_app
+move "%OLD%\app" "%ROOT%\app" >nul 2>&1
+:fail_runtime
+move "%OLD%\runtime" "%ROOT%\runtime" >nul 2>&1
+:fail_none
+echo failed> "%STAGE%\failed.txt"
+@FALLBACK@
+exit /b 1
+"""
+
+
+def portable_swap_script(root, new_dir, relaunch, relaunch_cwd, fallback, fallback_cwd,
+                         pid, tries=120):
+    """The .cmd text that swaps <root>\\runtime + app for new_dir's, then starts
+    `relaunch`; on any failure it restores the previous folders and starts
+    `fallback`. It first waits (up to 90 s) for the old Lia, process `pid`, to
+    exit: Windows lets a folder be renamed while a program from it still runs
+    (measured 2026-10-27), so a successful move proves nothing. Then the moves
+    are retried (once a second, `tries` times) while a child lets go."""
+    root, new_dir = _cmd_path(root), _cmd_path(new_dir)
+    pid = str(int(pid))
+    stage = os.path.join(root, PORTABLE_STAGE)
+
+    def start(cmd, cwd):
+        return 'start "" ' + ('/D %s ' % _q(cwd) if cwd else "") + " ".join(_q(a) for a in cmd)
+    copies = "\n".join(
+        'if exist "%NEW%\\{0}" copy /y "%NEW%\\{0}" "%ROOT%\\{0}" >nul'.format(n)
+        for n in PORTABLE_ROOT_FILES)
+    text = _SWAP_CMD
+    for k, v in (("@ROOT@", root), ("@NEW@", new_dir), ("@STAGE@", stage), ("@PID@", pid),
+                 ("@OLD@", os.path.join(stage, "old")), ("@TRIES@", str(int(tries))),
+                 ("@COPIES@", copies), ("@RELAUNCH@", start(relaunch, relaunch_cwd)),
+                 ("@FALLBACK@", start(fallback, fallback_cwd))):
+        text = text.replace(k, v)
+    return "\r\n".join(text.splitlines()) + "\r\n"
+
+
+def write_portable_swap(root, new_dir, relaunch, relaunch_cwd, fallback, fallback_cwd,
+                        pid=None):
+    """Write the swap script into <root>\\_update and return (its path, the
+    command that runs it - cmd.exe from System32). `pid` = the Lia that is
+    about to quit (default: this process)."""
+    path = os.path.join(root, PORTABLE_STAGE, "apply-update.cmd")
+    text = portable_swap_script(root, new_dir, relaunch, relaunch_cwd, fallback, fallback_cwd,
+                                os.getpid() if pid is None else pid)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+    return path, [os.path.join(system_dir(), "cmd.exe"), "/d", "/c", path]
+
+
+def portable_cleanup(root):
+    """At the next start: report how the last portable update went and delete
+    the staging folder (with the previous version kept for the swap).
+    Returns "swapped" / "failed" / "leftover" / None (nothing there)."""
+    import shutil
+    stage = os.path.join(root, PORTABLE_STAGE)
+    if not os.path.isdir(stage):
+        return None
+    res = ("swapped" if os.path.isfile(os.path.join(stage, "swapped.txt"))
+           else "failed" if os.path.isfile(os.path.join(stage, "failed.txt")) else "leftover")
+    shutil.rmtree(stage, ignore_errors=True)
+    return res
