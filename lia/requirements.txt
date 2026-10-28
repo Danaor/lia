@@ -22,6 +22,9 @@ pywebview>=6.2
 # pywin32: Outlook COM (win32com.client / pythoncom) for the email/summary
 # windows, and the de-elevation / window helpers.
 pywin32>=306
+# comtypes: Windows UI Automation - reads the speaker names from the Teams
+# live captions in the user's own Teams window (teams_captions.py).
+comtypes>=1.4
 # python-bidi: NO LONGER used for Tk display (this Tk renders bidi natively —
 # get_display would double-reverse). Kept only because _to_visual_rtl remains
 # for back-compat; safe to drop once that helper is removed.

@@ -14,6 +14,7 @@ Covers everything testable without real mic / keyboard / Windows events:
 - Icon generation for all states
 """
 import ast
+import gc
 import io
 import json
 import os
@@ -118,6 +119,12 @@ def _test(name, fn):
         results.append((FAIL, name, msg))
         print(f"  [ERR ] {name}")
         print(f"    {msg.splitlines()[0]}")
+    finally:
+        # Free what the test left HERE, on the main thread: a Tk root caught
+        # in a reference cycle and collected later by a GC that runs on a
+        # worker thread aborts the whole process ("Tcl_AsyncDelete: async
+        # handler deleted by the wrong thread" - the 1.6.17 runtime build).
+        gc.collect()
 
 
 def section(title):
@@ -3872,6 +3879,47 @@ def t_prompt_secondary_wired():
                    on_dismiss=lambda: fired.__setitem__("d", True),
                    on_timeout=lambda: fired.__setitem__("t", True))
     assert fired["t"] is True and fired["d"] is False, fired
+
+    # 2026-10-28: the call-ended "Stop the recording?" card stayed up after
+    # the meeting stopped another way, and the "transcript ready" card opened
+    # on top of it. A tagged card is taken down by close_prompts(tag) with no
+    # callback; other cards stay; the meeting stop does it.
+    import queue
+    import tkinter as tk
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        ov = w.OverlayNotification.__new__(w.OverlayNotification)
+        ov._root, ov._tk_queue = root, queue.Queue()
+        ov._brand_image = lambda *a: None
+        ov._prompt_work_area = lambda top: (0, 0, 1600, 900)
+        ov._prompt_round = ov._prompt_no_activate = lambda top: None
+        calls = []
+        cb = lambda name: (lambda: calls.append(name))
+        ov._create_prompt_toplevel("Call ended", "Stop?", "Stop", cb("stop"),
+                                   cb("keep"), 60000, cb("timeout"), "Keep",
+                                   cb("keep2"), tag="meeting-stop")
+        ov._create_prompt_toplevel("Other", "x", "OK", cb("ok"), None, 60000)
+        tops = [c for c in root.winfo_children() if isinstance(c, tk.Toplevel)]
+        assert len(tops) == 2
+        ov.close_prompts("meeting-stop")
+        while not ov._tk_queue.empty():
+            ov._tk_queue.get()()
+        root.update()
+        alive = [t for t in tops if t.winfo_exists()]
+        assert len(alive) == 1, "only the tagged card is closed"
+        __import__("time").sleep(0.05)
+        assert calls == [], calls
+    finally:
+        root.destroy()
+        # Free the interpreter HERE, on the thread that made it: left to a
+        # later GC cycle on a worker thread, Tcl aborts the whole suite
+        # ("Tcl_AsyncDelete: async handler deleted by the wrong thread").
+        ov = tops = alive = root = None
+        __import__("gc").collect()
+    src = inspect.getsource(w.LiaApp._stop_meeting)
+    assert 'close_prompts("meeting-stop")' in src
+    assert 'tag="meeting-stop"' in inspect.getsource(w.LiaApp)
 
 
 _test("prompt secondary button + no-root fallback", t_prompt_secondary_wired)
@@ -8215,6 +8263,83 @@ def t_meeting_late_and_failed_chunks():
         m._write_live_file = lambda: None
         m._submit_chunk(quiet, blocking=True)
         assert m._chunk_transcriber.n <= 1
+        # 2026-10-28: a short piece cut at a speaker change that comes back
+        # EMPTY is a gap between turns - omitted, no retry; a long one, or
+        # one that is not a speaker cut, still counts as lost speech
+        class Empty:
+            n = 0
+            def transcribe(self, audio, **k):
+                self.n += 1
+                return ""
+        for secs, extra, want, calls in ((2.4, {"turn_cut": True}, "empty", 1),
+                                         (5.0, {"turn_cut": True}, "failed", 2),
+                                         (2.4, None, "failed", 2)):
+            m = w.MeetingSession.__new__(w.MeetingSession)
+            m.app = App(); m._cancelled = False; m._wav_writer = None
+            m.diarize_mode = False; m._chunks_lock = _th.Lock(); m.chunks = []
+            m._next_chunk_index = 0; m.start_time = _t.time()
+            m._pending_lock = _th.Lock(); m._pending_jobs = []
+            m._chunk_transcriber = Empty(); m._chunk_language = "he"
+            m._write_live_file = lambda: None
+            piece = (np.sin(np.linspace(0, 3000, int(16000 * secs))) * 0.2).astype(np.float32)
+            m._submit_chunk(piece, blocking=True, cut="speaker", extra=extra)
+            assert m.chunks[0]["status"] == want, (secs, extra, m.chunks[0])
+            assert m._chunk_transcriber.n == calls, (secs, extra, m._chunk_transcriber.n)
+
+        # 2026-10-28 14:37: 10 s of silence with one short phrase - the cloud
+        # is empty on the whole chunk -> the retry sends only the part with
+        # sound, then the loaded local Whisper; both empty -> a pause
+        class Cloud:
+            def __init__(self, on_short=""): self.sent = []; self.on_short = on_short
+            def transcribe(self, audio, **k):
+                self.sent.append(len(audio) / 16000.0)
+                return self.on_short if len(audio) < 16000 * 5 else ""
+        class Local(w.FasterWhisperTranscriber):
+            def __init__(self, out): self.model = object(); self.out = out; self.kw = None
+            def transcribe(self, audio, **k):
+                self.kw = k; return self.out
+        def phrase_in_silence():
+            x = np.zeros(16000 * 10, dtype=np.float32)
+            x[16000 * 4:16000 * 5] = (np.sin(np.linspace(0, 900, 16000)) * 0.2)
+            return x
+        ev = _th.Event(); ev.set()
+        for on_short, local_out, want_text, want in (
+                ("טוב", "x", "טוב", "ok"),          # the trimmed retry is enough
+                ("", "מעולה", "מעולה", "ok"),       # the local model hears it
+                ("", "", "", "empty")):              # nobody hears words: a pause
+            m = w.MeetingSession.__new__(w.MeetingSession)
+            m.app = App(); m._cancelled = False; m._wav_writer = None
+            m.app._local_transcriber = Local(local_out); m.app._local_load_event = ev
+            m.app._get_language = lambda: "he"
+            m.diarize_mode = False; m._chunks_lock = _th.Lock(); m.chunks = []
+            m._next_chunk_index = 0; m.start_time = _t.time()
+            m._pending_lock = _th.Lock(); m._pending_jobs = []
+            m._chunk_transcriber = Cloud(on_short); m._chunk_language = "he"
+            m._write_live_file = lambda: None
+            m._submit_chunk(phrase_in_silence(), blocking=True)
+            assert m.chunks[0]["status"] == want, (on_short, local_out, m.chunks[0])
+            assert m.chunks[0]["text"] == want_text, m.chunks[0]
+            sent = m._chunk_transcriber.sent
+            assert len(sent) == 2 and sent[0] == 10.0 and 2.0 < sent[1] < 2.5, sent
+            if not on_short:
+                assert m.app._local_transcriber.kw.get("bias_ok") is False, \
+                    "no vocabulary prompt on a mostly-silent clip"
+        # the local retry is skipped when it IS the meeting engine, is not a
+        # Whisper (Parakeet), is not loaded yet, or the switch is off
+        m = w.MeetingSession.__new__(w.MeetingSession)
+        m.app = App(); m.app._local_load_event = ev
+        lw = Local("x"); m.app._local_transcriber = lw; m._chunk_transcriber = None
+        assert m._local_retry_transcriber() is lw
+        m._chunk_transcriber = lw
+        assert m._local_retry_transcriber() is None
+        m._chunk_transcriber = None; m.app._local_transcriber = object()
+        assert m._local_retry_transcriber() is None
+        m.app._local_transcriber = lw; m.app._local_load_event = _th.Event()
+        assert m._local_retry_transcriber() is None
+        m.app._local_load_event = ev; m.app.config = {"meeting_empty_local_retry": False}
+        assert m._local_retry_transcriber() is None
+        assert w.MeetingSession._voiced_span(np.zeros(16000)) is None
+        assert w.DEFAULT_CONFIG.get("meeting_empty_local_retry") is True
     finally:
         w.time.sleep = orig_sleep
 
@@ -13498,6 +13623,15 @@ def t_meeting_mic_auto_fallback():
     assert any("muted" in m for m in sx.app.notices), "one calm 'muted' notice"
     assert w.MeetingSession._mic_is_muted(silent) and not w.MeetingSession._mic_is_muted(hum)
     assert not w.MeetingSession._mic_is_muted(live) and not w.MeetingSession._mic_is_muted(None)
+    # 2026-10-28: the same zeros from a mic plugged in AFTER Lia started are a
+    # dead stream (stale PortAudio), not a mute -> switch at the first window
+    sd = fresh(silent, call, live)
+    sd.app._mic_arrived_at = 123.0
+    out = sd._drain_audio_inner()
+    assert sd._mic_recorder.tag == "backup" and sd._backup_recorder is None
+    assert any("reconnected" in m for m in sd.app.notices) and not sd.app.shown
+    assert out is not None and float(np.abs(out).max()) > 0.15, \
+        "the desk mic's audio must reach the mix at once"
     # config off -> no switch (the 3-drain nudge remains)
     s3 = fresh(hum, live, live, fallback=False)
     for _ in range(3):
@@ -13521,6 +13655,152 @@ def t_meeting_mic_auto_fallback():
 
 _test("meeting: silent-mic auto-fallback to the dictation (backup) mic",
       t_meeting_mic_auto_fallback)
+
+
+def t_meeting_auto_summary():
+    """2026-10-28 (Naor): "Summarize when a meeting ends" (default on). An
+    explicit end choice wins; otherwise the setting decides AT STOP time
+    (Stop pill, call-ended card, silence stop). Transcript-only meetings get a
+    "Summarize" on the card and in Home, through _do_meeting_summary."""
+    import inspect, os as _os, time as _t, threading as _th, queue as _q
+    import lia as w
+    assert w.DEFAULT_CONFIG["meeting_auto_summary"] is True
+
+    class A:
+        pass
+    a = A()
+    for on, model, want in ((True, True, True), (False, True, False), (True, False, False)):
+        a.config = {"meeting_auto_summary": on}
+        a._summary_available = lambda m=model: m
+        assert w.LiaApp._auto_summary_default(a) is want, (on, model)
+
+    # the real _stop_meeting up to the point where the choice is made
+    class Stop(Exception):
+        pass
+    class Any:
+        def __getattr__(self, n):
+            return lambda *x, **k: None
+    def stop(on, explicit):
+        app = w.LiaApp.__new__(w.LiaApp)
+        app.config = {"meeting_auto_summary": on}
+        app._summary_available = lambda: True
+        sess = A(); sess.summarize = True
+        app._meeting_lock = _th.Lock(); app._active_meeting = sess
+        app._meeting_detect_lock = _th.Lock(); app.overlay = Any(); app.tray_icon = None
+        def halt(s): raise Stop()
+        app._resolve_meeting_title = halt
+        try:
+            w.LiaApp._stop_meeting(app, summarize=explicit)
+        except Stop:
+            pass
+        return sess.summarize
+    assert stop(False, None) is False, "setting off: a pill / call-ended stop has no summary"
+    assert stop(True, None) is True
+    assert stop(False, True) is True, "End & summarize always summarizes"
+    assert stop(True, False) is False, "End (no summary) always skips it"
+
+    # every start follows the setting (no literal summarize=True left)
+    src = inspect.getsource(w.LiaApp)
+    assert "_start_meeting(summarize=True)" not in src
+    assert "_toggle_meeting(summarize=True)" not in src
+    assert src.count("summarize=self._auto_summary_default()") >= 4, \
+        "tray, Home, auto-detect and resume"
+
+    # Summarize a saved meeting: only inside the meetings folder, model needed
+    _os.makedirs(w.MEETINGS_DIR, exist_ok=True)
+    txt = _os.path.join(w.MEETINGS_DIR, "2026-10-28_10-00-00_auto_summary_test_meeting.txt")
+    with open(txt, "w", encoding="utf-8") as f:
+        f.write("Meeting transcript\n\n[0:01] שלום לכולם")
+    try:
+        app = w.LiaApp.__new__(w.LiaApp)
+        app._summary_available = lambda: True
+        got, pushed = [], []
+        app._do_meeting_summary = lambda text, path: got.append((text, path))
+        app._settings_push_state = lambda: pushed.append(1)
+        ok, msg = w.LiaApp._summarize_meeting_path(app, txt)[:2]
+        assert ok, msg
+        for _ in range(100):
+            if pushed:
+                break
+            _t.sleep(0.02)
+        assert got and got[0][1] == _os.path.abspath(txt) and "שלום" in got[0][0], got
+        assert app._settings_home_select == _os.path.abspath(txt)
+        outside = _os.path.join(_os.path.dirname(w.MEETINGS_DIR), "x_meeting.txt")
+        assert w.LiaApp._summarize_meeting_path(app, outside)[0] is False
+        app._summary_available = lambda: False
+        assert w.LiaApp._summarize_meeting_path(app, txt)[0] is False
+        assert w.LiaApp._summarize_card_action(app, txt) is None
+        app._summary_available = lambda: True
+        assert callable(w.LiaApp._summarize_card_action(app, txt))
+    finally:
+        _os.remove(txt)
+
+    # the "Transcript ready" card carries "Summarize"
+    ov = w.OverlayNotification.__new__(w.OverlayNotification)
+    ov._tk_queue = _q.Queue(); ov._mcard_model = {}
+    ov._card_gen_stale = lambda g: False
+    ov._mcard_render = lambda: None
+    ov.meeting_status_finish(title="Transcript ready", on_open=lambda: None,
+                             on_summarize=lambda: None, gen=1)
+    ov._tk_queue.get()()
+    labels = [x[0] for x in ov._mcard_model["actions"]]
+    assert labels[:2] == ["Open", "Summarize"], labels
+    assert "on_summarize=self._summarize_card_action(path)" in inspect.getsource(w.LiaApp._stop_meeting)
+    assert "_summarize_card_action" in inspect.getsource(w.MeetingSession)
+
+    # wiring: Settings actions, not read-only, the page and the Hebrew
+    amap = w.LiaApp._settings_action_map(w.LiaApp.__new__(w.LiaApp))
+    assert "toggle_meeting_auto_summary" in amap and "summarize_meeting_for" in amap
+    assert "summarize_meeting_for" not in w.LiaApp._SETTINGS_READONLY_METHODS
+    base = _os.path.dirname(_os.path.abspath(w.__file__))
+    sw = open(_os.path.join(base, "settings_window.py"), encoding="utf-8").read()
+    assert '"toggle_meeting_auto_summary"' in sw and 'data-call="summarize_meeting_for"' in sw
+    import ui_he
+    for k in ("Summarize when a meeting ends", "Summarize meetings automatically",
+              "Choose a summary model on the Models page first."):
+        assert k in ui_he.STRINGS, k
+
+
+_test("meeting: summarize when a meeting ends (setting) + Summarize later",
+      t_meeting_auto_summary)
+
+
+def t_mic_plugged_restart():
+    """2026-10-28: a mic that arrives while Lia runs opens through the stale
+    in-process PortAudio and records zeros in a meeting -> the device
+    watchdog notes the arrival and Lia restarts once idle (after a settle
+    time, never mid-meeting/dictation, retried at most every 10 min)."""
+    import inspect
+    import lia as w
+    restarts = []
+    app = w.LiaApp.__new__(w.LiaApp)
+    app.is_recording = False
+    app._compose_active = app._compose_instr_active = app._voice_ask_active = False
+    busy = [False]
+    app._meeting_busy = lambda: busy[0]
+    app._restart_app = lambda reason="": restarts.append(reason)
+    M = w.LiaApp
+    assert M._maybe_restart_for_new_mic(app, 1000.0) is False      # nothing arrived
+    M._note_mic_arrived(app, ["Headset Microphone (Jabra EVOLV"], 1000.0)
+    assert M._maybe_restart_for_new_mic(app, 1005.0) is False      # still settling
+    busy[0] = True
+    assert M._maybe_restart_for_new_mic(app, 1020.0) is False      # meeting: wait
+    busy[0] = False
+    app.is_recording = True
+    assert M._maybe_restart_for_new_mic(app, 1025.0) is False      # dictation: wait
+    app.is_recording = False
+    assert M._maybe_restart_for_new_mic(app, 1030.0) is True
+    assert restarts == ["mic-plugged"]
+    # a refused restart (we are still alive) does not retry every 5 s
+    assert M._maybe_restart_for_new_mic(app, 1040.0) is False
+    assert M._maybe_restart_for_new_mic(app, 1030.0 + M.MIC_RESTART_RETRY_S) is True
+    src = inspect.getsource(M._device_watchdog)
+    assert "_note_mic_arrived(" in src and "_maybe_restart_for_new_mic(" in src
+    assert "and prev_mic" in src, "an empty first list must not count as an arrival"
+
+
+_test("device: a mic plugged in while Lia runs -> restart when idle",
+      t_mic_plugged_restart)
 
 
 def t_meeting_rename_and_no_stop_prompt():
@@ -13691,6 +13971,194 @@ def t_meeting_windows_hidden():
 
 _test("meetings: Hide meeting windows (card, auto prompts, notices, auto-open)",
       t_meeting_windows_hidden)
+
+
+def t_teams_caption_names():
+    """2026-10-27 (Naor: see who speaks in a Teams call, from his own Teams,
+    no bot): speaker names read from the Teams live captions in the Teams
+    window (UI Automation). Pure layers: the captions region is found by its
+    name inside the web content only (the window frame's caption BUTTONS do
+    not count), one line per node or a flattened author/text sequence, lines
+    that grow in place stay one turn, a window is labelled only when one
+    speaker dominates it (or two share it), and the transcript paragraphs carry
+    the name and break on a change of speaker - with no "speaker" key the
+    layout is exactly as before."""
+    import inspect
+    import lia as w
+    import numpy as np
+    import teams_captions as tc
+    assert w.DEFAULT_CONFIG["teams_speaker_names"] is False
+
+    T = lambda name, ct=50020: {"name": name, "ct": ct, "children": []}
+    line = lambda a, t, rid: {"name": "", "ct": 50026, "cls": "fui-ChatMessageCompact",
+                              "rid": rid, "children": [T(a), T(t)]}
+    frame = {"name": "", "ct": 50033, "cls": "BrowserCaptionButtonContainer",
+             "children": [T("Minimize", 50000), T("Maximize", 50000),
+                          T("Restore", 50000), T("Close", 50000)]}
+    chat = {"name": "Chat", "ct": 50026, "children": [line("Chat Person", "hello there", [9])]}
+    caps = {"name": "Live Captions", "ct": 50026, "children": [
+        line("דנה לוי", "שלום לכולם נתחיל", [1]), line("Naor Daniel", "מעולה אני מתחיל", [2])]}
+    win = {"name": "Teams", "ct": 50032, "children": [
+        frame, {"name": "", "ct": 50030, "children": [chat, caps]}]}
+    root = tc.find_caption_root(win)
+    assert root is caps, "the captions region, not the frame buttons or the chat"
+    assert tc.parse_caption_entries(root) == [
+        ((1,), "דנה לוי", "שלום לכולם נתחיל"), ((2,), "Naor Daniel", "מעולה אני מתחיל")]
+    assert tc.find_caption_root({"name": "", "ct": 50032, "children": [
+        frame, {"name": "", "ct": 50030, "children": [chat]}]}) is None
+    # a flattened region: author, text, author, text
+    flat = {"name": "Live Captions", "children": [T("A B"), T("one two three"),
+                                                  T("C"), T("four five")]}
+    assert [(a, t) for _k, a, t in tc.parse_caption_entries(flat)] == [
+        ("A B", "one two three"), ("C", "four five")]
+    # caption authors as Teams really renders them
+    assert tc.clean_name("teams-Dana_Levi") == "Dana Levi"
+    assert tc.clean_name("\u200fיוסי (Unverified)") == "יוסי"
+    assert tc.clean_name("Levi, Dana") == "Dana Levi"
+    assert tc.clean_name("Dana Levi (Dana Levi)") == "Dana Levi"
+    assert tc.clean_name("Contoso-AI (IT)") == "Contoso-AI (IT)"
+
+    # lines grow in place: one turn per line, times from first/last sighting
+    tr = tc.TurnTracker(lag=1.0)
+    tr.update([((1,), "A", "hello")], now=10)
+    tr.update([((1,), "A", "hello there my friend")], now=13)
+    tr.update([((1,), "A", "hello there my friend"), ((2,), "B", "yes")], now=15)
+    turns = tr.turns()
+    assert [t["speaker"] for t in turns] == ["A", "B"]
+    assert 8.5 <= turns[0]["t0"] <= 9.0 and turns[0]["t1"] == 12.0
+    # keyless (flattened) lines: an old line still on screen is not re-added,
+    # and a new short line opening like an old one is a NEW line
+    tk = tc.TurnTracker(lag=0)
+    tk.update([(None, "A", "so as I said")], now=1)
+    tk.update([(None, "A", "so as I said"), (None, "A", "so")], now=2)
+    tk.update([(None, "A", "so as I said"), (None, "A", "so we go")], now=3)
+    assert [t["text"] for t in tk.turns()] == ["so as I said", "so we go"]
+    # 2026-10-28 real meeting: Teams rebuilt the pane (a screen share started)
+    # and every line came back under a NEW key; old lines must not become new
+    # turns (they put one speaker over another's sentence). A repeated short
+    # "yes" said again later IS new speech.
+    tb = tc.TurnTracker(lag=0)
+    tb.update([((1,), "Dana", "the list of the next steps"),
+               ((2,), "Dana", "short one")], now=90)
+    tb.update([((2,), "Dana", "short one"), ((3,), "Naor", "yes")], now=100)
+    tb.update([((3,), "Naor", "yes I want to show you")], now=192)
+    tb.update([((11,), "Dana", "the list of the next steps"),
+               ((12,), "Dana", "short one"),
+               ((13,), "Naor", "yes I want to show you something")], now=197)
+    tb.update([((13,), "Naor", "yes I want to show you something"),
+               ((14,), "Naor", "yes")], now=210)
+    got = [(t["speaker"], t["text"]) for t in tb.turns()]
+    assert got == [("Dana", "the list of the next steps"), ("Dana", "short one"),
+                   ("Naor", "yes I want to show you something"), ("Naor", "yes")], got
+    assert all(t["t1"] < 150 for t in tb.turns()[:2]), "old lines kept their old times"
+
+    # a short speaker-cut piece gets the meeting's language, not auto-detect
+    # (three Hebrew one-liners came back as invented English on 2026-10-28)
+    ms = w.MeetingSession.__new__(w.MeetingSession)
+    ms._chunk_language = None
+    ms._chunks_lock = __import__("threading").Lock()
+    ms.app = type("A", (), {"config": {"primary_language": "he"}})()
+    ms.chunks = []
+    short, long_ = np.zeros(16000), np.zeros(16000 * 5)
+    assert ms._short_piece_language(short) == "he", "no text yet: the primary language"
+    assert ms._short_piece_language(long_) is None, "a long piece keeps auto"
+    ms.chunks = [{"status": "ok", "text": "We talked about the Power BI direct query " * 3}]
+    assert ms._short_piece_language(short) == "en"
+    ms.chunks = [{"status": "ok", "text": "דיברנו על ה-dashboard וגם על הדוחות של החודש " * 3}]
+    assert ms._short_piece_language(short) == "he"
+    ms._chunk_language = "en"
+    assert ms._short_piece_language(short) == "en", "a set language always wins"
+
+    # labels: dominant / shared / unclear / none
+    turns = [{"speaker": "A", "t0": 0, "t1": 9}, {"speaker": "B", "t0": 9, "t1": 10},
+             {"speaker": "B", "t0": 10, "t1": 15}, {"speaker": "C", "t0": 15.5, "t1": 20}]
+    assert tc.label_window(turns, 0, 10) == "A"
+    assert tc.label_window(turns, 5, 15) == "A / B"
+    assert tc.label_window(turns, 30, 40) is None
+
+    # the transcript: named paragraphs, a break on a change of speaker
+    mk = lambda i, ts, text, spk="__none__": dict(
+        {"index": i, "timestamp_rel": ts, "text": text, "status": "ok",
+         "cut": "smart", "pause_s": 0.3},
+        **({} if spk == "__none__" else {"speaker": spk}))
+    plain = [mk(0, 0, "one two"), mk(1, 10, "three four")]
+    assert w.flow_chunk_paragraphs(plain) == [("text", 0, "one two three four")]
+    named = [mk(0, 0, "one two", "A"), mk(1, 10, "three four", "A"),
+             mk(2, 20, "five six", "B"), mk(3, 30, "seven", None)]
+    assert w.flow_chunk_paragraphs(named) == [
+        ("text", 0, "A: one two three four"), ("text", 20, "B: five six"),
+        ("text", 30, "seven")]
+
+    # the cut at the speaker changes: 10 s of "speech" with pauses at 3.0-3.5
+    # and 6.0-6.5 s; captions say A, then B, then A again
+    import numpy as np
+    sr = 16000
+    t = np.arange(10 * sr) / sr
+    speech = (0.3 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+    for a, b in ((3.0, 3.5), (6.0, 6.5)):
+        speech[int(a * sr):int(b * sr)] = 0.0
+    turns3 = [{"speaker": "A", "t0": 0.2, "t1": 2.8}, {"speaker": "B", "t0": 3.6, "t1": 5.9},
+              {"speaker": "A", "t0": 6.7, "t1": 9.9}]
+    pieces, carry = tc.split_audio_by_turns(speech, 100.0, [
+        dict(x, t0=x["t0"] + 100, t1=x["t1"] + 100) for x in turns3], guard_s=0)
+    starts = [round(s - 100, 2) for s, _p in pieces]
+    assert len(pieces) == 3 and carry is None, starts
+    assert 3.0 <= starts[1] <= 3.5 and 6.0 <= starts[2] <= 6.5, starts
+    assert sum(len(p) for _s, p in pieces) == len(speech), "no sample lost or doubled"
+    # not yet settled: the last 2.5 s wait for their captions (a breath at
+    # 7.4-7.6 s is where the settled part ends)
+    speech2 = speech.copy()
+    speech2[int(7.4 * sr):int(7.6 * sr)] = 0.0
+    pieces, carry = tc.split_audio_by_turns(speech2, 0.0, turns3, guard_s=2.5)
+    assert len(pieces) == 3 and carry is not None
+    assert sum(len(p) for _s, p in pieces) + len(carry) == len(speech2)
+    assert 7.4 <= 10 - len(carry) / sr <= 7.6
+    assert tc.split_audio_by_turns(speech, 50.0, turns3) is None, "no turn in the window"
+    # each piece is named by its own turn
+    named = [tc.label_window(turns3, s, s + len(p) / sr, dominant=0.55)
+             for s, p in tc.split_audio_by_turns(speech, 0.0, turns3, guard_s=0)[0]]
+    assert named == ["A", "B", "A"], named
+
+    # the session: a drained window becomes one chunk per turn, the tail waits
+    class W3:
+        def turns(self):
+            return turns3
+    s3 = w.MeetingSession.__new__(w.MeetingSession)
+    s3._teams, s3._carry_tail, got = W3(), None, []
+    s3._submit_chunk = lambda audio, **k: got.append((round(k["start_rel"], 1), k["cut"],
+                                                      k["extra"]["turn_cut"]))
+    assert s3._submit_by_speaker(speech2, now_rel=10.0) is True
+    assert [g[1] for g in got] == ["speaker", "speaker", "smart"] and all(g[2] for g in got)
+    assert [g[0] for g in got][0] == 0.0
+    assert s3._carry_tail is not None and len(s3._carry_tail) > 0
+    got.clear()
+    assert s3._submit_by_speaker(speech, now_rel=10.0, final=True) is True
+    assert [g[1] for g in got] == ["speaker", "speaker", "final"]
+    s3._teams = None
+    assert s3._submit_by_speaker(speech, now_rel=10.0) is False
+    assert "self._submit_by_speaker(audio, now_rel)" in inspect.getsource(
+        w.MeetingSession._rotation_loop)
+
+    # session wiring: labels from the watcher's turns, by the chunk's window
+    class W:
+        def turns(self):
+            return [{"speaker": "A", "t0": 0, "t1": 10}, {"speaker": "B", "t0": 10, "t1": 20}]
+    s = w.MeetingSession.__new__(w.MeetingSession)
+    s.chunk_seconds = 10
+    s._teams = W()
+    lab = s._teams_labelled([{"timestamp_rel": 0, "dur": 10}, {"timestamp_rel": 10}])
+    assert [c["speaker"] for c in lab] == ["A", "B"]
+    s._teams = None
+    assert s._teams_labelled([{"timestamp_rel": 0}]) == [{"timestamp_rel": 0}]
+    assert "self._start_teams_captions(stamp)" in inspect.getsource(w.MeetingSession.start)
+    assert "self._stop_teams_captions()" in inspect.getsource(w.MeetingSession.stop)
+    assert "toggle_teams_speaker_names" in w.LiaApp._settings_action_map(w.LiaApp.__new__(w.LiaApp))
+    base = os.path.dirname(os.path.abspath(w.__file__))
+    sw = open(os.path.join(base, "settings_window.py"), encoding="utf-8").read()
+    assert '"toggle_teams_speaker_names"' in sw
+
+
+_test("meetings: speaker names from the Teams live captions", t_teams_caption_names)
 
 
 def t_portable_self_update():

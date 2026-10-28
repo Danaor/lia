@@ -962,12 +962,17 @@ APP_JS = r"""
 
     // --- info line + primary actions, OR the live bar while a meeting runs ---
     var info;
+    // "Summarize when a meeting ends" picks the primary End button (2026-10-28)
+    var autoSum = !!cfg("meeting_auto_summary",true) && cfg("summary_model","off")!=="off";
     if(active){
       info = '<div class="home-live">'+RK.orb('sm busy')+
         '<span class="grow lv-t"><span class="rdot" style="--d:'+RK.ad(1.6667)+'"></span>Meeting in progress</span>'+
         (S.live_transcript_available ? '<button class="btn" data-call="open_live_transcript" data-args="[]">Open live transcript</button>':'')+
-        '<button class="btn lia" style="--d:'+RK.ad(4.8)+'" data-call="home_stop_meeting" data-args="[true]">End &amp; summarize</button>'+
-        '<button class="btn" data-call="home_stop_meeting" data-args="[false]">End</button>'+
+        (autoSum
+          ? '<button class="btn lia" style="--d:'+RK.ad(4.8)+'" data-call="home_stop_meeting" data-args="[true]">End &amp; summarize</button>'+
+            '<button class="btn" data-call="home_stop_meeting" data-args="[false]">End</button>'
+          : '<button class="btn lia" style="--d:'+RK.ad(4.8)+'" data-call="home_stop_meeting" data-args="[false]">End</button>'+
+            '<button class="btn" data-call="home_stop_meeting" data-args="[true]">End &amp; summarize</button>')+
         '<button class="btn danger" data-call="cancel_meeting" data-args="[]">Discard</button>'+
         '</div>';
     } else {
@@ -1489,6 +1494,13 @@ APP_JS = r"""
           swb(!!cfg("auto_detect_meetings",false), "toggle_auto_detect_meetings"))+
         srow('Hide meeting windows', 'No meeting cards, prompts or notices on screen, and the summary does not open by itself. Run meetings from the tray.',
           swb(!!cfg("meeting_windows_hidden",false), "toggle_meeting_windows_hidden"))+
+        (cfg("summary_model","off")==="off"
+          ? srow('Summarize when a meeting ends', 'Choose a summary model on the Models page first.',
+              swb(false, "toggle_meeting_auto_summary", true), 'disabledrow')
+          : srow('Summarize when a meeting ends', 'Off = the transcript only. Summarize a meeting later from Home, or choose End &amp; summarize when you stop.',
+              swb(!!cfg("meeting_auto_summary",true), "toggle_meeting_auto_summary")))+
+        srow('Speaker names from Teams', 'Reads who is speaking from the live captions in your Teams window and puts the names on the transcript. Turn on captions in Teams (Settings > Accessibility > Always show captions). Nothing is sent anywhere.',
+          swb(!!cfg("teams_speaker_names",false), "toggle_teams_speaker_names"))+
         srow('Live transcript updates every',
           'Lower = snappier, more transcription calls. A running meeting keeps its interval until it ends.',
           '<select data-select="set_meeting_chunk_seconds" style="max-width:200px">'+
@@ -1865,6 +1877,8 @@ APP_JS = r"""
         acts += '<button class="btn primary" data-call="open_meeting_path" data-args=\''+esc(pj)+'\'>'+RK.icon('edit',{size:15})+' Edit summary</button>'+
                 '<button class="btn" data-call="copy_meeting_summary" data-args=\''+esc(pj)+'\'>'+RK.icon('copy',{size:15})+' Copy summary</button>';
       }
+      if(!d.has_summary && cfg("summary_model","off")!=="off")
+        acts += '<button class="btn primary" data-call="summarize_meeting_for" data-args=\''+esc(pj)+'\'>'+RK.icon('summarize',{size:15})+' Summarize</button>';
       acts += '<button class="btn" data-call="open_meeting_transcript" data-args=\''+esc(pj)+'\'>'+RK.icon('file',{size:15})+' Open transcript</button>';
       acts += '<button class="btn" data-call="rename_meeting_for" data-args=\''+esc(pj)+'\'>'+RK.icon('edit',{size:15})+' Rename</button>';
       if(d.diarized)
@@ -1940,6 +1954,7 @@ APP_JS = r"""
     {t:"Home server (client)", k:"home server serve remote client שרת בית מרוחק לקוח", p:"server", f:"This PC"},
     {t:"Auto-detect meetings", k:"auto detect meetings zoom teams meet זיהוי פגישות", p:"meetings", f:"Auto-detect"},
     {t:"Live transcript interval", k:"live transcript interval chunk realtime תמלול חי מקצב מרווח", p:"meetings", f:"Live transcript updates"},
+    {t:"Summarize when a meeting ends", k:"auto summary automatic end meeting summarize סיכום אוטומטי סיום פגישה", p:"meetings", f:"Summarize when a meeting ends"},
     {t:"Summary template", k:"summary template technical minutes general תבנית סיכום", p:"meetings", f:"Template"},
     {t:"Summary language", k:"summary language שפת סיכום", p:"meetings", f:"Summary language"},
     {t:"Vocabulary terms", k:"vocabulary terms glossary מילון מונחים אוצר מילים", p:"vocab", f:"Manual terms"},

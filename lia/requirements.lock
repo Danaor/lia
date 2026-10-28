@@ -327,6 +327,10 @@ colorama==0.4.6 \
     --hash=sha256:08695f5cb7ed6e0531a20572697297273c47b8cae5a63ffc6d6ed5c201be6e44 \
     --hash=sha256:4f1d9991f5acc0ca119f9d443620b77f9d6b33703e51011c16baf57afb285fc6
     # via tqdm
+comtypes==1.4.16 \
+    --hash=sha256:cd66d1add01265cface4df51ba1e31cd1657e04463c281c802e737e79e1ba93c \
+    --hash=sha256:e18d85179ff12955524c5a8c3bc09cb3c0d890f1da4d7123d14244c7b78f84c8
+    # via -r requirements.txt
 ctranslate2==4.8.1 \
     --hash=sha256:0030670278a73cae09dff9bca72cdd248af61f9367257f18db9b3b94fbb3a50d \
     --hash=sha256:079976cbce3a68de04bf9948d08c96beb86df44e5cd2974e4187bc9c9bb388f3 \

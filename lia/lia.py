@@ -379,7 +379,7 @@ if sys.platform == "win32":
     ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
 
 # --- Configuration ---
-APP_VERSION = "1.6.16"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
+APP_VERSION = "1.6.17"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Lia")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -629,6 +629,7 @@ DEFAULT_CONFIG = {
     # hears the user, the meeting mic is the wrong device: promote the backup
     # to be the meeting mic, once, with an overlay. Needs meeting_backup_mic.
     "meeting_mic_auto_fallback": True,
+    "meeting_empty_local_retry": True,   # a chunk the cloud returned empty twice -> local Whisper
     # Retention (days) for each kept format — pruned at startup by file age.
     # WAV: lossless but ~115MB/hour → short window. Opus: ~11MB/hour → long
     # archive (still re-transcribable, quality-equivalent for ASR).
@@ -1038,6 +1039,20 @@ DEFAULT_CONFIG = {
     # automatic start/stop prompts, no meeting notices or balloons, and the
     # summary does not open by itself; the tray runs the meeting.
     "meeting_windows_hidden": False,
+    # Summarize when a meeting ends (2026-10-28, Naor). Decides every end
+    # that does not choose itself (the Stop pill, the call-ended card, the
+    # silence stop); "End & summarize" / "End" still choose explicitly.
+    # Off = the transcript only, summarized later from Home or the card.
+    "meeting_auto_summary": True,
+    # Speaker names from Teams (2026-10-27): while a meeting records, read the
+    # names Teams writes next to its live captions in the user's own Teams
+    # window (UI Automation, nothing leaves the PC) and put them on the
+    # transcript. Needs captions on in Teams ("Always show captions").
+    # _diagnostics: a local JSONL of what the reader saw (Teams window
+    # structure until captions are found, then the captions region) under
+    # %APPDATA%\Lia\diagnostics, kept 7 days - the reader is new.
+    "teams_speaker_names": False,
+    "teams_captions_diagnostics": True,
     # Diarized-meeting hybrid quality upgrade: after AssemblyAI returns
     # speaker-labelled utterances, re-transcribe each utterance's audio
     # slice via OpenAI gpt-4o-transcribe for much better Hebrew text.
@@ -1496,16 +1511,24 @@ def flow_chunk_paragraphs(chunks, para_seconds=60.0, enabled=True, live=False):
     ("in flight"), so a closing dot there is Whisper's artifact, never a real
     end (Naor 2026-09-16); (2) a still-pending chunk is a not-yet-arrived
     chunk, not a lost one, so it closes the paragraph WITHOUT the "audio lost"
-    marker. Pure (works on plain dicts) so it is testable without a session."""
-    items, cur = [], {"ts": None, "parts": []}
+    marker. Pure (works on plain dicts) so it is testable without a session.
+    A chunk may carry "speaker" (a name from the Teams captions, or None): a
+    change of speaker starts a new paragraph, and a named paragraph reads
+    "<name>: <text>". Chunks without the key are laid out exactly as before."""
+    items, cur = [], {"ts": None, "parts": [], "spk": None}
 
     def close():
         if cur["parts"]:
-            items.append(("text", cur["ts"], " ".join(cur["parts"])))
-        cur["ts"], cur["parts"] = None, []
+            text = " ".join(cur["parts"])
+            if cur["spk"]:
+                text = "%s: %s" % (cur["spk"], text)
+            items.append(("text", cur["ts"], text))
+        cur["ts"], cur["parts"], cur["spk"] = None, [], None
 
     prev = None
     for c in sorted(chunks, key=lambda c: c["index"]):
+        if (c.get("speaker") or None) != cur["spk"] and cur["parts"]:
+            close(); prev = None
         st, ts = c.get("status"), c.get("timestamp_rel", 0)
         if st == "empty":
             close(); prev = None
@@ -1526,6 +1549,7 @@ def flow_chunk_paragraphs(chunks, para_seconds=60.0, enabled=True, live=False):
         if not enabled or prev is None or not cur["parts"]:
             close()
             cur["ts"], cur["parts"] = ts, [clean]
+            cur["spk"] = c.get("speaker") or None
         else:
             adj, kind = soften_chunk_boundary(
                 cur["parts"][-1], clean, prev.get("cut", "drain"),
@@ -1534,6 +1558,7 @@ def flow_chunk_paragraphs(chunks, para_seconds=60.0, enabled=True, live=False):
             if kind == "break" and (ts - cur["ts"]) >= para_seconds:
                 close()
                 cur["ts"], cur["parts"] = ts, [clean]
+                cur["spk"] = c.get("speaker") or None
             else:
                 cur["parts"].append(clean)
         prev = c
@@ -13210,6 +13235,117 @@ class MeetingSession:
         # so a rotation already in flight when the user clicks Cancel doesn't
         # spawn a new (paid) transcription.
         self._cancelled = False
+        # Speaker names read from the Teams live captions (chunked meetings,
+        # config teams_speaker_names); None when off. See teams_captions.py.
+        self._teams = None
+
+    def _start_teams_captions(self, stamp):
+        """Chunked meetings: start reading speaker names from the Teams live
+        captions when the user turned it on. Best-effort, never blocks start."""
+        try:
+            if not bool(self.app.config.get("teams_speaker_names", False)):
+                return
+            import teams_captions
+            diag = (os.path.join(CONFIG_DIR, "diagnostics")
+                    if self.app.config.get("teams_captions_diagnostics", True) else None)
+            self._teams = teams_captions.TeamsCaptionWatcher(
+                self.start_time, diag_dir=diag, stamp=stamp).start()
+        except Exception as e:
+            log.info("Teams speaker names unavailable: %s", e)
+            self._teams = None
+
+    def _teams_status_line(self, final=False):
+        """One line for the transcript header: where the speaker names stand."""
+        t = self._teams
+        try:
+            names = t.speakers()
+            if names:
+                return "Speaker names from Teams captions: " + ", ".join(names)
+            if final:
+                return "Speaker names: none (no Teams live captions were read)"
+            st = t.state
+            if st.get("error", "").startswith("UI Automation"):
+                return "Speaker names: unavailable (" + st["error"] + ")"
+            if not st.get("teams_windows"):
+                return "Speaker names: Teams is not open"
+            if not st.get("captions_found"):
+                return ("Speaker names: waiting for Teams live captions (turn on "
+                        "captions in the Teams meeting)")
+            return "Speaker names: Teams captions found, nobody has spoken yet"
+        except Exception:
+            return "Speaker names: -"
+
+    def _stop_teams_captions(self, grace=1.5):
+        if getattr(self, "_teams", None) is not None:
+            try:
+                self._teams.stop(grace=grace)
+            except Exception:
+                pass
+
+    def _submit_by_speaker(self, audio, now_rel, final=False):
+        """Teams speaker names on: submit this drained window cut at the
+        speaker changes the captions show (teams_captions.split_audio_by_turns)
+        - each chunk is one speaker's turn, transcribed and named alone - and
+        carry the not-yet-captioned tail into the next window. False = no
+        caption turn touches the window; the caller cuts as usual."""
+        t = getattr(self, "_teams", None)
+        if t is None or audio is None or len(audio) == 0:
+            return False
+        try:
+            import teams_captions
+            w0 = now_rel - len(audio) / 16000.0
+            res = teams_captions.split_audio_by_turns(
+                audio, w0, t.turns(), guard_s=0.0 if final else 2.5)
+        except Exception as e:
+            log.debug("Speaker cut failed (usual cut): %s", e)
+            return False
+        if res is None:
+            return False
+        pieces, carry = res
+        if not final:
+            self._carry_tail = carry if carry is not None and len(carry) else None
+        for i, (start, piece) in enumerate(pieces):
+            last = i == len(pieces) - 1
+            if len(piece) < 1600:          # < 0.1 s: nothing to transcribe
+                continue
+            cut = ("final" if final else "smart") if last else "speaker"
+            pause_s = 0.0
+            if last and not final and carry is not None and len(carry):
+                pause_s = pause_seconds_at_cut(piece, carry)
+            self._submit_chunk(piece, blocking=final, cut=cut, pause_s=pause_s,
+                               start_rel=start, extra={"turn_cut": True})
+        if final and carry is not None and len(carry) >= 8000:
+            self._submit_chunk(carry, blocking=True, cut="final",
+                               start_rel=now_rel - len(carry) / 16000.0,
+                               extra={"turn_cut": True})
+        if len(pieces) > 1:
+            log.debug("Meeting window cut at %d speaker change(s)", len(pieces) - 1)
+        return True
+
+    def _teams_labelled(self, chunks):
+        """Chunk records with "speaker" set from the Teams caption turns (the
+        chunk's own time window). Unchanged when the reader is off."""
+        t = self._teams
+        if t is None:
+            return chunks
+        try:
+            turns = t.turns()
+            if not turns:
+                return chunks
+            import teams_captions
+            out = []
+            for c in chunks:
+                a = float(c.get("timestamp_rel", 0) or 0)
+                b = a + float(c.get("dur") or self.chunk_seconds)
+                # A chunk cut at the speaker changes is one turn: the speaker
+                # holding most of it names it.
+                dom = 0.55 if c.get("turn_cut") else 0.7
+                out.append(dict(c, speaker=teams_captions.label_window(
+                    turns, a, b, dominant=dom)))
+            return out
+        except Exception as e:
+            log.debug("Teams speaker labels failed: %s", e)
+            return chunks
 
     @staticmethod
     def _resolve_meeting_mic(app):
@@ -13347,6 +13483,7 @@ class MeetingSession:
                          self.chunk_seconds, self._live_path,
                          self._wav_path or "off")
                 self._open_track_writers(stamp)
+                self._start_teams_captions(stamp)
 
             # Status sidecar next to the LIVE file: the window reads the real
             # phase from here rather than guessing from the LIVE file's presence.
@@ -13405,6 +13542,9 @@ class MeetingSession:
 
         # Transcribe whatever audio was in the current recorder
         self._finalise_current_chunk()
+        # The last words' captions land ~1 s after the audio: read a moment
+        # longer, then stop (the turns stay for the transcript writer).
+        self._stop_teams_captions()
 
         duration_sec = self.stop_time - self.start_time
         log.info("Meeting stopped (duration=%.1fs%s)",
@@ -13558,6 +13698,7 @@ class MeetingSession:
         self._stop_event.set()
         self.stop_time = time.time()
         self._set_status(phase="cancelled")
+        self._stop_teams_captions(grace=0)
         # Let the rotation loop see the stop event and exit. Deliberately do
         # NOT call _finalise_current_chunk() — that would transcribe the last
         # chunk (and cost tokens), which is the whole point of cancelling.
@@ -13626,6 +13767,8 @@ class MeetingSession:
                     "Updates as chunks are transcribed (~every %ds). The final "
                     "file (with the summary) replaces this at Stop.\n\n"
                     % (start_dt.strftime("%Y-%m-%d %H:%M"), self.chunk_seconds))
+            if getattr(self, "_teams", None) is not None:
+                head = head.rstrip("\n") + "\n" + self._teams_status_line() + "\n\n"
             body = (self._assemble_live_markdown() if self.diarize_mode
                     else self._assemble_transcript_markdown(live=True))
             with self._live_lock:
@@ -14210,6 +14353,14 @@ class MeetingSession:
             # the user's choice: respect it, never switch on it. A wrong device
             # still hums a little and keeps the rescue below.
             if self._mic_is_muted(mic_audio):
+                # ...unless the mic was plugged in after Lia started: then
+                # the zeros are a dead stream, not a mute (2026-10-28 13:30)
+                if getattr(self.app, "_mic_arrived_at", None) is not None:
+                    return self._switch_to_backup_mic(
+                        backup_audio, mic_rms, backup_rms, "it was plugged in after Lia "
+                        "started and sends digital silence",
+                        "🎤  Your headset was reconnected - using your "
+                        "dictation mic for this meeting")
                 self._mic_fallback_streak = 0
                 if (backup_rms >= 2.0 * self.MIC_SILENT_RMS
                         and not getattr(self, "_mic_muted_logged", False)):
@@ -14227,35 +14378,41 @@ class MeetingSession:
             self._mic_fallback_streak = getattr(self, "_mic_fallback_streak", 0) + 1
             if self._mic_fallback_streak < self.MIC_FALLBACK_WINDOWS:
                 return mic_audio, backup_audio
-            self._mic_fallback_done = True
-            old_idx = self._input_device_index
-            old_rec = self._mic_recorder
-            self._mic_recorder, self._backup_recorder = self._backup_recorder, None
-            self._input_device_index = getattr(self, "_backup_device_index", None)
-            # Phase 3.2: STOP the abandoned recorder. It was dropped while its
-            # PortAudio callback kept appending to a buffer nobody drained
-            # (~115 MB/h at 16 kHz) and kept the device open all meeting.
-            if old_rec is not None:
-                try:
-                    old_rec.stop()
-                except Exception as e:
-                    log.debug("Meeting: stopping the silent mic failed: %s", e)
-            # A HANDLED recovery, not an error: the meeting keeps transcribing on
-            # the dictation mic. Log at WARNING (useful diagnostic; the user may
-            # want to fix the meeting-mic choice) and show a calm, NON-error GREEN
-            # notice - once per meeting (guarded by _mic_fallback_done above). It
-            # bypasses silent_mode on purpose: a mic switch changes WHAT is being
-            # recorded, so the user should get one heads-up even in silent mode.
-            log.warning("Meeting: the meeting mic (device %s) is silent (rms=%.5f) while "
-                        "the dictation mic hears you (rms=%.5f) - switched the meeting "
-                        "mic to the dictation mic (device %s)",
-                        old_idx, mic_rms, backup_rms, self._input_device_index)
-            self._notice("🎤  Using your dictation mic for this meeting")
-            # this window: the backup audio IS the user's side now
-            return backup_audio, None
+            return self._switch_to_backup_mic(
+                backup_audio, mic_rms, backup_rms, "it is silent while the dictation mic hears you",
+                "🎤  Using your dictation mic for this meeting")
         except Exception as e:
             log.debug("mic auto-fallback check failed: %s", e)
             return mic_audio, backup_audio
+
+    def _switch_to_backup_mic(self, backup_audio, mic_rms, backup_rms, why, notice):
+        """Promote the backup recorder to be the meeting mic (no device is
+        reopened), once. Returns (mic_audio, backup_audio) for this window:
+        the backup's audio IS the user's side now."""
+        self._mic_fallback_done = True
+        old_idx = self._input_device_index
+        old_rec = self._mic_recorder
+        self._mic_recorder, self._backup_recorder = self._backup_recorder, None
+        self._input_device_index = getattr(self, "_backup_device_index", None)
+        # Phase 3.2: STOP the abandoned recorder. It was dropped while its
+        # PortAudio callback kept appending to a buffer nobody drained
+        # (~115 MB/h at 16 kHz) and kept the device open all meeting.
+        if old_rec is not None:
+            try:
+                old_rec.stop()
+            except Exception as e:
+                log.debug("Meeting: stopping the silent mic failed: %s", e)
+        # A HANDLED recovery, not an error: the meeting keeps transcribing on
+        # the dictation mic. Log at WARNING (useful diagnostic; the user may
+        # want to fix the meeting-mic choice) and show a calm, NON-error GREEN
+        # notice - once per meeting (guarded by _mic_fallback_done). It
+        # bypasses silent_mode on purpose: a mic switch changes WHAT is being
+        # recorded, so the user should get one heads-up even in silent mode.
+        log.warning("Meeting: the meeting mic (device %s, rms=%.5f) - %s; switched "
+                    "the meeting mic to the dictation mic (device %s, rms=%.5f)",
+                    old_idx, mic_rms, why, self._input_device_index, backup_rms)
+        self._notice(notice)
+        return backup_audio, None
 
     def _check_mic_channel_silent(self, mic_audio, loop_audio, backup_audio=None):
         """Nudge ONCE when the mic channel stays ~silent for several rotations
@@ -14431,6 +14588,9 @@ class MeetingSession:
             try:
                 self._chunk_lock_acquire()
                 audio = self._drain_audio()
+                # The drained audio ends NOW (meeting seconds); the carried
+                # tail goes before it.
+                now_rel = (time.time() - self.start_time) if self.start_time else 0.0
                 audio = self._with_carry(audio)
                 if audio is not None and 0 < len(audio) < 8000:
                     # Too short for a chunk (e.g. right after a Recap drained
@@ -14449,6 +14609,10 @@ class MeetingSession:
                         voiced = True
                     if voiced:
                         self._last_voice_ts = time.time()
+                    # Speaker names from Teams: cut this window at the speaker
+                    # changes so every chunk is one speaker's turn.
+                    if self._submit_by_speaker(audio, now_rel):
+                        continue
                     # Smart boundary: cut at the quietest point near the end and
                     # carry the tail into the next chunk, so the 45s rotation
                     # never clips a word mid-syllable. Kill-switch
@@ -14502,8 +14666,11 @@ class MeetingSession:
         it, then closes the recorders for good."""
         self._chunk_lock_acquire()
         try:
-            audio = self._with_carry(self._drain_audio())
-            if audio is not None and len(audio) >= 8000:
+            drained = self._drain_audio()
+            now_rel = (time.time() - self.start_time) if self.start_time else 0.0
+            audio = self._with_carry(drained)
+            if audio is not None and len(audio) >= 8000 and not self._submit_by_speaker(
+                    audio, now_rel, final=True):
                 self._submit_chunk(audio, blocking=True, cut="final")
         except Exception as e:
             log.error("Meeting final chunk drain failed: %s", e)
@@ -14521,13 +14688,125 @@ class MeetingSession:
             log.error("Meeting recorder close failed: %s", e)
 
     # ---- chunk transcription ----
-    def _submit_chunk(self, audio_np, blocking=False, cut="drain", pause_s=0.0):
+    SHORT_PIECE_S = 3.0
+
+    def _short_piece_language(self, audio_np):
+        """The language for one chunk. A piece under SHORT_PIECE_S seconds
+        (the speaker cuts make many: "Ronen.", "yes, yes") gives an
+        auto-detecting model too little to go on - in the 2026-10-28 meeting
+        three Hebrew one-liners came back as invented English ("I can't",
+        "Yo, hombre"). So a short piece gets the meeting's language: the
+        script most of its text so far is written in (the primary language
+        before there is any). Longer pieces, and a meeting with a set
+        language, keep the configured one."""
+        lang = self._chunk_language
+        if lang not in (None, "", "auto"):
+            return lang
+        try:
+            if len(audio_np) / 16000.0 >= self.SHORT_PIECE_S:
+                return lang
+            with self._chunks_lock:
+                text = " ".join(c.get("text") or "" for c in self.chunks
+                                if c.get("status") == "ok")
+            he = sum(1 for ch in text if "\u0590" <= ch <= "\u05ff")
+            latin = sum(1 for ch in text if ch.isascii() and ch.isalpha())
+            if he + latin < 40:
+                primary = self.app.config.get("primary_language")
+                return primary if primary in ("he", "en") else lang
+            if he >= 0.5 * (he + latin):
+                return "he"
+            if latin >= 0.85 * (he + latin):
+                return "en"
+        except Exception:
+            pass
+        return lang
+
+    # A chunk that is mostly silence with one short phrase in it ("טוב",
+    # "מעולה", "נתן לך את הג'וב ID") comes back EMPTY from gpt-transcribe, and
+    # an identical retry is empty again (2026-10-28 14:37: 9 "[transcription
+    # failed]" chunks, 0.2-2.2 s of sound in 9-11 s; the local model heard
+    # words in 6 of them). So the retry sends only the part with sound, and
+    # a still-empty result goes to the local Whisper, already loaded as the
+    # cloud fallback (no extra API call).
+    VOICED_FRAME_RMS = 0.01
+    VOICED_PAD_S = 0.6
+
+    @classmethod
+    def _voiced_span(cls, audio, sr=16000):
+        """(start, end) samples around the frames with sound, padded; None
+        when no 50 ms frame passes VOICED_FRAME_RMS."""
+        a = np.asarray(audio, dtype=np.float32)
+        hop = sr // 20
+        n = len(a) // hop
+        if n == 0:
+            return None
+        rms = np.sqrt((a[:n * hop].reshape(n, hop) ** 2).mean(axis=1))
+        idx = np.nonzero(rms > cls.VOICED_FRAME_RMS)[0]
+        if len(idx) == 0:
+            return None
+        pad = int(cls.VOICED_PAD_S * sr)
+        return (max(0, int(idx[0]) * hop - pad),
+                min(len(a), (int(idx[-1]) + 1) * hop + pad))
+
+    def _local_retry_transcriber(self):
+        """The loaded local Whisper, when it is not already the meeting's
+        engine; None otherwise (Parakeet has no Hebrew)."""
+        if not bool(self.app.config.get("meeting_empty_local_retry", True)):
+            return None
+        t = getattr(self.app, "_local_transcriber", None)
+        ev = getattr(self.app, "_local_load_event", None)
+        if (t is None or t is self._chunk_transcriber
+                or not isinstance(t, FasterWhisperTranscriber)
+                or ev is None or not ev.is_set()
+                or getattr(t, "model", None) is None):
+            return None
+        return t
+
+    def _retry_empty_chunk(self, idx, audio_np, decode, language):
+        """The retry of a chunk with speech that came back empty. Returns
+        (text, local_heard_nothing): True when the local model also found no
+        words - then it is a pause, not lost speech. Never raises."""
+        text = ""
+        try:
+            span = self._voiced_span(audio_np)
+            if span is not None and span[1] - span[0] < 0.9 * len(audio_np):
+                log.info("Meeting chunk #%d: retrying on the %.1f s with sound",
+                         idx, (span[1] - span[0]) / 16000.0)
+                text = decode(audio_np[span[0]:span[1]]) or ""
+            else:
+                text = decode() or ""
+        except Exception as e:
+            log.warning("Meeting chunk #%d: retry failed: %s", idx, e)
+        if text:
+            return text, False
+        local = self._local_retry_transcriber()
+        if local is None:
+            return "", False
+        try:
+            with decoder_profile("chunk"):
+                # no vocabulary prompt: a mostly-silent clip copies it (S43)
+                text = local.transcribe(
+                    audio_np, language=language or self.app._get_language(),
+                    beam_size=1, task="transcribe", bias_ok=False) or ""
+            text = collapse_repetition_hallucinations(text) if text else ""
+            log.info("Meeting chunk #%d: the local model heard %d chars",
+                     idx, len(text))
+        except Exception as e:
+            log.warning("Meeting chunk #%d: local retry failed: %s", idx, e)
+            return "", False
+        return text, not text
+
+    def _submit_chunk(self, audio_np, blocking=False, cut="drain", pause_s=0.0,
+                      start_rel=None, extra=None):
         """In normal mode: reserve an index and transcribe in a thread.
         In diarize mode: append the chunk's audio to the meeting WAV file
         — AssemblyAI will process the whole thing on stop().
-        `cut` ("smart" / "drain" / "final") + `pause_s` describe how this
-        chunk's END was chosen; the transcript flow pass uses them to decide
-        whether the chunk's closing period is a real sentence end."""
+        `cut` ("smart" / "drain" / "final" / "speaker") + `pause_s` describe
+        how this chunk's END was chosen; the transcript flow pass uses them to
+        decide whether the chunk's closing period is a real sentence end.
+        start_rel: the chunk's start in meeting seconds when the caller knows
+        it (several pieces of one window); else it is derived from now.
+        extra: more keys for the chunk record."""
         if self._cancelled:
             return
         # Safety-net WAV: append raw audio whenever a writer is open. Diarized
@@ -14552,14 +14831,20 @@ class MeetingSession:
                 rel_ts = max(0.0, rel_ts - len(audio_np) / 16000.0)
             except Exception:
                 pass
-            self.chunks.append({
+            if start_rel is not None:
+                rel_ts = max(0.0, float(start_rel))
+            rec = {
                 "index": idx,
                 "timestamp_rel": rel_ts,
+                "dur": len(audio_np) / 16000.0,
                 "text": "",
                 "status": "pending",
                 "cut": cut,
                 "pause_s": float(pause_s or 0.0),
-            })
+            }
+            if extra:
+                rec.update(extra)
+            self.chunks.append(rec)
 
         def worker():
             if self._cancelled:
@@ -14579,17 +14864,21 @@ class MeetingSession:
                     # "chunk" decoder profile (DECODER_PROFILES; currently the
                     # library defaults, kept as the per-call-shape seam).
                     # Cloud backends ignore the profile.
-                    def _decode():
+                    chunk_lang = self._short_piece_language(audio_np)
+                    short_gap = (bool(extra and extra.get("turn_cut"))
+                                 and len(audio_np) / 16000.0 < self.SHORT_PIECE_S)
+
+                    def _decode(audio=audio_np):
                         with decoder_profile("chunk"):
                             if self._chunk_transcriber is not None:
                                 return self._chunk_transcriber.transcribe(
-                                    audio_np,
-                                    language=self._chunk_language,
+                                    audio,
+                                    language=chunk_lang,
                                     beam_size=1,
                                     task="transcribe",
                                 )
                             return self.app._transcribe_with_fallback(
-                                audio_np,
+                                audio,
                                 language=self.app._get_language(),
                                 beam_size=1,
                                 task="transcribe",
@@ -14610,12 +14899,24 @@ class MeetingSession:
                     # when the router ran one; no detection = the old rule.
                     det = self._chunk_detection()
                     speechy = det is None or det >= self.CHUNK_SPEECH_MIN_DETECT
+                    # A short piece cut at a speaker change (2026-10-28: 2.4 s
+                    # of a turn's tail, room noise and half a word) that the
+                    # model calls empty is a gap between turns, not lost
+                    # speech: no retry, no "[transcription failed]" marker.
+                    if (short_gap and not text and first_err is None):
+                        speechy = False
                     if not text and _rms_energy(audio_np) >= 0.005 and speechy:
                         log.info("Meeting chunk #%d: %s on speech - retrying once",
                                  idx, ("failed (%s)" % first_err) if first_err
                                  else "empty result")
                         time.sleep(2.0)
-                        text = _decode() or ""   # a 2nd failure -> "failed" below
+                        if first_err is None:
+                            text, no_words = self._retry_empty_chunk(
+                                idx, audio_np, _decode, chunk_lang)
+                            if no_words:
+                                speechy = False   # two engines, no words: a pause
+                        else:
+                            text = _decode() or ""   # a 2nd failure -> "failed" below
                     elif first_err is not None:
                         raise first_err          # quiet audio: no retry, as before
                 text = text or ""
@@ -14662,7 +14963,10 @@ class MeetingSession:
                 status = "failed"
             else:
                 status = "empty"   # silence / noise — omitted from the transcript
-                if _rms_energy(audio_np) >= 0.005:
+                if _rms_energy(audio_np) >= 0.005 and det is None:
+                    log.info("Meeting chunk #%d: %.1f s with sound but no words "
+                             "- omitted", idx, len(audio_np) / 16000.0)
+                elif _rms_energy(audio_np) >= 0.005:
                     log.info("Meeting chunk #%d: sound but no confident speech "
                              "(detection %.2f) - noise, not a lost chunk", idx, det)
 
@@ -14672,7 +14976,14 @@ class MeetingSession:
                         c["text"] = text
                         c["status"] = status
                         break
-            log.info("Meeting chunk #%d: %d chars (%s)", idx, len(text), status)
+            if status == "failed":
+                # where it sits in the recording, so a lost piece can be
+                # replayed exactly (2026-10-28: its bounds were nowhere)
+                log.info("Meeting chunk #%d: 0 chars (failed) - meeting %.2f-%.2f s",
+                         idx, rec["timestamp_rel"],
+                         rec["timestamp_rel"] + rec["dur"])
+            else:
+                log.info("Meeting chunk #%d: %d chars (%s)", idx, len(text), status)
             # Keep the rolling LIVE transcript current — crash-safety +
             # "peek at the transcript mid-meeting" (tray → Live Transcript).
             self._write_live_file()
@@ -15164,6 +15475,8 @@ class MeetingSession:
                     on_open=lambda p=md_path: os.startfile(p),
                     on_folder=folder_cb,
                     on_rename=_rename_cb,
+                    on_summarize=getattr(self.app, "_summarize_card_action",
+                                         lambda p: None)(md_path),
                     gen=gen)
             self.app._meeting_done_notify(
                 "Summary ready" if (self.summarize and self.last_summary)
@@ -15707,6 +16020,8 @@ class MeetingSession:
             para_s = float(cfg.get("meeting_transcript_paragraph_seconds", 60))
         except Exception:
             para_s = 60.0
+        if getattr(self, "_teams", None) is not None:
+            chunks = self._teams_labelled(chunks)
         return flow_chunk_paragraphs(chunks, para_seconds=para_s,
                                      enabled=enabled, live=live)
 
@@ -15837,8 +16152,10 @@ class MeetingSession:
         elif self.summarize and plain:
             self.app.overlay.meeting_status_step(
                 "summarize", gen=getattr(self, "_card_gen", None))
+            _teams_n = (len(self._teams.speakers())
+                        if getattr(self, "_teams", None) is not None else 0)
             _meta = self._meta_for_summary(
-                duration_sec,
+                duration_sec, num_speakers=(_teams_n or None),
                 lang=lang_pack.resolve_summary_lang(self.app.config, plain))
             summary_md = self._summary_until_discard(
                 plain, _meta, getattr(self, "_card_gen", None), _stop)
@@ -15866,6 +16183,8 @@ class MeetingSession:
                         f"source: {self.source}")
         if self.attendees:
             sections.append("Invited: " + "; ".join(self.attendees))
+        if getattr(self, "_teams", None) is not None:
+            sections.append(self._teams_status_line(final=True))
         sections.append("")
 
         if summary_md:
@@ -18021,18 +18340,18 @@ def _stamp_lia_launcher(exe_path):
         return False
     try:
         vi = VSVersionInfo(
-            ffi=FixedFileInfo(filevers=(1, 6, 16, 0), prodvers=(1, 6, 16, 0),
+            ffi=FixedFileInfo(filevers=(1, 6, 17, 0), prodvers=(1, 6, 17, 0),
                               mask=0x3f, flags=0x0, OS=0x40004,
                               fileType=0x1, subtype=0x0),
             kids=[
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.6.16.0'),
+                    StringStruct('FileVersion', '1.6.17.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.6.16.0'),
+                    StringStruct('ProductVersion', '1.6.17.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -20508,7 +20827,7 @@ class OverlayNotification:
 
     def show_prompt(self, header, body, button_label, on_action,
                     on_dismiss=None, duration_ms=30000, on_timeout=None,
-                    secondary_label=None, on_secondary=None):
+                    secondary_label=None, on_secondary=None, tag=None):
         """Show a clickable meeting prompt card (white, matches the status
         card since 2026-09-17). Primary button = on_action; an optional
         secondary button (secondary_label/on_secondary) sits beside it; the ✕
@@ -20519,6 +20838,9 @@ class OverlayNotification:
         Defaults to on_dismiss - pass it separately when a timeout means
         something different from an explicit ✕ (the call-ended Stop prompt:
         ✕ / Keep = keep deliberately; timeout = user away, ask again later).
+
+        tag: a name close_prompts(tag) can take the card down by, with no
+        callback, once its question is moot (the meeting stopped another way).
 
         Tk-thread-safe via the overlay queue. ALWAYS bypasses silent_mode -
         a prompt the user can't see would wedge the caller's state machine.
@@ -20545,16 +20867,32 @@ class OverlayNotification:
                     header, body, button_label,
                     on_action, on_dismiss, duration_ms,
                     on_timeout if on_timeout is not None else on_dismiss,
-                    secondary_label, on_secondary)
+                    secondary_label, on_secondary, tag)
             except Exception as e:
                 log.warning('show_prompt failed: %s', e)
 
         self._tk_queue.put(_do)
 
+    def close_prompts(self, tag):
+        """Take down every open prompt card shown with this tag, firing none
+        of its callbacks. 2026-10-28: the call-ended "Stop the recording?"
+        card stayed up after the meeting was stopped from elsewhere, and the
+        "transcript ready" card opened on the same spot - two translucent
+        cards on top of each other, unreadable."""
+        def _do():
+            for key, (t, closer) in list(getattr(self, "_open_prompts", {}).items()):
+                if t == tag:
+                    try:
+                        closer()
+                    except Exception as e:
+                        log.debug("close_prompts: %s", e)
+        if self._root:
+            self._tk_queue.put(_do)
+
     def _create_prompt_toplevel(self, header, body, button_label,
                                 on_action, on_dismiss, duration_ms,
                                 on_timeout=None, secondary_label=None,
-                                on_secondary=None):
+                                on_secondary=None, tag=None):
         """Build and show the white prompt card. Runs on the Tk thread.
         Same light language as the meeting status card (notification_style):
         Lia brand row + ✕, a title, body text, a primary button and an
@@ -20583,17 +20921,22 @@ class OverlayNotification:
         outer.pack(fill='both', expand=True)
 
         state = {'closed': False}
+        if not hasattr(self, "_open_prompts"):
+            self._open_prompts = {}
 
         def _close_and(callback):
             if state['closed']:
                 return
             state['closed'] = True
+            self._open_prompts.pop(id(state), None)
             try:
                 top.destroy()
             except Exception:
                 pass
             if callback:
                 threading.Thread(target=callback, daemon=True).start()
+
+        self._open_prompts[id(state)] = (tag, lambda: _close_and(None))
 
         def _icon(parent, glyph, cb):
             ib = tk.Button(parent, text=glyph, bg=ns.BG, fg=ns.FAINT,
@@ -22034,11 +22377,12 @@ class OverlayNotification:
     def meeting_status_finish(self, title="Summary ready", on_open=None,
                               on_edit=None, on_folder=None, on_rename=None,
                               gen=None, dot="ok", message="", on_retry=None,
-                              open_label="Open"):
+                              open_label="Open", on_summarize=None):
         """All stages done -> an actionable success card. No file auto-opens.
         P2.5: a failed summary passes dot='err', the reason as `message` and
         `on_retry` ("Summarize again", the primary action) - the transcript is
-        saved, so the card still offers it."""
+        saved, so the card still offers it. `on_summarize`: "Summarize" on a
+        transcript-only meeting (2026-10-28)."""
         def _do():
             if self._card_gen_stale(gen):
                 return
@@ -22047,6 +22391,8 @@ class OverlayNotification:
                 actions.append(("Summarize again", on_retry, True))
             if on_open:
                 actions.append((open_label, on_open, not on_retry))
+            if on_summarize:
+                actions.append(("Summarize", on_summarize, False))
             if on_edit:
                 actions.append(("Edit", on_edit, False))
             if on_rename:
@@ -23229,7 +23575,7 @@ class LiaApp:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
                 _tr(start_meeting_label),
-                lambda: self._toggle_meeting(summarize=True),
+                lambda: self._toggle_meeting(summarize=self._auto_summary_default()),
                 visible=lambda item: not self._is_meeting_active(),
             ),
             # Transcribe an existing audio/video file - a daily-use action, so it
@@ -23243,15 +23589,24 @@ class LiaApp:
             # While a meeting runs, the summarize decision moves to STOP time
             # (2026-08-29, Naor's ask): you know at the END whether the
             # meeting deserved a summary.
+            # The choice "Summarize when a meeting ends" makes comes first
+            # (2026-10-28): the same item, shown above or below "no summary".
             pystray.MenuItem(
                 _tr("⏹  End Meeting & Summarize"),
                 lambda: self._stop_meeting(summarize=True),
-                visible=lambda item: self._is_meeting_active(),
+                visible=lambda item: (self._is_meeting_active()
+                                      and self._auto_summary_default()),
             ),
             pystray.MenuItem(
                 _tr("⏹  End Meeting (no summary)"),
                 lambda: self._stop_meeting(summarize=False),
                 visible=lambda item: self._is_meeting_active(),
+            ),
+            pystray.MenuItem(
+                _tr("⏹  End Meeting & Summarize"),
+                lambda: self._stop_meeting(summarize=True),
+                visible=lambda item: (self._is_meeting_active()
+                                      and not self._auto_summary_default()),
             ),
             pystray.MenuItem(
                 _tr("📄  Live Transcript"),
@@ -23268,6 +23623,11 @@ class LiaApp:
                 _tr("Hide meeting windows"),
                 lambda: self._toggle_meeting_windows_hidden(),
                 checked=lambda item: self._meeting_windows_hidden(),
+            ),
+            pystray.MenuItem(
+                _tr("Summarize meetings automatically"),
+                lambda: self._toggle_meeting_auto_summary(),
+                checked=lambda item: bool(self.config.get("meeting_auto_summary", True)),
             ),
             # History lives here (under the Start Meeting group) per user layout.
             pystray.MenuItem(_tr("History"), lambda: self._show_history()),
@@ -25700,6 +26060,37 @@ class LiaApp:
             except Exception as e:
                 log.warning("Device heal: save failed: %s", e)
 
+    # A mic that ARRIVES while Lia runs (a USB headset re-plugged, or the
+    # monitor's USB hub waking) opens through this process's stale PortAudio
+    # and delivers exact zeros (2026-10-28: the Jabra left at 12:32 with the
+    # monitor and came back at 13:24; the 13:30 meeting got digital silence
+    # from it while Teams heard Naor, and a fresh process recorded it at
+    # once). Dictation records in a fresh subprocess, meetings in-process -
+    # so restart while idle, once the plug-in has settled.
+    MIC_ARRIVAL_SETTLE_S = 15.0
+    MIC_RESTART_RETRY_S = 600.0
+
+    def _note_mic_arrived(self, names, now):
+        self._mic_arrived_at = now
+        log.info("Microphone plugged in: %s - meetings cannot hear a mic that "
+                 "arrived after Lia started; restarting when idle", ", ".join(names))
+
+    def _maybe_restart_for_new_mic(self, now):
+        """Restart once a mic has arrived and Lia is idle. True if it did."""
+        at = getattr(self, "_mic_arrived_at", None)
+        if at is None or now - at < self.MIC_ARRIVAL_SETTLE_S:
+            return False
+        last = getattr(self, "_mic_restart_tried_at", None)
+        if last is not None and now - last < self.MIC_RESTART_RETRY_S:
+            return False
+        if (self.is_recording or self._meeting_busy()
+                or self._compose_active or self._compose_instr_active
+                or self._voice_ask_active):
+            return False
+        self._mic_restart_tried_at = now      # a refused restart retries later
+        self._restart_app("mic-plugged")
+        return True
+
     def _device_watchdog(self, _sleep=time.sleep, _clock=time.monotonic):
         """Background thread that detects audio device hot-plug events.
 
@@ -25741,6 +26132,10 @@ class LiaApp:
         while True:
             _sleep(CHECK_INTERVAL_SEC)
             try:
+                self._maybe_restart_for_new_mic(_clock())
+            except Exception as e:
+                log.error("New-mic restart check failed: %s", e)
+            try:
                 sig = _audio_device_signature()
                 if (sig is not None and sig == prev_sig
                         and _clock() - last_full < FULL_CHECK_SEC):
@@ -25764,6 +26159,9 @@ class LiaApp:
                 log.info("Audio devices changed:")
                 log.info("  mic before: %s", old_names_mic or "(none)")
                 log.info("  mic after:  %s", new_names_mic or "(none)")
+                arrived = sorted({n for _, n in new_mic} - {n for _, n in prev_mic})
+                if arrived and prev_mic:
+                    self._note_mic_arrived(arrived, _clock())
 
                 # ---- mic: handle index shift / disappearance (by NAME) ----
                 cur_mic_idx = self.config.get("input_device_index")
@@ -29380,6 +29778,78 @@ class LiaApp:
         except Exception:
             pass
 
+    def _auto_summary_default(self):
+        """Whether a meeting that ends without an explicit choice gets a
+        summary: the setting, and a summary model to write it."""
+        try:
+            return (bool(self.config.get("meeting_auto_summary", True))
+                    and bool(self._summary_available()))
+        except Exception:
+            return False
+
+    def _toggle_meeting_auto_summary(self):
+        """Settings / tray: summarize when a meeting ends. A running meeting
+        follows the new value when it ends."""
+        self.config["meeting_auto_summary"] = not bool(
+            self.config.get("meeting_auto_summary", True))
+        save_config(self.config)
+        log.info("Summarize when a meeting ends: %s",
+                 "on" if self.config["meeting_auto_summary"] else "off")
+        try:
+            self.tray_icon.update_menu()
+        except Exception:
+            pass
+
+    def _summarize_card_action(self, path):
+        """The "Summarize" action of a "Transcript ready" card, or None when
+        there is no summary model."""
+        try:
+            if not self._summary_available():
+                return None
+        except Exception:
+            return None
+        return lambda p=path: self._summarize_meeting_path(p)
+
+    def _summarize_meeting_path(self, path):
+        """Summarize a saved meeting that has no summary (Home "Summarize",
+        the "Transcript ready" card), on a worker thread, through the same
+        _do_meeting_summary as "Summarize a meeting file"."""
+        full = self._meeting_txt_in_dir(path)
+        if not full:
+            return (False, "That meeting is gone")
+        if not self._summary_available():
+            return (False, "Choose a summary model first (Settings > Models)")
+        running = self.__dict__.setdefault("_summarizing_paths", set())
+        if full in running:
+            return (True, "Already summarizing")
+        running.add(full)
+
+        def run():
+            try:
+                with open(full, encoding="utf-8") as f:
+                    text = f.read()
+                self._do_meeting_summary(text, full)
+            except Exception as e:
+                log.warning("Summarize meeting failed: %s", e)
+            finally:
+                running.discard(full)
+                self._settings_home_select = full
+                try:
+                    self._settings_push_state()
+                except Exception:
+                    pass
+        threading.Thread(target=run, daemon=True).start()
+        return (True, "Summarizing…")
+
+    def _toggle_teams_speaker_names(self):
+        """Settings > Meetings: speaker names from the Teams live captions.
+        Applies from the next meeting."""
+        self.config["teams_speaker_names"] = not bool(
+            self.config.get("teams_speaker_names", False))
+        save_config(self.config)
+        log.info("Teams speaker names: %s",
+                 "on" if self.config["teams_speaker_names"] else "off")
+
     def _toggle_meeting_mic_auto_fallback(self):
         """Settings: auto-switch the meeting mic to the dictation mic when the
         meeting mic is silent but the backup hears the user. Applies from the
@@ -31616,8 +32086,11 @@ class LiaApp:
             if session is None:
                 return
             self._active_meeting = None
-        if summarize is not None:
-            session.summarize = bool(summarize)
+        # An explicit end choice wins; otherwise "Summarize when a meeting
+        # ends" decides, read NOW so a change during the meeting applies.
+        if summarize is None:
+            summarize = self._auto_summary_default()
+        session.summarize = bool(summarize)
 
         # Reset the auto-detect state machine so the next call/meeting starts
         # clean — covers a manual stop of an 'adopted' meeting (otherwise the
@@ -31632,6 +32105,11 @@ class LiaApp:
         # Tear down the persistent Stop pill regardless of how stop was
         # triggered (Stop button click, tray menu, auto-detect prompt).
         self.overlay.hide_recording_pill()
+        # ...and a "Stop the recording?" card still asking: its answer is moot
+        try:
+            self.overlay.close_prompts("meeting-stop")
+        except Exception as e:
+            log.debug("close stop prompt failed: %s", e)
 
         if self.tray_icon:
             self.tray_icon.icon = self._create_icon("processing")
@@ -31752,6 +32230,7 @@ class LiaApp:
                         title="Transcript ready",
                         on_open=lambda p=path: os.startfile(p),
                         on_folder=folder_cb,
+                        on_summarize=self._summarize_card_action(path),
                         gen=getattr(session, "_card_gen", None))
                     self._meeting_done_notify("Transcript ready")
                 self._play_done_beep()
@@ -31957,7 +32436,7 @@ class LiaApp:
         except ValueError:
             start = os.path.getmtime(it["wav"]) - it["duration_s"]
         session = MeetingSession(
-            self, diarize_mode=True, summarize=self._summary_available(),
+            self, diarize_mode=True, summarize=self._auto_summary_default(),
             diarize_enhance_model=enh, diarize_backend=backend,
             transcribe_label=self._meeting_transcribe_display(key))
         session._wav_path = it["wav"]
@@ -32925,8 +33404,8 @@ class LiaApp:
             # _start_meeting is heavy (model resolve, API check, recorder
             # warm-up) — fire on its own thread so we don't block the
             # Tk thread that fired the callback. Auto-detected meetings
-            # default to WITH summary — the high-value path when joining a call.
-            self._start_meeting(summarize=True)
+            # follow "Summarize when a meeting ends" (2026-10-28).
+            self._start_meeting(summarize=self._auto_summary_default())
             # _start_meeting has several silent refuse paths (missing key,
             # press-to-talk active, compose active, start failure). If no
             # meeting actually started, ROLL BACK to idle — otherwise the
@@ -33067,6 +33546,7 @@ class LiaApp:
                 # wrapping up / stepping away — give it room to be noticed.
                 duration_ms=60000,
                 on_timeout=on_timeout,
+                tag="meeting-stop",
             )
             # Tray balloon ONLY on the first offer of an away-episode — firing
             # it on every re-offer was the notification-center spam.
@@ -35416,7 +35896,7 @@ class LiaApp:
         """Home primary action: start a meeting (summarize at stop, like the tray)."""
         if self._is_meeting_active():
             return (True, "Meeting already running")
-        self._toggle_meeting(summarize=True)
+        self._toggle_meeting(summarize=self._auto_summary_default())
         return (True, "Meeting started")
 
     def _home_stop_meeting(self, summarize=True):
@@ -35508,6 +35988,9 @@ class LiaApp:
         add("toggle_meeting_backup_mic", self._toggle_meeting_backup_mic)
         add("toggle_meeting_mic_auto_fallback", self._toggle_meeting_mic_auto_fallback)
         add("toggle_meeting_windows_hidden", self._toggle_meeting_windows_hidden)
+        add("toggle_meeting_auto_summary", self._toggle_meeting_auto_summary)
+        add("summarize_meeting_for", self._summarize_meeting_path)
+        add("toggle_teams_speaker_names", self._toggle_teams_speaker_names)
         add("open_meetings_ask", self._open_meetings_ask)
         add("voice_ask_now", self._voice_ask_toggle)
         add("set_voice_ask_output", self._set_voice_ask_output)
