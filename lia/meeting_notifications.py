@@ -113,6 +113,7 @@ class MeetingCard:
         self._auto = False
         self._peek = False
         self._timers = set()              # pending fold / peek after() ids
+        self._close_token = None          # the render whose auto-close is pending
         # a Tk root torn down with a fold still pending (an app restart of
         # the overlay, a test host) must not call back into a dead interpreter
         try:
@@ -148,6 +149,12 @@ class MeetingCard:
         if not same and self._foldable(st):
             a = st.get("anchor")
             self._later(ns.AUTO_COLLAPSE_MS, lambda a=a: self._auto_fold(a))
+        # A finished card closes itself. Every render starts over: a card that
+        # was replaced (a retry, the next meeting) is not closed by an old timer.
+        self._close_token = object() if st.get("auto_close") else None
+        if self._close_token:
+            tok = self._close_token
+            self._later(ns.DONE_CLOSE_MS, lambda t=tok: self._auto_close(t))
 
     def update_meta(self, *, elapsed_seconds=None, stage_label=None):
         """Cheap in-place refresh of elapsed / active-stage text. Tk-thread."""
@@ -498,7 +505,7 @@ class MeetingCard:
             highlightthickness=m.px(1),
             highlightbackground=bg if primary else ns.SECONDARY_BORDER,
             highlightcolor=ns.BUSY,
-            padx=m.px(ns.BTN_PAD_X), pady=m.px(6),
+            padx=m.px(ns.BTN_PAD_X), pady=m.px(ns.BTN_PAD_Y),
             command=lambda: self._fire(cb, b))
         b.bind("<Enter>", lambda _e: b.configure(bg=hov))
         b.bind("<Leave>", lambda _e: b.configure(bg=bg))
@@ -565,6 +572,16 @@ class MeetingCard:
     def _on_min(self):
         self._auto = self._peek = False   # the user decides from here on
         self._toggle_ui("minimized")
+
+    def _auto_close(self, token):
+        """Close the finished card (Tk thread, via after), unless it is being
+        read or used right now: then look again shortly."""
+        if token is not self._close_token or not self._top:
+            return
+        if self._pointer_inside():
+            self._later(ns.DONE_CLOSE_RETRY_MS, lambda: self._auto_close(token))
+            return
+        self.hide()
 
     # ---- auto-fold + hover peek ------------------------------------------
     @staticmethod

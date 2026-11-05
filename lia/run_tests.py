@@ -3728,7 +3728,7 @@ def t_meeting_status_card_api():
     assert w.MeetingSession._rerun_utterances("nofile.wav", _u, None) == _u
     # The light card (2026-09-17 redesign) + its tokens import cleanly.
     import notification_style as _ns, meeting_notifications as _mn
-    assert hasattr(_mn, "MeetingCard") and _ns.WIDTH >= 340
+    assert hasattr(_mn, "MeetingCard") and _ns.WIDTH >= 300
     # Tk 8.6.15 bidis button labels natively (re-measured 2026-10-13):
     # button_text keeps Hebrew LOGICAL (a visual reorder printed it backwards)
     # inside an RTL embedding per line (Tk laid a mixed line out left-to-right,
@@ -3851,7 +3851,7 @@ def t_notification_style_tokens():
     assert ns.rtl_text("") == "" and ns.wrap_rtl("Weekly sync", len, 10) == "Weekly sync"
     # wrap by width, each wrapped Hebrew line embedded on its own
     assert ns.wrap_rtl("אחת שתיים שלוש", len, 9) == "\u202bאחת שתיים\u202c\n\u202bשלוש\u202c"
-    assert ns.WIDTH >= ns.WIDTH_MIN >= 320
+    assert ns.WIDTH >= ns.WIDTH_MIN >= 260
     # notification_style must not import tkinter at module load (cheap tokens).
     import sys
     src = open(ns.__file__, encoding="utf-8").read()
@@ -7712,17 +7712,97 @@ _test("meeting card: processing card folds itself, opens on hover, finished card
       t_meeting_card_auto_fold)
 
 
-def t_meeting_card_hover_opacity():
-    """The bottom-right cards rest at REST_ALPHA (Naor 2026-10-27: still too
-    loud) and come to full opacity while the pointer is over them; moving
-    between child widgets never dims them; an error card stays opaque; a card
-    built under the pointer starts full; the meeting prompt card does the
-    same. A REAL Tk card, the alpha read back from the window."""
+def t_meeting_card_done_closes():
+    """The finished card closes itself after DONE_CLOSE_MS (Naor 2026-11-05),
+    not while the pointer is on it, and an old timer never closes the card that
+    replaced it. A failed summary stays. The adapter's state + a REAL Tk card."""
     import time as _t
     import lia as w
     import notification_preview as npv
     import notification_style as ns
-    assert ns.REST_ALPHA == 0.65 and ns.FULL_ALPHA == 1.0
+    assert 10000 <= ns.DONE_CLOSE_MS <= 15000, ns.DONE_CLOSE_MS
+
+    class _Card:
+        def __init__(self): self.renders = []
+        def render(self, s): self.renders.append(s)
+
+    class _Q:
+        def put(self, fn): fn()
+    ov = w.OverlayNotification.__new__(w.OverlayNotification)
+    ov._root = object(); ov._tk_queue = _Q(); ov._mcard = _Card()
+    ov._mcard_model = None; ov._meeting_card_gen = 0
+    ov._meeting_card_active_gen = None
+    ov.meeting_status_finish(title="Transcript ready", on_open=lambda: None)
+    assert ov._mcard.renders[-1]["auto_close"] is True
+    ov.meeting_status_finish(title="Summary ready", on_open=lambda: None)
+    assert ov._mcard.renders[-1]["auto_close"] is True
+    ov.meeting_status_finish(title="Summary failed", dot="err", on_retry=lambda: None)
+    assert ov._mcard.renders[-1]["auto_close"] is False, "a failure must stay"
+    ov.meeting_status_error("x", "boom")
+    assert ov._mcard.renders[-1]["auto_close"] is False, "an error must stay"
+    ov.meeting_status_note("Summarizing again...")
+    assert not ov._mcard.renders[-1]["auto_close"], "still working"
+    ov.meeting_status_start([("a", "Alpha")])
+    assert not ov._mcard.renders[-1].get("auto_close")
+
+    old = ns.DONE_CLOSE_MS, ns.DONE_CLOSE_RETRY_MS
+    ns.DONE_CLOSE_MS, ns.DONE_CLOSE_RETRY_MS = 300, 50
+    host = npv._PreviewHost()
+    try:
+        def pump(sec):
+            end = _t.time() + sec
+            while _t.time() < end:
+                host.root.update()
+                _t.sleep(0.02)
+        card = host.card
+        inside = {"v": False}
+        card._pointer_inside = lambda: inside["v"]
+        done = {"kind": "success", "title": "Transcript ready", "meeting_title": "Weekly sync",
+                "allow_close": True, "dot": "ok", "close_button": True, "auto_close": True,
+                "actions": [("Open", lambda: None, True)]}
+        card.render(dict(done)); pump(0.1)
+        assert card._top is not None, "it must show first"
+        pump(0.5)
+        assert card._top is None, "the finished card must close itself"
+        # under the pointer it waits, and closes once the pointer leaves
+        inside["v"] = True
+        card.render(dict(done)); pump(0.6)
+        assert card._top is not None, "closed under the pointer"
+        inside["v"] = False
+        pump(0.2)
+        assert card._top is None, "must close when the pointer leaves"
+        # a card that replaced it is not closed by the old timer
+        card.render(dict(done)); pump(0.1)
+        card.render({"kind": "success", "title": "Summary failed", "allow_close": True,
+                     "dot": "err", "close_button": True, "auto_close": False,
+                     "actions": [("Summarize again", lambda: None, True)]})
+        pump(0.6)
+        assert card._top is not None, "an old timer closed the failure card"
+        # a card closed by hand: the timer finds nothing and does no harm
+        card.render(dict(done)); pump(0.05)
+        card._teardown(); pump(0.5)
+        assert card._top is None
+    finally:
+        ns.DONE_CLOSE_MS, ns.DONE_CLOSE_RETRY_MS = old
+        host.card.hide()
+        host.root.destroy()
+
+
+_test("meeting card: a finished card closes itself, not under the pointer; a failure stays",
+      t_meeting_card_done_closes)
+
+
+def t_meeting_card_hover_opacity():
+    """The bottom-right cards are fully opaque (the 65% resting opacity of
+    2026-10-27 was turned off 2026-10-29, Naor: smaller cards instead), with
+    the pointer over them or not, and the meeting prompt card too. A REAL Tk
+    card, the alpha read back from the window."""
+    import time as _t
+    import lia as w
+    import notification_preview as npv
+    import notification_style as ns
+    assert ns.REST_ALPHA == 1.0 and ns.FULL_ALPHA == 1.0
+    assert ns.WIDTH <= 320, "the cards were made smaller"
     old_ptr, old_leave = ns.pointer_over, ns.HOVER_LEAVE_MS
     inside = {"v": False}
     ns.pointer_over = lambda top: inside["v"]
@@ -7743,7 +7823,7 @@ def t_meeting_card_hover_opacity():
               "stage_label": "Diarizing", "allow_close": True,
               "actions": [("Stop", lambda: None, False)]}
         card.render(dict(st)); pump()             # fades in to the rest level
-        assert alpha() == 0.65, alpha()
+        assert alpha() == 1.0, alpha()
         inside["v"] = True
         card._top.event_generate("<Enter>"); pump(0.1)
         assert alpha() == 1.0, "hover must bring it to full opacity"
@@ -7751,7 +7831,7 @@ def t_meeting_card_hover_opacity():
         assert alpha() == 1.0, "a Leave into a child widget must not dim it"
         inside["v"] = False
         card._top.event_generate("<Leave>"); pump(0.1)
-        assert alpha() == 0.65, "leaving must dim it again"
+        assert alpha() == 1.0, "leaving must not dim it"
         inside["v"] = True                         # rebuilt under the pointer
         card.render(dict(st, stage_label="Transcribing")); pump(0.1)
         assert alpha() == 1.0, alpha()
@@ -7768,7 +7848,7 @@ def t_meeting_card_hover_opacity():
         pump(0.1)
         tops = [t for t in host.root.winfo_children()
                 if t.winfo_class() == "Toplevel" and t is not card._top]
-        assert tops and round(float(tops[-1].attributes("-alpha")), 2) == 0.65
+        assert tops and round(float(tops[-1].attributes("-alpha")), 2) == 1.0
         tops[-1].destroy()
     finally:
         ns.pointer_over, ns.HOVER_LEAVE_MS = old_ptr, old_leave
@@ -7776,7 +7856,7 @@ def t_meeting_card_hover_opacity():
         host.root.destroy()
 
 
-_test("meeting card + prompt: rest at 65% opacity, full under the pointer",
+_test("meeting card + prompt: fully opaque, smaller",
       t_meeting_card_hover_opacity)
 
 
@@ -13506,7 +13586,7 @@ def t_meeting_tracks_written():
     assert w.DEFAULT_CONFIG.get("keep_meeting_tracks") is True
     assert w.DEFAULT_CONFIG.get("meeting_backup_mic") is True
     src = inspect.getsource(w.MeetingSession)
-    assert "_backup_recorder = AudioRecorder(" in src, "backup mic recorder missing"
+    assert "_backup_recorder = self._start_mic_recorder(" in src, "backup mic recorder missing"
     assert src.count("self._open_track_writers(stamp)") == 2, "both start() modes must open tracks"
     assert src.count("self._finalize_tracks(") >= 3, "stop (diarize) + chunk-close + cancel"
     assert "self._write_tracks(mic_audio, loop_audio, backup_audio)" in src
@@ -13623,10 +13703,17 @@ def t_meeting_mic_auto_fallback():
     assert any("muted" in m for m in sx.app.notices), "one calm 'muted' notice"
     assert w.MeetingSession._mic_is_muted(silent) and not w.MeetingSession._mic_is_muted(hum)
     assert not w.MeetingSession._mic_is_muted(live) and not w.MeetingSession._mic_is_muted(None)
-    # 2026-10-28: the same zeros from a mic plugged in AFTER Lia started are a
-    # dead stream (stale PortAudio), not a mute -> switch at the first window
+    # the mic arrived BEFORE this meeting: it opened in a fresh process, so the
+    # zeros are a real mute (a screen wake must not undo the rule above)
+    sb = fresh(silent, call, live)
+    sb.app._mic_arrived_at, sb._mic_opened_at = 100.0, 123.0
+    for _ in range(4):
+        sb._drain_audio_inner()
+    assert sb._mic_recorder.tag == "mic", "zeros from a fresh process are a mute"
+    # the same zeros from a mic plugged in DURING the meeting are a dead stream
+    # (stale PortAudio), not a mute -> switch at the first window
     sd = fresh(silent, call, live)
-    sd.app._mic_arrived_at = 123.0
+    sd.app._mic_arrived_at, sd._mic_opened_at = 123.0, 100.0
     out = sd._drain_audio_inner()
     assert sd._mic_recorder.tag == "backup" and sd._backup_recorder is None
     assert any("reconnected" in m for m in sd.app.notices) and not sd.app.shown
@@ -13765,42 +13852,100 @@ _test("meeting: summarize when a meeting ends (setting) + Summarize later",
       t_meeting_auto_summary)
 
 
-def t_mic_plugged_restart():
-    """2026-10-28: a mic that arrives while Lia runs opens through the stale
-    in-process PortAudio and records zeros in a meeting -> the device
-    watchdog notes the arrival and Lia restarts once idle (after a settle
-    time, never mid-meeting/dictation, retried at most every 10 min)."""
+def t_mic_plugged_no_restart():
+    """A mic that arrives while Lia runs (at every screen wake when it hangs off
+    the monitor's USB hub): no restart (2026-11-02, it meant a Loading pill and
+    no dictation for up to a minute), the idle dictation workers are replaced
+    once, and later meetings record the mic in a fresh process. Real pipes: a
+    fake mic process runs under the real PipedAudioRecorder."""
     import inspect
+    import time as _t
     import lia as w
-    restarts = []
     app = w.LiaApp.__new__(w.LiaApp)
-    app.is_recording = False
-    app._compose_active = app._compose_instr_active = app._voice_ask_active = False
-    busy = [False]
-    app._meeting_busy = lambda: busy[0]
-    app._restart_app = lambda reason="": restarts.append(reason)
+    app.is_recording = app._voice_ask_active = False
+    resp = []
+    app.recorder = type("R", (), {"respawn_after_stale": lambda s: resp.append(1)})()
     M = w.LiaApp
-    assert M._maybe_restart_for_new_mic(app, 1000.0) is False      # nothing arrived
+    assert M._refresh_workers_for_new_mic(app, 1000.0) is False     # nothing arrived
     M._note_mic_arrived(app, ["Headset Microphone (Jabra EVOLV"], 1000.0)
-    assert M._maybe_restart_for_new_mic(app, 1005.0) is False      # still settling
-    busy[0] = True
-    assert M._maybe_restart_for_new_mic(app, 1020.0) is False      # meeting: wait
-    busy[0] = False
+    assert M._refresh_workers_for_new_mic(app, 1005.0) is False     # still settling
     app.is_recording = True
-    assert M._maybe_restart_for_new_mic(app, 1025.0) is False      # dictation: wait
+    assert M._refresh_workers_for_new_mic(app, 1020.0) is False     # dictation: wait
     app.is_recording = False
-    assert M._maybe_restart_for_new_mic(app, 1030.0) is True
-    assert restarts == ["mic-plugged"]
-    # a refused restart (we are still alive) does not retry every 5 s
-    assert M._maybe_restart_for_new_mic(app, 1040.0) is False
-    assert M._maybe_restart_for_new_mic(app, 1030.0 + M.MIC_RESTART_RETRY_S) is True
+    assert M._refresh_workers_for_new_mic(app, 1025.0) is True and resp == [1]
+    assert M._refresh_workers_for_new_mic(app, 1100.0) is False and resp == [1], "once"
+    M._note_mic_arrived(app, ["Microphone (HD Pro Webcam C920)"], 2000.0)   # next wake
+    assert M._refresh_workers_for_new_mic(app, 2020.0) is True and resp == [1, 1]
     src = inspect.getsource(M._device_watchdog)
-    assert "_note_mic_arrived(" in src and "_maybe_restart_for_new_mic(" in src
+    assert "_note_mic_arrived(" in src and "_refresh_workers_for_new_mic(" in src
     assert "and prev_mic" in src, "an empty first list must not count as an arrival"
+    assert "_restart_app" not in inspect.getsource(M._refresh_workers_for_new_mic)
+
+    # the fresh-process recorder: known PCM through the real pipe
+    fake = ("import os, sys, threading, time\n"
+            "def _end():\n"
+            "    sys.stdin.buffer.read()\n"
+            "    os._exit(0)\n"
+            "threading.Thread(target=_end, daemon=True).start()\n"
+            "out = sys.stdout.buffer\n"
+            "assert sys.argv[1] == '7'\n"
+            "out.write(b'OK\\n'); out.flush()\n"
+            "while True:\n"
+            "    out.write(b'\\x00\\x40' * 1024); out.flush(); time.sleep(0.02)\n")
+    rec = w.PipedAudioRecorder(input_device_index=7, _script=fake)
+    rec.start()
+    proc = rec._proc
+    end = _t.time() + 5
+    got = rec.drain()
+    while got.size == 0 and _t.time() < end:
+        _t.sleep(0.05)
+        got = rec.drain()
+    assert got.size and abs(float(got[0]) - 0.5) < 1e-6, "PCM must arrive through drain()"
+    _t.sleep(0.1)
+    last = rec.stop()
+    assert last.size > 0 and rec.is_recording is False
+    assert proc.poll() is not None, "stop must end the mic process"
+    # a process that cannot open a mic: start() raises, nothing stays recording
+    bad = w.PipedAudioRecorder(_script="import sys; sys.exit(3)")
+    bad.START_TIMEOUT_S = 5.0
+    try:
+        bad.start()
+        raise AssertionError("start must raise")
+    except RuntimeError:
+        pass
+    assert bad.is_recording is False
+
+    # the meeting picks the recorder: in-process until a mic has arrived
+    class _Rec:
+        def __init__(self, input_device_index=None):
+            self.dev = input_device_index
+
+        def start(self):
+            pass
+
+    class _Piped(_Rec):
+        pass
+
+    class _BadPiped(_Rec):
+        def start(self):
+            raise RuntimeError("no")
+    old = w.AudioRecorder, w.PipedAudioRecorder
+    w.AudioRecorder, w.PipedAudioRecorder = _Rec, _Piped
+    try:
+        s = w.MeetingSession.__new__(w.MeetingSession)
+        s.app = type("A", (), {"_mic_arrived_at": None})()
+        assert type(s._start_mic_recorder(2)) is _Rec
+        s.app._mic_arrived_at = 5.0
+        r = s._start_mic_recorder(2)
+        assert type(r) is _Piped and r.dev == 2
+        w.PipedAudioRecorder = _BadPiped
+        assert type(s._start_mic_recorder(2)) is _Rec, "falls back to in-process"
+    finally:
+        w.AudioRecorder, w.PipedAudioRecorder = old
 
 
-_test("device: a mic plugged in while Lia runs -> restart when idle",
-      t_mic_plugged_restart)
+_test("device: a mic plugged in while Lia runs -> no restart, meetings in a fresh process",
+      t_mic_plugged_no_restart)
 
 
 def t_meeting_rename_and_no_stop_prompt():
@@ -13987,7 +14132,38 @@ def t_teams_caption_names():
     import lia as w
     import numpy as np
     import teams_captions as tc
-    assert w.DEFAULT_CONFIG["teams_speaker_names"] is False
+    # on by default since 2026-10-29; a config saved while it was off gets it
+    # once, and a later "off" is kept
+    assert w.DEFAULT_CONFIG["teams_speaker_names"] is True
+    _tmp = tempfile.mkdtemp()
+    _saved = (w.CONFIG_DIR, w.CONFIG_FILE)
+    w.CONFIG_DIR, w.CONFIG_FILE = _tmp, os.path.join(_tmp, "config.json")
+    try:
+        with open(w.CONFIG_FILE, "w") as f:
+            json.dump({"teams_speaker_names": False}, f)
+        cfg = w.load_config()
+        assert cfg["teams_speaker_names"] is True and cfg["_teams_names_on_migrated"]
+        cfg["teams_speaker_names"] = False
+        w.save_config(cfg)
+        assert w.load_config()["teams_speaker_names"] is False, "the user's off must stay"
+    finally:
+        w.CONFIG_DIR, w.CONFIG_FILE = _saved
+    # no Teams in the meeting (Zoom / Meet) -> no speaker-names line at all
+    class _W:
+        def __init__(self, seen, names=()):
+            self.state = {"teams_windows": 0, "captions_found": False, "lines": 0,
+                          "error": "", "teams_seen": seen}
+            self._n = list(names)
+        def speakers(self):
+            return self._n
+    ms = w.MeetingSession.__new__(w.MeetingSession)
+    ms._teams = _W(False)
+    assert ms._teams_status_line() == "" and ms._teams_status_line(final=True) == ""
+    ms._teams = _W(True)
+    assert "Teams is not open" in ms._teams_status_line()
+    assert "none" in ms._teams_status_line(final=True)
+    ms._teams = _W(False, ["Dana"])
+    assert "Dana" in ms._teams_status_line(final=True)
 
     T = lambda name, ct=50020: {"name": name, "ct": ct, "children": []}
     line = lambda a, t, rid: {"name": "", "ct": 50026, "cls": "fui-ChatMessageCompact",
@@ -18213,8 +18389,8 @@ _test("transcript flow: chunk boundary period stripped / kept by pause + opener"
 
 def t_flow_chunk_paragraphs():
     """flow_chunk_paragraphs joins consecutive chunks into paragraphs (one
-    timestamp each), splits only at a real sentence end after para_seconds,
-    never mid-sentence; silence / failed / pending close a paragraph;
+    timestamp each), a new one once para_seconds have elapsed, even
+    mid-sentence; silence / failed / pending close a paragraph;
     enabled=False = the old one-block-per-chunk layout. The session assemblers
     (.txt + summary input) render the same items."""
     import lia as w
@@ -18223,11 +18399,11 @@ def t_flow_chunk_paragraphs():
         index=i, timestamp_rel=ts, text=text, status=status, cut=cut, pause_s=pause)
     chunks = [
         mk(0, 0,  "עד עכשיו היה מצב ש."),
-        mk(1, 15, "פורטסה פרייס על 50% מהצריכה."),
+        mk(1, 15, "מחיר קבוע על חצי מהצריכה."),
         mk(2, 30, "אבל לפי צריכה מוערכת.", pause=1.0),   # real end (long pause)
         mk(3, 45, "אז זה יכול להגיע."),                     # before 60s: same paragraph
-        mk(4, 60, "נתי זה היה קרוב ל-100 אלף."),           # mid-sentence at 60s: NO split
-        mk(5, 75, "דולר מימון.", pause=1.0),                # real end after 60s -> split next
+        mk(4, 60, "המחיר היה קרוב לעשרה אלף."),           # mid-sentence at 60s: a new mark
+        mk(5, 75, "דולר מימון.", pause=1.0),                # a real end before 60s: same one
         mk(6, 90, "מבחינת מימונים יש לנו."),
         mk(7, 105, "", status="empty"),                     # silence closes the paragraph
         mk(8, 120, "", status="failed"),
@@ -18238,30 +18414,30 @@ def t_flow_chunk_paragraphs():
     kinds = [it[0] for it in items]
     assert kinds == ["text", "text", "failed", "text", "pending"], kinds
     p0 = items[0][2]
-    assert p0 == ("עד עכשיו היה מצב ש פורטסה פרייס על 50% מהצריכה. "
-                  "אבל לפי צריכה מוערכת. אז זה יכול להגיע נתי זה היה קרוב ל-100 אלף "
-                  "דולר מימון."), p0
+    assert p0 == ("עד עכשיו היה מצב ש מחיר קבוע על חצי מהצריכה. "
+                  "אבל לפי צריכה מוערכת. אז זה יכול להגיע"), p0
     assert items[0][1] == 0
-    assert items[1] == ("text", 90, "מבחינת מימונים יש לנו.")
+    assert items[1] == ("text", 60, "המחיר היה קרוב לעשרה אלף דולר מימון. "
+                                    "מבחינת מימונים יש לנו."), items[1]
     assert items[2] == ("failed", 120)
     assert items[3] == ("text", 135, "סיכום.")
     assert items[4] == ("pending", 150)
     # Legacy layout: every ok chunk is its own block, text untouched.
     old = w.flow_chunk_paragraphs(chunks, para_seconds=60, enabled=False)
     assert [it[0] for it in old].count("text") == 8
-    assert old[0][2] == "עד עכשיו היה מצב ש." and old[1][2] == "פורטסה פרייס על 50% מהצריכה."
+    assert old[0][2] == "עד עכשיו היה מצב ש." and old[1][2] == "מחיר קבוע על חצי מהצריכה."
     # Session assemblers render the items (no app on the session = defaults).
     s = w.MeetingSession.__new__(w.MeetingSession)
     s._chunks_lock = threading.Lock()
     s.chunks = chunks
     md = w.MeetingSession._assemble_transcript_markdown(s)
-    assert md.count("[0:00]") == 1 and "[0:15]" not in md and "[1:30]" in md, md
+    assert md.count("[0:00]") == 1 and "[0:15]" not in md and "[1:00]" in md, md
     assert "[transcription failed]" in md and "not transcribed in time" in md
     assert "audio lost" not in md, "the audio is kept in the WAV (Phase 3.3)"
-    assert "ש פורטסה" in md, "the artificial period is gone from the .txt"
+    assert "ש מחיר" in md, "the artificial period is gone from the .txt"
     plain = w.MeetingSession._assemble_transcript_plain(s)
     assert "[" not in plain and plain.count("\n") == 2, plain
-    assert plain.startswith("עד עכשיו היה מצב ש פורטסה")
+    assert plain.startswith("עד עכשיו היה מצב ש מחיר")
     # The flag off reproduces the per-chunk .txt.
     class _App:
         config = {"meeting_transcript_flow": False}
@@ -18287,8 +18463,8 @@ def t_flow_live_tail():
         index=i, timestamp_rel=ts, text=text, status=status, cut=cut, pause_s=pause)
     # Live tail dot stripped.
     items = w.flow_chunk_paragraphs(
-        [mk(0, 0, "אז נתי זה היה קרוב ל-100 אלף דולר מימון.")], live=True)
-    assert items == [("text", 0, "אז נתי זה היה קרוב ל-100 אלף דולר מימון")], items
+        [mk(0, 0, "אז המחיר היה קרוב לעשרה אלף דולר מימון.")], live=True)
+    assert items == [("text", 0, "אז המחיר היה קרוב לעשרה אלף דולר מימון")], items
     # ? / ! kept even on the live tail.
     assert w.flow_chunk_paragraphs([mk(0, 0, "מה דעתך?")], live=True) == \
         [("text", 0, "מה דעתך?")]
@@ -18471,8 +18647,82 @@ _test("decoder profiles: all keep the library ladder (measured), context-local s
       t_decoder_profiles)
 
 
-_test("transcript flow: paragraphs join chunks, split only at a real end after 60s",
+_test("transcript flow: paragraphs join chunks, a new mark once 60s have elapsed",
       t_flow_chunk_paragraphs)
+
+
+def t_flow_mark_every_minute():
+    """Speech with no real sentence end still gets a mark about every minute
+    (the 2026-11-05 meeting had 253 words under one mark, 119 s long). No text
+    is lost and the marks stay in order. Both live and final."""
+    import lia as w
+    chunks = [dict(index=i, timestamp_rel=i * 10.0, text="מילה%d ועוד אחת." % i, status="ok",
+                   cut="smart", pause_s=0.1) for i in range(40)]
+    for live in (False, True):
+        items = w.flow_chunk_paragraphs(chunks, para_seconds=60, live=live)
+        marks = [it[1] for it in items]
+        assert marks == [i * 60.0 for i in range(7)], marks
+        words = " ".join(it[2] for it in items)
+        for i in range(40):
+            assert ("מילה%d " % i) in words, i
+    # The mark before and after a cap is mid-sentence: no invented period.
+    items = w.flow_chunk_paragraphs(chunks, para_seconds=60)
+    assert not items[0][2].endswith("."), items[0][2]
+    assert items[-1][2].endswith("."), "the last chunk keeps its own"
+
+
+_test("transcript flow: a mark about every minute even without a sentence end",
+      t_flow_mark_every_minute)
+
+
+def t_rotation_marks_continuous():
+    """A chunk's mark is where its audio starts: through the REAL rotation loop
+    + the real smart cut, each chunk's mark + length = the next chunk's mark. It
+    used to be late by the tail held back for the next chunk, up to 2.5 s."""
+    import lia as w
+    import numpy as np
+    import threading
+    import time as _t
+    sr = 16000
+    loud = (0.2 * np.sin(np.arange(10 * sr) * 0.05)).astype(np.float32)
+    loud[int(8.0 * sr):int(8.4 * sr)] = 0.0     # a pause 2 s before the end of each window
+
+    class _App:
+        config = {"meeting_chunk_smart_cut": True}
+
+    class _Stop:
+        """Runs the loop for three windows, 10 s of meeting apart."""
+        def __init__(self): self.n = 0
+        def wait(self, timeout=None):
+            self.n += 1
+            s.start_time -= 10.0
+            return self.n > 3
+
+    s = w.MeetingSession.__new__(w.MeetingSession)
+    s.app, s.chunk_seconds, s._active = _App(), 10, True
+    s._teams, s._carry_tail, s._chunk_lock = None, None, threading.Lock()
+    s._stop_event = _Stop()
+    s.start_time = _t.time()
+    s._drain_audio = lambda: loud.copy()
+    got = []
+    s._submit_chunk = lambda a, **k: got.append((k["start_rel"], len(a) / sr, k["cut"]))
+    s._rotation_loop()
+    assert len(got) == 3, got
+    assert all(g[2] == "smart" for g in got), got
+    assert abs(got[0][0]) < 0.2, got
+    for a, b in zip(got, got[1:]):
+        assert abs(a[0] + a[1] - b[0]) < 0.2, (a, b)
+    # The diarized live view takes the same mark.
+    p = w.MeetingSession.__new__(w.MeetingSession)
+    p._cancelled, p._wav_writer, p.diarize_mode = False, None, True
+    seen = {}
+    p._submit_live_peek = lambda a, **k: seen.update(k)
+    p._submit_chunk(loud, cut="smart", start_rel=12.5)
+    assert seen.get("start_rel") == 12.5, seen
+
+
+_test("meeting chunks: each mark + length = the next mark, through the real rotation loop",
+      t_rotation_marks_continuous)
 
 
 def t_pause_seconds_at_cut():

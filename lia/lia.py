@@ -379,7 +379,7 @@ if sys.platform == "win32":
     ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
 
 # --- Configuration ---
-APP_VERSION = "1.6.17"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
+APP_VERSION = "1.6.18"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Lia")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -1051,7 +1051,9 @@ DEFAULT_CONFIG = {
     # _diagnostics: a local JSONL of what the reader saw (Teams window
     # structure until captions are found, then the captions region) under
     # %APPDATA%\Lia\diagnostics, kept 7 days - the reader is new.
-    "teams_speaker_names": False,
+    # On by default since 2026-10-29 (Naor): no Teams captions = no names,
+    # nothing else changes.
+    "teams_speaker_names": True,
     "teams_captions_diagnostics": True,
     # Diarized-meeting hybrid quality upgrade: after AssemblyAI returns
     # speaker-labelled utterances, re-transcribe each utterance's audio
@@ -1501,10 +1503,11 @@ def flow_chunk_paragraphs(chunks, para_seconds=60.0, enabled=True, live=False):
     """Turn the meeting's chunk records into transcript paragraphs.
     Returns a list of items: ("text", ts_rel, text) | ("failed", ts_rel) |
     ("pending", ts_rel). Consecutive 'ok' chunks are joined via
-    soften_chunk_boundary; a paragraph (= one timestamp) is closed only at a
-    real sentence end once `para_seconds` have elapsed, so a sentence is never
-    split across timestamps. Silence, a failed and a pending chunk each close
-    the current paragraph. enabled=False reproduces the old one-block-per-chunk
+    soften_chunk_boundary; a paragraph (= one timestamp) is closed once
+    `para_seconds` have elapsed, even mid-sentence: waiting for a real sentence
+    end left 2 minutes of speech under one mark, which read as wrong times
+    (Naor 2026-11-05). Silence, a failed and a pending chunk each close the
+    current paragraph. enabled=False reproduces the old one-block-per-chunk
     layout.
     live=True is the rolling transcript: (1) the trailing period / ellipsis is
     stripped off the very last paragraph - that tail is always mid-sentence
@@ -1551,11 +1554,11 @@ def flow_chunk_paragraphs(chunks, para_seconds=60.0, enabled=True, live=False):
             cur["ts"], cur["parts"] = ts, [clean]
             cur["spk"] = c.get("speaker") or None
         else:
-            adj, kind = soften_chunk_boundary(
+            adj, _kind = soften_chunk_boundary(
                 cur["parts"][-1], clean, prev.get("cut", "drain"),
                 prev.get("pause_s", 0.0))
             cur["parts"][-1] = adj
-            if kind == "break" and (ts - cur["ts"]) >= para_seconds:
+            if (ts - cur["ts"]) >= para_seconds:
                 close()
                 cur["ts"], cur["parts"] = ts, [clean]
                 cur["spk"] = c.get("speaker") or None
@@ -3105,6 +3108,11 @@ def load_config():
                 log.info("Meetings: the stop-time name box is off now (Home > Rename "
                          "names a meeting)")
             cfg["meeting_title_prompt_on_stop"] = False
+        # Speaker names from Teams is on by default since 2026-10-29; configs
+        # saved while it was off by default (1.6.17) carry False. One-time.
+        if not cfg.get("_teams_names_on_migrated"):
+            cfg["_teams_names_on_migrated"] = True
+            cfg["teams_speaker_names"] = True
         if "summary_local_ensemble" in cfg:
             if cfg.get("summary_local_ensemble"):
                 log.info("Summary: the 3-phase ensemble was retired; using the "
@@ -4658,6 +4666,119 @@ _MIC_SUBPROCESS_SCRIPT = (
     "        except Exception: pass\n"
     "main()\n"
 )
+
+
+# The stream of a PipedAudioRecorder, in its own process: the stream opens on
+# this process's fresh PortAudio. stdin closing (Stop, or the parent died) ends it.
+_PIPED_MIC_SCRIPT = (
+    "import os, sys, threading\n"
+    "import pyaudio\n"
+    "dev = int(sys.argv[1])\n"
+    "out = sys.stdout.buffer\n"
+    "pa = pyaudio.PyAudio()\n"
+    "kw = dict(format=pyaudio.paInt16, channels=1, rate=16000, input=True,\n"
+    "          frames_per_buffer=1024)\n"
+    "try:\n"
+    "    s = pa.open(input_device_index=dev if dev >= 0 else None, **kw)\n"
+    "except Exception as e:\n"
+    "    sys.stderr.write('device %d failed (%s), using the default\\n' % (dev, e))\n"
+    "    sys.stderr.flush()\n"
+    "    s = pa.open(**kw)\n"
+    "def _end():\n"
+    "    sys.stdin.buffer.read()\n"
+    "    os._exit(0)\n"
+    "threading.Thread(target=_end, daemon=True).start()\n"
+    "out.write(b'OK\\n'); out.flush()\n"
+    "while True:\n"
+    "    out.write(s.read(1024, exception_on_overflow=False)); out.flush()\n"
+)
+
+
+class PipedAudioRecorder(AudioRecorder):
+    """AudioRecorder whose stream lives in a fresh subprocess, its PCM piped
+    back. A mic that arrived after Lia started opens through this process's
+    stale PortAudio and delivers exact zeros (2026-10-28), while a fresh
+    process hears it at once. drain() / stop() are AudioRecorder's: the reader
+    thread fills the same audio_data. start() raises if the process cannot
+    open a mic, so the caller can fall back."""
+
+    START_TIMEOUT_S = 8.0
+
+    def __init__(self, sample_rate=16000, channels=1, input_device_index=None,
+                 _script=None):
+        super().__init__(sample_rate, channels, input_device_index)
+        self._script = _script or _PIPED_MIC_SCRIPT
+        self._proc = None
+
+    def start(self):
+        import subprocess
+        if self.is_recording:
+            log.warning("PipedAudioRecorder.start() while already recording - ignored")
+            return
+        interp = find_python_interpreter()
+        if interp is None:
+            raise RuntimeError("no Python interpreter for the mic process")
+        dev = self.input_device_index
+        self._proc = proc = subprocess.Popen(
+            [interp, "-c", self._script, str(-1 if dev is None else int(dev))],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
+            bufsize=0)
+        self.audio_data = []
+        self.is_recording = True
+        ready = threading.Event()
+        threading.Thread(target=self._read_pcm, args=(proc, ready), daemon=True).start()
+        threading.Thread(target=self._drain_stderr, args=(proc,), daemon=True).start()
+        if not ready.wait(self.START_TIMEOUT_S) or proc.poll() is not None:
+            self.is_recording = False
+            self._end_proc()
+            raise RuntimeError("the mic process did not start")
+
+    def _read_pcm(self, proc, ready):
+        try:
+            if proc.stdout.readline() != b"OK\n":
+                return
+            ready.set()
+            while True:
+                data = proc.stdout.read(2048)
+                if not data:
+                    break
+                with self._data_lock:
+                    self.audio_data.append(data)
+            if self.is_recording:
+                log.error("Meeting mic process ended during the recording (exit %s)",
+                          proc.poll())
+        except Exception as e:
+            if self.is_recording:
+                log.error("Meeting mic process: read failed: %s", e)
+
+    @staticmethod
+    def _drain_stderr(proc):
+        try:
+            for raw in iter(proc.stderr.readline, b""):
+                line = raw.decode("utf-8", errors="replace").rstrip()
+                if line:
+                    log.warning("meeting-mic process: %s", line)
+        except Exception:
+            pass
+
+    def _end_proc(self):
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        try:
+            proc.stdin.close()
+            proc.wait(timeout=2.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def stop(self) -> np.ndarray:
+        self.is_recording = False
+        self._end_proc()
+        return super().stop()
 
 
 class SubprocessAudioRecorder:
@@ -13243,7 +13364,7 @@ class MeetingSession:
         """Chunked meetings: start reading speaker names from the Teams live
         captions when the user turned it on. Best-effort, never blocks start."""
         try:
-            if not bool(self.app.config.get("teams_speaker_names", False)):
+            if not bool(self.app.config.get("teams_speaker_names", True)):
                 return
             import teams_captions
             diag = (os.path.join(CONFIG_DIR, "diagnostics")
@@ -13255,15 +13376,19 @@ class MeetingSession:
             self._teams = None
 
     def _teams_status_line(self, final=False):
-        """One line for the transcript header: where the speaker names stand."""
+        """One line for the transcript header: where the speaker names stand.
+        "" when Teams was never open: on by default, a Zoom or Meet meeting
+        says nothing about Teams (2026-10-29)."""
         t = self._teams
         try:
             names = t.speakers()
             if names:
                 return "Speaker names from Teams captions: " + ", ".join(names)
+            st = t.state
+            if not st.get("teams_seen"):
+                return ""
             if final:
                 return "Speaker names: none (no Teams live captions were read)"
-            st = t.state
             if st.get("error", "").startswith("UI Automation"):
                 return "Speaker names: unavailable (" + st["error"] + ")"
             if not st.get("teams_windows"):
@@ -13767,8 +13892,10 @@ class MeetingSession:
                     "Updates as chunks are transcribed (~every %ds). The final "
                     "file (with the summary) replaces this at Stop.\n\n"
                     % (start_dt.strftime("%Y-%m-%d %H:%M"), self.chunk_seconds))
-            if getattr(self, "_teams", None) is not None:
-                head = head.rstrip("\n") + "\n" + self._teams_status_line() + "\n\n"
+            _tl = (self._teams_status_line()
+                   if getattr(self, "_teams", None) is not None else "")
+            if _tl:
+                head = head.rstrip("\n") + "\n" + _tl + "\n\n"
             body = (self._assemble_live_markdown() if self.diarize_mode
                     else self._assemble_transcript_markdown(live=True))
             with self._live_lock:
@@ -13787,7 +13914,7 @@ class MeetingSession:
                 self._live_warned = True
                 log.warning("Live transcript write failed (will not re-log): %s", e)
 
-    def _submit_live_peek(self, audio_np, cut="drain", pause_s=0.0):
+    def _submit_live_peek(self, audio_np, cut="drain", pause_s=0.0, start_rel=None):
         """Diarized meetings only: transcribe this ~45s chunk with a FAST,
         speaker-less pass purely to keep the rolling live transcript current for
         mid-meeting peeking. Runs in a daemon thread; NEVER touches self.chunks,
@@ -13805,6 +13932,8 @@ class MeetingSession:
                 rel_ts = max(0.0, rel_ts - len(audio_np) / 16000.0)
             except Exception:
                 pass
+            if start_rel is not None:
+                rel_ts = max(0.0, float(start_rel))
             self._live_chunks.append({"index": idx, "timestamp_rel": rel_ts,
                                       "text": "", "status": "pending",
                                       "cut": cut, "pause_s": float(pause_s or 0.0)})
@@ -14078,15 +14207,30 @@ class MeetingSession:
             return None
 
     # ---- recorder management ----
+    def _start_mic_recorder(self, device_index):
+        """A started mic recorder. In this process, unless a mic arrived after
+        Lia started: this process's PortAudio would record zeros from it, so
+        the stream goes in a fresh process (2026-11-02)."""
+        if getattr(self.app, "_mic_arrived_at", None) is not None:
+            rec = PipedAudioRecorder(input_device_index=device_index)
+            try:
+                rec.start()
+                log.info("Meeting mic: device %s in its own process (a mic arrived "
+                         "after Lia started)", device_index)
+                return rec
+            except Exception as e:
+                log.warning("Meeting mic process failed (%s) - recording in-process", e)
+        rec = AudioRecorder(input_device_index=device_index)
+        rec.start()
+        return rec
+
     def _open_recorders(self):
         """Create + start the recorders based on the meeting's source mode."""
         self._mic_recorder = None
         self._loopback_recorder = None
         if self.source in ("microphone", "both"):
-            self._mic_recorder = AudioRecorder(
-                input_device_index=self._input_device_index
-            )
-            self._mic_recorder.start()
+            self._mic_recorder = self._start_mic_recorder(self._input_device_index)
+            self._mic_opened_at = time.monotonic()
         if self.source in ("stereo_mix", "both") and LoopbackRecorder.is_available():
             try:
                 self._loopback_recorder = LoopbackRecorder(
@@ -14112,8 +14256,7 @@ class MeetingSession:
                     b = _device_name_for_index(self._input_device_index)
                     same = bool(a) and a == b     # same physical device, other slot
                 if not same:
-                    self._backup_recorder = AudioRecorder(input_device_index=dict_idx)
-                    self._backup_recorder.start()
+                    self._backup_recorder = self._start_mic_recorder(dict_idx)
                     self._backup_device_index = dict_idx
                     log.info("Meeting backup mic: also recording the dictation mic "
                              "(device %s)", dict_idx)
@@ -14353,12 +14496,15 @@ class MeetingSession:
             # the user's choice: respect it, never switch on it. A wrong device
             # still hums a little and keeps the rescue below.
             if self._mic_is_muted(mic_audio):
-                # ...unless the mic was plugged in after Lia started: then
-                # the zeros are a dead stream, not a mute (2026-10-28 13:30)
-                if getattr(self.app, "_mic_arrived_at", None) is not None:
+                # ...unless a mic was plugged in during this meeting: the
+                # open stream is dead then, the zeros are not a mute. A mic
+                # that arrived before the meeting opened in a fresh process
+                # (_start_mic_recorder), where zeros do mean a mute.
+                arrived = getattr(self.app, "_mic_arrived_at", None)
+                if arrived is not None and arrived > getattr(self, "_mic_opened_at", arrived):
                     return self._switch_to_backup_mic(
-                        backup_audio, mic_rms, backup_rms, "it was plugged in after Lia "
-                        "started and sends digital silence",
+                        backup_audio, mic_rms, backup_rms, "it was plugged in during the "
+                        "meeting and sends digital silence",
                         "🎤  Your headset was reconnected - using your "
                         "dictation mic for this meeting")
                 self._mic_fallback_streak = 0
@@ -14619,6 +14765,9 @@ class MeetingSession:
                     # `meeting_chunk_smart_cut`; any error falls back to the
                     # raw drain boundary.
                     cut, pause_s = "drain", 0.0
+                    # This chunk starts where the window starts. Measured back
+                    # from now it would be late by the tail held back below.
+                    start_rel = max(0.0, now_rel - len(audio) / 16000.0)
                     if bool(self.app.config.get("meeting_chunk_smart_cut", True)):
                         try:
                             head, tail = smart_cut_tail(audio)
@@ -14630,7 +14779,8 @@ class MeetingSession:
                                 cut = "smart"
                         except Exception as e:
                             log.warning("Meeting smart cut failed (raw cut): %s", e)
-                    self._submit_chunk(audio, cut=cut, pause_s=pause_s)
+                    self._submit_chunk(audio, cut=cut, pause_s=pause_s,
+                                       start_rel=start_rel)
             except Exception as e:
                 log.error("Meeting rotation loop error: %s", e)
             finally:
@@ -14817,7 +14967,8 @@ class MeetingSession:
         if self.diarize_mode:
             # Hybrid: keep a rolling live transcript via a fast speaker-less pass,
             # in parallel with the WAV that feeds the final diarization at Stop.
-            self._submit_live_peek(audio_np, cut=cut, pause_s=pause_s)
+            self._submit_live_peek(audio_np, cut=cut, pause_s=pause_s,
+                                   start_rel=start_rel)
             return
         with self._chunks_lock:
             idx = self._next_chunk_index
@@ -16183,8 +16334,10 @@ class MeetingSession:
                         f"source: {self.source}")
         if self.attendees:
             sections.append("Invited: " + "; ".join(self.attendees))
-        if getattr(self, "_teams", None) is not None:
-            sections.append(self._teams_status_line(final=True))
+        _tl = (self._teams_status_line(final=True)
+               if getattr(self, "_teams", None) is not None else "")
+        if _tl:
+            sections.append(_tl)
         sections.append("")
 
         if summary_md:
@@ -18340,18 +18493,18 @@ def _stamp_lia_launcher(exe_path):
         return False
     try:
         vi = VSVersionInfo(
-            ffi=FixedFileInfo(filevers=(1, 6, 17, 0), prodvers=(1, 6, 17, 0),
+            ffi=FixedFileInfo(filevers=(1, 6, 18, 0), prodvers=(1, 6, 18, 0),
                               mask=0x3f, flags=0x0, OS=0x40004,
                               fileType=0x1, subtype=0x0),
             kids=[
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.6.17.0'),
+                    StringStruct('FileVersion', '1.6.18.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.6.17.0'),
+                    StringStruct('ProductVersion', '1.6.18.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -20960,7 +21113,7 @@ class OverlayNotification:
                            highlightthickness=m.px(1),
                            highlightbackground=bg if primary else ns.SECONDARY_BORDER,
                            highlightcolor=ns.BUSY,
-                           padx=m.px(ns.BTN_PAD_X), pady=m.px(6), command=cb)
+                           padx=m.px(ns.BTN_PAD_X), pady=m.px(ns.BTN_PAD_Y), command=cb)
             ab.bind('<Enter>', lambda _e: ab.configure(bg=hov))
             ab.bind('<Leave>', lambda _e: ab.configure(bg=bg))
             return ab
@@ -22259,6 +22412,8 @@ class OverlayNotification:
             # A finished card gets a text "Close" beside its actions (same as
             # the X). Not on a 'note' card (a retry still running).
             st["close_button"] = kind in ("success", "error", "discarded")
+            # Done is done: it closes itself. A failure waits to be read.
+            st["auto_close"] = kind == "success" and mo.get("dot") == "ok"
         return st
 
     def _mcard_render(self):
@@ -26065,30 +26220,31 @@ class LiaApp:
     # and delivers exact zeros (2026-10-28: the Jabra left at 12:32 with the
     # monitor and came back at 13:24; the 13:30 meeting got digital silence
     # from it while Teams heard Naor, and a fresh process recorded it at
-    # once). Dictation records in a fresh subprocess, meetings in-process -
-    # so restart while idle, once the plug-in has settled.
+    # once). Meetings then record the mic in a fresh process
+    # (MeetingSession._start_mic_recorder). No restart: the monitor's hub does
+    # this at every screen wake, and a restart there meant a "Loading" pill and
+    # no dictation for up to a minute, each time (2026-11-02). Only the idle
+    # dictation workers are replaced, once the plug-in has settled: they
+    # enumerated the devices before the mic came back.
     MIC_ARRIVAL_SETTLE_S = 15.0
-    MIC_RESTART_RETRY_S = 600.0
 
     def _note_mic_arrived(self, names, now):
         self._mic_arrived_at = now
-        log.info("Microphone plugged in: %s - meetings cannot hear a mic that "
-                 "arrived after Lia started; restarting when idle", ", ".join(names))
+        log.info("Microphone plugged in: %s - later meetings record the mic in "
+                 "a fresh process", ", ".join(names))
 
-    def _maybe_restart_for_new_mic(self, now):
-        """Restart once a mic has arrived and Lia is idle. True if it did."""
+    def _refresh_workers_for_new_mic(self, now):
+        """Replace the dictation workers once a mic has arrived and settled, and
+        no dictation is running. True if it did."""
         at = getattr(self, "_mic_arrived_at", None)
-        if at is None or now - at < self.MIC_ARRIVAL_SETTLE_S:
+        if (at is None or now - at < self.MIC_ARRIVAL_SETTLE_S
+                or at == getattr(self, "_mic_workers_refreshed_for", None)
+                or self.is_recording or self._voice_ask_active):
             return False
-        last = getattr(self, "_mic_restart_tried_at", None)
-        if last is not None and now - last < self.MIC_RESTART_RETRY_S:
-            return False
-        if (self.is_recording or self._meeting_busy()
-                or self._compose_active or self._compose_instr_active
-                or self._voice_ask_active):
-            return False
-        self._mic_restart_tried_at = now      # a refused restart retries later
-        self._restart_app("mic-plugged")
+        self._mic_workers_refreshed_for = at
+        rec = getattr(self, "recorder", None)
+        if hasattr(rec, "respawn_after_stale"):
+            rec.respawn_after_stale()
         return True
 
     def _device_watchdog(self, _sleep=time.sleep, _clock=time.monotonic):
@@ -26132,9 +26288,9 @@ class LiaApp:
         while True:
             _sleep(CHECK_INTERVAL_SEC)
             try:
-                self._maybe_restart_for_new_mic(_clock())
+                self._refresh_workers_for_new_mic(_clock())
             except Exception as e:
-                log.error("New-mic restart check failed: %s", e)
+                log.error("New-mic worker refresh failed: %s", e)
             try:
                 sig = _audio_device_signature()
                 if (sig is not None and sig == prev_sig
@@ -29845,7 +30001,7 @@ class LiaApp:
         """Settings > Meetings: speaker names from the Teams live captions.
         Applies from the next meeting."""
         self.config["teams_speaker_names"] = not bool(
-            self.config.get("teams_speaker_names", False))
+            self.config.get("teams_speaker_names", True))
         save_config(self.config)
         log.info("Teams speaker names: %s",
                  "on" if self.config["teams_speaker_names"] else "off")

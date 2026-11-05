@@ -497,7 +497,7 @@ class TeamsCaptionWatcher:
         self._stop = threading.Event()
         self._thread = None
         self.state = {"teams_windows": 0, "captions_found": False,
-                      "lines": 0, "error": ""}
+                      "lines": 0, "error": "", "teams_seen": False}
         self._diag = None
         self._diag_lines = 0
         if diag_dir:
@@ -627,6 +627,8 @@ class TeamsCaptionWatcher:
     def _search(self, uia, dump):
         wins = uia.windows(self.window_classes)
         self.state["teams_windows"] = len(wins)
+        if wins:
+            self.state["teams_seen"] = True
         for w in wins:
             tree = uia.snapshot(w)
             root = find_caption_root(tree)

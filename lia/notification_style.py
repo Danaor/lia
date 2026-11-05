@@ -120,33 +120,40 @@ CHIP_FG = "#3A3C46"
 
 # DWM rounded-corner border colour, as 0x00BBGGRR (Win11).
 DWM_BORDER_BGR = (0xE3, 0xE2, 0xDC)   # matches BORDER; converted in the widget
-ORB = 18                  # Lia's orb (the busy indicator), logical px
+ORB = 16                  # Lia's orb (the busy indicator), logical px
 FADE_MS = 180             # the card fades in when it first appears
 # A processing card folds to its one-line form after this long (unless the
 # user already chose Minimize/Restore or opened Details); hovering opens it,
 # leaving folds it again; the finished card always opens in full.
 AUTO_COLLAPSE_MS = 8000
 HOVER_CLOSE_MS = 350      # grace before a hover-opened card folds back
-# The bottom-right cards rest half-transparent and come to full opacity while
-# the pointer is over them (Naor, 2026-10-27: "too loud"). An error card
-# stays opaque - a failure must never be easy to miss.
-REST_ALPHA = 0.65
+# A finished meeting card (Transcript / Summary ready) closes itself after this
+# long (Naor 2026-11-05), never under the pointer; a failure card stays.
+DONE_CLOSE_MS = 15000
+DONE_CLOSE_RETRY_MS = 1000  # the pointer is on it: look again this soon
+# The bottom-right cards rested at 65% (2026-10-27) and came to full opacity
+# under the pointer; turned off 2026-10-29 (Naor): they stay fully opaque and
+# are smaller instead. HoverOpacity stays as the seam (rest == full).
+REST_ALPHA = 1.0
 FULL_ALPHA = 1.0
 HOVER_LEAVE_MS = 150      # grace so moving between child widgets never flickers
 
 # ---- Sizes (logical px @ 96 DPI) -----------------------------------------
-WIDTH = 384
-WIDTH_MIN = 340
-PAD = 16                  # card inner padding
-GAP_SM = 8               # tight content gap
-GAP_MD = 12              # section gap / gap between stacked cards
-CORNER = 14              # corner radius (native DWM)
-MARGIN = 24              # distance from the work-area edge (bottom-right)
+# Made smaller 2026-10-29 (Naor: the cards were too big): 384 -> 320 wide,
+# tighter padding, buttons and type.
+WIDTH = 320
+WIDTH_MIN = 280
+PAD = 12                  # card inner padding
+GAP_SM = 6               # tight content gap
+GAP_MD = 10              # section gap / gap between stacked cards
+CORNER = 12              # corner radius (native DWM)
+MARGIN = 16              # distance from the work-area edge (bottom-right)
 DOT = 8                  # state dot diameter
-HIT = 30                 # min/close clickable box (icon sits inside)
+HIT = 26                 # min/close clickable box (icon sits inside)
 ICON = 16               # min/close glyph box
-BTN_H = 35               # action button height
-BTN_PAD_X = 14           # action button horizontal padding
+BTN_H = 30               # action button height
+BTN_PAD_X = 10           # action button horizontal padding
+BTN_PAD_Y = 4            # action button vertical padding
 
 # ---- Typography (Tk POINT sizes; scaled by the root's tk scaling) --------
 # Calibrated in the preview so the rendered heights match the spec's logical
@@ -158,13 +165,13 @@ FONT_FACE = "Segoe UI Variable Text"
 # ("תפעילו" for "פעילות" on a real meeting name, 2026-09-23). Any card with
 # Hebrew/RTL text renders in classic Segoe UI, which covers Hebrew.
 FONT_FACE_RTL = "Segoe UI"
-PT_TITLE = 12            # ~ spec 15px semibold
-PT_NAME = 10             # ~ spec 13-14px
-PT_BODY = 10             # message / stage label
+PT_TITLE = 11            # ~ spec 15px semibold
+PT_NAME = 9              # ~ spec 13-14px
+PT_BODY = 9              # message / stage label
 PT_META = 8              # ~ spec 12px secondary
 PT_BRAND = 8             # brand name
 PT_BTN = 9               # action button label
-PT_ICON = 11             # min/close glyph
+PT_ICON = 10             # min/close glyph
 
 
 class Metrics:

@@ -1500,7 +1500,7 @@ APP_JS = r"""
           : srow('Summarize when a meeting ends', 'Off = the transcript only. Summarize a meeting later from Home, or choose End &amp; summarize when you stop.',
               swb(!!cfg("meeting_auto_summary",true), "toggle_meeting_auto_summary")))+
         srow('Speaker names from Teams', 'Reads who is speaking from the live captions in your Teams window and puts the names on the transcript. Turn on captions in Teams (Settings > Accessibility > Always show captions). Nothing is sent anywhere.',
-          swb(!!cfg("teams_speaker_names",false), "toggle_teams_speaker_names"))+
+          swb(!!cfg("teams_speaker_names",true), "toggle_teams_speaker_names"))+
         srow('Live transcript updates every',
           'Lower = snappier, more transcription calls. A running meeting keeps its interval until it ends.',
           '<select data-select="set_meeting_chunk_seconds" style="max-width:200px">'+
