@@ -16,6 +16,10 @@ release), so there is no per-model update path. Flow:
   installer_command()   Setup /SILENT: Inno keeps the previous folder + tasks,
                         closes the running app, and (since 1.6.6) relaunches
                         Lia after a silent install.
+  stage_delta()         (1.6.19) the small update: only the files that
+                        changed, from the signed Lia-Update-<v>.zip, swapped
+                        in place like a portable update; the full Setup /
+                        Portable whenever it cannot be used.
 
 Stdlib + requests only; no UI here (lia.py owns the notices / Settings)."""
 from __future__ import annotations
@@ -35,6 +39,8 @@ SUMS_NAME = "SHA256SUMS.txt"
 RELEASES_PAGE = "https://github.com/Danaor/lia/releases/latest"
 SETUP_RE = re.compile(r"^Lia-Setup-(\d+\.\d+\.\d+)\.exe$", re.I)
 PORTABLE_RE = re.compile(r"^Lia-Portable-(\d+\.\d+\.\d+)\.zip$", re.I)
+# The small update (2026-11-06): only the files that changed (see stage_delta)
+UPDATE_RE = re.compile(r"^Lia-Update-(\d+\.\d+\.\d+)\.zip$", re.I)
 
 
 def parse_version(s):
@@ -68,14 +74,15 @@ def parse_release(data):
     out = {"version": version, "tag": data.get("tag_name", ""),
            "url": data.get("html_url", ""), "notes": (data.get("body") or "")[:4000],
            "published": data.get("published_at", ""), "setup": None, "portable": None,
-           "sums": None, "sums_sig": None}
+           "update": None, "sums": None, "sums_sig": None}
     for a in data.get("assets") or []:
         name = a.get("name", "")
         if name == SUMS_NAME:
             out["sums"] = _asset(a)
         elif name == SUMS_NAME + ".sig":
             out["sums_sig"] = _asset(a)
-        for kind, rx in (("setup", SETUP_RE), ("portable", PORTABLE_RE)):
+        for kind, rx in (("setup", SETUP_RE), ("portable", PORTABLE_RE),
+                         ("update", UPDATE_RE)):
             m = rx.match(name)
             if m and m.group(1) == version:
                 out[kind] = _asset(a)
@@ -130,8 +137,12 @@ def _get_small(url, session=None, cap=64 * 1024, timeout=20):
         return data
 
 
+_ASSET_WORDS = {"setup": "installer", "portable": "portable zip", "update": "update pack"}
+
+
 def authorize(rel, session=None, public_key_hex=None, asset="setup"):
-    """Check that `rel`'s Setup (or, asset="portable", its Portable zip) is one
+    """Check that `rel`'s Setup (or, asset="portable", its Portable zip, or
+    asset="update", its small update pack) is one
     the release key signed, BEFORE it is downloaded: SHA256SUMS.txt + .sig from
     the SAME release, the Ed25519 signature valid for the pinned key, the
     file's line in that list equal to GitHub's digest, and every URL under
@@ -140,8 +151,7 @@ def authorize(rel, session=None, public_key_hex=None, asset="setup"):
     import lia_ed25519
     setup, sums, sig = rel.get(asset), rel.get("sums"), rel.get("sums_sig")
     if not setup or not setup.get("sha256"):
-        raise VerifyError("the release has no verifiable %s" % (
-            "installer" if asset == "setup" else "portable zip"))
+        raise VerifyError("the release has no verifiable %s" % _ASSET_WORDS.get(asset, asset))
     if not sums or not sig:
         raise VerifyError("the release is not signed (no %s.sig)" % SUMS_NAME)
     prefix = "%s%s/" % (DOWNLOAD_PREFIX, rel.get("tag") or ("v" + rel.get("version", "")))
@@ -365,14 +375,20 @@ def stage_portable(zip_path, root, version):
             raise VerifyError("the Lia folder's path is too long to update in place - "
                               "move the folder somewhere shorter (e.g. C:\\Lia)")
         z.extractall(base)
+    _check_staged(new, version, "the portable zip")
+    return new
+
+
+def _check_staged(new, version, what):
+    """`new` is a whole Lia folder of `version` (runtime\\Lia.exe + app\\lia.py
+    with that APP_VERSION). Raises VerifyError."""
     lia_py = os.path.join(new, "app", "lia.py")
     if not (os.path.isfile(os.path.join(new, "runtime", "Lia.exe")) and os.path.isfile(lia_py)):
-        raise VerifyError("the portable zip is not a Lia folder")
+        raise VerifyError("%s is not a Lia folder" % what)
     with open(lia_py, encoding="utf-8", errors="replace") as f:
         m = re.search(r'^APP_VERSION = "([0-9.]+)"', f.read(), re.M)
     if not m or m.group(1) != version:
-        raise VerifyError("the portable zip is not Lia %s" % version)
-    return new
+        raise VerifyError("%s is not Lia %s" % (what, version))
 
 
 def _cmd_path(p):
@@ -487,3 +503,281 @@ def portable_cleanup(root):
            else "failed" if os.path.isfile(os.path.join(stage, "failed.txt")) else "leftover")
     shutil.rmtree(stage, ignore_errors=True)
     return res
+
+
+# ---- Small update (2026-11-06) ---------------------------------------------
+# Every release also publishes Lia-Update-<v>.zip: lia-update.json (EVERY file
+# of the new version: path, SHA-256, size) + files/<path> for each file that
+# changed since any of the last few releases (make_update_pack.py). The pack
+# is listed in the SAME signed SHA256SUMS.txt as the Setup and the Portable
+# zip (authorize(asset="update")), so its manifest and its files carry the
+# release key's signature. A copy of Lia hashes its own files, hard-links the
+# ones that already match into <root>\_update\new, takes the rest from the
+# pack (each checked against the manifest), and the portable swap script
+# does the rest (waits for Lia to exit, swaps runtime\ + app\, rolls back on
+# any failure). A file the pack does not carry, a malformed pack, a folder
+# Lia cannot write -> DeltaError -> the full Setup / Portable as before.
+DELTA_MANIFEST = "lia-update.json"
+DELTA_FILES = "files/"
+DELTA_FORMAT = 1
+DELTA_TREES = ("runtime", "app")
+INNO_APP_ID = "{826613BA-1DFC-4C6E-A0E5-6CA97A5A74FB}"
+_DELTA_MANIFEST_CAP = 8 * 1024 * 1024
+_SAFE_REL = re.compile(r'^[^\\:*?"<>|\x00-\x1f]+$')
+
+
+class DeltaError(Exception):
+    """The small update cannot be used for this copy - take the full one."""
+
+
+def _file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def tree_manifest(root):
+    """{posix/relative/path: [sha256, size]} for every file of a Lia folder,
+    without __pycache__ / *.pyc and the _update staging folder. The release
+    side builds the update pack's manifest from build_runtime\\ with this."""
+    out = {}
+    root = os.path.abspath(root)
+    for d, dirs, files in os.walk(root):
+        dirs[:] = sorted(x for x in dirs if x != "__pycache__"
+                         and not (d == root and x == PORTABLE_STAGE))
+        for f in sorted(files):
+            if f.endswith(".pyc"):
+                continue
+            p = os.path.join(d, f)
+            rel = os.path.relpath(p, root).replace(os.sep, "/")
+            out[rel] = [_file_sha256(p), os.path.getsize(p)]
+    return out
+
+
+def valid_rel(rel):
+    """A manifest path Lia may write: relative, '/'-separated, no '..', no
+    drive or stream, inside runtime/ or app/ (or a plain file at the top)."""
+    if not isinstance(rel, str) or not rel or len(rel) > 240 or not _SAFE_REL.match(rel):
+        return False
+    parts = rel.split("/")
+    if any(p in ("", ".", "..") or p.endswith((" ", ".")) for p in parts):
+        return False
+    return len(parts) == 1 or parts[0] in DELTA_TREES
+
+
+def read_delta_manifest(z, version):
+    """The pack's manifest (an open ZipFile), checked: format, version, every
+    entry well formed. Raises DeltaError."""
+    import json
+    try:
+        info = z.getinfo(DELTA_MANIFEST)
+    except KeyError:
+        raise DeltaError("the update pack has no %s" % DELTA_MANIFEST)
+    if info.file_size > _DELTA_MANIFEST_CAP:
+        raise DeltaError("the update pack's manifest is too large")
+    try:
+        m = json.loads(z.read(info).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise DeltaError("the update pack's manifest is malformed")
+    if not isinstance(m, dict) or m.get("format") != DELTA_FORMAT:
+        raise DeltaError("unknown update pack format %r" % (
+            m.get("format") if isinstance(m, dict) else None))
+    if m.get("version") != version:
+        raise DeltaError("the update pack is for Lia %s, not %s" % (m.get("version"), version))
+    files = m.get("files")
+    if not isinstance(files, dict) or not files:
+        raise DeltaError("the update pack lists no files")
+    seen = set()
+    for rel, v in files.items():
+        if not (valid_rel(rel) and isinstance(v, list) and len(v) == 2
+                and isinstance(v[0], str) and re.fullmatch(r"[0-9a-f]{64}", v[0])
+                and isinstance(v[1], int) and not isinstance(v[1], bool) and v[1] >= 0):
+            raise DeltaError("the update pack lists a bad entry: %r" % str(rel)[:80])
+        low = rel.lower()          # Windows paths are case-insensitive
+        if low in seen:
+            raise DeltaError("the update pack lists %r twice" % rel[:80])
+        seen.add(low)
+    if "runtime/Lia.exe" not in files or "app/lia.py" not in files:
+        raise DeltaError("the update pack is not a whole Lia")
+    return m
+
+
+def plan_delta(files, root, packed):
+    """Which files of the new version this folder already has, by hashing
+    them. Returns (keep, fetch, top): keep = runtime/app files whose local
+    copy matches (hard-linked over), fetch = runtime/app files taken from the
+    pack, top = files at the top of the folder that exist here, differ and
+    are in the pack (README, launchers - refreshed by the swap). Raises
+    DeltaError when a needed runtime/app file is not in the pack."""
+    keep, fetch, top, missing = [], [], [], []
+    for rel in sorted(files):
+        sha, size = files[rel]
+        local = os.path.join(root, *rel.split("/"))
+        exists = os.path.isfile(local)
+        have = exists and os.path.getsize(local) == size and _file_sha256(local) == sha
+        if "/" not in rel:
+            if exists and not have and rel in packed:
+                top.append(rel)
+        elif have:
+            keep.append(rel)
+        elif rel in packed:
+            fetch.append(rel)
+        else:
+            missing.append(rel)
+    if missing:
+        raise DeltaError("%d file(s) of the new version are not in the update pack "
+                         "(e.g. %s)" % (len(missing), missing[0]))
+    return keep, fetch, top
+
+
+def _extract_verified(z, name, dst, sha, size):
+    """Stream one pack member to dst; it must be exactly `size` bytes with
+    SHA-256 `sha`, else it is deleted and VerifyError is raised."""
+    h, n = hashlib.sha256(), 0
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    try:
+        with z.open(name) as src, open(dst, "wb") as out:
+            while True:
+                chunk = src.read(1 << 20)
+                if not chunk:
+                    break
+                n += len(chunk)
+                if n > size:
+                    raise VerifyError("%s is larger than the manifest says" % name)
+                h.update(chunk)
+                out.write(chunk)
+        if n != size or h.hexdigest() != sha:
+            raise VerifyError("%s does not match the signed manifest" % name)
+    except BaseException:
+        try:
+            os.remove(dst)
+        except OSError:
+            pass
+        raise
+
+
+def _carry_pycache(root, new):
+    """Hard-link the compiled bytecode (__pycache__) over, so the first start
+    after a small update does not recompile every package. Safe: a .pyc
+    records its source's mtime + size, and every file taken from the pack is
+    new (a fresh mtime), so Python recompiles exactly those. Best effort."""
+    n = 0
+    for tree in DELTA_TREES:
+        for d, dirs, files in os.walk(os.path.join(root, tree)):
+            if os.path.basename(d) != "__pycache__":
+                continue
+            dst_dir = os.path.join(new, os.path.relpath(d, root))
+            if not os.path.isdir(os.path.dirname(dst_dir)):
+                continue
+            for f in files:
+                if not f.endswith(".pyc"):
+                    continue
+                try:
+                    os.makedirs(dst_dir, exist_ok=True)
+                    os.link(os.path.join(d, f), os.path.join(dst_dir, f))
+                    n += 1
+                except OSError:
+                    pass
+    return n
+
+
+def stage_delta(pack_path, root, version):
+    """Build <root>\\_update\\new = Lia `version` from this folder's own files
+    plus the verified update pack, for portable_swap_script(). Unchanged
+    files are hard-linked (copied where links do not work, e.g. FAT), the
+    changed ones come from the pack, each checked against the signed
+    manifest. Returns (new_dir, stats). Raises DeltaError (use the full
+    download) or VerifyError."""
+    import shutil
+    import zipfile
+    root = os.path.abspath(root)
+    new = os.path.join(root, PORTABLE_STAGE, "new")
+    shutil.rmtree(new, ignore_errors=True)
+    try:
+        z = zipfile.ZipFile(pack_path)
+    except (zipfile.BadZipFile, OSError) as e:
+        raise DeltaError("the update pack cannot be opened (%s)" % e)
+    try:
+        return _stage_delta(z, root, new, version)
+    except BaseException:
+        shutil.rmtree(new, ignore_errors=True)     # never leave a half update
+        raise
+    finally:
+        z.close()
+
+
+def _stage_delta(z, root, new, version):
+    import shutil
+    m = read_delta_manifest(z, version)
+    files = m["files"]
+    packed = {n[len(DELTA_FILES):] for n in z.namelist()
+              if n.startswith(DELTA_FILES) and not n.endswith("/")}
+    if len(new) + 1 + max(len(r) for r in files) > 255:
+        raise DeltaError("the Lia folder's path is too long to update in place")
+    keep, fetch, top = plan_delta(files, root, packed)
+    os.makedirs(new)
+    linked = copied = 0
+    for rel in keep:
+        src = os.path.join(root, *rel.split("/"))
+        dst = os.path.join(new, *rel.split("/"))
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        try:
+            os.link(src, dst)
+            linked += 1
+        except OSError:
+            shutil.copy2(src, dst)
+            copied += 1
+    nbytes = 0
+    for rel in fetch + top:
+        sha, size = files[rel]
+        _extract_verified(z, DELTA_FILES + rel, os.path.join(new, *rel.split("/")),
+                          sha, size)
+        nbytes += size
+    pyc = _carry_pycache(root, new)
+    for rel, (sha, size) in files.items():
+        if "/" in rel:
+            p = os.path.join(new, *rel.split("/"))
+            if not os.path.isfile(p) or os.path.getsize(p) != size:
+                raise VerifyError("the staged update is missing %s" % rel)
+    _check_staged(new, version, "the update")
+    return new, {"kept": len(keep), "linked": linked, "copied": copied,
+                 "fetched": len(fetch), "top": len(top), "bytes": nbytes, "pyc": pyc}
+
+
+def note_installed_version(root, version, _key=None):
+    """After a small update of a per-user install: Apps & features shows the
+    version that runs now (Setup wrote the previous one). Only the HKCU entry
+    whose InstallLocation is this folder; an all-users (HKLM) entry is left
+    alone. Returns True when it changed the entry."""
+    try:
+        import winreg
+    except ImportError:
+        return False
+    key = _key or (r"Software\Microsoft\Windows\CurrentVersion\Uninstall\%s_is1" % INNO_APP_ID)
+    v = parse_version(version)
+    if not v:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key, 0,
+                            winreg.KEY_READ | winreg.KEY_SET_VALUE) as k:
+            loc = winreg.QueryValueEx(k, "InstallLocation")[0]
+            if os.path.normcase(os.path.abspath(loc.rstrip("\\/"))) != \
+                    os.path.normcase(os.path.abspath(root)):
+                return False
+            try:
+                if winreg.QueryValueEx(k, "DisplayVersion")[0] == version:
+                    return False
+            except OSError:
+                pass
+            winreg.SetValueEx(k, "DisplayVersion", 0, winreg.REG_SZ, version)
+            for name, val in (("MajorVersion", v[0]), ("MinorVersion", v[1])):
+                try:
+                    winreg.QueryValueEx(k, name)
+                    winreg.SetValueEx(k, name, 0, winreg.REG_DWORD, val)
+                except OSError:
+                    pass
+            return True
+    except OSError:
+        return False

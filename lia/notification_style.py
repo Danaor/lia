@@ -127,8 +127,11 @@ FADE_MS = 180             # the card fades in when it first appears
 # leaving folds it again; the finished card always opens in full.
 AUTO_COLLAPSE_MS = 8000
 HOVER_CLOSE_MS = 350      # grace before a hover-opened card folds back
-# A finished meeting card (Transcript / Summary ready) closes itself after this
-# long (Naor 2026-11-05), never under the pointer; a failure card stays.
+# Every card and prompt Lia shows by itself closes after this long, never under
+# the pointer (Naor 2026-11-05 for the finished card, 2026-11-06 for all of
+# them: "15 seconds is enough to read"). A finished, failed or stopped meeting
+# card closes; an unanswered "Stop processing?" goes back to the processing
+# card; a prompt fires its timeout. Only a card that is still working stays.
 DONE_CLOSE_MS = 15000
 DONE_CLOSE_RETRY_MS = 1000  # the pointer is on it: look again this soon
 # The bottom-right cards rested at 65% (2026-10-27) and came to full opacity

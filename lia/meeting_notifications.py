@@ -581,7 +581,11 @@ class MeetingCard:
         if self._pointer_inside():
             self._later(ns.DONE_CLOSE_RETRY_MS, lambda: self._auto_close(token))
             return
-        self.hide()
+        cb = (self._state or {}).get("on_auto_close")
+        if cb:
+            cb()          # e.g. an unanswered "Stop processing?" goes back
+        else:
+            self.hide()
 
     # ---- auto-fold + hover peek ------------------------------------------
     @staticmethod

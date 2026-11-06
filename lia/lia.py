@@ -224,6 +224,7 @@ import logging
 import numpy as np
 import lang_pack
 import secret_store
+import speakers_setup
 import gpu_lease
 import ollama_gate
 import updater
@@ -379,7 +380,7 @@ if sys.platform == "win32":
     ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
 
 # --- Configuration ---
-APP_VERSION = "1.6.18"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
+APP_VERSION = "1.6.19"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Lia")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -461,7 +462,7 @@ DEFAULT_CONFIG = {
     # GPU-busy policy (2026-09-23): when the GPU is busy, a local dictation goes
     # to this cloud provider FIRST (then the others that have a key: OpenAI,
     # Gemini, Groq). "off" = always local (it waits on the busy GPU). Long jobs
-    # (meetings, pyannote, local summaries) never offload - they wait.
+    # (meetings, local summaries) never offload - they wait.
     # OFF by default since 1.6.11 (audit F10): a user who chose LOCAL dictation
     # and saved a key for something else must not have clips sent to a cloud
     # just because the GPU is busy. A one-time notice points to the setting.
@@ -577,7 +578,7 @@ DEFAULT_CONFIG = {
     #   "openai_gpt4o" / "openai_gpt4o_mini" / "groq_turbo"
     #   "local_hebrew_turbo" / "local_english_distil"
     #   "assemblyai_universal_2"  (always diarized — speaker labels)
-    #   "local_pyannote_hebrew"   (100% local diarization: pyannote + ivrit.ai)
+    #   "local_diarize_hebrew"   (100% local: Nemotron speakers + ivrit.ai)
     # DEFAULT is the fully-LOCAL Hebrew model so a fresh install with NO API
     # keys still records + transcribes meetings out of the box (the summary
     # degrades to transcript-only without an OpenAI/Ollama summary model, and
@@ -589,7 +590,7 @@ DEFAULT_CONFIG = {
     # "" = follow meeting_model (the historical behaviour).
     "file_transcribe_model": "",
     # Bilingual auto-routing for the LOCAL meeting/file models (2026-07-31).
-    # True: local_hebrew_turbo / local_pyannote_hebrew detect each segment's
+    # True: local_hebrew_turbo / local_diarize_hebrew detect each segment's
     # language and route he→ivrit.ai, en/other→general large-v3-turbo — an
     # English (or mixed) meeting stops coming out as phonetic-Hebrew gibberish.
     # False: the old hard language="he" lock.
@@ -642,23 +643,11 @@ DEFAULT_CONFIG = {
     # 0 = keep transcripts + summaries forever (the archive feeds the RAG /
     # action tracker - it IS the product); >0 = prune them like the audio.
     "meeting_transcript_retention_days": 0,
-    # 100% LOCAL diarization (option alongside AssemblyAI). pyannote.audio runs
-    # on the GPU to find speaker turns; the local ivrit.ai Hebrew model then
-    # transcribes each turn — no cloud, no per-minute cost. Needs a FREE
-    # HuggingFace token (read) + accepting the model terms once; after the first
-    # download it's fully offline. hf_token is used ONLY to fetch the weights.
-    "hf_token": "",
-    # community-1 is the newest open-source pyannote model (v4.x, big speaker-
-    # confusion reduction over 3.1) + an "exclusive" view that aligns cleanly with
-    # per-turn transcription. Needs pyannote.audio 4.x (diarize_local.py pins the
-    # tested versions); diarize_local.py auto-
-    # falls back to speaker-diarization-3.1 if community-1 can't load.
-    "diarize_local_model": "pyannote/speaker-diarization-community-1",
-    # Offline bundle: a self-contained HF cache dir. "" = auto-use
-    # <app>/diarization_models when populated (see "Download diarization model").
-    # When present, diarization runs with NO network and NO HF token — so the
-    # weights can ship inside a product and end users never touch HuggingFace.
-    "diarize_models_dir": "",
+    # 100% LOCAL speaker detection (2026-11-06): NVIDIA Nemotron 3 Diarization
+    # on the CPU finds the speaker turns (about 33 s per meeting hour), then the
+    # local model transcribes each turn. Installed on demand (Settings >
+    # Meetings > Speakers) into %LOCALAPPDATA%\Lia\speakers - see
+    # speakers_setup.py. pyannote (and its HF token) was removed.
     "silent_mode": False,  # True = hide waveform overlay & status notifications (tray icon still changes color)
     # Privacy: the log records only SIZES of user content (dictations, voice-ask
     # questions, detected meeting titles, correction hits). True = log the full
@@ -1003,17 +992,19 @@ DEFAULT_CONFIG = {
     # loopback = everyone else). speaker_self_name "" = Windows display name.
     "speaker_self_detect": True,
     "speaker_self_name": "",
-    # Voiceprint store: learn a named speaker's embedding on every rename-save
-    # (and the self cluster automatically); auto-name matching clusters in
-    # future meetings. Fully local (speaker_profiles.json). Kill-switch.
-    "speaker_profiles_enabled": True,
     # WP6 (2026-09-17): after the mic-correlated self cluster is found, fix
     # turns the diarizer misfiled relative to the local user by the per-second
     # channel ratio (measured self-cluster purity 70-77% -> higher).
     "speaker_self_sharpen": True,
-    # One-time tip when a cloud diarize model is chosen while local pyannote
-    # speaker detection is installed (it learns voices; the cloud paths cannot).
-    "local_diarize_tip_shown": False,
+    # Live speaker labels in CHUNKED meetings (2026-11-06): NVIDIA Nemotron 3
+    # on the CPU labels the audio every step (38 x 80 ms = 3.04 s), each chunk is
+    # cut at the label changes and carries its label into the transcript with
+    # its text. Needs speaker detection installed; Teams caption names win.
+    "meeting_live_speakers": True,
+    "meeting_live_speakers_step_frames": 38,
+    # Speaker detection downloads itself in the background the first time it
+    # is needed (Naor 2026-11-06: no Install click). Remove turns this off.
+    "speakers_auto_install": True,
     # Phase 2: one narrow LOCAL gemma call matches still-unnamed labels to
     # calendar candidates from conversational evidence (self-intros, being
     # addressed by name and answering). Evidence-or-nothing, code-enforced.
@@ -2700,12 +2691,12 @@ _LOCAL_HW_NOTES = {
     "local_parakeet_english": "fast on a plain CPU · no GPU needed",
     "local_multilang_turbo":
         "GPU (4 GB+) recommended · CPU: ready ~5 min after a 1h meeting",
-    "local_pyannote_hebrew":
-        "GPU (6 GB+) strongly recommended · CPU: ~90 min per meeting hour",
-    "local_pyannote_parakeet":
-        "GPU (6 GB+) strongly recommended · CPU: ~90 min per meeting hour",
-    "local_pyannote_multilang":
-        "GPU (6 GB+) strongly recommended · CPU: ~90 min per meeting hour",
+    "local_diarize_hebrew":
+        "GPU (4 GB+) recommended · speakers on the CPU, ~30 s per meeting hour",
+    "local_diarize_parakeet":
+        "fast on a plain CPU · speakers ~30 s per meeting hour",
+    "local_diarize_multilang":
+        "GPU (4 GB+) recommended · speakers on the CPU, ~30 s per meeting hour",
 }
 
 # Supply-chain pinning (2026-08-28 audit): every HuggingFace model download is
@@ -2799,7 +2790,7 @@ def _default_meeting_model(cfg=None):
     CUDA GPU. Chunked keeps the live transcript working, is lighter/faster, and
     scales; and for decision/task meetings the summary is ~identical to diarized
     (owners come from spoken NAMES, not speaker-diarization labels — the summary
-    prompt ignores the labels). Turn on 'Local diarize (pyannote)' per-meeting
+    prompt ignores the labels). Turn on a '+ Speaker detection' model per-meeting
     when 'who said what' genuinely matters (1:1s, interviews, disputes). Only used
     when the user has no saved meeting_model; an explicit menu choice is never
     overridden.
@@ -2812,35 +2803,6 @@ def _default_meeting_model(cfg=None):
         if cfg.get("gemini_api_key"):
             return "gemini_transcribe"
     return "local_hebrew_turbo"
-
-
-# HuggingFace token FALLBACK for the local diarization model, read from a file
-# NEXT TO this script (gitignored — see .gitignore). This lets a bundled/shipped
-# build carry a token so a colleague's first-ever pyannote download works even
-# without the offline bundle, WITHOUT the secret ever entering the PUBLIC repo.
-# Precedence at runtime: the offline bundle (no token at all) > the user's own
-# config hf_token > this file. Absent file → "" (no fallback). Never commit the
-# real token to source: this repo is public, and GitHub/HF secret-scanning would
-# auto-revoke a committed token.
-_HF_TOKEN_FILE = "hf_token.local"
-_bundled_hf_token_cache = None
-
-
-def bundled_hf_token():
-    """Return the fallback HF token shipped alongside the app (hf_token.local),
-    or "" when the file is absent/empty. Cached after first read."""
-    global _bundled_hf_token_cache
-    if _bundled_hf_token_cache is None:
-        _bundled_hf_token_cache = ""
-        try:
-            p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             _HF_TOKEN_FILE)
-            if os.path.isfile(p):
-                with open(p, encoding="utf-8") as f:
-                    _bundled_hf_token_cache = f.read().strip()
-        except Exception as e:
-            log.debug("bundled_hf_token read failed: %s", e)
-    return _bundled_hf_token_cache
 
 
 # Portable-build config SEED, read from a JSON file NEXT TO this script
@@ -3051,6 +3013,23 @@ def _normalize_language_config(cfg):
     return cfg
 
 
+# Settings > Models: a "+ Nemotron Speakers" row before speaker detection is installed.
+_SPEAKERS_NOTE = "picking it downloads speaker detection once (about 650 MB)"
+_SPEAKERS_BUSY_NOTE = "speaker detection is downloading..."
+# Each speaker model's plain (chunked) twin: the same transcription, no speakers.
+_SPEAKERS_PLAIN_KEY = {
+    "local_diarize_hebrew": "local_hebrew_turbo",
+    "local_diarize_parakeet": "local_parakeet_english",
+    "local_diarize_multilang": "local_multilang_turbo",
+}
+
+_PYANNOTE_KEY_SUCCESSOR = {
+    "local_pyannote_hebrew": "local_diarize_hebrew",
+    "local_pyannote_parakeet": "local_diarize_parakeet",
+    "local_pyannote_multilang": "local_diarize_multilang",
+}
+
+
 def load_config():
     os.makedirs(CONFIG_DIR, exist_ok=True)
     if os.path.exists(CONFIG_FILE):
@@ -3096,6 +3075,16 @@ def load_config():
         if cfg.get("transcription_backend") == "gemini_live":
             log.info("Migrating transcription_backend 'gemini_live' → 'gemini'")
             cfg["transcription_backend"] = "gemini"
+        # pyannote was replaced by NVIDIA Nemotron 3 Diarization (2026-11-06,
+        # Naor: drop pyannote entirely). The meeting model keys lost the name.
+        for _k in ("meeting_model", "file_transcribe_model"):
+            _new = _PYANNOTE_KEY_SUCCESSOR.get(cfg.get(_k))
+            if _new:
+                log.info("Migrating %s %s -> %s", _k, cfg.get(_k), _new)
+                cfg[_k] = _new
+        for _k in ("hf_token", "diarize_local_model", "diarize_models_dir",
+                   "pyannote_vram_need_mb", "speaker_profiles_enabled"):
+            cfg.pop(_k, None)
         # The 3-phase local summary ENSEMBLE was retired 2026-09-14 (single-pass
         # gemma4:31b is the method - SOL-class and ~10x faster; the ensemble was a
         # workaround for Ollama infra bugs long fixed). Drop the stale opt-in key
@@ -3190,7 +3179,7 @@ def load_config():
         if "meeting_model" not in seed:
             cfg["meeting_model"] = {
                 "local_hebrew_turbo": "local_parakeet_english",
-                "local_pyannote_hebrew": "local_pyannote_parakeet",
+                "local_diarize_hebrew": "local_diarize_parakeet",
             }.get(cfg["meeting_model"], cfg["meeting_model"])
     # A multilingual-locale first run picks the multilingual meeting default now
     # that primary + enabled are set (Gemini when keyed, else chunked local which
@@ -12354,14 +12343,6 @@ def _ollama_split(model, root=None):
     return vram < size
 
 
-# GPU coordination (P2.3, 2026-09-23). pyannote (local diarization) was MEASURED
-# at +11.1 GB (a 4-min meeting) and +12.2 GB (23-min) of VRAM on the 3090, and
-# gemma4:31b holds ~19 GB: they can never share the 24 GB card, and pyannote on
-# CUDA with gemma loaded ended in "CUDA unknown error" + an nvlddmkm driver
-# reset (13/153). gemma is still loaded for 5 min after any summary / ask /
-# harvest, so a back-to-back meeting hits it. Default = the measured peak plus
-# a margin; config `pyannote_vram_need_mb` overrides.
-_PYANNOTE_VRAM_NEED_MB = 12800
 # 127.0.0.1, not "localhost": on Windows a NEW connection to localhost tries
 # IPv6 first and costs 2.08 s (measured 2026-09-23; 127.0.0.1 = 2-15 ms), and
 # the GPU gate opens one per /api/ps.
@@ -12372,7 +12353,7 @@ def _ollama_fast_root(root):
     return (root or _OLLAMA_ROOT).replace("//localhost:", "//127.0.0.1:")
 
 # GPU-busy policy (2026-09-23): work is NEVER moved to the CPU because the
-# card is busy. A long job (meeting transcription, pyannote, a local summary)
+# card is busy. A long job (meeting transcription, a local summary)
 # WAITS for the GPU and says so on its card; a short dictation goes to the cloud
 # and says so. Field case (2026-09-23): another app held the 3090 at ~96%, the
 # meeting chunks slowed from ~0.5 s to 10-17 s each, a 12.6 s dictation queued
@@ -12623,7 +12604,7 @@ def _fmt_wait(seconds):
     return "%d:%02d" % (s // 60, s % 60)
 
 
-# Lia's OWN heavy GPU work in flight (a local summary call, pyannote, a whole
+# Lia's OWN heavy GPU work in flight (a local summary call, a whole
 # diarized-meeting job). Used to (a) not count Lia's own Ollama work as "another
 # app" (a dictation was sent to the cloud because of Lia's own summary, 09-23)
 # and (b) restore the models Lia released for that work once it is over.
@@ -12724,7 +12705,7 @@ def _lease_unload_idle(need_mib, keep_model, job):
 
 @contextlib.contextmanager
 def heavy_gpu_job(job, detail="", expect_s=300, need_mib=0, keep_model=None):
-    """Run a WHOLE heavy GPU job (a local summary run, pyannote + its
+    """Run a WHOLE heavy GPU job (a local summary run, the per-turn
     re-transcription) under the cross-app lease: wait for it (the card says
     who holds it and since when; a Discard ends the wait), unload idle Ollama
     models right after taking it when the job's need is not free, and mark the
@@ -12866,19 +12847,6 @@ def _wait_for_gpu(need_mb, what, *, shed_own=True, min_wait_s=0.0, poll_s=None,
                 log.info("GPU free again for %s after %s (%s MiB free)", what,
                          _fmt_wait(clock() - t0), "?" if free is None else free)
                 return True
-
-
-def _pyannote_device(requested, need_mb=_PYANNOTE_VRAM_NEED_MB):
-    """The --device for local diarization. 'cpu' (the user's own choice) stays
-    'cpu'. For CUDA: wait until need_mb is free - NEVER a CPU fallback for a
-    busy card (2026-09-23: a 32-min meeting diarized on CPU for minutes while
-    another app held the GPU), and never by unloading another app's Ollama
-    model. A CUDA failure with too little VRAM took the display driver down,
-    so pyannote only starts with room. Unknown free VRAM -> unchanged."""
-    if requested == "cpu":
-        return "cpu"
-    _wait_for_gpu(need_mb, "pyannote (speaker diarization)")
-    return requested
 
 
 def _task_done_runaway(n_votes, n_tasks):
@@ -13219,8 +13187,8 @@ class MeetingSession:
         # Decided by the caller at meeting start from the meeting_model and
         # resolved lazily at stop (see _run_diarize_job).
         self._diarize_enhance_model = diarize_enhance_model
-        # Which engine finds the speaker turns: "assemblyai" (cloud) or
-        # "local_pyannote" (pyannote.audio on the GPU). Pinned at start so
+        # Which engine finds the speaker turns: "assemblyai" (cloud), "gemini",
+        # or "local_diarize" (NVIDIA Nemotron 3 on the CPU). Pinned at start so
         # switching the model mid-meeting can't flip it. See _run_diarize_job.
         self._diarize_backend = diarize_backend
         # When True ("Start Meeting & Summarize"), run a gpt-5.5 summary on
@@ -13288,7 +13256,6 @@ class MeetingSession:
         self._loop_rms_1s = []
         # Phase 3: this meeting's per-cluster voiceprints (local diarization),
         # kept for learning when the user names speakers in the rename dialog.
-        self._speaker_embeddings = {}
         # Serialises writeframes (rotation thread) vs close (stop /
         # finalize_wav_on_exit from the quit path). wave.Wave_write is NOT
         # thread-safe: close() seeks back to patch the RIFF header while a
@@ -13359,6 +13326,9 @@ class MeetingSession:
         # Speaker names read from the Teams live captions (chunked meetings,
         # config teams_speaker_names); None when off. See teams_captions.py.
         self._teams = None
+        # Live speaker labels from NVIDIA Nemotron 3 (chunked meetings, config
+        # meeting_live_speakers, speaker detection installed); see speakers_live.py.
+        self._live_spk = None
 
     def _start_teams_captions(self, stamp):
         """Chunked meetings: start reading speaker names from the Teams live
@@ -13399,6 +13369,185 @@ class MeetingSession:
             return "Speaker names: Teams captions found, nobody has spoken yet"
         except Exception:
             return "Speaker names: -"
+
+    def _start_live_speakers(self):
+        """Chunked meetings: label speakers live with Nemotron 3 when speaker
+        detection is installed and meeting_live_speakers is on. Best-effort:
+        any failure leaves the meeting exactly as before."""
+        try:
+            if not bool(self.app.config.get("meeting_live_speakers", True)):
+                return
+            if not speakers_setup.installed():
+                self.app._speakers_auto_install("meeting")
+                return
+            interp = find_python_interpreter()
+            if interp is None:
+                return
+            import speakers_live
+            step = int(self.app.config.get("meeting_live_speakers_step_frames", 38) or 38)
+            threads = max(1, min(4, (os.cpu_count() or 2) // 4))
+            self._live_spk = speakers_live.LiveSpeakers(
+                interp, speakers_setup.script_path(), speakers_setup.pkgs_dir(),
+                speakers_setup.model_dir(), step_frames=step, threads=threads,
+                log=log.info).start()
+            children = getattr(self.app, "_child_procs", None)
+            if children is not None and self._live_spk.proc is not None:
+                children.add(self._live_spk.proc)
+            log.info("Live speakers: on (step %.2f s, %d threads)",
+                     self._live_spk.step_s, threads)
+        except Exception as e:
+            log.info("Live speakers unavailable: %s", e)
+            self._live_spk = None
+
+    def _stop_live_speakers(self):
+        sp = getattr(self, "_live_spk", None)
+        if sp is None:
+            return
+        try:
+            sp.stop()
+            children = getattr(self.app, "_child_procs", None)
+            if children is not None and sp.proc is not None:
+                children.discard(sp.proc)
+            log.info("Live speakers: %d label(s) over %.0f s",
+                     len(sp.speakers()), sp.covered_s)
+        except Exception:
+            pass
+
+    def _live_turns_meeting_time(self):
+        """The live speaker turns shifted onto meeting seconds (the tracker
+        counts fed samples; the meeting counts the wall clock)."""
+        sp = getattr(self, "_live_spk", None)
+        if sp is None:
+            return []
+        off = float(getattr(self, "_live_spk_offset", 0.0) or 0.0)
+        return [dict(t, t0=t["t0"] + off, t1=t["t1"] + off) for t in sp.turns()]
+
+    def _submit_by_live_speakers(self, audio, now_rel, final=False):
+        """Live speaker labels on (no Teams caption turn in this window): cut
+        the window at the label changes, label each piece BEFORE it is
+        transcribed (text and speaker arrive together), and carry the part
+        not labelled yet. False = no labels; the caller cuts as usual."""
+        sp = getattr(self, "_live_spk", None)
+        if sp is None or audio is None or len(audio) == 0:
+            return False
+        try:
+            import teams_captions
+            import speakers_live
+            if final:
+                sp.finish(timeout=10.0)
+            else:
+                sp.wait_labels(timeout=4.0)
+            if not sp.alive() and not final:
+                return False
+            fed = sp.fed_s
+            # meeting seconds = tracker seconds + offset (re-measured every
+            # window, so a slow clock drift never accumulates)
+            self._live_spk_offset = now_rel - fed
+            turns = sp.turns()
+            w0 = fed - len(audio) / 16000.0
+            guard = 0.0 if final else max(0.3, fed - sp.covered_s + 0.3)
+            res = teams_captions.split_audio_by_turns(audio, w0, turns, guard_s=guard)
+        except Exception as e:
+            log.debug("Live speaker cut failed (usual cut): %s", e)
+            return False
+        if res is None:
+            return False
+        pieces, carry = res
+        if not final:
+            self._carry_tail = carry if carry is not None and len(carry) else None
+        off = self._live_spk_offset
+        for i, (start, piece) in enumerate(pieces):
+            last = i == len(pieces) - 1
+            if len(piece) < 1600:
+                continue
+            cut = ("final" if final else "smart") if last else "speaker"
+            pause_s = 0.0
+            if last and not final and carry is not None and len(carry):
+                pause_s = pause_seconds_at_cut(piece, carry)
+            lab = speakers_live.dominant_label(turns, start, start + len(piece) / 16000.0)
+            self._submit_chunk(piece, blocking=final, cut=cut, pause_s=pause_s,
+                               start_rel=start + off,
+                               extra={"turn_cut": True, "live_label": lab})
+        if final and carry is not None and len(carry) >= 8000:
+            self._submit_chunk(carry, blocking=True, cut="final",
+                               start_rel=now_rel - len(carry) / 16000.0,
+                               extra={"turn_cut": True, "live_label": None})
+        return True
+
+    # A live label takes a Teams caption name when that name holds this share
+    # of the label's captioned time and at least this many seconds of it. Votes
+    # are PER LABEL: two labels of one voice (a split) both get the name.
+    LIVE_NAME_SHARE = 0.6
+    LIVE_NAME_MIN_S = 8.0
+
+    @classmethod
+    def live_label_names(cls, live_turns, caption_turns):
+        """{live label: caption name} by overlap votes (meeting seconds)."""
+        votes = {}
+        for t in live_turns:
+            for c in caption_turns:
+                ov = min(t["t1"], c["t1"]) - max(t["t0"], c["t0"])
+                if ov > 0 and c.get("speaker"):
+                    v = votes.setdefault(t["speaker"], {})
+                    v[c["speaker"]] = v.get(c["speaker"], 0.0) + ov
+        out = {}
+        for lab, v in votes.items():
+            name, sec = max(v.items(), key=lambda kv: kv[1])
+            if sec >= cls.LIVE_NAME_MIN_S and sec >= cls.LIVE_NAME_SHARE * sum(v.values()):
+                out[lab] = name
+        return out
+
+    def _live_labelled(self, chunks):
+        """Chunk records -> "speaker" from the live label, unless the Teams
+        captions already named that chunk: the Teams name the label's own time
+        voted for (live_label_names), else the user's name for the label that
+        tracks the MIC channel (pick_self_speaker), else "Speaker A"."""
+        if not any(c.get("live_label") for c in chunks):
+            return chunks
+        live = self._live_turns_meeting_time()
+        names = {}
+        try:
+            t = getattr(self, "_teams", None)
+            caps = t.turns() if t is not None else []
+            if caps and live:
+                names = self.live_label_names(live, caps)
+        except Exception as e:
+            log.debug("Live label names from captions failed: %s", e)
+        try:
+            utts = [{"speaker": t["speaker"], "start": t["t0"] * 1000.0,
+                     "end": t["t1"] * 1000.0} for t in live]
+            self_lab = None
+            if utts and self._mic_rms_1s and self._loop_rms_1s:
+                self_lab, _gap = pick_self_speaker(utts, self._mic_rms_1s, self._loop_rms_1s)
+            me = self.app._self_speaker_name() if self_lab else ""
+        except Exception as e:
+            log.debug("Live self speaker failed: %s", e)
+            self_lab, me = None, ""
+        out = []
+        for c in chunks:
+            lab = c.get("live_label")
+            if lab and not c.get("speaker"):
+                nm = names.get(lab) or (me if lab == self_lab and me else "") \
+                    or "Speaker %s" % lab
+                c = dict(c, speaker=nm)
+            out.append(c)
+        return out
+
+    # The model has 8 speaker slots: once they are all in use a new voice
+    # lands on an existing label (measured on a 16-voice meeting).
+    LIVE_MAX_LABELS = 8
+
+    def _live_status_line(self):
+        """Transcript header line for the live labels: "" normally; a visible
+        note once all 8 labels are in use."""
+        sp = getattr(self, "_live_spk", None)
+        try:
+            if sp is not None and len(sp.speakers()) >= self.LIVE_MAX_LABELS:
+                return ("Speaker labels: all 8 in use - with more voices than "
+                        "that, some voices share a label")
+        except Exception:
+            pass
+        return ""
 
     def _stop_teams_captions(self, grace=1.5):
         if getattr(self, "_teams", None) is not None:
@@ -13466,7 +13615,7 @@ class MeetingSession:
                 # holding most of it names it.
                 dom = 0.55 if c.get("turn_cut") else 0.7
                 out.append(dict(c, speaker=teams_captions.label_window(
-                    turns, a, b, dominant=dom)))
+                    turns, a, b, dominant=dom) or c.get("speaker")))
             return out
         except Exception as e:
             log.debug("Teams speaker labels failed: %s", e)
@@ -13609,6 +13758,7 @@ class MeetingSession:
                          self._wav_path or "off")
                 self._open_track_writers(stamp)
                 self._start_teams_captions(stamp)
+                self._start_live_speakers()
 
             # Status sidecar next to the LIVE file: the window reads the real
             # phase from here rather than guessing from the LIVE file's presence.
@@ -13670,6 +13820,7 @@ class MeetingSession:
         # The last words' captions land ~1 s after the audio: read a moment
         # longer, then stop (the turns stay for the transcript writer).
         self._stop_teams_captions()
+        self._stop_live_speakers()
 
         duration_sec = self.stop_time - self.start_time
         log.info("Meeting stopped (duration=%.1fs%s)",
@@ -13824,6 +13975,7 @@ class MeetingSession:
         self.stop_time = time.time()
         self._set_status(phase="cancelled")
         self._stop_teams_captions(grace=0)
+        self._stop_live_speakers()
         # Let the rotation loop see the stop event and exit. Deliberately do
         # NOT call _finalise_current_chunk() — that would transcribe the last
         # chunk (and cost tokens), which is the whole point of cancelling.
@@ -13894,8 +14046,10 @@ class MeetingSession:
                     % (start_dt.strftime("%Y-%m-%d %H:%M"), self.chunk_seconds))
             _tl = (self._teams_status_line()
                    if getattr(self, "_teams", None) is not None else "")
-            if _tl:
-                head = head.rstrip("\n") + "\n" + _tl + "\n\n"
+            _ll = self._live_status_line()
+            for _line in (_tl, _ll):
+                if _line:
+                    head = head.rstrip("\n") + "\n" + _line + "\n\n"
             body = (self._assemble_live_markdown() if self.diarize_mode
                     else self._assemble_transcript_markdown(live=True))
             with self._live_lock:
@@ -14273,7 +14427,11 @@ class MeetingSession:
         from another thread, and two concurrent drains would interleave
         reads from the same recorder buffers."""
         with self._drain_lock:
-            return self._drain_audio_inner()
+            audio = self._drain_audio_inner()
+            sp = getattr(self, "_live_spk", None)
+            if sp is not None and audio is not None and len(audio):
+                sp.feed(audio)
+            return audio
 
     def _drain_audio_inner(self):
         mic_audio = None
@@ -14757,7 +14915,8 @@ class MeetingSession:
                         self._last_voice_ts = time.time()
                     # Speaker names from Teams: cut this window at the speaker
                     # changes so every chunk is one speaker's turn.
-                    if self._submit_by_speaker(audio, now_rel):
+                    if (self._submit_by_speaker(audio, now_rel)
+                            or self._submit_by_live_speakers(audio, now_rel)):
                         continue
                     # Smart boundary: cut at the quietest point near the end and
                     # carry the tail into the next chunk, so the 45s rotation
@@ -14819,8 +14978,9 @@ class MeetingSession:
             drained = self._drain_audio()
             now_rel = (time.time() - self.start_time) if self.start_time else 0.0
             audio = self._with_carry(drained)
-            if audio is not None and len(audio) >= 8000 and not self._submit_by_speaker(
-                    audio, now_rel, final=True):
+            if audio is not None and len(audio) >= 8000 and not (
+                    self._submit_by_speaker(audio, now_rel, final=True)
+                    or self._submit_by_live_speakers(audio, now_rel, final=True)):
                 self._submit_chunk(audio, blocking=True, cut="final")
         except Exception as e:
             log.error("Meeting final chunk drain failed: %s", e)
@@ -15235,9 +15395,9 @@ class MeetingSession:
         """_run_diarize_job, but whatever path it leaves by (an early return,
         an unexpected exception) the status sidecar ends terminal."""
         why = "processing stopped before a result"
-        self._pyannote_lease = contextlib.ExitStack()
+        self._diar_lease = contextlib.ExitStack()
         try:
-            # The whole job (pyannote, per-turn transcription, summary) is Lia's
+            # The whole job (per-turn transcription, summary) is Lia's
             # own GPU work: models released for it come back only after it.
             with gpu_own_work():
                 self._run_diarize_job()
@@ -15245,7 +15405,7 @@ class MeetingSession:
             why = "processing failed: %s" % e
             log.exception("Diarized meeting job crashed: %s", e)
         finally:
-            self._pyannote_lease.close()      # never leave the lease held
+            self._diar_lease.close()          # never leave the lease held
             self._ensure_terminal_status(why)
 
     def _run_diarize_job(self):
@@ -15253,16 +15413,16 @@ class MeetingSession:
         (optionally) re-transcribe each utterance for better Hebrew text →
         markdown. Two diarization backends, pinned at start:
           - "assemblyai"     : upload → AssemblyAI (cloud) → utterances(text).
-          - "local_pyannote" : pyannote.audio (100% local, GPU) → speaker turns,
-            then the ivrit.ai Hebrew model transcribes each turn (mandatory,
-            since pyannote gives no text). No cloud, no per-minute cost.
+          - "local_diarize" : NVIDIA Nemotron 3 (100% local, CPU) → speaker
+            turns, then the local model transcribes each turn (mandatory, since
+            the speaker model gives no text). No cloud, no per-minute cost.
           - "gemini"         : gemini-3.5-transcribe (cloud, free tier) returns
             speaker-labelled words directly (no separate diarizer, no enhance).
             Whole file split into inline-sized segments; labels renumber per
             segment (the downstream naming pass reconciles them).
         Runs after stop(); the user gets a notification when done."""
         backend = getattr(self, "_diarize_backend", "assemblyai")
-        is_local = (backend == "local_pyannote")
+        is_local = (backend == "local_diarize")
         is_gemini = (backend == "gemini")
         transcriber = getattr(self.app, "_assemblyai_transcriber", None)
         gem = self.app._ensure_gemini_transcriber() if is_gemini else None
@@ -15298,7 +15458,7 @@ class MeetingSession:
         # utterance ("openai_gpt4o" or "local_hebrew_turbo").
         enhance_model = getattr(self, "_diarize_enhance_model", None)
         do_enhance = enhance_model is not None
-        # Stage list differs by backend. Local: pyannote (diarize) → per-turn
+        # Stage list differs by backend. Local: speakers (diarize) → per-turn
         # transcription (the "enhance" step IS the transcription here).
         if is_local:
             first_stage = ("diarize", "Diarizing speakers")
@@ -15357,7 +15517,7 @@ class MeetingSession:
 
         stage = first_stage[0]
         # GPU-busy policy: any GPU wait inside this job (a failed per-turn
-        # Whisper call, pyannote, the local summary) shows on the CURRENT
+        # Whisper call, the local summary) shows on the CURRENT
         # stage's card line and ends on Discard. `stage` is read late (closure),
         # so the note follows the pipeline. This job owns its thread, so the
         # context needs no reset.
@@ -15366,16 +15526,8 @@ class MeetingSession:
             self._discarded.is_set, _MeetingDiscarded))
         try:
             if is_local:
-                # pyannote + its per-turn re-transcription = ONE heavy job under
-                # the cross-app GPU lease (contract v1). expect_s measured:
-                # a 77-min meeting took ~4 min on CUDA -> 60 + 4 s per minute.
-                _mins = max(1, int(((getattr(self, "stop_time", None) or time.time())
-                                    - (getattr(self, "start_time", None) or time.time()))
-                                   / 60))
-                if getattr(self, "_pyannote_lease", None) is None:
-                    self._pyannote_lease = contextlib.ExitStack()
-                self._pyannote_lease.enter_context(
-                    self.app._pyannote_lease_job("meeting %d min" % _mins, _mins))
+                # Speakers on the CPU (Nemotron 3): no GPU lease for this
+                # step; the per-turn transcription below takes it.
                 ov.meeting_status_step("diarize", gen=gen)
                 utts, spk_embs = self.app._run_local_diarization(
                     self._wav_path,
@@ -15407,8 +15559,8 @@ class MeetingSession:
                     on_status=lambda st: ov.meeting_status_detail("transcribe", st, gen=gen),
                 )
 
-            # Discarded during transcription (AssemblyAI poll / local pyannote
-            # have no per-step cancel, so they land here at the stage boundary;
+            # Discarded during transcription (the AssemblyAI poll has no
+            # per-step cancel, so they land here at the stage boundary;
             # Gemini already raised between pieces). Skip enhance/naming/summary.
             if self._discarded.is_set():
                 raise _MeetingDiscarded()
@@ -15421,6 +15573,16 @@ class MeetingSession:
             if do_enhance:
                 stage = "enhance"
                 ov.meeting_status_step("enhance", gen=gen)
+                if is_local:
+                    # The per-turn local transcription = ONE heavy GPU job under
+                    # the cross-app lease (contract v1).
+                    _mins = max(1, int(((getattr(self, "stop_time", None) or time.time())
+                                        - (getattr(self, "start_time", None) or time.time()))
+                                       / 60))
+                    if getattr(self, "_diar_lease", None) is None:
+                        self._diar_lease = contextlib.ExitStack()
+                    self._diar_lease.enter_context(
+                        self.app._diarize_lease_job("meeting %d min" % _mins, _mins))
                 utterances = result.get("utterances") or []
                 etx, elang, _ = self.app._resolve_meeting_model(enhance_model)
                 upgraded = self._rerun_utterances(
@@ -15428,31 +15590,15 @@ class MeetingSession:
                     on_progress=lambda d, t: ov.meeting_status_detail(
                         "enhance", f"{d}/{t}", gen=gen))
                 result["utterances"] = upgraded
-            # pyannote + re-transcription done: give the lease back before the
-            # naming + summary passes (they take it as their own jobs).
-            if getattr(self, "_pyannote_lease", None) is not None:
-                self._pyannote_lease.close()
-
-            # Speaker naming: this meeting's usable voiceprints. Clusters with
-            # under ~10s of speech are dropped up front - a low-speech cluster
-            # embeds weakly (measured 2026-08-27: same-speaker cosine ~0.83
-            # with real speech vs ~0.2 for a weak cluster) and would pollute
-            # learning and matching alike.
-            _talk_s = {}
-            for u in (result.get("utterances") or []):
-                _l = u.get("speaker")
-                if _l:
-                    _talk_s[_l] = _talk_s.get(_l, 0.0) + max(
-                        0.0, (float(u.get("end") or 0)
-                              - float(u.get("start") or 0)) / 1000.0)
-            self._speaker_embeddings = {
-                l: e for l, e in (result.get("speaker_embeddings") or {}).items()
-                if _talk_s.get(l, 0.0) >= 10.0}
+            # Re-transcription done: give the lease back before the naming +
+            # summary passes (they take it as their own jobs).
+            if getattr(self, "_diar_lease", None) is not None:
+                self._diar_lease.close()
 
             # Outcome tallies for the ONE-line naming summary logged below
             # (2026-09-17: the layers used to be invisible in the field).
             _self_lab, _self_gap, _sharp = None, 0.0, (0, 0)
-            _vp_matched, _llm_votes = {}, {}
+            _llm_votes = {}
             # Speaker naming, phase 1b: the diarized cluster whose talk
             # intervals correlate with the MIC channel (vs loopback) is the
             # LOCAL user - name it deterministically, no ML, no cloud.
@@ -15477,47 +15623,10 @@ class MeetingSession:
                                 u["speaker_name"] = name
                         log.info("Self speaker: Speaker %s = %s "
                                  "(mic-correlation margin %.2f)", lab, _priv(name), gap)
-                        # The deterministic self cluster is a FREE training
-                        # sample for the voiceprint store (talk-gated above).
-                        emb = self._speaker_embeddings.get(lab)
-                        if emb is not None and bool(self.app.config.get(
-                                "speaker_profiles_enabled", True)):
-                            try:
-                                import speaker_profiles
-                                cnt = speaker_profiles.learn(name, emb)
-                                log.info("Voiceprint learned (self): %s "
-                                         "(samples=%d)", _priv(name), cnt)
-                            except Exception as e:
-                                log.warning("Voiceprint self-learn failed: %s", e)
                     else:
                         log.info("Self speaker: no clearly mic-dominant cluster")
                 except Exception as e:
                     log.warning("Self-speaker detection failed: %s", e)
-
-            # Voiceprint MATCHING (speaker naming, phase 3): clusters whose
-            # embedding clearly matches a LEARNED profile get the real name
-            # automatically. Conservative thresholds - a wrong name is worse
-            # than 'Speaker B'. Local diarization only (AssemblyAI gives no
-            # embeddings, so this is inert there).
-            if (self._speaker_embeddings
-                    and bool(self.app.config.get("speaker_profiles_enabled", True))):
-                try:
-                    import speaker_profiles
-                    utts_sp = result.get("utterances") or []
-                    named = {u.get("speaker") for u in utts_sp
-                             if u.get("speaker_name")}
-                    cand = {l: e for l, e in self._speaker_embeddings.items()
-                            if l not in named}
-                    matched = speaker_profiles.match(cand)
-                    _vp_matched = matched
-                    for u in utts_sp:
-                        nm = matched.get(u.get("speaker"))
-                        if nm and not u.get("speaker_name"):
-                            u["speaker_name"] = nm
-                    for l, nm in sorted(matched.items()):
-                        log.info("Voiceprint match: Speaker %s = %s", l, _priv(nm))
-                except Exception as e:
-                    log.warning("Voiceprint matching failed: %s", e)
 
             # Speaker naming, phase 2: LLM name assignment from conversational
             # evidence (self-intros, being addressed and answering), candidates
@@ -15553,10 +15662,10 @@ class MeetingSession:
                 _labs = {u.get("speaker") for u in _uu if u.get("speaker")}
                 _named = {u.get("speaker") for u in _uu if u.get("speaker_name")}
                 log.info("Speaker naming: speakers=%d self=%s sharpened=%d/%d "
-                         "voiceprint=%d llm=%d -> named %d/%d",
+                         "llm=%d -> named %d/%d",
                          len(_labs),
                          ("%s(%.1f)" % (_self_lab, _self_gap)) if _self_lab else "none",
-                         _sharp[0], _sharp[1], len(_vp_matched), len(_llm_votes),
+                         _sharp[0], _sharp[1], len(_llm_votes),
                          len(_named), len(_labs))
             except Exception:
                 pass
@@ -15592,8 +15701,7 @@ class MeetingSession:
             # Done — actionable completion card (NO file auto-opens). "Open"
             # shows the RTL summary popup when we summarised, else the .txt.
             _rename_cb = (lambda p=md_path: self.app._rename_speakers_dialog(
-                p, attendees=self.attendees, audio_hint=self._wav_path,
-                speaker_embeddings=self._speaker_embeddings))
+                p, attendees=self.attendees, audio_hint=self._wav_path))
             if self.summarize and self.last_summary:
                 def _open(h=self.summary_html_path, m=md_path, s=self.last_summary):
                     if h and os.path.exists(h):
@@ -15668,7 +15776,7 @@ class MeetingSession:
             # itself and key/auth errors point at the right Settings card.)
             msg = str(e).lower()
             if is_local:
-                # pyannote raises a clear, actionable message already.
+                # Local speaker detection raises a clear, actionable message.
                 friendly = str(e)[:140]
             elif is_gemini:
                 if ('api key' in msg or 'api_key_invalid' in msg
@@ -16039,7 +16147,7 @@ class MeetingSession:
         # Credit the ACTUAL diarizer in the saved file (before 2026-09-02 every
         # non-local backend was written "diarized via AssemblyAI" - so a Gemini
         # meeting's transcript wrongly credited AssemblyAI).
-        _diar_by = {"local_pyannote": "pyannote + ivrit.ai (local)",
+        _diar_by = {"local_diarize": "Nemotron 3 speakers + local transcription",
                     "gemini": "Gemini 3.5 transcribe"}.get(
                         getattr(self, "_diarize_backend", "assemblyai"),
                         "AssemblyAI")
@@ -16173,6 +16281,8 @@ class MeetingSession:
             para_s = 60.0
         if getattr(self, "_teams", None) is not None:
             chunks = self._teams_labelled(chunks)
+        if getattr(self, "_live_spk", None) is not None:
+            chunks = self._live_labelled(chunks)
         return flow_chunk_paragraphs(chunks, para_seconds=para_s,
                                      enabled=enabled, live=live)
 
@@ -16338,6 +16448,9 @@ class MeetingSession:
                if getattr(self, "_teams", None) is not None else "")
         if _tl:
             sections.append(_tl)
+        _ll = self._live_status_line()
+        if _ll:
+            sections.append(_ll)
         sections.append("")
 
         if summary_md:
@@ -18493,18 +18606,18 @@ def _stamp_lia_launcher(exe_path):
         return False
     try:
         vi = VSVersionInfo(
-            ffi=FixedFileInfo(filevers=(1, 6, 18, 0), prodvers=(1, 6, 18, 0),
+            ffi=FixedFileInfo(filevers=(1, 6, 19, 0), prodvers=(1, 6, 19, 0),
                               mask=0x3f, flags=0x0, OS=0x40004,
                               fileType=0x1, subtype=0x0),
             kids=[
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.6.18.0'),
+                    StringStruct('FileVersion', '1.6.19.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.6.18.0'),
+                    StringStruct('ProductVersion', '1.6.19.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -21173,9 +21286,17 @@ class OverlayNotification:
         self._prompt_no_activate(top)
         ns.HoverOpacity(top)        # rests dimmed, full under the pointer
 
-        top.after(duration_ms,
-                  lambda: _close_and(on_timeout if on_timeout is not None
-                                     else on_dismiss))
+        # Never longer than any other card (Naor 2026-11-06), and never while
+        # the pointer is on it: then look again shortly.
+        def _timed_out():
+            if state['closed']:
+                return
+            if ns.pointer_over(top):
+                top.after(ns.DONE_CLOSE_RETRY_MS, _timed_out)
+                return
+            _close_and(on_timeout if on_timeout is not None else on_dismiss)
+
+        top.after(min(int(duration_ms), ns.DONE_CLOSE_MS), _timed_out)
 
     @staticmethod
     def _prompt_work_area(top):
@@ -22405,6 +22526,9 @@ class OverlayNotification:
                 ("Stop processing", lambda g=gen: self._mcard_do_stop(g), True),
                 ("Keep going", lambda g=gen: self._mcard_cancel_stop(g), False),
             ]
+            # Unanswered: back to the processing card, the work goes on.
+            st["auto_close"] = True
+            st["on_auto_close"] = lambda g=gen: self._mcard_cancel_stop(g)
         else:  # success / error / discarded - terminal; actions preset in model
             st["dot"] = mo.get("dot")
             st["message"] = mo.get("message", "")
@@ -22412,8 +22536,9 @@ class OverlayNotification:
             # A finished card gets a text "Close" beside its actions (same as
             # the X). Not on a 'note' card (a retry still running).
             st["close_button"] = kind in ("success", "error", "discarded")
-            # Done is done: it closes itself. A failure waits to be read.
-            st["auto_close"] = kind == "success" and mo.get("dot") == "ok"
+            # A finished card closes itself, a failure too (Naor 2026-11-06:
+            # 15 s is enough to read; the meeting stays on Home).
+            st["auto_close"] = kind in ("success", "error", "discarded")
         return st
 
     def _mcard_render(self):
@@ -23339,9 +23464,9 @@ class LiaApp:
         # any OTHER explicit meeting_model (AssemblyAI / OpenAI) is left alone, and
         # diarize is still one click away per-meeting from the menu.
         if not self.config.get("_meeting_chunked_default_migrated"):
-            if self.config.get("meeting_model") == "local_pyannote_hebrew":
+            if self.config.get("meeting_model") == "local_diarize_hebrew":
                 self.config["meeting_model"] = "local_hebrew_turbo"
-                log.info("Migrated meeting_model local_pyannote_hebrew → "
+                log.info("Migrated meeting_model local_diarize_hebrew → "
                          "local_hebrew_turbo (chunked default)")
             self.config["_meeting_chunked_default_migrated"] = True
             save_config(self.config)
@@ -23586,7 +23711,7 @@ class LiaApp:
         # discard it; _quit dumps this reference too.
         self._finalizing_meeting = None
         # Every session still being processed after Stop (see _meeting_busy),
-        # and child processes (pyannote) a quit must not orphan.
+        # and child processes (speaker detection) a quit must not orphan.
         self._processing_meetings = set()
         self._processing_lock = threading.Lock()
         self._child_procs = set()
@@ -24066,6 +24191,18 @@ class LiaApp:
             if not getattr(self, "_shutting_down", False):
                 self._offer_unfinished_meetings()
         threading.Thread(target=_resume_offer_later, daemon=True).start()
+
+        # Speaker detection downloads itself when this user needs it (a
+        # speakers model, or live labels + meetings on disk). Retried every
+        # 30 min while it fails (offline at logon, a server error).
+        def _speakers_auto_later():
+            time.sleep(90)
+            for _ in range(12):
+                if getattr(self, "_shutting_down", False) or self._local_diarize_ready():
+                    return
+                self._speakers_auto_install("startup")
+                time.sleep(self._SPEAKERS_AUTO_RETRY_S + 5)
+        threading.Thread(target=_speakers_auto_later, daemon=True).start()
 
         # Wait for Windows Explorer / taskbar to be ready before showing the tray
         # icon. Fixes the case where auto-start launches Lia before the
@@ -27219,10 +27356,10 @@ class LiaApp:
                 self.tray_icon.icon = self._create_icon("processing")
 
             try:
-                if is_diarized and model_key in ("local_pyannote_hebrew",
-                                                 "local_pyannote_parakeet",
-                                                 "local_pyannote_multilang"):
-                    # 100% LOCAL diarization on the picked file: decode → pyannote
+                if is_diarized and model_key in ("local_diarize_hebrew",
+                                                 "local_diarize_parakeet",
+                                                 "local_diarize_multilang"):
+                    # 100% LOCAL diarization on the picked file: decode → Nemotron
                     # speaker turns → re-transcribe each with the local model
                     # (ivrit.ai / Parakeet) → diarized .txt next to the source.
                     # Nothing uploaded.
@@ -27389,12 +27526,12 @@ class LiaApp:
 
     def _diarize_file_local(self, file_path, lang, transcriber):
         """100% LOCAL diarization for a user-picked FILE: decode → 16kHz mono WAV
-        → pyannote speaker turns → re-transcribe each turn with the local Hebrew
+        → Nemotron 3 speaker turns (CPU) → re-transcribe each turn with the local
         model → diarized .txt next to the source. Nothing is uploaded. Returns
         (out_path, joined_text). Raises with a user-facing message on failure."""
         import tempfile
         from faster_whisper.audio import decode_audio
-        self.overlay.show("  ⏳  Diarizing locally (pyannote)…  ", bg_color="#f77f00")
+        self.overlay.show("  ⏳  Detecting speakers…  ", bg_color="#f77f00")
         audio = np.asarray(decode_audio(file_path, sampling_rate=16000), dtype=np.float32)
         fd, wav_tmp = tempfile.mkstemp(suffix=".wav", prefix="wt_fdiar_")
         os.close(fd)
@@ -27406,12 +27543,12 @@ class LiaApp:
                 wf.setframerate(16000)
                 wf.writeframes(pcm.tobytes())
             _say = lambda s: self.overlay.show("  🖥  " + s + "  ", bg_color="#f77f00")
-            # pyannote + re-transcription = one heavy job under the cross-app
-            # GPU lease (the overlay says who holds it while it waits).
-            with gpu_wait_context(on_wait=_say), self._pyannote_lease_job(
+            # Speakers on the CPU first; the re-transcription is one heavy job
+            # under the cross-app GPU lease (the overlay says who holds it).
+            utts, _spk_embs = self._run_local_diarization(wav_tmp, on_status=_say)
+            with gpu_wait_context(on_wait=_say), self._diarize_lease_job(
                     "file %d min" % max(1, len(audio) // (16000 * 60)),
                     len(audio) / (16000.0 * 60)):
-                utts, _spk_embs = self._run_local_diarization(wav_tmp, on_status=_say)
                 self.overlay.show("  ✍  Transcribing %d turns…  " % len(utts),
                                   bg_color="#f77f00")
                 # Re-transcribe each speaker turn with the local Hebrew model
@@ -27429,7 +27566,7 @@ class LiaApp:
                         for u in utts if (u.get("text") or "").strip())
         out_path = self._write_diarized_file_markdown(
             file_path, {"utterances": utts, "text": text},
-            engine="pyannote (local) + Whisper Hebrew - 100% local")
+            engine="Nemotron 3 speakers + local transcription - 100% local")
         log.info("Local-diarized file saved: %s (%d turns, %d chars)",
                  out_path, len(utts), len(text))
         return out_path, text
@@ -28938,16 +29075,16 @@ class LiaApp:
     # Model display names are kept IDENTICAL to the dictation picker
     # (_MENU_MODELS_ORDERED) so the same model reads the same everywhere, with no
     # ⭐ markers (Naor's ask 2026-09-16). Rows that run on the SAME underlying
-    # model are grouped one under the other: each local ASR model, its pyannote
-    # diarization variant right below it. A diarize variant is named
-    # "<model> + Pyannote Diarization".
+    # model are grouped one under the other: each local ASR model, its speaker
+    # detection variant right below it. A diarize variant is named
+    # "<model> + Nemotron Speakers" (NVIDIA Nemotron 3 Diarization, CPU).
     _MEETING_MODELS = [
         ("Whisper Hebrew Local", "local_hebrew_turbo", []),
-        ("Whisper Hebrew Local + Pyannote Diarization", "local_pyannote_hebrew", []),
+        ("Whisper Hebrew Local + Nemotron Speakers", "local_diarize_hebrew", []),
         ("Parakeet Multi-Language Local (25 languages)", "local_parakeet_english", []),
-        ("Parakeet Multi-Language Local + Pyannote Diarization", "local_pyannote_parakeet", []),
+        ("Parakeet Multi-Language Local + Nemotron Speakers", "local_diarize_parakeet", []),
         ("Whisper Multi-Language Local (99 languages)", "local_multilang_turbo", []),
-        ("Whisper Multi-Language Local + Pyannote Diarization", "local_pyannote_multilang", []),
+        ("Whisper Multi-Language Local + Nemotron Speakers", "local_diarize_multilang", []),
         ("Gemini 3.5 transcribe Multi-Language", "gemini_transcribe", ["gemini_api_key"]),
         ("Gemini 3.5 transcribe Multi-Language · speakers", "gemini_diarize", ["gemini_api_key"]),
         ("AssemblyAI + Whisper Hebrew Local", "assemblyai_local_hebrew", ["assemblyai_api_key"]),
@@ -29009,9 +29146,9 @@ class LiaApp:
         "local_english_distil": "English Distil (local)",
         "local_parakeet_english": "Parakeet Multi-Language (local)",
         "local_multilang_turbo": "Whisper Multi-Language (local)",
-        "local_pyannote_hebrew": "Whisper Hebrew (local) · pyannote speakers",
-        "local_pyannote_parakeet": "Parakeet Multi-Language (local) · pyannote speakers",
-        "local_pyannote_multilang": "Whisper Multi-Language (local) · pyannote speakers",
+        "local_diarize_hebrew": "Whisper Hebrew (local) · Nemotron speakers",
+        "local_diarize_parakeet": "Parakeet Multi-Language (local) · Nemotron speakers",
+        "local_diarize_multilang": "Whisper Multi-Language (local) · Nemotron speakers",
         "gemini_transcribe": "Gemini 3.5 transcribe Multi-Language",
         "gemini_diarize": "Gemini 3.5 transcribe Multi-Language · speakers",
         "assemblyai_universal_2": "AssemblyAI → OpenAI GPT-4o transcribe",
@@ -29040,107 +29177,141 @@ class LiaApp:
         return triple
 
     def _local_diarize_ready(self):
-        """True when the offline pyannote bundle is on disk AND pyannote.audio
-        imports (a GPU makes it fast, not possible). Cheap; no model load."""
+        """True when local speaker detection (Nemotron 3) is installed: its
+        packages + the checked model files. Cheap: two marker files."""
         try:
-            import importlib.util
-            return bool(self._diarize_bundle_dir()) and \
-                importlib.util.find_spec("pyannote.audio") is not None
+            return speakers_setup.installed()
         except Exception:
             return False
 
-    def _diarize_bundle_dir(self):
-        """Return a ready OFFLINE pyannote bundle dir (a self-contained HF cache)
-        or "". Priority: an explicit config path, else the default
-        <base>/diarization_models when it holds a populated 'hub' cache. When one
-        exists, diarization runs with NO network and NO HF token — which is what
-        lets the weights ship inside a product (end users never touch HuggingFace)."""
-        explicit = (self.config.get("diarize_models_dir", "") or "").strip()
-        if explicit:
-            return explicit if os.path.isdir(explicit) else ""
-        default = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               "diarization_models")
-        hub = os.path.join(default, "hub")
+    def _speakers_status(self):
+        """Settings > Meetings > Speakers: install state + progress."""
         try:
-            if os.path.isdir(hub) and os.listdir(hub):
-                return default
-        except OSError:
-            pass
-        return ""
+            return speakers_setup.status()
+        except Exception as e:
+            return {"installed": False, "busy": False, "error": str(e)}
 
-    def _download_diarization_model(self):
-        """One-time: fetch the pyannote weights into a local BUNDLE dir (default
-        <base>/diarization_models) using the configured HF token. Afterwards the
-        app diarizes fully OFFLINE, and that folder can be shipped with a product
-        so end users need no token. Requires the token + accepted model terms."""
-        hf = (self.config.get("hf_token", "") or "").strip() or bundled_hf_token()
-        if not hf:
-            self.overlay.show_error("Set a HuggingFace token first")
-            self._set_hf_token()
-            return
-        base_dir = os.path.dirname(os.path.abspath(__file__))
+    # Automatic download: one try per this many seconds, and only with room
+    # for it (1.6 GB on disk + the pip cache of the install).
+    _SPEAKERS_AUTO_RETRY_S = 1800
+    _SPEAKERS_MIN_FREE_GB = 2.5
+
+    def _speakers_needed(self, reason):
+        """Does this user need speaker detection now? A "+ Nemotron Speakers"
+        meeting or file model always; live labels (on by default) at a meeting
+        start, or at startup for someone who already records meetings."""
+        c = self.config
+        if any((c.get(k) or "").startswith("local_diarize_")
+               for k in ("meeting_model", "file_transcribe_model")):
+            return True
+        if not bool(c.get("meeting_live_speakers", True)):
+            return False
+        if reason == "meeting":
+            return True
+        try:
+            return any("_meeting" in n and n.endswith(".txt")
+                       for n in os.listdir(MEETINGS_DIR))
+        except OSError:
+            return False
+
+    @staticmethod
+    def _free_gb(path):
+        import shutil
+        p = os.path.abspath(path)
+        while p and not os.path.exists(p):
+            parent = os.path.dirname(p)
+            if parent == p:
+                break
+            p = parent
+        return shutil.disk_usage(p).free / 1e9
+
+    def _speakers_auto_install(self, reason):
+        """Start the speaker-detection download in the background when it is
+        needed and missing (no click). True when a download is running after
+        the call. Quiet: a failure is logged and retried later."""
+        try:
+            st = speakers_setup.status()
+            if st.get("busy"):
+                return True
+            if st.get("installed"):
+                return False
+            if not bool(self.config.get("speakers_auto_install", True)):
+                return False
+            if not self._speakers_needed(reason):
+                return False
+            last = getattr(self, "_speakers_auto_last", 0.0)
+            if last and time.time() - last < self._SPEAKERS_AUTO_RETRY_S:
+                return False
+            self._speakers_auto_last = time.time()
+            free = self._free_gb(speakers_setup.root())
+            if free < self._SPEAKERS_MIN_FREE_GB:
+                log.warning("Speaker detection: not downloading - %.1f GB free "
+                            "(needs %.1f)", free, self._SPEAKERS_MIN_FREE_GB)
+                return False
+            log.info("Speaker detection: automatic download (%s)", reason)
+            ok, _msg = self._speakers_install(auto=True)
+            return ok
+        except Exception as e:
+            log.info("Speaker detection: automatic download skipped: %s", e)
+            return False
+
+    def _speakers_install(self, auto=False):
+        """Install local speaker detection on a worker thread: the hashed
+        packages, then the checked model. Progress reaches an open Settings
+        window through a state push every 2 s. auto = the background download
+        (no error card; retried later)."""
+        if speakers_setup.status().get("busy"):
+            return (False, "Already installing.")
         interp = find_python_interpreter()
-        script = os.path.join(base_dir, "diarize_local.py")
-        if interp is None or not os.path.exists(script):
-            self.overlay.show_error("Diarization script unavailable")
-            return
-        target = (self.config.get("diarize_models_dir", "") or "").strip() \
-            or os.path.join(base_dir, "diarization_models")
+        if interp is None:
+            return (False, "No Python interpreter to install with.")
+        if not auto and not self.config.get("speakers_auto_install", True):
+            self.config["speakers_auto_install"] = True
+            save_config(self.config)
+        done = threading.Event()
+
+        def pusher():
+            while not done.wait(2.0):
+                self._settings_push_state()
 
         def worker():
-            import subprocess
-            import tempfile
+            log.info("Speaker detection: install started (%s)", speakers_setup.root())
+            threading.Thread(target=pusher, daemon=True).start()
             try:
-                os.makedirs(target, exist_ok=True)
-            except Exception as e:
-                self.overlay.show_error("Cannot create %s: %s" % (target, e))
-                return
-            self.overlay.show("  ⬇  Downloading diarization model (one-time, ~GB)…  ",
-                               bg_color="#1e64c8", duration=4000)
-            env = os.environ.copy()
-            env["PYTHONUTF8"] = "1"
-            env["PYTHONIOENCODING"] = "utf-8"
-            env["HF_TOKEN"] = hf
-            env["HUGGING_FACE_HUB_TOKEN"] = hf
-            fd, outp = tempfile.mkstemp(suffix=".json", prefix="wt_diardl_")
-            os.close(fd)
-            # Token rides ONLY in env (HF_TOKEN above) - argv is visible to any
-            # same-user process via the process list, env of a child is not.
-            args = [interp, "-X", "utf8", script, "--download", "--models-dir", target,
-                    "--model", self.config.get("diarize_local_model",
-                                               "pyannote/speaker-diarization-community-1"),
-                    "--out", outp]
-            flags = 0x08000000  # CREATE_NO_WINDOW
-            try:
-                subprocess.run(args, env=env, creationflags=flags, timeout=3600,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-                data = {}
-                try:
-                    with open(outp, encoding="utf-8") as f:
-                        data = json.load(f)
-                finally:
-                    try:
-                        os.remove(outp)
-                    except Exception:
-                        pass
-                if data.get("ok"):
-                    log.info("Diarization model bundled at %s (%s)",
-                             target, data.get("used_model"))
-                    self.overlay.show("  ✓  Diarization model ready — runs offline now  ",
-                                       bg_color="#1a7a3a", duration=4000)
-                else:
-                    self.overlay.show_error("Download failed: "
-                                            + (data.get("error", "?")[:80]))
-            except subprocess.TimeoutExpired:
-                self.overlay.show_error("Model download timed out")
-            except Exception as e:
-                self.overlay.show_error("Download failed: %s" % str(e)[:80])
+                ok, msg = speakers_setup.install(interp, log=log.info)
+            finally:
+                done.set()
+            if ok:
+                self._meeting_xcribers.clear()
+                self.overlay.show("  ✓  Speaker detection is ready  ",
+                                  bg_color="#1a7a3a", duration=4000)
+            else:
+                log.warning("Speaker detection install failed: %s", msg)
+                if not auto:
+                    self.overlay.show_error("Speaker detection: %s" % msg[:80])
+            self._settings_push_state()
 
         threading.Thread(target=worker, daemon=True).start()
+        return (True, "Installing speaker detection (about %d MB)..."
+                % speakers_setup.DOWNLOAD_MB)
 
-    # --- Turn-merge tuning for LOCAL (pyannote) diarization ---
+    def _speakers_remove(self):
+        mm = (self.config.get("meeting_model") or "",
+              self.config.get("file_transcribe_model") or "")
+        if any(k.startswith("local_diarize_") for k in mm):
+            return (False, "A meeting or file model still uses speaker detection - "
+                           "pick another one first.")
+        ok, msg = speakers_setup.remove()
+        log.info("Speaker detection removed: %s", ok)
+        if ok:
+            # The user's choice: no automatic download until Install again.
+            self.config["speakers_auto_install"] = False
+            save_config(self.config)
+        return (ok, msg)
+
+    # --- Turn-merge tuning for LOCAL speaker detection ---
     # Measured on real meetings (2026-08-12, a 2-spk and a 4-spk 5-min slice):
-    # raw pyannote emits ~2x the turns AssemblyAI does — the same speaker gets
+    # raw diarizer output has ~2x the turns AssemblyAI does — the same speaker gets
     # split at every breath, and sub-2s fragments then transcribe badly for
     # lack of context ("שהיא מתה דת"-grade gibberish from ivrit). Merging
     # same-speaker turns across small gaps (and across sub-second backchannels
@@ -29153,7 +29324,7 @@ class LiaApp:
     _DIAR_MERGE_LOOKBACK = 3         # walk back over at most this many interjections
 
     def _merge_diarized_turns(self, utterances):
-        """Merge pyannote's over-segmented turns into transcription-friendly
+        """Merge the diarizer's over-segmented turns into transcription-friendly
         blocks: consecutive same-speaker turns whose gap is ≤ GAP_MS become one
         turn, including across ≤ INTERJECT_MS backchannels from other speakers
         (the backchannel keeps its own turn — same shape AssemblyAI produces;
@@ -29211,93 +29382,66 @@ class LiaApp:
                 return True
         return False
 
-    def _pyannote_need_mb(self):
-        """Free VRAM pyannote needs (measured +11.1-12.2 GB; config override)."""
-        try:
-            return int(self.config.get("pyannote_vram_need_mb")
-                       or _PYANNOTE_VRAM_NEED_MB)
-        except (TypeError, ValueError):
-            return _PYANNOTE_VRAM_NEED_MB
-
-    def _pyannote_lease_job(self, detail, minutes):
-        """The cross-app lease for pyannote + its re-transcription, or a no-op
-        when the user runs local models on the CPU (no GPU to share)."""
+    def _diarize_lease_job(self, detail, minutes):
+        """The cross-app GPU lease for the per-turn re-transcription after local
+        speaker detection (which itself runs on the CPU), or a no-op when the
+        user runs local models on the CPU (no GPU to share)."""
         if self.config.get("whisper_device") == "cpu":
             return contextlib.nullcontext()
-        return heavy_gpu_job("pyannote", detail=detail,
-                             expect_s=60 + 4 * max(1, int(minutes)),
-                             need_mib=self._pyannote_need_mb())
+        return heavy_gpu_job("transcription", detail=detail,
+                             expect_s=60 + 3 * max(1, int(minutes)))
 
     def _run_local_diarization(self, wav_path, on_status=None, should_cancel=None):
-        """Run pyannote (diarize_local.py subprocess) on the meeting WAV and
-        return AssemblyAI-shaped utterances [{speaker,start,end,text:""}] with
-        start/end in MILLISECONDS. Diarization ONLY — the caller then transcribes
-        each turn with the local ivrit.ai model (_rerun_utterances). Raises
-        RuntimeError with a user-facing message on any failure (pyannote missing,
-        HF token / model-terms, diarization error)."""
+        """Run local speaker detection (NVIDIA Nemotron 3 Diarization,
+        diarize_nemotron.py in a subprocess, CPU) on the meeting WAV and return
+        (utterances, {}) - AssemblyAI-shaped [{speaker,start,end,text:""}] with
+        start/end in MILLISECONDS. Speakers ONLY: the caller then transcribes
+        each turn with the local model (_rerun_utterances). Raises RuntimeError
+        with a user-facing message on any failure (not installed, bad WAV,
+        model error). No GPU, so no GPU wait: about 33 s per meeting hour on 8
+        threads (measured 2026-11-06)."""
         import subprocess
         import tempfile
-        base_dir = os.path.dirname(os.path.abspath(__file__))
         interp = find_python_interpreter()
-        script = os.path.join(base_dir, "diarize_local.py")
+        script = speakers_setup.script_path()
         if interp is None or not os.path.exists(script):
-            raise RuntimeError("Local diarization unavailable (no interpreter / script)")
-        bundle = self._diarize_bundle_dir()
+            raise RuntimeError("Speaker detection unavailable (no interpreter / script)")
+        if not speakers_setup.installed():
+            raise RuntimeError("Speaker detection is not installed - "
+                               "Settings > Meetings > Speakers > Install")
         if on_status:
             try:
-                on_status("loading pyannote (bundled)…" if bundle else "loading pyannote…")
+                on_status("detecting speakers…")
             except Exception:
                 pass
+        if should_cancel is not None and should_cancel():
+            raise _MeetingDiscarded()
         env = os.environ.copy()
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
-        # Token precedence: user's own config, then the shipped fallback file
-        # (bundled_hf_token). Ignored entirely when the offline bundle is present
-        # (diarize_local.py forces HF_HUB_OFFLINE with --models-dir).
-        hf = (self.config.get("hf_token", "") or "").strip() or bundled_hf_token()
-        if hf:
-            env["HF_TOKEN"] = hf
-            env["HUGGING_FACE_HUB_TOKEN"] = hf
+        env["HF_HUB_OFFLINE"] = "1"
+        env["TRANSFORMERS_OFFLINE"] = "1"
+        for _k in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP"):
+            env.pop(_k, None)
         fd, out_path = tempfile.mkstemp(suffix=".json", prefix="wt_diar_")
         os.close(fd)
-        # Make room on the GPU first (P2.3): pyannote needs ~12 GB, gemma holds
-        # ~19 GB for 5 min after any summary/ask - together they crash CUDA.
-        need = self._pyannote_need_mb()
-        requested = "cpu" if self.config.get("whisper_device") == "cpu" else "auto"
-        # GPU busy -> WAIT (the card says so, Discard works), never the CPU.
+        threads = max(1, min(8, (os.cpu_count() or 2) // 2))
+        args = [interp, "-X", "utf8", "-I", script, wav_path, "--out", out_path,
+                "--pkgs", speakers_setup.pkgs_dir(),
+                "--model-dir", speakers_setup.model_dir(),
+                "--threads", str(threads)]
+        # CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS: a CPU job must never
+        # make dictation or the meeting app itself feel slow.
+        flags = 0x08000000 | 0x00004000
+        t0 = time.monotonic()
         try:
-            with gpu_wait_context(on_wait=on_status, should_cancel=should_cancel,
-                                  cancel_exc=_MeetingDiscarded):
-                device = _pyannote_device(requested, need_mb=need)
-        except BaseException:
-            _safe_remove(out_path)
-            raise
-        # Discard pressed while we were making room? Do not even start.
-        if should_cancel is not None and should_cancel():
-            try:
-                os.remove(out_path)
-            except Exception:
-                pass
-            raise _MeetingDiscarded()
-        # Token rides ONLY in env (HF_TOKEN above), never on the command line.
-        args = [interp, "-X", "utf8", script, wav_path, "--out", out_path,
-                "--model", self.config.get("diarize_local_model",
-                                           "pyannote/speaker-diarization-community-1"),
-                "--device", device]
-        if bundle:
-            # Offline bundle present → load from it, no network / no HF token.
-            args += ["--models-dir", bundle]
-        flags = 0x08000000  # CREATE_NO_WINDOW
-        try:
-            # First run downloads model weights (can be minutes) → 1h ceiling.
-            # Popen (not run) + registered, so a quit can kill it instead of
-            # leaving pyannote running on as an orphan for up to an hour.
-            # stderr -> a temp file, not a PIPE: we POLL the child (to honour
-            # Discard) instead of communicate(), and an unread pipe can block it.
+            # Popen (not run) + registered, so a quit can kill it, and polled so
+            # Discard stops it. stderr -> a temp file (an unread pipe can block).
             efd, err_path = tempfile.mkstemp(suffix=".log", prefix="wt_diar_err_")
             err_f = os.fdopen(efd, "wb")
             try:
                 proc = subprocess.Popen(args, env=env, creationflags=flags,
+                                        stdin=subprocess.DEVNULL,
                                         stdout=subprocess.DEVNULL, stderr=err_f)
             except BaseException:
                 err_f.close()
@@ -29307,22 +29451,18 @@ class LiaApp:
             if children is not None:
                 children.add(proc)
             try:
-                # Discard during pyannote (2026-09-23): the card sat on
-                # "Stopping..." for the whole CPU run because nothing looked at
-                # the Discard until pyannote returned. Poll it every second.
                 deadline = time.monotonic() + 3600
-                with gpu_own_work():    # pyannote holds ~12 GB: Lia's own work
-                    while proc.poll() is None:
-                        if should_cancel is not None and should_cancel():
-                            proc.kill()
-                            proc.wait(10)
-                            log.info("Local diarization stopped: the meeting was discarded")
-                            raise _MeetingDiscarded()
-                        if time.monotonic() > deadline:
-                            proc.kill()
-                            proc.wait(10)
-                            raise subprocess.TimeoutExpired(args, 3600)
-                        time.sleep(1.0)
+                while proc.poll() is None:
+                    if should_cancel is not None and should_cancel():
+                        proc.kill()
+                        proc.wait(10)
+                        log.info("Speaker detection stopped: the meeting was discarded")
+                        raise _MeetingDiscarded()
+                    if time.monotonic() > deadline:
+                        proc.kill()
+                        proc.wait(10)
+                        raise subprocess.TimeoutExpired(args, 3600)
+                    time.sleep(0.5)
             finally:
                 if children is not None:
                     children.discard(proc)
@@ -29335,10 +29475,7 @@ class LiaApp:
                     err_bytes = ef.read()
             except Exception:
                 err_bytes = b""
-            try:
-                os.remove(err_path)
-            except Exception:
-                pass
+            _safe_remove(err_path)
             try:
                 with open(out_path, encoding="utf-8") as f:
                     data = json.load(f)
@@ -29348,28 +29485,26 @@ class LiaApp:
                     tail = (err_bytes or b"").decode("utf-8", "replace").strip().splitlines()[-1]
                 except Exception:
                     pass
-                raise RuntimeError("Diarization produced no result "
+                raise RuntimeError("Speaker detection produced no result "
                                    + ("(%s)" % tail[:120] if tail else ""))
         except subprocess.TimeoutExpired:
-            raise RuntimeError("Local diarization timed out")
+            raise RuntimeError("Speaker detection timed out")
         finally:
-            try:
-                os.remove(out_path)
-            except Exception:
-                pass
+            _safe_remove(out_path)
         if not data.get("ok"):
             hint = data.get("hint")
-            raise RuntimeError((data.get("error") or "diarization failed")
-                               + (" — " + hint if hint else ""))
+            raise RuntimeError((data.get("error") or "speaker detection failed")
+                               + (" - " + hint if hint else ""))
         utts = data.get("utterances") or []
-        log.info("Local diarization: %d speakers, %d turns (model=%s, device=%s)",
-                 data.get("num_speakers", 0), len(utts),
-                 data.get("used_model"), data.get("device"))
+        log.info("Speaker detection: %d speakers, %d turns, %.0f s audio in %.1f s "
+                 "(model=%s, %s threads)", data.get("num_speakers", 0), len(utts),
+                 float(data.get("audio_s") or 0), time.monotonic() - t0,
+                 data.get("used_model"), data.get("threads"))
         if not utts:
             raise RuntimeError("No speakers detected in the recording")
         merged = self._merge_diarized_turns(utts)
         if len(merged) != len(utts):
-            log.info("Local diarization: merged %d raw turns → %d blocks",
+            log.info("Speaker detection: merged %d raw turns → %d blocks",
                      len(utts), len(merged))
         utts = merged
         if on_status:
@@ -29377,8 +29512,7 @@ class LiaApp:
                 on_status("%d speakers · %d turns" % (data.get("num_speakers", 0), len(utts)))
             except Exception:
                 pass
-        # Speaker naming: per-cluster voiceprints ride along (may be {}).
-        return utts, (data.get("speaker_embeddings") or {})
+        return utts, {}
 
     def _ensure_remote_transcriber(self):
         """Build (once) + return the WhisperLive serve-mode transcriber for the
@@ -29496,12 +29630,12 @@ class LiaApp:
                 return (None, None, False)
             return (t, None, False)
 
-        if key in ("local_parakeet_english", "local_pyannote_parakeet"):
-            # Parakeet (multi-language, v3). local_pyannote_parakeet = the SAME model,
-            # but the meeting is DIARIZED locally (pyannote is language-agnostic;
+        if key in ("local_parakeet_english", "local_diarize_parakeet"):
+            # Parakeet (multi-language, v3). local_diarize_parakeet = the SAME model,
+            # but the meeting is DIARIZED locally (speaker detection is language-agnostic;
             # per-turn ASR = Parakeet). Reuse the dictation-side instance when
             # it is the same model and already loaded.
-            diarized = (key == "local_pyannote_parakeet")
+            diarized = (key == "local_diarize_parakeet")
             main = self._local_transcriber
             if (isinstance(main, ParakeetTranscriber)
                     and main.model is not None):
@@ -29515,15 +29649,15 @@ class LiaApp:
                 return (None, None, False)
             return (t, None, diarized)   # v3: auto-detect (25 European languages)
 
-        if key in ("local_multilang_turbo", "local_pyannote_multilang"):
+        if key in ("local_multilang_turbo", "local_diarize_multilang"):
             # Plain multilingual Whisper (large-v3-turbo, 99 languages,
             # auto-detect) - the meeting/file counterpart of the dictation
             # "Whisper Multi-Language Local (99 languages)" row. NOT the ivrit
             # Hebrew model or the he/en router. Honors a single-language lock if
-            # the user set one (else full auto-detect). local_pyannote_multilang =
-            # the SAME model, but the meeting is DIARIZED locally (pyannote finds
+            # the user set one (else full auto-detect). local_diarize_multilang =
+            # the SAME model, but the meeting is DIARIZED locally (Nemotron finds
             # the turns, this model transcribes each - see _run_diarize_job).
-            diarized = (key == "local_pyannote_multilang")
+            diarized = (key == "local_diarize_multilang")
             mt = FasterWhisperTranscriber(
                 model_size="large-v3-turbo",
                 cpu_threads=self.config.get("cpu_threads", 16),
@@ -29540,7 +29674,7 @@ class LiaApp:
                      if self._language_locked() else None)
             return (mt, mlock, diarized)
 
-        if key in ("local_hebrew_turbo", "local_english_distil", "local_pyannote_hebrew"):
+        if key in ("local_hebrew_turbo", "local_english_distil", "local_diarize_hebrew"):
             # Multilingual profile (2026-09-15): a local meeting uses the
             # 99-language large-v3-turbo (auto-detect, or the locked language) -
             # NOT the ivrit Hebrew model or the he/en router. Keeps the Hebrew
@@ -29561,12 +29695,12 @@ class LiaApp:
                     return (None, None, False)
                 mlock = (lang_pack.enabled_languages(self.config)[0]
                          if self._language_locked() else None)
-                return (mt, mlock, key == "local_pyannote_hebrew")
-            # local_pyannote_hebrew = the SAME ivrit.ai Hebrew Whisper, but the
-            # meeting is DIARIZED locally (pyannote finds the speaker turns, then
+                return (mt, mlock, key == "local_diarize_hebrew")
+            # local_diarize_hebrew = the SAME ivrit.ai Hebrew Whisper, but the
+            # meeting is DIARIZED locally (Nemotron finds the speaker turns, then
             # this model transcribes each turn — see _run_diarize_job's local path).
-            is_hebrew = key in ("local_hebrew_turbo", "local_pyannote_hebrew")
-            diarized = (key == "local_pyannote_hebrew")
+            is_hebrew = key in ("local_hebrew_turbo", "local_diarize_hebrew")
+            diarized = (key == "local_diarize_hebrew")
             model_size = ("ivrit-ai/whisper-large-v3-turbo-ct2"
                            if is_hebrew else "distil-large-v3")
             language = "he" if is_hebrew else "en"
@@ -29668,6 +29802,8 @@ class LiaApp:
         self.config["file_transcribe_model"] = key
         save_config(self.config)
         log.info("File transcribe model: %s", key or "(follow meeting model)")
+        if (key or "").startswith("local_diarize_"):
+            self._speakers_auto_install("model")
         try:
             if self.tray_icon:
                 self.tray_icon.update_menu()
@@ -29682,6 +29818,8 @@ class LiaApp:
         self.config["meeting_model"] = key
         save_config(self.config)
         log.info("Meeting model changed to: %s", key)
+        if (key or "").startswith("local_diarize_"):
+            self._speakers_auto_install("model")
         try:
             if self.tray_icon:
                 self.tray_icon.update_menu()
@@ -29890,6 +30028,15 @@ class LiaApp:
         # restart threshold causes the app to spuriously self-restart
         # while the user is in the middle of switching mics.
         self._reset_silent_state()
+
+    def _toggle_meeting_live_speakers(self):
+        """Settings > Meetings > Speakers: live speaker labels in chunked
+        meetings (Nemotron 3). Applies from the NEXT meeting."""
+        self.config["meeting_live_speakers"] = not bool(
+            self.config.get("meeting_live_speakers", True))
+        save_config(self.config)
+        log.info("Live speaker labels: %s",
+                 "on" if self.config["meeting_live_speakers"] else "off")
 
     def _toggle_keep_meeting_tracks(self):
         """Settings: keep the raw per-source meeting tracks (mic / system /
@@ -30129,10 +30276,10 @@ class LiaApp:
     }
     _LANG_MEETING = {
         "en": {"local_hebrew_turbo": "local_parakeet_english",
-               "local_pyannote_hebrew": "local_pyannote_parakeet",
+               "local_diarize_hebrew": "local_diarize_parakeet",
                "remote_hebrew_turbo": "local_parakeet_english"},
         "he": {"local_parakeet_english": "local_hebrew_turbo",
-               "local_pyannote_parakeet": "local_pyannote_hebrew"},
+               "local_diarize_parakeet": "local_diarize_hebrew"},
     }
 
     def _set_primary_language(self, lang):
@@ -30212,8 +30359,8 @@ class LiaApp:
         # Prefer Gemini for meetings when a key exists (free, 85+ langs, diarize);
         # only swap AWAY from a language-specific LOCAL/remote key, never a cloud choice.
         if (self.config.get("gemini_api_key") and self.config.get("meeting_model") in (
-                "local_hebrew_turbo", "local_pyannote_hebrew",
-                "local_parakeet_english", "local_pyannote_parakeet",
+                "local_hebrew_turbo", "local_diarize_hebrew",
+                "local_parakeet_english", "local_diarize_parakeet",
                 "remote_hebrew_turbo")):
             self.config["meeting_model"] = "gemini_transcribe"
             changed.append("meetings -> Gemini Transcribe")
@@ -31000,17 +31147,21 @@ class LiaApp:
         if self._update_kind() == "source":
             log.info("Update check: running from a source checkout - skipped")
             return
-        if self._update_kind() == "portable":
-            # the staging folder of the last portable update (the previous
-            # version kept for the swap) is no longer needed
+        if self._update_kind() in ("portable", "installer"):
+            # the staging folder of the last in-place update (a portable
+            # update, or since 1.6.19 a small update of either copy; the
+            # previous version kept for the swap) is no longer needed
             try:
-                res = updater.portable_cleanup(
-                    updater.portable_root(os.path.dirname(os.path.abspath(__file__))))
+                root = updater.portable_root(os.path.dirname(os.path.abspath(__file__)))
+                res = updater.portable_cleanup(root)
                 if res:
-                    log.info("Portable update: last swap %s (Lia %s now); staging removed",
+                    log.info("In-place update: last swap %s (Lia %s now); staging removed",
                              res, APP_VERSION)
+                if res == "swapped" and self._update_kind() == "installer" \
+                        and updater.note_installed_version(root, APP_VERSION):
+                    log.info("In-place update: Apps & features now shows Lia %s", APP_VERSION)
             except Exception as e:
-                log.warning("Portable update cleanup failed: %s", e)
+                log.warning("In-place update cleanup failed: %s", e)
         time.sleep(self._UPDATE_FIRST_DELAY_S)
         while not getattr(self, "_shutting_down", False):
             if self.config.get("update_check", True):
@@ -31123,6 +31274,9 @@ class LiaApp:
             if time.time() - last[0] > 1.0:   # at most one Settings push a second
                 last[0] = time.time()
                 self._settings_push_state()
+        # 1.6.19: only the files that changed, when this folder allows it
+        if self._update_try_delta(rel, progress):
+            return
         try:
             # The release key must have signed this Setup (audit F4): the
             # signed SHA256SUMS.txt names its hash and GitHub's digest agrees.
@@ -31201,6 +31355,8 @@ class LiaApp:
             st["status"], st["error"] = "error", msg[:200]
             self._settings_push_state()
             self._force_show_error_overlay("Lia update failed - see Settings")
+        if self._update_try_delta(rel, progress):
+            return
         root = updater.portable_root(os.path.dirname(os.path.abspath(__file__)))
         stage = os.path.join(root, updater.PORTABLE_STAGE)
         try:
@@ -31221,6 +31377,81 @@ class LiaApp:
             st["status"], st["error"] = "error", "A meeting started - update again when it ends."
             self._settings_push_state()
             return
+        self._update_launch_swap(rel, root, new_dir, fail)
+
+    def _update_delta_root(self, rel):
+        """The folder a small update (1.6.19) can be applied to, or None: the
+        release has an update pack, this is an installed or portable copy
+        whose folder this user can write, and it is not under Program Files
+        (an all-users install updates through its Setup, as before)."""
+        if not (rel or {}).get("update") or not self.config.get("update_delta", True):
+            return None
+        if self._update_kind() not in ("installer", "portable"):
+            return None
+        root = updater.portable_root(os.path.dirname(os.path.abspath(__file__)))
+        try:
+            if _install_root_is_protected(root) or not updater.portable_writable(root):
+                return None
+        except Exception:
+            return None
+        return root
+
+    def _update_try_delta(self, rel, progress):
+        """Download only the files that changed (Lia-Update-<v>.zip, signed
+        with the release) and swap them in like a portable update. True =
+        handled (Lia is quitting into the new version, or a meeting started);
+        False = take the full Setup / Portable download (no pack, a folder Lia
+        cannot write, files the pack does not carry, any failure)."""
+        root = self._update_delta_root(rel)
+        if not root:
+            return False
+        st = self._update_info()
+        stage = os.path.join(root, updater.PORTABLE_STAGE)
+        import shutil
+        t0 = time.time()
+        try:
+            updater.authorize(rel, asset="update")
+            shutil.rmtree(stage, ignore_errors=True)
+            path = updater.download_verified(rel["update"], stage, progress=progress)
+            st["status"] = "installing"
+            self._settings_push_state()
+            new_dir, stats = updater.stage_delta(path, root, rel["version"])
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        except Exception as e:
+            log.info("Update: the small update cannot be used here (%s) - "
+                     "downloading the full Lia %s", str(e)[:200], rel["version"])
+            shutil.rmtree(stage, ignore_errors=True)
+            st["status"], st["progress"] = "downloading", 0
+            self._settings_push_state()
+            return False
+        log.info("Update: small update to Lia %s - %d files from a %.1f MB pack, %d kept "
+                 "(%d linked, %d copied), %d .pyc carried, %.1f s",
+                 rel["version"], stats["fetched"] + stats["top"],
+                 (rel["update"].get("size") or 0) / 1e6, stats["kept"], stats["linked"],
+                 stats["copied"], stats["pyc"], time.time() - t0)
+        if self._meeting_busy() or getattr(self, "is_recording", False):
+            shutil.rmtree(stage, ignore_errors=True)
+            st["status"], st["error"] = "error", "A meeting started - update again when it ends."
+            self._settings_push_state()
+            return True
+
+        def fail(msg):
+            log.warning("Small update: %s", msg)
+            shutil.rmtree(stage, ignore_errors=True)
+            st["status"], st["error"] = "error", msg[:200]
+            self._settings_push_state()
+            self._force_show_error_overlay("Lia update failed - see Settings")
+        self._update_launch_swap(rel, root, new_dir, fail)
+        return True
+
+    def _update_launch_swap(self, rel, root, new_dir, fail):
+        """Write apply-update.cmd for `new_dir`, start it (it waits for this
+        process to exit, swaps runtime\\ + app\\, starts the new Lia - the
+        previous one on any failure) and quit."""
+        stage = os.path.join(root, updater.PORTABLE_STAGE)
         try:
             again, again_cwd = _restart_command("updated")
             back, back_cwd = _restart_command("update-failed")
@@ -31228,7 +31459,7 @@ class LiaApp:
                                                        back, back_cwd)
         except Exception as e:
             return fail("Update refused: %s" % e)
-        log.info("Update: portable swap to Lia %s staged in %s - quitting", rel["version"], stage)
+        log.info("Update: in-place swap to Lia %s staged in %s - quitting", rel["version"], stage)
         try:
             import subprocess
             flags = 0x08000000 | 0x00000200          # CREATE_NO_WINDOW | NEW_GROUP
@@ -31744,6 +31975,22 @@ class LiaApp:
             log.warning("Meeting model %s needs %s (missing) — falling back to "
                         "local_hebrew_turbo", model_key, ", ".join(_missing))
             model_key = "local_hebrew_turbo"
+        # A "+ Nemotron Speakers" model whose speaker detection is not installed
+        # (or was removed): record with the same model, chunked, and say why.
+        if model_key in _SPEAKERS_PLAIN_KEY and not self._local_diarize_ready():
+            log.warning("Meeting model %s: speaker detection is not installed - "
+                        "recording without speakers", model_key)
+            model_key = _SPEAKERS_PLAIN_KEY[model_key]
+            downloading = self._speakers_auto_install("meeting")
+            try:
+                self._force_show_notice_overlay(
+                    "Speaker detection is downloading - this meeting records "
+                    "without speakers, the next one will have them"
+                    if downloading else
+                    "Speaker detection is not installed - recording without "
+                    "speakers. Settings > Meetings > Speakers")
+            except Exception:
+                pass
         transcriber, language, is_diarized = self._resolve_meeting_model(model_key)
         diarize_enhance_model, diarize_backend = self._diarize_plan(model_key)
         # Friendly transcription-engine name for the status card (computed AFTER
@@ -31795,23 +32042,6 @@ class LiaApp:
                 )
                 session.start()
                 self._active_meeting = session
-                # One-time tip (WP2, 2026-09-17): the LOCAL diarizer measured far
-                # stronger than the cloud one on real meetings (self-detect 3/3,
-                # cross-meeting voiceprints 0.9+, and it is the only path that
-                # LEARNS voices). Point there once when a cloud diarize model is
-                # chosen while local speaker detection is installed.
-                try:
-                    if (is_diarized and diarize_backend != "local_pyannote"
-                            and not self.config.get("local_diarize_tip_shown")
-                            and self._local_diarize_ready()):
-                        self.config["local_diarize_tip_shown"] = True
-                        save_config(self.config)
-                        self._force_show_notice_overlay(
-                            "Tip: local speaker detection (pyannote) is ready - "
-                            "it recognizes you and learns voices. Settings > "
-                            "Models > Meeting model")
-                except Exception as e:
-                    log.debug("local diarize tip skipped: %s", e)
                 # Speaker naming, phase 1a: fetch the calendar attendees of the
                 # meeting overlapping NOW (async, de-elevated COM helper).
                 try:
@@ -32401,7 +32631,7 @@ class LiaApp:
         # _run_diarize_job which finalise() doesn't block on.
         self._finalizing_meeting = session
         # ...and in the processing SET, which outlives finalise(): a diarized
-        # meeting keeps working in session._diarize_job_thread (pyannote,
+        # meeting keeps working in session._diarize_job_thread (speakers,
         # re-transcription, summary - 10+ min) after finalise() returns, and
         # every auto-restart / quit decision must see that (_meeting_busy).
         self._track_processing_meeting(session)
@@ -32435,7 +32665,7 @@ class LiaApp:
         """A meeting is RECORDING or still being PROCESSED after Stop.
 
         _is_meeting_active() only covers recording: _active_meeting is cleared
-        the moment Stop is pressed, while a diarized meeting then runs pyannote,
+        the moment Stop is pressed, while a diarized meeting then runs speaker detection,
         per-turn transcription and the summary for up to 10+ minutes. Every
         auto-restart, background indexer and quit decision gated on
         _is_meeting_active() alone could kill that work mid-way (real loss:
@@ -32578,7 +32808,7 @@ class LiaApp:
         if backend == "assemblyai" and not str(key).startswith("assemblyai"):
             # The current meeting model is a chunked one: pick a diarizer.
             if self._local_diarize_ready():
-                key = "local_pyannote_hebrew"
+                key = "local_diarize_hebrew"
             elif (self.config.get("gemini_api_key") or "").strip():
                 key = "gemini_diarize"
             else:
@@ -32621,26 +32851,26 @@ class LiaApp:
         enhance_model = which model (if any) re-transcribes each utterance:
         the menu choice is authoritative ('AssemblyAI + GPT-4o' -> gpt-4o,
         'AssemblyAI + Hebrew Turbo Local' -> the local HE model, 'AssemblyAI
-        only' -> none). pyannote gives ONLY speaker turns (no text), so there
+        only' -> none). Local speaker detection gives ONLY speaker turns (no text), so there
         the per-turn transcription is mandatory, not an "enhance".
         diarize_backend = which engine finds the speaker turns: gemini_diarize
-        returns text + word timestamps directly (no enhance pass); pyannote
+        returns text + word timestamps directly (no enhance pass); Nemotron
         gives turns only; else AssemblyAI. Non-diarized keys get
         (None, 'assemblyai') and ignore both."""
         enhance = {
             "assemblyai_universal_2": "openai_gpt4o",
             "assemblyai_local_hebrew": "local_hebrew_turbo",
-            "local_pyannote_hebrew": "local_hebrew_turbo",
-            # English variant (2026-08): same pyannote turns, Parakeet per turn.
-            "local_pyannote_parakeet": "local_parakeet_english",
+            "local_diarize_hebrew": "local_hebrew_turbo",
+            # English variant (2026-08): same speaker turns, Parakeet per turn.
+            "local_diarize_parakeet": "local_parakeet_english",
             # Multilingual variant (2026-09-16): large-v3-turbo per turn.
-            "local_pyannote_multilang": "local_multilang_turbo",
+            "local_diarize_multilang": "local_multilang_turbo",
         }.get(model_key)
         if model_key == "gemini_diarize":
             backend = "gemini"
-        elif model_key in ("local_pyannote_hebrew", "local_pyannote_parakeet",
-                           "local_pyannote_multilang"):
-            backend = "local_pyannote"
+        elif model_key in ("local_diarize_hebrew", "local_diarize_parakeet",
+                           "local_diarize_multilang"):
+            backend = "local_diarize"
         else:
             backend = "assemblyai"
         return enhance, backend
@@ -34111,7 +34341,7 @@ class LiaApp:
         "speaker", "meeting", "meetings", "summary", "transcript",
         "transcription", "transcription failed", "duration", "generated",
         "recap", "engine", "chunks", "chunk", "live", "html", "source",
-        "lia", "whispertype", "assemblyai", "pyannote",
+        "lia", "whispertype", "assemblyai", "pyannote", "nemotron",
     ))
 
     def _vocab_mine_texts_async(self, texts, source, notify=False):
@@ -34362,16 +34592,14 @@ class LiaApp:
                 return c
         return None
 
-    def _rename_speakers_dialog(self, txt_path, attendees=None, audio_hint=None,
-                                speaker_embeddings=None):
+    def _rename_speakers_dialog(self, txt_path, attendees=None, audio_hint=None):
         """Open the speaker-rename dialog for a saved diarized transcript; on
         save, find/replace the 'Speaker A/B' labels with the typed names. Wired
         to the 'Rename speakers' button on the meeting completion card.
         2026-08-27 (speaker naming): each row gets a ▶ voice preview (the
         speaker's longest turn, from the kept WAV/Opus), the calendar attendees
-        appear as click-to-fill suggestion chips, and every SAVED name whose
-        cluster has a voiceprint is LEARNED into the speaker-profile store, so
-        recurring participants get auto-named in future meetings."""
+        appear as click-to-fill suggestion chips. A saved name is LOCKED in the
+        speaker sidecar."""
         import re
         try:
             with open(txt_path, encoding="utf-8") as f:
@@ -34408,28 +34636,17 @@ class LiaApp:
             m = re.search(r"(?m)^‏?Invited:\s*(.+)$", content)
             if m:
                 attendees = [p.strip() for p in m.group(1).split(";") if p.strip()]
-        # WP4/WP5 (2026-09-17): a voiceprint that is CLOSE to a known voice but
-        # below the auto-name gate becomes a per-row suggestion in the hint
-        # ("voice: דנה?"), and a name the user locked earlier is shown as such.
+        # WP5 (2026-09-17): a name the user locked earlier is shown as such.
         attendees = list(attendees or [])
         try:
             side = load_speaker_sidecar(speaker_sidecar_path(txt_path))
-            vp_sugg = {}
-            if speaker_embeddings and bool(self.config.get("speaker_profiles_enabled", True)):
-                import speaker_profiles
-                vp_sugg = speaker_profiles.suggest(speaker_embeddings)
-            if side or vp_sugg:
+            if side:
                 new_speakers = []
                 for lab, hint in speakers:
                     tag = []
                     st = side.get(lab) or {}
                     if st.get("status") == "locked" and st.get("name"):
                         tag.append("locked: %s" % st["name"])
-                    if lab in vp_sugg:
-                        nm, sim = vp_sugg[lab]
-                        tag.append("voice: %s? (%.2f)" % (nm, sim))
-                        if nm not in attendees:
-                            attendees.append(nm)
                     new_speakers.append((lab, ("[%s] " % "; ".join(tag) if tag else "") + (hint or "")))
                 speakers = new_speakers
         except Exception as e:
@@ -34481,21 +34698,6 @@ class LiaApp:
                     save_speaker_sidecar(sp, side)
             except Exception as e:
                 log.debug("speaker sidecar lock skipped: %s", e)
-            # LEARN: every saved name whose cluster has a voiceprint sharpens
-            # (or creates) that person's profile - the auto-name asset.
-            if speaker_embeddings and bool(
-                    self.config.get("speaker_profiles_enabled", True)):
-                try:
-                    import speaker_profiles
-                    for label, name in applied.items():
-                        emb = speaker_embeddings.get(label)
-                        if emb is not None:
-                            cnt = speaker_profiles.learn(name, emb)
-                            log.info("Voiceprint learned (rename): %s "
-                                     "(samples=%d)", _priv(name), cnt)
-                except Exception as e:
-                    log.warning("Voiceprint learn failed: %s", e)
-
         self.overlay.show_speaker_rename(speakers, on_save,
                                          suggestions=attendees, on_play=on_play)
 
@@ -34725,10 +34927,6 @@ class LiaApp:
         """OpenAI API key. Redirects to Settings -> Keys (the page uses _apply_openai_key)."""
         self._open_settings_window(page="keys", focus="openai")
 
-    def _set_hf_token(self):
-        """HuggingFace token. Redirects to Settings -> Keys (_apply_hf_token)."""
-        self._open_settings_window(page="keys", focus="hf")
-
     def _set_gemini_api_key(self):
         """Gemini API key. Redirects to Settings -> Keys (_apply_gemini_key)."""
         self._open_settings_window(page="keys", focus="gemini")
@@ -34831,18 +35029,6 @@ class LiaApp:
         log.info("Gemini API key %s", "saved" if key else "cleared")
         return (True, "Saved." if key else "Cleared.")
 
-    def _apply_hf_token(self, tok):
-        tok = (tok or "").strip()
-        self.config["hf_token"] = tok
-        save_config(self.config)
-        log.info("HuggingFace token %s", "saved" if tok else "cleared")
-        if self._diarize_bundle_dir():
-            return (True, "Saved. Model already downloaded (offline-ready).")
-        if not tok:
-            return (False, "Enter a token — it's needed to download the model.")
-        self._download_diarization_model()
-        return (True, "Saved. Downloading model (one-time, ~GB)…")
-
     def _apply_assemblyai_key(self, key):
         key = (key or "").strip()
         if not key:
@@ -34867,7 +35053,6 @@ class LiaApp:
             "openai": self._apply_openai_key,
             "groq": self._apply_groq_key,
             "gemini": self._apply_gemini_key,
-            "hf": self._apply_hf_token,
             "assemblyai": self._apply_assemblyai_key,
         }.get(service, lambda v: (False, "Unknown service: %s" % service))(value)
 
@@ -34916,10 +35101,6 @@ class LiaApp:
             save_config(self.config)
             return (True, "Key cleared." + (" Reverted to Local."
                                             if reverted else ""))
-        if service == "hf":
-            self.config["hf_token"] = ""
-            save_config(self.config)
-            return (True, "Token cleared.")
         if service == "assemblyai":
             self.config["assemblyai_api_key"] = ""
             self._assemblyai_transcriber = None
@@ -35853,28 +36034,6 @@ class LiaApp:
         except Exception as e:
             return (False, str(e)[:120])
 
-    def _speaker_profiles_state(self):
-        """Settings > Meetings "Known voices": [{name, count, updated}]."""
-        import speaker_profiles
-        import datetime as _dt
-        out = []
-        for name, cnt, upd in speaker_profiles.stats():
-            when = _dt.datetime.fromtimestamp(upd).strftime("%Y-%m-%d") if upd else ""
-            out.append({"name": name, "count": int(cnt), "updated": when})
-        # Settings-open only (never the tick): the count + the path actually
-        # read, so an empty list is explainable from lia.log alone.
-        log.info("Known voices: %d profile(s) from %s", len(out),
-                 speaker_profiles._store_path())
-        return out
-
-    def _delete_speaker_profile(self, name):
-        """Settings > Meetings: forget one learned voice (WP4). A QA-era noise
-        profile next to a real name defeats the margin gate for both."""
-        import speaker_profiles
-        ok = speaker_profiles.delete(name)
-        log.info("Voiceprint profile %s: %s", "deleted" if ok else "not found", _priv(name))
-        return (ok, ("Forgot %s" % name) if ok else "No such voice")
-
     def _rename_speakers_for(self, path):
         """Home preview: open the speaker-rename dialog for THIS meeting (no
         picker). Only a file inside the meetings dir."""
@@ -36141,6 +36300,7 @@ class LiaApp:
         add("toggle_auto_detect_meetings", self._toggle_auto_detect_meetings)
         add("set_meeting_chunk_seconds", self._set_meeting_chunk_seconds)
         add("toggle_keep_meeting_tracks", self._toggle_keep_meeting_tracks)
+        add("toggle_meeting_live_speakers", self._toggle_meeting_live_speakers)
         add("toggle_meeting_backup_mic", self._toggle_meeting_backup_mic)
         add("toggle_meeting_mic_auto_fallback", self._toggle_meeting_mic_auto_fallback)
         add("toggle_meeting_windows_hidden", self._toggle_meeting_windows_hidden)
@@ -36212,7 +36372,8 @@ class LiaApp:
         add("open_meeting_transcript", self._open_meeting_transcript)
         add("rename_speakers_for", self._rename_speakers_for)
         add("rename_meeting_for", self._rename_meeting_for)
-        add("delete_speaker_profile", self._delete_speaker_profile)
+        add("speakers_install", self._speakers_install, True)
+        add("speakers_remove", self._speakers_remove)
         add("copy_meeting_summary", self._copy_meeting_summary)
         return A
 
@@ -36360,8 +36521,12 @@ class LiaApp:
                               "where": where_of(backend), "wnote": wn,
                               "note": ("pip install onnx-asr" if pk_missing else
                                        "This PC is the transcription server" if remote_blocked else "")})
+        has_speakers = self._local_diarize_ready()
+        sp_note = (_SPEAKERS_BUSY_NOTE if speakers_setup.status().get("busy")
+                   else _SPEAKERS_NOTE)
+
         def _key_reqs(reqs):
-            return [r for r in reqs if r.endswith("_api_key") or r == "hf_token"]
+            return [r for r in reqs if r.endswith("_api_key")]
 
         def _meeting_wnote(key, reqs):
             if where_of(key) == "local":
@@ -36393,12 +36558,15 @@ class LiaApp:
             wn = _meeting_wnote(key, reqs)
             m_checked = c.get("meeting_model", "local_hebrew_turbo") == key
             remote_blocked = where_of(key) == "remote" and is_server and not m_checked
+            sp_missing = (key.startswith("local_diarize_") and not has_speakers
+                          and not m_checked)
             meeting.append({"key": key, "label": unbadge(label),
                             "checked": m_checked,
                             "enabled": not miss and not pk_missing and not remote_blocked,
                             "where": where_of(key), "wnote": wn,
                             "note": ("pip install onnx-asr" if pk_missing else
                                      "This PC is the transcription server" if remote_blocked else
+                                     sp_note if sp_missing else
                                      ("needs " + ", ".join(miss)) if miss else "")})
         file_rows = [{"key": "", "label": "Same as meeting model",
                       "checked": (c.get("file_transcribe_model", "") or "") == "",
@@ -36412,12 +36580,15 @@ class LiaApp:
             wn = _meeting_wnote(key, reqs)
             f_checked = c.get("file_transcribe_model", "") == key
             remote_blocked = where_of(key) == "remote" and is_server and not f_checked
+            sp_missing = (key.startswith("local_diarize_") and not has_speakers
+                          and not f_checked)
             file_rows.append({"key": key, "label": unbadge(label),
                               "checked": f_checked,
                               "enabled": not miss and not pk_missing and not remote_blocked,
                               "where": where_of(key), "wnote": wn,
                               "note": ("pip install onnx-asr" if pk_missing else
                                        "This PC is the transcription server" if remote_blocked else
+                                       sp_note if sp_missing else
                                        ("needs " + ", ".join(miss)) if miss else "")})
         pulled = self._ollama_pulled() if ollama else "skip"
         cur_sm = c.get("summary_model", "")
@@ -36566,9 +36737,8 @@ class LiaApp:
                 "recent_meetings": _safe(lambda: self._recent_meetings(), []),
                 # a meeting just renamed: Home keeps it selected under its new path
                 "select": self.__dict__.pop("_settings_home_select", None),
-                # WP4: known voices (name, samples, last seen) for the Meetings
-                # page list with Delete (a wrong profile poisons matching).
-                "speaker_profiles": _safe(self._speaker_profiles_state, []),
+                # Local speaker detection (Nemotron 3): installed / progress.
+                "speakers": _safe(self._speakers_status, {}),
                 "action_items_open": _safe(self._home_action_items_open_count, None),
                 "recording_source": c.get("recording_source", "microphone"),
                 "mic_name": (c.get("input_device_name")
@@ -37123,7 +37293,7 @@ class LiaApp:
         os._exit(0)
 
     def _kill_child_procs(self):
-        """Terminate registered child processes (e.g. the pyannote diarizer).
+        """Terminate registered child processes (e.g. the speaker detector).
         Best-effort, never raises."""
         for p in list(getattr(self, "_child_procs", ()) or ()):
             try:
@@ -37203,7 +37373,7 @@ class LiaApp:
         # A DIARIZED meeting still processing after Stop: its job dies with us.
         # Say so in the status sidecar (the live window stops showing a spinner)
         # and KEEP the LIVE file - it is what the next launch's resume uses to
-        # recognise an interrupted meeting. Then kill child processes (pyannote)
+        # recognise an interrupted meeting. Then kill child processes (speaker detection)
         # so they don't run on as orphans for up to an hour.
         try:
             for s in self._processing_sessions():

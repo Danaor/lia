@@ -372,9 +372,32 @@ STRINGS = {
     "Written for your own turns and biased into transcription. Empty = your Windows name.":
         "נכתב על הדיבור שלך ומשפר את זיהויו בתמלול. ריק = שם המשתמש ב-Windows.",
     "e.g. נאור / Naor": "לדוגמה: נאור / Naor",
-    "Known voices": "קולות מוכרים",
-    "Learned when you named speakers (local detection). Forget a wrong one.":
-        "נלמדו כשנתת שמות לדוברים (זיהוי מקומי). אפשר לשכוח קול שגוי.",
+    "Speaker detection": "זיהוי דוברים",
+    "Live speaker labels": "תוויות דוברים בזמן אמת",
+    "Label who speaks in the live transcript, with the text (CPU, about half a core). Teams caption names win.":
+        "מסמן מי מדבר בתמלול החי, יחד עם הטקסט (מעבד, בערך חצי ליבה). שמות מכתוביות Teams קודמים.",
+    "Who spoke when, 100% local on the CPU (NVIDIA Nemotron 3). One-time download, about 650 MB.":
+        "מי דיבר מתי, מקומי לגמרי על המעבד (NVIDIA Nemotron 3). הורדה חד-פעמית של כ-650 MB.",
+    'Installed - meeting models "+ Nemotron Speakers" can be picked in Models.':
+        'מותקן - אפשר לבחור במודלים את מודלי הפגישות "+ Nemotron Speakers".',
+    "Installing packages... (a few minutes)": "מתקינה חבילות... (כמה דקות)",
+    "Installing...": "מתקינה...",
+    "Speaker detection (who spoke when)": "זיהוי דוברים (מי דיבר מתי)",
+    "picking it downloads speaker detection once (about 650 MB)":
+        "בחירה בו מורידה את זיהוי הדוברים פעם אחת (כ-650 MB)",
+    "speaker detection is downloading...": "זיהוי הדוברים בהורדה...",
+    "Who spoke when, 100% local on the CPU (NVIDIA Nemotron 3). Downloads by itself the first time a meeting needs it, about 650 MB once.":
+        "מי דיבר מתי, מקומי לגמרי על המעבד (NVIDIA Nemotron 3). יורד לבד בפעם הראשונה שפגישה צריכה אותו, כ-650 MB פעם אחת.",
+    "Speaker detection is downloading - this meeting records without speakers, the next one will have them":
+        "זיהוי הדוברים בהורדה - הפגישה הזו תוקלט בלי דוברים, בפגישה הבאה הם יופיעו",
+    "Speaker detection is not installed - recording without speakers. Settings > Meetings > Speakers":
+        "זיהוי הדוברים לא מותקן - מקליטה בלי דוברים. הגדרות > פגישות > דוברים",
+    "GPU (4 GB+) recommended · speakers on the CPU, ~30 s per meeting hour":
+        "מומלץ GPU (4 GB ומעלה) · הדוברים על המעבד, כ-30 שניות לשעת פגישה",
+    "fast on a plain CPU · speakers ~30 s per meeting hour":
+        "מהיר על מעבד רגיל · הדוברים כ-30 שניות לשעת פגישה",
+    "✓  Speaker detection is ready": "✓  זיהוי הדוברים מוכן",
+    "⏳  Detecting speakers…": "⏳  מזהה דוברים…",
     "{n} voices": "{n} קולות",
     "1 voice": "קול אחד",
     "{n} sample · {d}": "דגימה {n} · {d}",
@@ -419,9 +442,9 @@ STRINGS = {
     "Gemini 3.5 transcribe Multi-Language": "Gemini 3.5 transcribe רב-לשוני",
     "Gemini 3.5 transcribe Multi-Language · speakers": "Gemini 3.5 transcribe רב-לשוני · דוברים",
     "Remote Transcription server": "שרת תמלול מרוחק",
-    "Whisper Hebrew Local + Pyannote Diarization": "Whisper עברית מקומי + זיהוי דוברים Pyannote",
-    "Parakeet Multi-Language Local + Pyannote Diarization": "Parakeet רב-לשוני מקומי + זיהוי דוברים Pyannote",
-    "Whisper Multi-Language Local + Pyannote Diarization": "Whisper רב-לשוני מקומי + זיהוי דוברים Pyannote",
+    "Whisper Hebrew Local + Nemotron Speakers": "Whisper עברית מקומי + זיהוי דוברים Nemotron",
+    "Parakeet Multi-Language Local + Nemotron Speakers": "Parakeet רב-לשוני מקומי + זיהוי דוברים Nemotron",
+    "Whisper Multi-Language Local + Nemotron Speakers": "Whisper רב-לשוני מקומי + זיהוי דוברים Nemotron",
     "AssemblyAI + Whisper Hebrew Local": "AssemblyAI + Whisper עברית מקומי",
     "Gemma 4 31B QAT (best quality · needs a 24 GB GPU)": "Gemma 4 31B QAT (האיכות הגבוהה ביותר · דורש GPU של 24 GB)",
     "Gemma 3 12B (balanced · needs a 16 GB GPU)": "Gemma 3 12B (מאוזן · דורש GPU של 16 GB)",
@@ -434,8 +457,6 @@ STRINGS = {
     "works on CPU · GPU faster": "עובד על CPU · מהיר יותר עם GPU",
     "GPU (4 GB+) recommended · CPU: ready ~5 min after a 1h meeting":
         "מומלץ GPU (4 GB ומעלה) · ב-CPU: מוכן כ-5 דק׳ אחרי פגישה של שעה",
-    "GPU (6 GB+) strongly recommended · CPU: ~90 min per meeting hour":
-        "מומלץ מאוד GPU (6 GB ומעלה) · ב-CPU: כ-90 דק׳ לכל שעת פגישה",
     "API key set": "מפתח API מוגדר",
     "Requires API key": "נדרש מפתח API",
     "API key set · Free Tier Available": "מפתח API מוגדר · יש מסלול חינמי",
@@ -454,13 +475,10 @@ STRINGS = {
     "needs openai_api_key": "דורש מפתח OpenAI",
     "needs gemini_api_key": "דורש מפתח Gemini",
     "needs groq_api_key": "דורש מפתח Groq",
-    "needs hf_token": "דורש אסימון Hugging Face",
     "set Gemini key": "הגדרת מפתח Gemini",
     "set OpenAI key": "הגדרת מפתח OpenAI",
     "set Groq key": "הגדרת מפתח Groq",
     "start Ollama": "הפעלת Ollama",
-    "Local Diarization": "זיהוי דוברים מקומי",
-    "100% local speaker labels on your GPU (pyannote + ivrit.ai).": "זיהוי דוברים מקומי לגמרי על ה-GPU (pyannote + ivrit.ai).",
     "Local summaries": "סיכומים מקומיים",
 
     # ------------------------------------------------------------------
@@ -586,7 +604,6 @@ STRINGS = {
     "Paid - best dictation, meeting transcription & summaries.": "בתשלום - ההכתבה, תמלול הפגישות והסיכומים הטובים ביותר.",
     "Free, fast cloud dictation (Whisper v3 Turbo).": "הכתבה בענן, חינמית ומהירה (Whisper v3 Turbo).",
     "Free meeting summaries + free AI cleanup (Google AI Studio).": "סיכומי פגישות וניקוי AI בחינם (Google AI Studio).",
-    "Needed for local speaker detection (pyannote).": "נדרש לזיהוי דוברים מקומי (pyannote).",
     "Gemini rejected this key (revoked, deleted or mistyped). Paste a new one below.":
         "Gemini דחה את המפתח הזה (בוטל, נמחק או הוקלד לא נכון). אפשר להדביק מפתח חדש למטה.",
     "OpenAI rejected this key (revoked, deleted or mistyped). Paste a new one below.":
@@ -854,7 +871,6 @@ STRINGS = {
     "Groq key": "מפתח Groq",
     "Gemini key": "מפתח Gemini",
     "OpenAI key": "מפתח OpenAI",
-    "Hugging Face token (local diarization)": "אסימון Hugging Face (זיהוי דוברים מקומי)",
     "Host a server on this GPU": "הפעלת שרת על ה-GPU הזה",
     "Server listen address / port / token": "כתובת האזנה / פורט / אסימון של השרת",
     "Transcription server (client / host)": "שרת תמלול (לקוח / שרת)",
@@ -911,8 +927,8 @@ STRINGS = {
     "New token generated and copied to the clipboard - paste it into the client's Access token on your other device.":
         "נוצר אסימון חדש והועתק ללוח - יש להדביק אותו בשדה ״אסימון גישה״ של הלקוח במכשיר השני.",
     "Type DELETE to confirm:": "לאישור יש להקליד DELETE:",
-    "Delete ALL Lia data?\n\nThis permanently removes:\n- meeting recordings, transcripts and summaries\n- transcription history and chat history\n- the email/meeting indexes and voiceprints\n- vocabulary, settings, API keys and the log\n\nClose any other open Lia windows first.\nLia will quit when done. This cannot be undone.":
-        "למחוק את כל הנתונים של Lia?\n\nהפעולה מוחקת לצמיתות:\n- הקלטות, תמלולים וסיכומים של פגישות\n- היסטוריית תמלולים והיסטוריית צ׳אט\n- אינדקסי הדואר והפגישות וטביעות הקול\n- אוצר מילים, הגדרות, מפתחות API והיומן\n\nקודם כדאי לסגור חלונות Lia פתוחים אחרים.\nLia תיסגר בסיום. אי אפשר לבטל את הפעולה.",
+    "Delete ALL Lia data?\n\nThis permanently removes:\n- meeting recordings, transcripts and summaries\n- transcription history and chat history\n- the email/meeting indexes\n- vocabulary, settings, API keys and the log\n\nClose any other open Lia windows first.\nLia will quit when done. This cannot be undone.":
+        "למחוק את כל הנתונים של Lia?\n\nהפעולה מוחקת לצמיתות:\n- הקלטות, תמלולים וסיכומים של פגישות\n- היסטוריית תמלולים והיסטוריית צ׳אט\n- אינדקסי הדואר והפגישות\n- אוצר מילים, הגדרות, מפתחות API והיומן\n\nקודם כדאי לסגור חלונות Lia פתוחים אחרים.\nLia תיסגר בסיום. אי אפשר לבטל את הפעולה.",
     "Add an OpenAI, Groq or Gemini key to enable AI cleanup.": "כדי להפעיל ניקוי AI צריך מפתח OpenAI, Groq או Gemini.",
     "No key": "אין מפתח",
     "Go to API Keys": "למפתחות API",
@@ -1355,7 +1371,6 @@ STRINGS = {
     "☁  Uploading to AssemblyAI…": "☁  מעלה ל-AssemblyAI…",
     "✓  Diarized transcript ready": "✓  התמלול עם זיהוי הדוברים מוכן",
     "AssemblyAI failed": "AssemblyAI נכשל",
-    "⏳  Diarizing locally (pyannote)…": "⏳  מזהה דוברים מקומית (pyannote)…",
     "✍  Transcribing {x} turns…": "✍  מתמללת {x} קטעי דיבור…",
     "⚠  Home server down, using OpenAI": "⚠  השרת הביתי לא זמין, משתמשת ב-OpenAI",
     "⚠  Cloud failed, using local": "⚠  הענן נכשל, משתמשת במקומי",
@@ -1381,11 +1396,7 @@ STRINGS = {
     "↩  Nothing to undo": "↩  אין מה לבטל",
     "↩  Last paste too old to undo": "↩  ההדבקה האחרונה ישנה מדי לביטול",
     "↩  Undone ({n} chars)": "↩  בוטל ({n} תווים)",
-    "Set a HuggingFace token first": "קודם צריך להגדיר אסימון HuggingFace",
-    "Diarization script unavailable": "סקריפט זיהוי הדוברים לא זמין",
     "Cannot create {a}: {b}": "לא ניתן ליצור {a}: {b}",
-    "⬇  Downloading diarization model (one-time, ~GB)…": "⬇  מורידה את מודל זיהוי הדוברים (פעם אחת, כמה GB)…",
-    "✓  Diarization model ready — runs offline now": "✓  מודל זיהוי הדוברים מוכן - עובד עכשיו בלי רשת",
     "Download failed: {x}": "ההורדה נכשלה: {x}",
     "Model download timed out": "הורדת המודל חרגה מהזמן",
     "AI summaries are OFF - meetings save a transcript only": "סיכומי AI כבויים - פגישות נשמרות כתמלול בלבד",
@@ -1417,8 +1428,6 @@ STRINGS = {
     "✨  Cleanup: {x}": "✨  ניקוי: {x}",
     "Meeting model {x} unavailable": "מודל הפגישות {x} לא זמין",
     "Finish Compose first": "קודם לסיים את הניסוח",
-    "Tip: local speaker detection (pyannote) is ready - it recognizes you and learns voices. Settings > Models > Meeting model":
-        "טיפ: זיהוי דוברים מקומי (pyannote) מוכן - הוא מזהה אותך ולומד קולות. הגדרות > מודלים > מודל פגישות",
     "Meeting start failed: {x}": "התחלת הפגישה נכשלה: {x}",
     "No transcript yet — starting up": "עדיין אין תמלול - מתחילה",
     "Could not open live transcript": "לא ניתן לפתוח את התמלול החי",

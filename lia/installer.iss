@@ -17,7 +17,7 @@
 ; ============================================================
 
 #define AppName       "Lia"
-#define AppVersion    "1.6.18"
+#define AppVersion    "1.6.19"
 #define AppPublisher  "Naor Daniel"
 #define AppURL        "https://github.com/Danaor/lia"
 #define AppExeName    "Lia.exe"
@@ -154,6 +154,15 @@ Filename: "{cmd}"; \
 ; by default — re-installs preserve user data. The uninstaller ASKS (see
 ; CurUninstallStepChanged below, default No); silent uninstalls always keep
 ; the data. Settings -> Advanced -> "Delete all my data" wipes it in-app.
+; Speaker detection (Nemotron 3) is downloaded SOFTWARE, not user data: its
+; packages + model (~1.6 GB, Settings > Meetings > Speakers) always go.
+Type: filesandordirs; Name: "{localappdata}\Lia\speakers"
+; A small in-place update (1.6.19, Lia-Update-<v>.zip) adds and replaces files
+; Setup did not install, and Python writes __pycache__ next to the sources:
+; remove the program folders whole, whatever is in them now.
+Type: filesandordirs; Name: "{app}\runtime"
+Type: filesandordirs; Name: "{app}\app"
+Type: filesandordirs; Name: "{app}\_update"
 
 [Code]
 // Audit 2026-09-26 F6: the ELEVATED logon task may only point at a folder

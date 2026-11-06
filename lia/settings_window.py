@@ -207,10 +207,10 @@ def _demo_state():
         },
         "secrets": {"openai_api_key": "sk-abc…7xQ", "groq_api_key": "",
                     "gemini_api_key": "AQ.xyz…9kk", "assemblyai_api_key": "",
-                    "hf_token": "", "remote_server_token": ""},
+                    "remote_server_token": ""},
         "has": {"openai_api_key": True, "groq_api_key": False,
                 "gemini_api_key": True, "assemblyai_api_key": False,
-                "hf_token": False, "remote_server_token": False},
+                "remote_server_token": False},
         # the demo shows the red "rejected" state on the Gemini card
         "rejected": {"openai_api_key": False, "groq_api_key": False,
                      "gemini_api_key": True},
@@ -222,9 +222,8 @@ def _demo_state():
         "meeting_active": False, "live_transcript_available": False,
         "home": {"recording_source": "both", "mic_name": "JOUNIVO Mic",
                  "meeting_mic_name": "Jabra Headset", "action_items_open": 3,
-                 "speaker_profiles": [
-                     {"name": "דנה", "count": 3, "updated": "2026-09-14"},
-                     {"name": "Avi Bar-Yuda", "count": 1, "updated": "2026-09-17"}],
+                 "speakers": {"installed": False, "busy": False, "step": "", "pct": 0,
+                              "error": "", "download_mb": 650},
                  "recent_meetings": [
                      {"title": "Meeting %d" % i,
                       "date": "2026-09-%02d %02d:%02d" % (16 - i // 3, 9 + i % 8, (i * 7) % 60),
@@ -278,11 +277,11 @@ def _demo_state():
                           {"idx": 7, "label": "Gemini 3.5 transcribe Multi-Language", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · Free Tier Available · ~3.6s, slower than Groq"},
                           {"idx": 8, "label": "Remote Transcription server", "checked": False, "where": "remote"}],
             "meeting": [{"key": "local_hebrew_turbo", "label": "Whisper Hebrew Local", "checked": True, "enabled": True, "where": "local", "wnote": "GPU (4 GB+) recommended · CPU: ready ~5 min after a 1h meeting", "note": ""},
-                        {"key": "local_pyannote_hebrew", "label": "Whisper Hebrew Local + Pyannote Diarization", "checked": False, "enabled": True, "where": "local", "wnote": "GPU (6 GB+) strongly recommended · CPU: ~90 min per meeting hour", "note": ""},
+                        {"key": "local_diarize_hebrew", "label": "Whisper Hebrew Local + Nemotron Speakers", "checked": False, "enabled": True, "where": "local", "wnote": "GPU (4 GB+) recommended · speakers on the CPU, ~30 s per meeting hour", "note": ""},
                         {"key": "local_parakeet_english", "label": "Parakeet Multi-Language Local (25 languages)", "checked": False, "enabled": True, "where": "local", "wnote": "fast on a plain CPU · no GPU needed", "note": ""},
-                        {"key": "local_pyannote_parakeet", "label": "Parakeet Multi-Language Local + Pyannote Diarization", "checked": False, "enabled": True, "where": "local", "wnote": "GPU (6 GB+) strongly recommended · CPU: ~90 min per meeting hour", "note": ""},
+                        {"key": "local_diarize_parakeet", "label": "Parakeet Multi-Language Local + Nemotron Speakers", "checked": False, "enabled": True, "where": "local", "wnote": "GPU (4 GB+) recommended · speakers on the CPU, ~30 s per meeting hour", "note": ""},
                         {"key": "local_multilang_turbo", "label": "Whisper Multi-Language Local (99 languages)", "checked": False, "enabled": True, "where": "local", "wnote": "GPU (4 GB+) recommended · CPU: ready ~5 min after a 1h meeting", "note": ""},
-                        {"key": "local_pyannote_multilang", "label": "Whisper Multi-Language Local + Pyannote Diarization", "checked": False, "enabled": True, "where": "local", "wnote": "GPU (6 GB+) strongly recommended · CPU: ~90 min per meeting hour", "note": ""},
+                        {"key": "local_diarize_multilang", "label": "Whisper Multi-Language Local + Nemotron Speakers", "checked": False, "enabled": True, "where": "local", "wnote": "GPU (4 GB+) recommended · speakers on the CPU, ~30 s per meeting hour", "note": ""},
                         {"key": "gemini_transcribe", "label": "Gemini 3.5 transcribe Multi-Language", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · Free Tier Available", "note": "needs gemini_api_key"},
                         {"key": "openai_gpt_transcribe", "label": "OpenAI GPT transcribe", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · ~$0.27 per meeting hour", "note": "needs openai_api_key"}],
             "file": [{"key": "", "label": "Same as meeting model", "checked": True, "enabled": True, "note": ""}],
@@ -1299,14 +1298,11 @@ APP_JS = r"""
     {svc:"gemini", key:"gemini_api_key", name:"Gemini", badge:"G", color:"#3b6fd4", img:"__GEMINI_LOGO__",
      sub:"Free meeting summaries + free AI cleanup (Google AI Studio).",
      save:"Save", url:"https://aistudio.google.com/apikey", slow:true},
-    {svc:"hf", key:"hf_token", name:"Local Diarization", badge:"H", color:"#b08900",
-     sub:"100% local speaker labels on your GPU (pyannote + ivrit.ai).",
-     save:"Save & Download", url:"https://huggingface.co/settings/tokens", slow:true, noun:"token"},
     {svc:"groq", key:"groq_api_key", name:"Groq", badge:"G", color:"#d97706", img:"__GROQ_LOGO__",
      sub:"Free, fast cloud dictation (Whisper v3 Turbo).",
      save:"Save & Verify", url:"https://console.groq.com/keys", slow:true}
     // AssemblyAI (paid cloud diarization) card removed 2026-09-01 - local
-    // pyannote + Gemini diarize cover meetings; the key/code path still exist.
+    // speaker detection + Gemini diarize cover meetings; the key/code path still exist.
   ];
 
   PAGES.keys = function(){
@@ -1487,7 +1483,17 @@ APP_JS = r"""
         return [r.id, "Always "+r.name_en];
       }));
     var slangCur = slangRows.filter(function(r){ return r[0]===slang; })[0];
-    var profiles = ((S.home||{}).speaker_profiles)||[];
+    var spk = ((S.home||{}).speakers)||{};
+    var spkStatus = spk.installed ? 'Installed - meeting models "+ Nemotron Speakers" can be picked in Models.'
+      : spk.busy ? (spk.step==="model" ? 'Downloading the model... '+(spk.pct||0)+'%' : 'Installing packages... (a few minutes)')
+      : spk.error ? ('Install failed: '+spk.error)
+      : cfg("speakers_auto_install",true)!==false
+        ? 'Who spoke when, 100% local on the CPU (NVIDIA Nemotron 3). Downloads by itself the first time a meeting needs it, about '+(spk.download_mb||650)+' MB once.'
+      : 'Who spoke when, 100% local on the CPU (NVIDIA Nemotron 3). One-time download, about '+(spk.download_mb||650)+' MB.';
+    var spkCtl = spk.installed
+      ? '<span class="cur ok">Installed</span> <button class="btn" data-call="speakers_remove" data-args="[]">Remove</button>'
+      : spk.busy ? '<span class="cur">Installing...</span>'
+      : '<button class="btn primary" data-call="speakers_install" data-args="[]" data-slow="1">'+(spk.error?'Try again':'Install')+'</button>';
     return '<div class="content-head"><h1>Meetings</h1></div>'+
       grp('Recording',
         srow('Auto-detect Zoom / Teams / Meet calls', 'Offers to record when a call starts.',
@@ -1534,16 +1540,9 @@ APP_JS = r"""
         srow('Your name', 'Written for your own turns and biased into transcription. Empty = your Windows name.',
           '<input type="text" id="selfName" dir="auto" style="width:200px" placeholder="e.g. נאור / Naor" value="'+esc(draftOr("selfName", cfg("speaker_self_name","")))+'">'+
           '<button class="btn primary" data-save-selfname="1">Save</button>')+
-        (profiles.length ?
-          more('voices', 'Known voices', 'Learned when you named speakers (local detection). Forget a wrong one.',
-            '<span class="cur">'+profiles.length+' voice'+(profiles.length===1?'':'s')+'</span>',
-            profiles.map(function(p){
-              return '<div class="row" style="display:flex;align-items:center;gap:10px;padding:6px 0">'+
-                '<span dir="auto" style="flex:1">'+esc(p.name)+'</span>'+
-                '<span class="hint" style="margin:0">'+esc(String(p.count))+' sample'+(p.count===1?'':'s')+(p.updated?' · '+esc(p.updated):'')+'</span>'+
-                '<button class="btn" data-call="delete_speaker_profile" data-args=\''+esc(JSON.stringify([p.name]))+'\'>Forget</button>'+
-              '</div>';
-            }).join('')) : '')
+        srow('Speaker detection', spkStatus, spkCtl)+
+        (spk.installed ? srow('Live speaker labels', 'Label who speaks in the live transcript, with the text (CPU, about half a core). Teams caption names win.',
+          swb(cfg("meeting_live_speakers",true)!==false, "toggle_meeting_live_speakers")) : '')
       )+
       // Tools stay on this page as a compact grid (Naor 2026-10-05).
       '<div class="grp-h">Tools</div><div class="grp agrid">'+
@@ -1965,7 +1964,6 @@ APP_JS = r"""
     {t:"Snippets", k:"snippets expansion abbreviation קיצורים הרחבה", p:"snippets", f:""},
     {t:"Groq key", k:"groq key api מפתח", p:"keys", f:"Groq"},
     {t:"Gemini key", k:"gemini google key api מפתח", p:"keys", f:"Gemini"},
-    {t:"Hugging Face token (local diarization)", k:"hugging face hf token pyannote diarization דוברים", p:"keys", f:"Local Diarization"},
     {t:"Host a server on this GPU", k:"host serve server gpu port token אירוח שרת", p:"server", f:"This PC"},
     {t:"Server listen address / port / token", k:"listen port token bind tailscale פורט טוקן", p:"server", f:"Listen on"},
     {t:"Transcription server (client / host)", k:"transcription server serve client host שרת תמלול", p:"server", f:""},
@@ -1973,7 +1971,8 @@ APP_JS = r"""
     {t:"Keep raw meeting tracks", k:"raw tracks mixdown backup safety רצועות גיבוי", p:"meetings", f:"Keep raw per-source tracks"},
     {t:"Backup mic / auto-switch mic", k:"backup mic fallback switch מיקרופון גיבוי", p:"meetings", f:"Backup mic"},
     {t:"Your name (speaker)", k:"name speaker self שם דובר", p:"meetings", f:"Your name"},
-    {t:"Known voices", k:"voices speakers forget קולות דוברים", p:"meetings", f:"Known voices"},
+    {t:"Live speaker labels", k:"live speaker labels realtime דוברים בזמן אמת", p:"meetings", f:"Live speaker labels"},
+    {t:"Speaker detection (who spoke when)", k:"speaker detection diarization nemotron speakers install זיהוי דוברים", p:"meetings", f:"Speaker detection"},
     {t:"Voice ask answer output", k:"voice ask answer paste card שאלה קולית תשובה", p:"meetings", f:"Voice ask answer"},
     {t:"Meeting tools (action items, rename, transcribe)", k:"tools action items rename speakers folder כלים משימות", p:"meetings", f:"Action items"},
     {t:"Local summary passes (tasks, depth, coverage)", k:"gemma ollama depth coverage tasks pass סיכום מקומי", p:"advanced", f:"Local summary passes"},
@@ -2407,7 +2406,7 @@ APP_JS = r"""
       var msg = "Delete ALL Lia data?\n\nThis permanently removes:\n"+
         "- meeting recordings, transcripts and summaries\n"+
         "- transcription history and chat history\n"+
-        "- the email/meeting indexes and voiceprints\n"+
+        "- the email/meeting indexes\n"+
         "- vocabulary, settings, API keys and the log\n\n"+
         "Close any other open Lia windows first.\n"+
         "Lia will quit when done. This cannot be undone.";

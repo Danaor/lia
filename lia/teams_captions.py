@@ -100,12 +100,26 @@ def _leaves(node):
     return out
 
 
+# Teams' own notices inside the captions region read like a line too: the
+# banner "Captions will be shown in" + "Hebrew (Israel)" + "." became a speaker
+# called "Captions will be shown in" in 4 meetings (2026-11-02..05).
+_UI_NOTICE_RE = re.compile(r"captions will be|live captions|spoken language", re.I)
+# Lowercase English words that make a phrase a sentence, not a name. Two of
+# them in lowercase never happen in a display name ("Will Smith" is capitalized).
+_SENTENCE_WORDS = frozenset(
+    "will be is are was been the to in on of for your you has have can now "
+    "this shown turned started stopped joined left".split())
+
+
 def _name_like(s):
     """A person's display name: short, a few words, not a sentence."""
     s = (s or "").strip()
     if not s or len(s) > 60:
         return False
-    if len(s.split()) > 6:
+    words = s.split()
+    if len(words) > 6:
+        return False
+    if _UI_NOTICE_RE.search(s) or sum(w in _SENTENCE_WORDS for w in words) >= 2:
         return False
     return not re.search(r"[.!?…:]$", s)
 

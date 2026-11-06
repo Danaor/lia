@@ -8,8 +8,8 @@ the first dictation (no key needed). Pick "Bundle in the installer" in the
 packaging flow only if you need a fully offline installer.
 
 Deliberately EXCLUDED (kept small + they don't work in a frozen onefile):
-  - torch / pyannote — LOCAL SPEAKER DIARIZATION runs as a separate Python
-    subprocess (diarize_local.py) via find_python_interpreter(), which returns
+  - torch / transformers — LOCAL SPEAKER DETECTION runs as a separate Python
+    subprocess (diarize_nemotron.py) via find_python_interpreter(), which returns
     None in a frozen exe. So diarization is unavailable in the packaged build;
     GPU-less colleagues default to plain local transcripts anyway. (Run from
     source with run.bat to keep diarization + the editor / email / chat windows,
@@ -27,7 +27,7 @@ import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-VERSION = "1.6.18"
+VERSION = "1.6.19"
 _v = tuple(int(x) for x in VERSION.split(".")) + (0,)
 
 

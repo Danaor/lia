@@ -831,12 +831,11 @@ def t_speaker_naming_wp1_wp6():
     (2) sharpen_self_turns relabels only DECISIVE turns by the channel ratio:
     a clearly-me turn in a remote cluster -> self; a clearly-not-me turn in the
     self cluster -> the sole remote speaker (2-party) and untouched otherwise.
-    (3) speaker_profiles.delete / suggest (band below the auto gate).
+    (3) Known voices (the pyannote voiceprint store) is gone (2026-11-06).
     (4) the speaker sidecar path + lock round-trip; wiring source checks."""
     import inspect
     import tempfile
     import lia as w
-    import speaker_profiles as sp
     # (1) vote parser
     f = w._parse_speaker_name_votes
     assert f("Speaker S11-spk:0: Avi Bar-Yuda", ["S11-spk:0"], ["Avi Bar-Yuda"]) == {"S11-spk:0": "Avi Bar-Yuda"}
@@ -866,24 +865,6 @@ def t_speaker_naming_wp1_wp6():
     assert w.sharpen_self_turns(utts2, "S", [0.001] * 6, [0.05] * 6) == (0, 0)
     assert utts2[0]["speaker"] == "S"
     assert w.sharpen_self_turns([], "S", [], []) == (0, 0)
-    # (3) profile store: delete + suggest (APPDATA is the suite's temp dir)
-    import numpy as np
-    rng = np.random.RandomState(3)
-    a = rng.randn(256); b = rng.randn(256)
-    assert sp.learn("דנה", a) == 1 and sp.learn("יובל", b) == 1
-    # A vector at cosine ~0.50 to Dana (0.5*a_hat + 0.866*orthogonal): inside
-    # the suggestion band [0.45, 0.55), below the auto gate.
-    a_hat = a / np.linalg.norm(a)
-    orth = rng.randn(256); orth -= orth @ a_hat * a_hat; orth /= np.linalg.norm(orth)
-    near = 0.5 * a_hat + 0.866 * orth
-    s = sp.suggest({"X": near, "Y": rng.randn(256)})
-    assert set(s) == {"X"} and s["X"][0] == "דנה" and 0.45 <= s["X"][1] < 0.55, s
-    assert sp.match({"X": near}) == {}, "the band never auto-names"
-    assert sp.match({"X": a}) == {"X": "דנה"}, "an exact voice still auto-names"
-    assert sp.suggest({"X": a}) == {}, "auto-named clusters are not also suggested"
-    assert sp.delete("דנה") is True and sp.delete("דנה") is False
-    assert [n for n, _c, _u in sp.stats()] == ["יובל"]
-    sp.delete("יובל")
     # (4) sidecar
     assert w.speaker_sidecar_path("X_meeting_diarized.txt") == "X_meeting_speakers.json"
     assert w.speaker_sidecar_path("X_meeting.txt") == "X_meeting_speakers.json"
@@ -897,19 +878,22 @@ def t_speaker_naming_wp1_wp6():
     assert "sharpen_self_turns(" in src and "Speaker naming: speakers=" in src
     assert "_write_speaker_sidecar(md_path, result)" in src
     assert '"status": "locked"' in inspect.getsource(w.LiaApp._rename_speakers_dialog)
-    assert "speaker_profiles.suggest(" in inspect.getsource(w.LiaApp._rename_speakers_dialog)
-    assert "_local_diarize_ready()" in inspect.getsource(w.LiaApp._start_meeting)
+    assert "speaker_profiles" not in inspect.getsource(w.LiaApp._rename_speakers_dialog)
+    assert "speaker_profiles" not in src and "speaker_embeddings" not in inspect.getsource(
+        w.LiaApp._rename_speakers_dialog)
     assert w.DEFAULT_CONFIG["speaker_self_sharpen"] is True
     lia_src = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)), "lia.py"),
                    encoding="utf-8").read()
-    assert 'add("delete_speaker_profile", self._delete_speaker_profile)' in lia_src
-    assert '"speaker_profiles": _safe(self._speaker_profiles_state, [])' in lia_src
+    assert "import speaker_profiles" not in lia_src and "delete_speaker_profile" not in lia_src
+    assert not os.path.exists(os.path.join(os.path.dirname(os.path.abspath(w.__file__)),
+                                           "speaker_profiles.py"))
     sw_src = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)), "settings_window.py"),
                   encoding="utf-8").read()
-    assert 'data-call="delete_speaker_profile"' in sw_src and "Known voices" in sw_src
+    assert "delete_speaker_profile" not in sw_src and "Known voices" not in sw_src
+    assert 'data-call="speakers_install"' in sw_src and "Speaker detection" in sw_src
 
 
-_test("speakers: Gemini-label votes parse, channel-sharpened self turns, profile delete/suggest, lock sidecar",
+_test("speakers: Gemini-label votes parse, channel-sharpened self turns, no voiceprints, lock sidecar",
       t_speaker_naming_wp1_wp6)
 
 
@@ -1072,9 +1056,9 @@ _test("low-VRAM local summary tiers (8/16 GB base + cap + passes)",
 def t_meeting_model_names_match_dictation():
     """Model display names line up across the pickers (Naor's ask 2026-09-16):
     no ⭐ markers; shared local models read the same in the dictation and
-    meeting/file pickers; every local ASR model has a "+ Pyannote Diarization"
+    meeting/file pickers; every local ASR model has a "+ Nemotron Speakers"
     variant (incl. the multilingual Whisper), each grouped right under its plain
-    row; and the new pyannote-multilingual model is fully wired."""
+    row; and the multilingual speaker model is fully wired."""
     import lia as w
     App = w.LiaApp
     # only the LOCAL rows own their model_id (cloud rows reuse a local model_id
@@ -1094,27 +1078,28 @@ def t_meeting_model_names_match_dictation():
     assert meet_label["local_parakeet_english"] == \
         dict_label["parakeet-tdt-0.6b-v3"]
     assert meet_label["local_multilang_turbo"] == dict_label["large-v3-turbo"]
-    # each local model has a pyannote diarize variant named "<model> + Pyannote
-    # Diarization", the plain base name shared with its plain row
+    # each local model has a speaker detection variant named "<model> +
+    # Nemotron Speakers", the plain base name shared with its plain row
     for plain, diar, base in (
-            ("local_hebrew_turbo", "local_pyannote_hebrew", "Whisper Hebrew Local"),
-            ("local_parakeet_english", "local_pyannote_parakeet",
+            ("local_hebrew_turbo", "local_diarize_hebrew", "Whisper Hebrew Local"),
+            ("local_parakeet_english", "local_diarize_parakeet",
              "Parakeet Multi-Language Local"),
-            ("local_multilang_turbo", "local_pyannote_multilang",
+            ("local_multilang_turbo", "local_diarize_multilang",
              "Whisper Multi-Language Local")):
-        assert meet_label[diar] == base + " + Pyannote Diarization", meet_label[diar]
+        assert meet_label[diar] == base + " + Nemotron Speakers", meet_label[diar]
         assert meet_label[plain].startswith(base), meet_label[plain]
         # grouped: the diarize row sits immediately under its plain row
         assert meet_keys.index(diar) == meet_keys.index(plain) + 1, meet_keys
-    # the previously-missing pyannote + multilingual Whisper now exists + is wired
-    assert "local_pyannote_multilang" in meet_keys, "pyannote + multilang missing"
-    assert App._MEETING_TRANSCRIBE_NAMES.get("local_pyannote_multilang")
-    assert w._LOCAL_HW_NOTES.get("local_pyannote_multilang")
+    # speakers + multilingual Whisper exists + is wired
+    assert "local_diarize_multilang" in meet_keys, "speakers + multilang missing"
+    assert not any("yannote" in l for l, _k, _r in meet), meet
+    assert App._MEETING_TRANSCRIBE_NAMES.get("local_diarize_multilang")
+    assert w._LOCAL_HW_NOTES.get("local_diarize_multilang")
     src = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)),
                             "lia.py"), encoding="utf-8").read()
-    assert 'if key in ("local_multilang_turbo", "local_pyannote_multilang"):' in src
+    assert 'if key in ("local_multilang_turbo", "local_diarize_multilang"):' in src
     # diarize per-turn ASR mapping + backend routing for the new key
-    assert '"local_pyannote_multilang": "local_multilang_turbo"' in src
+    assert '"local_diarize_multilang": "local_multilang_turbo"' in src
     # Naming rule (Naor 2026-09-16): model/brand name FIRST, then the qualifier,
     # no "Turbo"; "Multi-Language" for the qualifier, and the LOCAL multi-language
     # models (Parakeet + Whisper) also keep the language count in parentheses.
@@ -1132,7 +1117,7 @@ def t_meeting_model_names_match_dictation():
     assert meet_label["openai_gpt_transcribe"] == "OpenAI GPT transcribe"
 
 
-_test("model picker names: no stars, consistent, grouped, + pyannote-multilang",
+_test("model picker names: no stars, consistent, grouped, + Nemotron speakers",
       t_meeting_model_names_match_dictation)
 
 
@@ -1675,7 +1660,7 @@ def t_gemini_diarize_request_constraints():
     # (3) saved transcript credits Gemini, not AssemblyAI.
     wsrc = inspect.getsource(w.MeetingSession._write_diarized_markdown)
     assert '"gemini": "Gemini 3.5 transcribe"' in wsrc, "diarizer label for gemini missing"
-    assert "local_pyannote" in wsrc
+    assert "local_diarize" in wsrc
 
 
 _test("Gemini diarize: vocab/timestamp constraint + 429 retry + diarizer label",
@@ -2554,16 +2539,16 @@ def t_parakeet_registration():
     assert row and row[2] == "local" and row[3] is False and row[4] == ""
     # meeting + file keys (file picker inherits _MEETING_MODELS)
     keys = [k for _, k, _ in w.LiaApp._MEETING_MODELS]
-    assert "local_parakeet_english" in keys and "local_pyannote_parakeet" in keys
+    assert "local_parakeet_english" in keys and "local_diarize_parakeet" in keys
     reqs = {k: r for _, k, r in w.LiaApp._MEETING_MODELS}
-    assert reqs["local_parakeet_english"] == [] and reqs["local_pyannote_parakeet"] == []
-    for k in ("local_parakeet_english", "local_pyannote_parakeet"):
+    assert reqs["local_parakeet_english"] == [] and reqs["local_diarize_parakeet"] == []
+    for k in ("local_parakeet_english", "local_diarize_parakeet"):
         assert k in w.LiaApp._MEETING_TRANSCRIBE_NAMES, k
     # enhance map + diarize backend + file diarize route (source-level checks)
     src = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)),
                             "lia.py"), encoding="utf-8").read()
-    assert '"local_pyannote_parakeet": "local_parakeet_english"' in src
-    assert src.count('"local_pyannote_parakeet")') >= 1  # diarize_backend tuple
+    assert '"local_diarize_parakeet": "local_parakeet_english"' in src
+    assert src.count('"local_diarize_parakeet")') >= 1  # diarize_backend tuple
     # config default + availability probe + packaging
     assert w.DEFAULT_CONFIG.get("parakeet_device") == "cpu"
     assert isinstance(w.LiaApp._parakeet_available(), bool)
@@ -2618,7 +2603,7 @@ def t_primary_language_cascade():
     app.config = {"primary_language": "he",
                   "model_size": "ivrit-ai/whisper-large-v3-turbo-ct2",
                   "transcription_backend": "local",
-                  "meeting_model": "local_pyannote_hebrew",
+                  "meeting_model": "local_diarize_hebrew",
                   "file_transcribe_model": "",
                   "groq_he_en_bias": True}
     app._groq_transcriber = None
@@ -2627,7 +2612,7 @@ def t_primary_language_cascade():
     app._set_model = calls.append
     ok, msg = w.LiaApp._set_primary_language(app, "en")
     assert ok and "English" in msg, msg
-    assert app.config["meeting_model"] == "local_pyannote_parakeet", \
+    assert app.config["meeting_model"] == "local_diarize_parakeet", \
         "diarized flavor must be preserved"
     assert app.config["groq_he_en_bias"] is False
     assert app.config["bilingual_english_model"] == "parakeet"
@@ -2637,7 +2622,7 @@ def t_primary_language_cascade():
     calls.clear()
     ok, _ = w.LiaApp._set_primary_language(app, "he")
     assert ok
-    assert app.config["meeting_model"] == "local_pyannote_hebrew"
+    assert app.config["meeting_model"] == "local_diarize_hebrew"
     assert app.config["groq_he_en_bias"] is True
     assert calls == ["ivrit-ai/whisper-large-v3-turbo-ct2"], calls
     # a CLOUD dictation backend is never switched by the cascade
@@ -2909,7 +2894,7 @@ _test("multilang: detect/gemini byte-identity + multilingual path + config migra
 
 def t_file_transcribe_model():
     """Transcribe File has its OWN model, decoupled from the meeting model:
-    "" follows meeting_model; an explicit key wins; the local-pyannote (meetings
+    "" follows meeting_model; an explicit key wins; the local speakers (meetings
     only) model is not offered for files."""
     import lia as w
     assert "file_transcribe_model" in w.DEFAULT_CONFIG
@@ -2929,11 +2914,11 @@ def t_file_transcribe_model():
     assert f._file_model_key() == "local_hebrew_turbo", "explicit file model must win"
     assert "Whisper Hebrew Local" in f._file_model_label(), f._file_model_label()
 
-    # the file picker must offer Whisper Hebrew Local and omit meetings-only pyannote
+    # the file picker must offer Whisper Hebrew Local and omit the meetings-only speakers row
     offered = [k for (_l, k, _r) in w.LiaApp._MEETING_MODELS
-               if k != "local_pyannote_hebrew"]
+               if k != "local_diarize_hebrew"]
     assert "local_hebrew_turbo" in offered
-    assert "local_pyannote_hebrew" not in offered
+    assert "local_diarize_hebrew" not in offered
 
 
 _test("Transcribe File: dedicated model, decoupled from meeting model",
@@ -3917,6 +3902,43 @@ def t_prompt_secondary_wired():
         # ("Tcl_AsyncDelete: async handler deleted by the wrong thread").
         ov = tops = alive = root = None
         __import__("gc").collect()
+    # 2026-11-06: no prompt stays longer than DONE_CLOSE_MS (asked 60 s), and
+    # never closes under the pointer. A REAL Tk prompt.
+    import notification_style as ns
+    old = ns.DONE_CLOSE_MS, ns.DONE_CLOSE_RETRY_MS, ns.pointer_over
+    ns.DONE_CLOSE_MS, ns.DONE_CLOSE_RETRY_MS = 200, 50
+    inside = {"v": False}
+    ns.pointer_over = lambda top: inside["v"]
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        ov = w.OverlayNotification.__new__(w.OverlayNotification)
+        ov._root, ov._tk_queue = root, queue.Queue()
+        ov._brand_image = lambda *a: None
+        ov._prompt_work_area = lambda top: (0, 0, 1600, 900)
+        ov._prompt_round = ov._prompt_no_activate = lambda top: None
+        calls = []
+        def pump(sec):
+            end = __import__("time").time() + sec
+            while __import__("time").time() < end:
+                root.update()
+                __import__("time").sleep(0.02)
+        inside["v"] = True
+        ov._create_prompt_toplevel("Call ended", "Stop?", "Stop", None, None,
+                                   60000, lambda: calls.append("timeout"))
+        pump(0.4)
+        __import__("time").sleep(0.05)
+        assert calls == [], "closed under the pointer"
+        inside["v"] = False
+        pump(0.2)
+        __import__("time").sleep(0.1)
+        assert calls == ["timeout"], calls
+        assert not [c for c in root.winfo_children() if isinstance(c, tk.Toplevel)]
+    finally:
+        ns.DONE_CLOSE_MS, ns.DONE_CLOSE_RETRY_MS, ns.pointer_over = old
+        root.destroy()
+        ov = root = None
+        __import__("gc").collect()
     src = inspect.getsource(w.LiaApp._stop_meeting)
     assert 'close_prompts("meeting-stop")' in src
     assert 'tag="meeting-stop"' in inspect.getsource(w.LiaApp)
@@ -4302,30 +4324,350 @@ _test("chat: window module + lia wiring", t_chat_wiring)
 
 
 def t_local_diarization_wiring():
-    """Local pyannote diarization option: subprocess module + lia wiring."""
+    """Local speaker detection (Nemotron 3, 2026-11-06): the subprocess script,
+    the installer module + hashed lock, the lia wiring, and pyannote gone."""
     base = os.path.dirname(os.path.abspath(__file__))
-    dl = os.path.join(base, "diarize_local.py")
-    assert os.path.exists(dl), "diarize_local.py missing"
-    src = open(dl, encoding="utf-8").read()
-    for marker in ('def _load_pipeline', 'itertracks', '"speaker"', '"start"', '"ok"',
-                   '--models-dir', '--download', 'HF_HUB_OFFLINE'):
-        assert marker in src, "diarize_local missing %r" % marker
-    # subprocess reports pyannote-not-installed as clean JSON (verified live in tests)
+    assert not os.path.exists(os.path.join(base, "diarize_local.py")), "pyannote script still here"
+    src = open(os.path.join(base, "diarize_nemotron.py"), encoding="utf-8").read()
+    for marker in ('"--pkgs"', '"--model-dir"', "speaker_cache", "is_streaming=True",
+                   "is_last_audio_chunk=True", "Nemotron3DiarizationSpeakerCache",
+                   "local_files_only=True", "_isolate_sys_path", '"speaker_embeddings": {}'):
+        assert marker in src, "diarize_nemotron missing %r" % marker
+    import speakers_setup as ss
+    lock = open(ss.lock_path(), encoding="utf-8").read()
+    reqs = [l for l in lock.splitlines() if l and not l.startswith("#")]
+    assert reqs and all(" --hash=sha256:" in l and "==" in l for l in reqs), reqs[:3]
+    names = {l.split("==")[0].lower() for l in reqs}
+    assert {"torch", "transformers", "librosa", "numpy", "safetensors"} <= names, names
+    assert "torch==2.14.1+cpu " in lock and "transformers==5.18.0 " in lock
+    assert ss.MODEL_REVISION and len(ss.MODEL_REVISION) == 40
+    assert ss.MODEL_FILES["model.safetensors"][0].startswith("c074d863")
+    inst = open(os.path.join(base, "speakers_setup.py"), encoding="utf-8").read()
+    for marker in ("--require-hashes", "--no-deps", "--only-binary=:all:", "--target",
+                   "download.pytorch.org/whl/cpu", ".part"):
+        assert marker in inst, "speakers_setup missing %r" % marker
     import lia as wt
-    for m in ("_run_local_diarization", "_set_hf_token", "_diarize_bundle_dir",
-              "_download_diarization_model"):
+    for m in ("_run_local_diarization", "_local_diarize_ready", "_speakers_install",
+              "_speakers_remove", "_speakers_status", "_diarize_lease_job"):
         assert hasattr(wt.LiaApp, m), "%s missing" % m
+    for m in ("_set_hf_token", "_diarize_bundle_dir", "_download_diarization_model",
+              "_pyannote_lease_job", "_pyannote_need_mb"):
+        assert not hasattr(wt.LiaApp, m), "%s still here" % m
+    assert not hasattr(wt, "_pyannote_device") and not hasattr(wt, "bundled_hf_token")
     keys = [k for _l, k, _r in wt.LiaApp._MEETING_MODELS]
-    assert "local_pyannote_hebrew" in keys, "local diarize model not in selector"
-    for c in ("hf_token", "diarize_local_model", "diarize_models_dir"):
-        assert c in wt.DEFAULT_CONFIG, "config key %s missing" % c
+    assert "local_diarize_hebrew" in keys, "local diarize model not in selector"
+    assert not any("pyannote" in k for k in keys), keys
+    for c in ("hf_token", "diarize_local_model", "diarize_models_dir",
+              "speaker_profiles_enabled", "local_diarize_tip_shown"):
+        assert c not in wt.DEFAULT_CONFIG, "stale config key %s" % c
+    acts = open(os.path.join(base, "lia.py"), encoding="utf-8").read()
+    assert 'add("speakers_install", self._speakers_install, True)' in acts
+    assert 'add("speakers_remove", self._speakers_remove)' in acts
     # MeetingSession must accept + store the backend
     import inspect
     sig = inspect.signature(wt.MeetingSession.__init__)
     assert "diarize_backend" in sig.parameters, "MeetingSession missing diarize_backend"
+    # the CPU speaker step never takes the GPU lease; the re-transcription does
+    job = inspect.getsource(wt.MeetingSession._run_diarize_job)
+    i_diar = job.index("self.app._run_local_diarization(")
+    i_lease = job.index("self.app._diarize_lease_job(")
+    assert i_lease > i_diar, "the lease must start after the CPU speaker step"
+    # a speaker model without speaker detection installed records chunked
+    assert "model_key = _SPEAKERS_PLAIN_KEY[model_key]" in inspect.getsource(
+        wt.LiaApp._start_meeting)
+    assert set(wt._SPEAKERS_PLAIN_KEY) == {k for k in keys if k.startswith("local_diarize_")}
 
 
-_test("diarize: local pyannote option + lia wiring", t_local_diarization_wiring)
+def t_nemotron_turns():
+    """diarize_nemotron's pure numpy part: (T, 8) probabilities -> exclusive
+    turns -> smoothed -> A/B/C utterances in arrival order, in milliseconds."""
+    import numpy as np
+    import diarize_nemotron as dn
+    p = np.zeros((300, 8), np.float32)
+    p[0:100, 3] = 0.9          # first voice is model speaker 3 -> label A
+    p[100:105, 3] = 0.2        # 50 ms gap, same speaker -> merged
+    p[105:150, 3] = 0.8
+    p[120:150, 1] = 0.95       # overlap: the more probable speaker wins
+    p[150:152, 5] = 0.7        # a 20 ms blip -> dropped by smooth
+    p[200:300, 1] = 0.6
+    turns = [(round(x, 3), round(y, 3), k)
+             for x, y, k in dn.smooth(dn.turns_from_probabilities(p))]
+    assert turns == [(0.0, 1.2, 3), (1.2, 1.5, 1), (2.0, 3.0, 1)], turns
+    utts, n = dn.utterances_from_turns(turns)
+    assert n == 2 and [u["speaker"] for u in utts] == ["A", "B", "B"], utts
+    assert utts[0]["start"] == 0.0 and utts[0]["end"] == 1200.0 and utts[1]["text"] == ""
+    assert dn.turns_from_probabilities(np.zeros((0, 8))) == []
+    assert dn.turns_from_probabilities(np.full((50, 8), 0.1)) == []
+
+
+def t_config_drops_pyannote():
+    """An old config: the pyannote meeting keys migrate to the speaker keys and
+    the pyannote-only keys (HF token, bundle dir, voiceprint switch) go."""
+    import json as _j
+    import lia as w
+    old = {"meeting_model": "local_pyannote_parakeet",
+           "file_transcribe_model": "local_pyannote_hebrew",
+           "hf_token": "x", "diarize_models_dir": "", "diarize_local_model": "p",
+           "speaker_profiles_enabled": True, "pyannote_vram_need_mb": 1}
+    keep = None
+    if os.path.exists(w.CONFIG_FILE):
+        with open(w.CONFIG_FILE, "rb") as f:
+            keep = f.read()
+    with open(w.CONFIG_FILE, "w", encoding="utf-8") as f:
+        _j.dump(old, f)
+    try:
+        cfg = w.load_config()
+    finally:
+        if keep is None:
+            os.remove(w.CONFIG_FILE)
+        else:
+            with open(w.CONFIG_FILE, "wb") as f:
+                f.write(keep)
+    assert cfg["meeting_model"] == "local_diarize_parakeet", cfg["meeting_model"]
+    assert cfg["file_transcribe_model"] == "local_diarize_hebrew"
+    for k in ("hf_token", "diarize_models_dir", "diarize_local_model",
+              "speaker_profiles_enabled", "pyannote_vram_need_mb"):
+        assert k not in cfg, k
+
+
+_test("diarize: Nemotron turns from probabilities (exclusive, smoothed, A/B in order)",
+      t_nemotron_turns)
+_test("config: pyannote keys migrate to the Nemotron speaker keys", t_config_drops_pyannote)
+_test("diarize: local Nemotron speaker detection + installer + lia wiring, pyannote gone",
+      t_local_diarization_wiring)
+
+
+def t_live_speakers_tracker():
+    """speakers_live.LiveSpeakers without a child: runs merge across steps,
+    labels by arrival, blips dropped; dominant_label needs a clear majority."""
+    import speakers_live as sl
+    t = sl.LiveSpeakers("py", "x.py", "p", "m", step_frames=38)
+    assert abs(t.step_s - 3.04) < 1e-9
+    for r in ((0.0, 3.0, 5), (3.0, 4.0, 5), (4.2, 6.0, 2), (6.0, 6.1, 7), (6.1, 9.0, 5)):
+        t._add_run(*r)
+    turns = t.turns()
+    assert [(x["t0"], x["t1"], x["speaker"]) for x in turns] == \
+        [(0.0, 4.0, "A"), (4.2, 6.0, "B"), (6.1, 9.0, "A")], turns
+    assert t.speakers() == ["A", "B", "C"]          # the blip still took a label
+    assert sl.dominant_label(turns, 0.0, 4.0) == "A"
+    assert sl.dominant_label(turns, 3.0, 6.0) == "B"
+    assert sl.dominant_label(turns, 3.6, 4.6) is None   # 0.4 s vs 0.4 s: a mix
+    assert sl.dominant_label(turns, 20.0, 30.0) is None
+    # a dead tracker never blocks the meeting
+    assert t.alive() is False and t.wait_labels(timeout=0.01) in (True, False)
+    t.feed([0.1, 0.2])                               # no child: a no-op
+    assert t.fed_s == 0.0
+
+
+def t_live_speakers_meeting():
+    """MeetingSession's live labels with a fake tracker: the window is cut at
+    the label change, each piece carries its label into the chunk record
+    (before transcription), the unlabelled tail is carried, the final window
+    flushes; rendering names the label ("Speaker A"), keeps a Teams name, and
+    gives the mic-tracking label the user's own name."""
+    import inspect
+    import threading as _th
+    import numpy as np
+    import lia as w
+
+    class Fake:
+        step_s = 3.04
+        proc = None
+
+        def __init__(self):
+            self.fed, self.cov, self.done = 0.0, 0.0, False
+            self.tt = []
+
+        def wait_labels(self, timeout=4.0):
+            return True
+
+        def finish(self, timeout=10.0):
+            self.cov, self.done = self.fed, True
+            return True
+
+        def alive(self):
+            return True
+
+        @property
+        def fed_s(self):
+            return self.fed
+
+        @property
+        def covered_s(self):
+            return self.cov
+
+        def turns(self):
+            return list(self.tt)
+
+        def speakers(self):
+            return sorted({x["speaker"] for x in self.tt})
+
+        def stop(self):
+            pass
+
+    s = w.MeetingSession.__new__(w.MeetingSession)
+    s._carry_tail = None
+    s._chunks_lock = _th.Lock()
+    s.chunks = []
+    recs = []
+
+    def sub(audio, blocking=False, cut="drain", pause_s=0.0, start_rel=None, extra=None):
+        r = dict(extra or {}, dur=len(audio) / 16000.0, timestamp_rel=start_rel, cut=cut,
+                 text="t", status="ok", index=len(recs))
+        recs.append(r)
+        s.chunks.append(r)
+    s._submit_chunk = sub
+    fk = Fake()
+    s._live_spk = fk
+    rng = np.random.RandomState(0)
+    audio = (rng.randn(160000) * 0.1).astype(np.float32)
+    audio[80000:81600] = 0.0                    # a pause at 5 s where A hands to B
+    fk.fed, fk.cov = 10.0, 9.12                 # 3 full steps labelled
+    fk.tt = [{"t0": 0.0, "t1": 5.0, "speaker": "A"}, {"t0": 5.1, "t1": 9.12, "speaker": "B"}]
+    assert s._submit_by_live_speakers(audio, now_rel=10.5) is True
+    assert [r["live_label"] for r in recs] == ["A", "B"], recs
+    assert recs[0]["cut"] == "speaker" and abs(recs[0]["timestamp_rel"] - 0.5) < 1e-6
+    assert s._carry_tail is not None and len(s._carry_tail) > 0      # not labelled yet
+    assert abs(sum(r["dur"] for r in recs) + len(s._carry_tail) / 16000.0 - 10.0) < 1e-6
+    # final window: the tracker flushes, nothing is carried
+    fk.fed = 12.0
+    fk.tt.append({"t0": 9.12, "t1": 12.0, "speaker": "B"})
+    tail = np.concatenate([s._carry_tail, audio[:32000]])
+    s._carry_tail = None
+    assert s._submit_by_live_speakers(tail, now_rel=12.5, final=True) is True
+    assert fk.done and recs[-1]["cut"] == "final" and recs[-1]["live_label"] == "B"
+    # rendering: labels -> names; a Teams name stays; the mic label is the user
+    s.app = type("A", (), {"_self_speaker_name": lambda self: "Naor",
+                           "config": {}})()
+    s._mic_rms_1s = [0.05] * 5 + [0.001] * 7
+    s._loop_rms_1s = [0.001] * 5 + [0.05] * 7
+    s._live_spk_offset = 0.5
+    out = s._live_labelled([dict(r) for r in recs])
+    assert out[0]["speaker"] == "Naor" and out[1]["speaker"] == "Speaker B", out
+    named = s._live_labelled([dict(recs[1], speaker="Dana")])
+    assert named[0]["speaker"] == "Dana"
+    # Teams caption votes PER LABEL name a live label (a split: both labels
+    # of one voice get the name); a weak or mixed vote leaves it unnamed
+    live = [{"t0": 0, "t1": 20, "speaker": "A"}, {"t0": 20, "t1": 40, "speaker": "B"},
+            {"t0": 40, "t1": 50, "speaker": "C"}, {"t0": 50, "t1": 70, "speaker": "D"}]
+    caps = [{"t0": 0, "t1": 40, "speaker": "Dana"}, {"t0": 40, "t1": 45, "speaker": "Avi"},
+            {"t0": 50, "t1": 60, "speaker": "Avi"}, {"t0": 60, "t1": 70, "speaker": "Dana"}]
+    assert w.MeetingSession.live_label_names(live, caps) == {"A": "Dana", "B": "Dana"}
+    class _T:
+        def turns(self):
+            return [{"t0": 0.0, "t1": 12.5, "speaker": "Yoni"}]
+    s._teams = _T()
+    keep_min = w.MeetingSession.LIVE_NAME_MIN_S
+    w.MeetingSession.LIVE_NAME_MIN_S = 4.0          # the fake meeting is 12 s long
+    try:
+        out2 = s._live_labelled([dict(r) for r in recs])
+    finally:
+        w.MeetingSession.LIVE_NAME_MIN_S = keep_min
+    assert out2[0]["speaker"] == "Yoni", out2       # the caption name beats the mic guess
+    s._teams = None
+    # the visible note once all 8 labels are in use
+    assert s._live_status_line() == ""
+    fk.tt = [{"t0": i, "t1": i + 0.5, "speaker": chr(65 + i)} for i in range(8)]
+    assert "all 8 in use" in s._live_status_line()
+    # wiring
+    src = inspect.getsource(w.MeetingSession._drain_audio)
+    assert "sp.feed(audio)" in src
+    rot = inspect.getsource(w.MeetingSession._rotation_loop)
+    assert "self._submit_by_live_speakers(audio, now_rel)" in rot
+    fin = inspect.getsource(w.MeetingSession._finalise_current_chunk)
+    assert "self._submit_by_live_speakers(audio, now_rel, final=True)" in fin
+    assert "self._live_labelled(chunks)" in inspect.getsource(w.MeetingSession._flow_items)
+    assert w.DEFAULT_CONFIG["meeting_live_speakers"] is True
+    assert w.DEFAULT_CONFIG["meeting_live_speakers_step_frames"] == 38
+    dn = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)), "diarize_nemotron.py"),
+              encoding="utf-8").read()
+    assert "def live_main(args)" in dn and "lia_live=(step, 0)" in dn
+
+
+def t_speakers_auto_install():
+    """Speaker detection downloads itself when needed (Naor 2026-11-06, no
+    Install click): only when missing + needed + enabled + room on disk, one
+    try per retry window, quiet; Remove turns it off, Install turns it on."""
+    import inspect
+    import tempfile
+    import lia as w
+    import speakers_setup as ss
+    app = w.LiaApp.__new__(w.LiaApp)
+    calls = []
+    st = {"installed": False, "busy": False}
+    saved = (ss.status, w.save_config, w.MEETINGS_DIR, ss.remove)
+    mdir = tempfile.mkdtemp()
+    try:
+        ss.status = lambda: dict(st)
+        w.save_config = lambda c: None
+        w.MEETINGS_DIR = mdir
+        app._speakers_install = lambda auto=False: (calls.append(auto), (True, "ok"))[1]
+        app._free_gb = lambda path: 100.0
+
+        def fresh(**cfg):
+            app.config = dict({"meeting_model": "local_hebrew_turbo",
+                               "file_transcribe_model": "",
+                               "meeting_live_speakers": True,
+                               "speakers_auto_install": True}, **cfg)
+            app._speakers_auto_last = 0.0
+            del calls[:]
+        fresh()
+        # live labels on, but no meeting recorded yet: nothing at startup
+        assert app._speakers_auto_install("startup") is False and calls == []
+        # ... a meeting start needs it
+        assert app._speakers_auto_install("meeting") is True and calls == [True]
+        # one try per window
+        assert app._speakers_auto_install("meeting") is False and calls == [True]
+        # startup for someone who records meetings
+        fresh()
+        open(os.path.join(mdir, "2026-11-06_10-00-00_meeting.txt"), "w").close()
+        assert app._speakers_auto_install("startup") is True and calls == [True]
+        # live labels off + a plain model: never
+        fresh(meeting_live_speakers=False)
+        assert app._speakers_auto_install("meeting") is False and calls == []
+        # a "+ Nemotron Speakers" model needs it even with live labels off
+        fresh(meeting_live_speakers=False, meeting_model="local_diarize_hebrew_turbo")
+        assert app._speakers_auto_install("model") is True and calls == [True]
+        # switched off (after Remove), installed, low disk: never
+        fresh(speakers_auto_install=False)
+        assert app._speakers_auto_install("meeting") is False and calls == []
+        fresh()
+        st["installed"] = True
+        assert app._speakers_auto_install("meeting") is False and calls == []
+        st["installed"] = False
+        app._free_gb = lambda path: 1.0
+        assert app._speakers_auto_install("meeting") is False and calls == []
+        app._free_gb = lambda path: 100.0
+        # already downloading: reported as running, no second install
+        fresh()
+        st["busy"] = True
+        assert app._speakers_auto_install("meeting") is True and calls == []
+        st["busy"] = False
+        # Remove = the user's choice: no automatic download afterwards
+        fresh()
+        ss.remove = lambda: (True, "removed")
+        ok, _m = w.LiaApp._speakers_remove(app)
+        assert ok and app.config["speakers_auto_install"] is False
+        # free space helper walks up to an existing folder
+        assert w.LiaApp._free_gb(os.path.join(mdir, "no", "such", "dir")) > 0
+    finally:
+        ss.status, w.save_config, w.MEETINGS_DIR, ss.remove = saved
+    assert w.DEFAULT_CONFIG["speakers_auto_install"] is True
+    src = inspect.getsource(w.LiaApp._speakers_install)
+    assert "if not auto:" in src and 'self.config["speakers_auto_install"] = True' in src
+    for fn in (w.LiaApp._set_meeting_model, w.LiaApp._set_file_transcribe_model):
+        assert '_speakers_auto_install("model")' in inspect.getsource(fn)
+    assert 'self.app._speakers_auto_install("meeting")' in inspect.getsource(
+        w.MeetingSession._start_live_speakers)
+    inst = open(ss.__file__, encoding="utf-8").read()
+    assert "0x08000000 | 0x00004000" in inst
+
+
+_test("speaker detection downloads itself when needed (gates, retry, Remove)",
+      t_speakers_auto_install)
+_test("live speakers: tracker merges runs, arrival labels, dominant label", t_live_speakers_tracker)
+_test("live speakers: windows cut + labelled before transcription, carry, final flush, names",
+      t_live_speakers_meeting)
 
 
 def t_strip_foreign_script():
@@ -5996,85 +6338,64 @@ def t_ollama_sticky_ctx():
 _test("ollama P2.2: sticky num_ctx - no reload per pass, one map window, "
       "ask == prewarm", t_ollama_sticky_ctx)
 
-def t_pyannote_gpu_guard():
-    """P2.3 (2026-09-23): pyannote was measured at +11-12 GB VRAM and gemma
-    holds ~19 GB for 5 min after any summary/ask; together on the 24 GB card
-    they ended in "CUDA unknown error" + a driver reset. Before local
-    diarization: enough free VRAM -> as is; else WAIT (GPU-busy policy,
-    2026-09-23: never the CPU) - and never by unloading an Ollama model, which
-    may be another app's in the middle of its run (09-23 10:04 + 12:50). The
-    real _run_local_diarization must pass the guard's device."""
+def t_speakers_cpu_launch():
+    """Local speaker detection (Nemotron 3, 2026-11-06) runs on the CPU: the real
+    _run_local_diarization launches diarize_nemotron.py at below-normal priority
+    with the installed package + model folders, never waits for the GPU (the
+    pyannote VRAM gate is gone), and refuses clearly when not installed."""
     import subprocess
     import lia as w
-    saved = (w._gpu_free_mb, w._ollama_loaded_models, w._ollama_unload)
-    calls = []
-    try:
-        # plenty free -> untouched, nothing unloaded
-        w._gpu_free_mb = lambda: 20000
-        w._ollama_loaded_models = lambda root=None: ["gemma4:31b-it-qat"]
-        w._ollama_unload = lambda names, **k: calls.append(names) or True
-        assert w._pyannote_device("auto") == "auto" and calls == []
-        # cpu requested -> cpu, no probing
-        w._gpu_free_mb = lambda: (_ for _ in ()).throw(AssertionError("probed"))
-        assert w._pyannote_device("cpu") == "cpu"
-        # gemma resident, 995 MiB free (measured) -> NOT unloaded (it may be
-        # another app's): wait until it frees, then CUDA
-        w._GPU_SHED_HOOK[0] = None
-        w._GPU_WAIT_POLL_S = 1.0      # one real 1 s poll, not 30
-        free = iter([995, 20194])
-        w._gpu_free_mb = lambda: next(free)
-        assert w._pyannote_device("auto") == "auto"
-        assert calls == [], calls
-        # another app holds the GPU: nothing in Ollama, still short -> WAIT
-        # for the GPU (GPU-busy policy, 2026-09-23), never the CPU
-        free = iter([6000, 14000])
-        w._gpu_free_mb = lambda: next(free)
-        w._ollama_loaded_models = lambda root=None: []
-        notes = []
-        with w.gpu_wait_context(on_wait=notes.append):
-            assert w._pyannote_device("auto") == "auto" and calls == []
-        assert notes and notes[0].startswith("GPU busy - waiting for 12.5 GB"), notes
-        # nvidia-smi unavailable -> unchanged (cannot tell)
-        w._gpu_free_mb = lambda: None
-        assert w._pyannote_device("auto") == "auto"
-        # the config override is honoured
-        w._gpu_free_mb = lambda: 9000
-        assert w._pyannote_device("auto", need_mb=8000) == "auto"
-    finally:
-        w._gpu_free_mb, w._ollama_loaded_models, w._ollama_unload = saved
-        w._GPU_WAIT_POLL_S = 30.0
-
+    import speakers_setup as ss
     # unloading also forgets the sticky ctx (P2.2): the model is gone
     w._ollama_ctx_note("gone-model", 32768)
     w._ollama_ctx_forget("gone-model")
     assert w._ollama_ctx_for("gone-model", 8192) == 8192
 
-    # the real _run_local_diarization launches pyannote with the guard's device
-    got = {}
-    class Stop(Exception):
-        pass
-    def fake_popen(args, **k):
-        got["args"] = list(args); raise Stop()
-    orig_dev, orig_popen = w._pyannote_device, subprocess.Popen
-    w._pyannote_device = lambda req, need_mb=0: (got.setdefault("need", need_mb), "cpu")[1]
-    subprocess.Popen = fake_popen
+    app = w.LiaApp.__new__(w.LiaApp)
+    app.config = {"whisper_device": "cuda"}
+    # not installed -> a clear, actionable error, nothing launched
+    orig_inst, orig_popen, orig_wait = ss.installed, subprocess.Popen, w._wait_for_gpu
+    started = []
+    subprocess.Popen = lambda *a, **k: started.append(a) or (_ for _ in ()).throw(
+        AssertionError("launched while not installed"))
+    ss.installed = lambda: False
     try:
-        app = w.LiaApp.__new__(w.LiaApp)
-        app.config = {"whisper_device": "cuda", "pyannote_vram_need_mb": 9999}
-        app._diarize_bundle_dir = lambda: ""
+        try:
+            app._run_local_diarization("x.wav")
+            raise AssertionError("no error")
+        except RuntimeError as e:
+            assert "not installed" in str(e) and "Settings" in str(e), e
+        assert not started
+        # installed -> the Nemotron script with its folders, CPU, low priority,
+        # and no GPU wait at all
+        got = {}
+
+        class Stop(Exception):
+            pass
+
+        def fake_popen(args, **k):
+            got["args"], got["flags"] = list(args), k.get("creationflags", 0)
+            raise Stop()
+        subprocess.Popen = fake_popen
+        ss.installed = lambda: True
+        w._wait_for_gpu = lambda *a, **k: (_ for _ in ()).throw(AssertionError("GPU wait"))
         try:
             app._run_local_diarization("x.wav")
         except Stop:
             pass
     finally:
-        w._pyannote_device, subprocess.Popen = orig_dev, orig_popen
+        ss.installed, subprocess.Popen, w._wait_for_gpu = orig_inst, orig_popen, orig_wait
     a = got["args"]
-    assert a[a.index("--device") + 1] == "cpu", a
-    assert got["need"] == 9999
+    assert a[a.index("-I") + 1].endswith("diarize_nemotron.py"), a
+    assert a[a.index("--pkgs") + 1] == ss.pkgs_dir()
+    assert a[a.index("--model-dir") + 1] == ss.model_dir()
+    assert 1 <= int(a[a.index("--threads") + 1]) <= 8
+    assert "--device" not in a
+    assert got["flags"] & 0x00004000 and got["flags"] & 0x08000000, hex(got["flags"])
 
 
-_test("gpu P2.3: pyannote makes room (unload Ollama) or WAITS - never the CPU",
-      t_pyannote_gpu_guard)
+_test("speakers: Nemotron launches on the CPU (low priority, no GPU wait); "
+      "not installed = a clear error", t_speakers_cpu_launch)
 
 
 def t_gpu_busy_wait_for_gpu():
@@ -6101,7 +6422,7 @@ def t_gpu_busy_wait_for_gpu():
         w._gpu_free_mb = lambda: next(seq)
         notes = []
         with w.gpu_wait_context(on_wait=notes.append):
-            assert w._wait_for_gpu(12800, "pyannote", sleep=fake_sleep,
+            assert w._wait_for_gpu(12800, "transcription", sleep=fake_sleep,
                                    clock=fake_clock) is True
         assert now[0] > 0 and notes, notes
         assert notes[0] == "GPU busy - waiting for 12.5 GB free (0.5 GB now) 0:00", notes
@@ -6150,31 +6471,6 @@ def t_gpu_busy_wait_for_gpu():
     finally:
         w._gpu_free_mb, w._ollama_loaded_models, w._ollama_unload = saved
 
-    # the real _run_local_diarization: a Discard during the GPU wait ends it
-    # BEFORE pyannote starts (no Popen) and leaves no temp file behind
-    import subprocess, glob, tempfile
-    orig = (w._gpu_free_mb, subprocess.Popen, w._ollama_loaded_models)
-    started = []
-    subprocess.Popen = lambda *a, **k: started.append(a) or (_ for _ in ()).throw(
-        AssertionError("pyannote started on a busy GPU"))
-    w._gpu_free_mb = lambda: 500
-    w._ollama_loaded_models = lambda root=None: []
-    before = set(glob.glob(os.path.join(tempfile.gettempdir(), "wt_diar_*.json")))
-    try:
-        app = w.LiaApp.__new__(w.LiaApp)
-        app.config = {"whisper_device": "auto"}
-        app._diarize_bundle_dir = lambda: ""
-        try:
-            app._run_local_diarization("x.wav", on_status=lambda s: None,
-                                       should_cancel=lambda: True)
-            raise AssertionError("no discard")
-        except w._MeetingDiscarded:
-            pass
-    finally:
-        w._gpu_free_mb, subprocess.Popen, w._ollama_loaded_models = orig
-    assert not started
-    after = set(glob.glob(os.path.join(tempfile.gettempdir(), "wt_diar_*.json")))
-    assert after <= before, after - before
 
 
 _test("gpu-busy: long jobs wait for VRAM (card note, Discard), never the CPU",
@@ -7714,8 +8010,10 @@ _test("meeting card: processing card folds itself, opens on hover, finished card
 
 def t_meeting_card_done_closes():
     """The finished card closes itself after DONE_CLOSE_MS (Naor 2026-11-05),
-    not while the pointer is on it, and an old timer never closes the card that
-    replaced it. A failed summary stays. The adapter's state + a REAL Tk card."""
+    a failed or stopped one too (2026-11-06), not while the pointer is on it,
+    and an old timer never closes the card that replaced it. An unanswered
+    "Stop processing?" goes back to the processing card. A card still working
+    stays. The adapter's state + a REAL Tk card."""
     import time as _t
     import lia as w
     import notification_preview as npv
@@ -7737,12 +8035,21 @@ def t_meeting_card_done_closes():
     ov.meeting_status_finish(title="Summary ready", on_open=lambda: None)
     assert ov._mcard.renders[-1]["auto_close"] is True
     ov.meeting_status_finish(title="Summary failed", dot="err", on_retry=lambda: None)
-    assert ov._mcard.renders[-1]["auto_close"] is False, "a failure must stay"
+    assert ov._mcard.renders[-1]["auto_close"] is True, "a failure closes too"
     ov.meeting_status_error("x", "boom")
-    assert ov._mcard.renders[-1]["auto_close"] is False, "an error must stay"
+    assert ov._mcard.renders[-1]["auto_close"] is True, "an error closes too"
+    ov.meeting_status_discarded()
+    assert ov._mcard.renders[-1]["auto_close"] is True
+    assert not ov._mcard.renders[-1].get("on_auto_close")
     ov.meeting_status_note("Summarizing again...")
     assert not ov._mcard.renders[-1]["auto_close"], "still working"
-    ov.meeting_status_start([("a", "Alpha")])
+    g = ov.meeting_status_start([("a", "Alpha")])
+    assert not ov._mcard.renders[-1].get("auto_close")
+    ov._mcard_arm_stop(g)
+    st = ov._mcard.renders[-1]
+    assert st["title"] == "Stop processing?" and st["auto_close"] is True
+    st["on_auto_close"]()
+    assert ov._mcard_model["kind"] == "processing", "unanswered = keep going"
     assert not ov._mcard.renders[-1].get("auto_close")
 
     old = ns.DONE_CLOSE_MS, ns.DONE_CLOSE_RETRY_MS
@@ -7773,11 +8080,14 @@ def t_meeting_card_done_closes():
         assert card._top is None, "must close when the pointer leaves"
         # a card that replaced it is not closed by the old timer
         card.render(dict(done)); pump(0.1)
-        card.render({"kind": "success", "title": "Summary failed", "allow_close": True,
-                     "dot": "err", "close_button": True, "auto_close": False,
-                     "actions": [("Summarize again", lambda: None, True)]})
+        card.render({"kind": "processing", "title": "Processing meeting",
+                     "dot": "busy", "actions": []})
         pump(0.6)
-        assert card._top is not None, "an old timer closed the failure card"
+        assert card._top is not None, "an old timer closed the working card"
+        # on_auto_close replaces the close (the unanswered Stop question)
+        fired = []
+        card.render(dict(done, on_auto_close=lambda: fired.append(1))); pump(0.6)
+        assert fired == [1] and card._top is not None, fired
         # a card closed by hand: the timer finds nothing and does no harm
         card.render(dict(done)); pump(0.05)
         card._teardown(); pump(0.5)
@@ -7788,7 +8098,7 @@ def t_meeting_card_done_closes():
         host.root.destroy()
 
 
-_test("meeting card: a finished card closes itself, not under the pointer; a failure stays",
+_test("meeting card: a finished, failed or stopped card closes itself, not under the pointer",
       t_meeting_card_done_closes)
 
 
@@ -8009,7 +8319,7 @@ def t_meeting_card_hebrew_font():
     try:
         base = {"kind": "processing", "title": "Processing meeting",
                 "allow_close": True, "anchor": _t.monotonic(), "dot": "busy",
-                "chips": ["Whisper Hebrew (local) · pyannote speakers"],
+                "chips": ["Whisper Hebrew (local) · Nemotron speakers"],
                 "stage_label": "Transcribing · 127/756", "allow_min": True,
                 "stages": [("enhance", "Transcribing", "active")]}
         host.card.render(dict(base, meeting_title="סקירת תוכנית העבודה לרבעון"))
@@ -8964,28 +9274,27 @@ _test("live transcript window: text is selectable + Copy all", t_live_transcript
 
 def t_discard_stops_pyannote():
     """2026-09-23 (a real meeting): Stop processing was pressed 5 s after the
-    meeting ended, pyannote then ran on CPU (other jobs held the GPU) and the
-    card sat on "Stopping..." for the whole run - nothing looked at the
-    Discard until pyannote returned. Now the Discard is checked before the
-    launch and every second during it (the child is killed). A REAL child
-    process. (GPU-busy policy, same day: no CPU fallback any more - a busy
-    card WAITS with its own card note, see t_gpu_busy_wait_for_gpu.)"""
+    meeting ended and the card sat on "Stopping..." for the whole diarizer
+    run - nothing looked at the Discard until it returned. Now the Discard is
+    checked before the launch and twice a second during it (the child is
+    killed). A REAL child process. (Since 2026-11-06 the diarizer is Nemotron 3
+    on the CPU; the contract is the same.)"""
     import subprocess, sys as _sys, threading as _th, time as _t
     import lia as w
+    import speakers_setup as ss
     app = w.LiaApp.__new__(w.LiaApp)
     app.config = {"whisper_device": "cuda"}
-    app._diarize_bundle_dir = lambda: ""
     app._child_procs = set()
     statuses = []
-    orig_dev, orig_popen = w._pyannote_device, subprocess.Popen
-    w._pyannote_device = lambda req, need_mb=0: "auto"
+    orig_inst, orig_popen = ss.installed, subprocess.Popen
+    ss.installed = lambda: True
     spawned = []
     def slow_child(args, **kw):
         p = orig_popen([_sys.executable, "-c", "import time; time.sleep(60)"], **kw)
         spawned.append(p); return p
     subprocess.Popen = slow_child
     try:
-        # 1. Discard pressed while pyannote runs -> killed, _MeetingDiscarded
+        # 1. Discard pressed while speaker detection runs -> killed, _MeetingDiscarded
         flag = _th.Event()
         _th.Timer(1.5, flag.set).start()
         t0 = _t.monotonic()
@@ -8996,17 +9305,17 @@ def t_discard_stops_pyannote():
         except w._MeetingDiscarded:
             pass
         assert _t.monotonic() - t0 < 6, _t.monotonic() - t0
-        assert spawned and spawned[0].poll() is not None, "pyannote child left running"
-        # 2. Discard already pressed -> pyannote is never started
+        assert spawned and spawned[0].poll() is not None, "speaker child left running"
+        # 2. Discard already pressed -> the speaker child is never started
         spawned.clear()
         try:
             app._run_local_diarization("x.wav", should_cancel=lambda: True)
             raise AssertionError("not cancelled")
         except w._MeetingDiscarded:
             pass
-        assert spawned == [], "started pyannote after a Discard"
+        assert spawned == [], "started speaker detection after a Discard"
     finally:
-        w._pyannote_device, subprocess.Popen = orig_dev, orig_popen
+        ss.installed, subprocess.Popen = orig_inst, orig_popen
         for p in spawned:
             try: p.kill()
             except Exception: pass
@@ -9016,7 +9325,7 @@ def t_discard_stops_pyannote():
         w.MeetingSession._run_diarize_job)
 
 
-_test("meeting: Discard stops a running pyannote (no endless 'Stopping...')",
+_test("meeting: Discard stops a running speaker detection (no endless 'Stopping...')",
       t_discard_stops_pyannote)
 
 def t_privilege_boundaries():
@@ -9414,10 +9723,10 @@ _test("webview + prompt: CSP in every window + saved summaries, editor drops act
 
 
 def t_supply_chain_pins():
-    """Audit 2026-09-26 F21 + F27: Parakeet and the pyannote pipeline load a
-    reviewed revision (never a moved main branch - the pyannote checkpoints are
-    torch pickles); the diarization install hint names exact versions; the
-    release build copies only the tkinter files from the build machine."""
+    """Audit 2026-09-26 F21 + F27: Parakeet and the speaker model load a
+    reviewed revision (never a moved main branch); the speaker model files are
+    sha256-checked and its packages hash-locked; the release build copies only
+    the tkinter files from the build machine."""
     import lia as w
     here = os.path.dirname(os.path.abspath(w.__file__))
     rev = w.MODEL_REVISIONS.get("istupakov/parakeet-tdt-0.6b-v3-onnx", "")
@@ -9434,18 +9743,20 @@ def t_supply_chain_pins():
     assert any("int8" in f for f in seen["allow_patterns"]), seen
     src = open(os.path.join(here, "lia.py"), encoding="utf-8").read()
     assert 'kwargs["path"] = pinned' in src
-    dl = open(os.path.join(here, "diarize_local.py"), encoding="utf-8").read()
-    assert '"pyannote/speaker-diarization-community-1": "3533c8cf' in dl
-    assert "revision=PIPELINE_REVISIONS.get(m)" in dl
-    assert "pyannote.audio==4.0.7" in dl and '"pyannote.audio>=4.0"' not in dl
+    import speakers_setup as ss
+    assert len(ss.MODEL_REVISION) == 40
+    assert all(len(h) == 64 and n > 0 for h, n in ss.MODEL_FILES.values())
+    inst = open(os.path.join(here, "speakers_setup.py"), encoding="utf-8").read()
+    assert '"https://huggingface.co/%s/resolve/%s/%s" % (MODEL_REPO, MODEL_REVISION, name)' in inst
+    assert "h.hexdigest() != sha" in inst and "--require-hashes" in inst
     bp = os.path.join(here, "build_runtime.py")
     if os.path.exists(bp):                      # stripped from a release's app\
         b = open(bp, encoding="utf-8").read()
         assert "for item in TK_GRAFT_FILES:" in b and "for item in os.listdir(dlls_src):" not in b
 
 
-_test("supply chain: Parakeet + pyannote pinned to reviewed revisions, exact "
-      "diarization versions, build copies only the tkinter files", t_supply_chain_pins)
+_test("supply chain: Parakeet + the speaker model pinned to reviewed revisions, "
+      "checked files, build copies only the tkinter files", t_supply_chain_pins)
 
 def t_build_supply_chain_pins():
     """WP4: the shipped CPython embeddable AND get-pip.py are hash-pinned (no
@@ -14187,6 +14498,19 @@ def t_teams_caption_names():
                                                   T("C"), T("four five")]}
     assert [(a, t) for _k, a, t in tc.parse_caption_entries(flat)] == [
         ("A B", "one two three"), ("C", "four five")]
+    # 2026-11-06: Teams' banner inside the region is not a speaker (it was
+    # "Captions will be shown in" with the text "Hebrew (Israel) .")
+    banner = {"name": "", "ct": 50026, "children": [
+        T("Captions will be shown in "), T("Hebrew (Israel)"), T(".")]}
+    caps2 = {"name": "Live Captions", "ct": 50026, "children": [
+        banner, line("Dana Levi", "hello everyone", [3])]}
+    assert [(a, t) for _k, a, t in tc.parse_caption_entries(caps2)] == [
+        ("Dana Levi", "hello everyone")]
+    for s in ("Live captions are on", "Your spoken language is English",
+              "Recording has started"):
+        assert not tc._name_like(s), s
+    for s in ("Will Smith", "Jean de la Fontaine", "דנה לוי", "Contoso-AI (IT)", "john smith"):
+        assert tc._name_like(s), s
     # caption authors as Teams really renders them
     assert tc.clean_name("teams-Dana_Levi") == "Dana Levi"
     assert tc.clean_name("\u200fיוסי (Unverified)") == "יוסי"
@@ -14479,6 +14803,301 @@ def t_portable_self_update():
 
 _test("update: a portable copy updates itself in place (signed zip, swap, rollback)",
       t_portable_self_update)
+
+
+def t_delta_update():
+    """2026-11-06 (Naor: why is every update a full 77-126 MB download?): a
+    release also publishes Lia-Update-<v>.zip (a manifest of every file + the
+    files that changed since the last few releases), signed in the same
+    SHA256SUMS.txt. A copy hashes its own files, hard-links the matching ones
+    into <root>\\_update\\new, takes the rest from the pack (each checked
+    against the manifest) and swaps in place; anything it cannot use falls
+    back to the full Setup / Portable. Measured: 2.9-4.0 MB instead of 126 MB
+    (plans/DELTA_UPDATE_PLAN_2026-11-06.md); the real swap of a real tree:
+    plans/release_tools/delta_update_test.py."""
+    import json
+    import secrets
+    import shutil
+    import tempfile
+    import zipfile
+    import lia_ed25519 as ed
+    import make_update_pack as mk
+    import updater as U
+    import lia as w
+
+    # 1) the pack is a release asset, signed like the others
+    rel_json = {"tag_name": "v9.9.9", "assets": [
+        {"name": n, "browser_download_url": "u/" + n, "digest": "sha256:" + "ab" * 32, "size": 1}
+        for n in ("Lia-Setup-9.9.9.exe", "Lia-Portable-9.9.9.zip", "Lia-Update-9.9.9.zip",
+                  "Lia-Update-9.9.8.zip")]}
+    r = U.parse_release(rel_json)
+    assert r["update"]["name"] == "Lia-Update-9.9.9.zip", r["update"]
+    seed = secrets.token_bytes(32)
+    pub = ed.public_key(seed).hex()
+    usha = "cd" * 32
+    sums = ("%s  Lia-Setup-9.9.9.exe\n%s  Lia-Update-9.9.9.zip\n" % ("ab" * 32, usha)).encode()
+    base = "https://github.com/Danaor/lia/releases/download/v9.9.9/"
+    files = {base + "SHA256SUMS.txt": sums,
+             base + "SHA256SUMS.txt.sig": ed.sign(seed, sums).hex().encode()}
+
+    class _R:
+        def __init__(self, data): self.data = data
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def raise_for_status(self): pass
+        def iter_content(self, chunk_size=1): yield self.data
+
+    class _S:
+        def get(self, url, **k): return _R(files[url])
+
+    def rel(sha=usha, name="Lia-Update-9.9.9.zip"):
+        return {"version": "9.9.9", "tag": "v9.9.9",
+                "update": {"name": name, "url": base + name, "sha256": sha},
+                "sums": {"name": "SHA256SUMS.txt", "url": base + "SHA256SUMS.txt"},
+                "sums_sig": {"name": "SHA256SUMS.txt.sig", "url": base + "SHA256SUMS.txt.sig"}}
+    assert U.authorize(rel(), session=_S(), public_key_hex=pub, asset="update") == usha
+    for bad, why in ((rel("ef" * 32), "differs"), (dict(rel(), update=None), "update pack"),
+                     (rel(name="Lia-Update-9.9.8.zip"), "not in the signed")):
+        try:
+            U.authorize(bad, session=_S(), public_key_hex=pub, asset="update")
+            raise AssertionError("must refuse: " + why)
+        except U.VerifyError as e:
+            assert why in str(e), (why, str(e))
+
+    d = tempfile.mkdtemp()
+    try:
+        def tree(path, content):
+            for rel_, data in content.items():
+                p = os.path.join(path, *rel_.split("/"))
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "wb") as f:
+                    f.write(data if isinstance(data, bytes) else data.encode("utf-8"))
+
+        old = {"runtime/Lia.exe": b"exe-1", "runtime/python313.dll": b"D" * 5000,
+               "runtime/Lib/site-packages/pkg/mod.py": "x = 1\n",
+               "runtime/Lib/site-packages/pkg/gone.py": "old\n",
+               "app/lia.py": 'APP_VERSION = "9.9.8"\n', "app/ui_kit.py": "ui = 1\n",
+               "app/assets/logo.png": b"\x89PNG" + b"L" * 3000,
+               "README.md": "old readme\n", "Lia.bat": "@echo old\n"}
+        new = dict(old)
+        del new["runtime/Lib/site-packages/pkg/gone.py"]
+        new.update({"runtime/Lia.exe": b"exe-2", "app/lia.py": 'APP_VERSION = "9.9.9"\n',
+                    "app/new_module.py": "fresh = True\n", "README.md": "new readme\n",
+                    "Lia.bat": "@echo new\n"})
+        build = os.path.join(d, "build")
+        tree(build, new)
+        base_zip = os.path.join(d, "Lia-Portable-9.9.8.zip")
+        with zipfile.ZipFile(base_zip, "w") as z:
+            for rel_, data in old.items():
+                z.writestr(rel_, data)
+        pack = os.path.join(d, "Lia-Update-9.9.9.zip")
+        st = mk.build_pack(build, "9.9.9", [base_zip], pack)
+        assert st["packed"] == 5 and st.get("pack_bytes"), st     # exe, lia.py, new_module, README, bat
+        with zipfile.ZipFile(pack) as z:
+            names = set(z.namelist())
+            man = json.loads(z.read(U.DELTA_MANIFEST))
+        assert "files/app/ui_kit.py" not in names and "files/app/new_module.py" in names
+        assert man["version"] == "9.9.9" and len(man["files"]) == len(new)
+        assert mk.auto_bases(d, "9.9.9") == [base_zip] and mk.auto_bases(d, "9.9.8") == []
+
+        # 2) an installed-style copy of 9.9.8 (no Lia.bat at its top) updates
+        root = os.path.join(d, "Lia inst")
+        tree(root, {k: v for k, v in old.items() if k != "Lia.bat"})
+        tree(root, {"app/__pycache__/ui_kit.cpython-313.pyc": b"pyc",
+                    "app/__pycache__/lia.cpython-313.pyc": b"stale",
+                    "app/stray.txt": "not in the release"})
+        nd, stats = U.stage_delta(pack, root, "9.9.9")
+        assert nd == os.path.join(root, "_update", "new")
+        got = U.tree_manifest(nd)
+        want = {k: v for k, v in man["files"].items() if "/" in k}
+        want["README.md"] = man["files"]["README.md"]               # exists here + changed
+        assert got == want, (sorted(set(got) ^ set(want)))
+        assert not os.path.exists(os.path.join(nd, "Lia.bat")), "a launcher this copy never had"
+        assert not os.path.exists(os.path.join(nd, "app", "stray.txt"))
+        assert stats["fetched"] == 3 and stats["top"] == 1 and stats["kept"] == 4, stats
+        # unchanged files are the SAME file (hard link), not a copy
+        for rel_ in ("runtime/python313.dll", "app/ui_kit.py"):
+            a = os.stat(os.path.join(root, *rel_.split("/")))
+            b = os.stat(os.path.join(nd, *rel_.split("/")))
+            assert (a.st_ino, a.st_dev) == (b.st_ino, b.st_dev), rel_
+        assert stats["linked"] == 4 and stats["copied"] == 0 and stats["pyc"] == 2, stats
+        # the old folders are untouched until the swap
+        assert open(os.path.join(root, "app", "lia.py")).read() == old["app/lia.py"]
+
+        # 3) fallbacks: never a half update
+        def refuses(exc, why, pack_=pack, version="9.9.9", root_=root):
+            try:
+                U.stage_delta(pack_, root_, version)
+            except exc as e:
+                assert why in str(e), (why, str(e))
+                return
+            raise AssertionError("must refuse: " + why)
+        refuses(U.DeltaError, "is for Lia 9.9.9, not 9.9.7", version="9.9.7")
+        with open(os.path.join(root, "runtime", "python313.dll"), "wb") as f:
+            f.write(b"corrupted")                   # a changed file the pack does not carry
+        refuses(U.DeltaError, "not in the update pack")
+        with open(os.path.join(root, "runtime", "python313.dll"), "wb") as f:
+            f.write(old["runtime/python313.dll"])
+
+        def mkpack(name, manifest, members):
+            p = os.path.join(d, name)
+            with zipfile.ZipFile(p, "w") as z:
+                if manifest is not None:
+                    z.writestr(U.DELTA_MANIFEST, json.dumps(manifest))
+                for n, data in members.items():
+                    z.writestr(n, data)
+            return p
+        with zipfile.ZipFile(pack) as z:
+            real = {n: z.read(n) for n in z.namelist() if n.startswith(U.DELTA_FILES)}
+        tampered = dict(real)
+        tampered["files/app/new_module.py"] = b"import os; os.system('evil')\n"
+        refuses(U.VerifyError, "manifest", mkpack("t.zip", man, tampered))      # longer
+        tampered["files/app/new_module.py"] = b"fresh = Tru3\n"                    # same size
+        refuses(U.VerifyError, "does not match the signed manifest", mkpack("t2.zip", man, tampered))
+        for name, mf, why in (
+                ("nm.zip", None, "has no lia-update.json"),
+                ("fmt.zip", dict(man, format=2), "unknown update pack format"),
+                ("dot.zip", dict(man, files=dict(man["files"], **{"app/../../evil.py": ["0" * 64, 1]})),
+                 "bad entry"),
+                ("out.zip", dict(man, files=dict(man["files"], **{"Windows/evil.dll": ["0" * 64, 1]})),
+                 "bad entry"),
+                ("ads.zip", dict(man, files=dict(man["files"], **{"app/x.py:stream": ["0" * 64, 1]})),
+                 "bad entry"),
+                ("case.zip", dict(man, files=dict(man["files"], **{"app/LIA.PY": man["files"]["app/lia.py"]})),
+                 "twice"),
+                ("half.zip", dict(man, files={"app/lia.py": man["files"]["app/lia.py"]}),
+                 "not a whole Lia")):
+            refuses(U.DeltaError, why, mkpack(name, mf, real))
+        with open(os.path.join(d, "junk.zip"), "wb") as f:
+            f.write(b"not a zip")
+        refuses(U.DeltaError, "cannot be opened", os.path.join(d, "junk.zip"))
+        assert not os.path.exists(os.path.join(root, "_update", "new", "app", "new_module.py"))
+        for good in ("runtime/Lia.exe", "app/a b/c (1).py", "Lia (Work PC).bat",
+                     "runtime/Lib/site-packages/x-1.0.dist-info/RECORD"):
+            assert U.valid_rel(good), good
+        for bad in ("", "/abs", "C:/x", "app\\x", "app//x", "app/./x", "app/x.", "app/x ",
+                    "tools/x.py", "app/" + "a" * 240):
+            assert not U.valid_rel(bad), bad
+
+        # a pack that would be most of the tree (a CPython bump) is not made
+        assert mk.build_pack(build, "9.9.9", [base_zip], os.path.join(d, "x.zip"),
+                             max_fraction=0.001).get("skipped")
+        assert not os.path.exists(os.path.join(d, "x.zip"))
+        try:
+            mk.build_pack(build, "9.9.7", [base_zip], os.path.join(d, "y.zip"))
+            raise AssertionError("a build of another version must be refused")
+        except SystemExit:
+            pass
+
+        # 4) Apps & features shows the new version (HKCU only, this folder only)
+        import winreg
+        key = r"Software\LiaTest-%s" % secrets.token_hex(6)
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key) as k:
+            winreg.SetValueEx(k, "InstallLocation", 0, winreg.REG_SZ, root + "\\")
+            winreg.SetValueEx(k, "DisplayVersion", 0, winreg.REG_SZ, "9.9.8")
+            winreg.SetValueEx(k, "MajorVersion", 0, winreg.REG_DWORD, 9)
+        try:
+            assert U.note_installed_version(os.path.join(d, "other"), "9.9.9", _key=key) is False
+            assert U.note_installed_version(root, "9.9.9", _key=key) is True
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
+                assert winreg.QueryValueEx(k, "DisplayVersion")[0] == "9.9.9"
+            assert U.note_installed_version(root, "9.9.9", _key=key) is False
+        finally:
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, key)
+        assert U.note_installed_version(root, "9.9.9", _key=key) is False   # no key
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+    # 5) Lia: the small update first, the full download whenever it cannot be used
+    import subprocess as _sp
+    app = w.LiaApp.__new__(w.LiaApp)
+    app.config = {}
+    app._update = {"release": None, "status": "idle", "progress": 0, "error": "",
+                   "kind": "portable"}
+    calls = []
+    saved = {k: getattr(U, k) for k in ("authorize", "download_verified", "stage_portable",
+                                        "stage_delta", "write_portable_swap", "portable_writable")}
+    saved_w = {k: getattr(w, k) for k in ("is_user_admin", "_install_root_is_protected")}
+    saved_popen, saved_sleep = _sp.Popen, w.time.sleep
+    delta_ok = [True]
+
+    def _stage_delta(p, r, v):
+        calls.append(("stage_delta", v))
+        if not delta_ok[0]:
+            raise U.DeltaError("2 file(s) of the new version are not in the update pack")
+        return os.path.join(r, "_update", "new"), {"kept": 9, "linked": 9, "copied": 0,
+                                                   "fetched": 2, "top": 0, "bytes": 5, "pyc": 0}
+    try:
+        U.authorize = lambda r, **k: calls.append(("authorize", k.get("asset")))
+        U.download_verified = lambda a, dd, **k: calls.append(("download", a["name"])) or os.path.join(dd, "z.zip")
+        U.stage_portable = lambda z, r, v: calls.append(("stage", v)) or os.path.join(r, "_update", "new")
+        U.stage_delta = _stage_delta
+        U.write_portable_swap = lambda *a: calls.append(("script",)) or ("s.cmd", ["cmd.exe", "/c", "s.cmd"])
+        U.portable_writable = lambda root: True
+        w._install_root_is_protected = lambda p=None: False
+        w.is_user_admin = lambda: False
+        _sp.Popen = lambda line, **k: calls.append(("popen",))
+        w.time.sleep = lambda s: None
+        app._settings_push_state = lambda: None
+        app._meeting_busy = lambda: False
+        app._force_show_notice_overlay = lambda *a, **k: None
+        app._force_show_error_overlay = lambda *a, **k: calls.append(("error",))
+        app._quit = lambda: calls.append(("quit",))
+        full = {"version": "9.9.9", "portable": {"name": "Lia-Portable-9.9.9.zip"},
+                "setup": {"name": "Lia-Setup-9.9.9.exe", "sha256": "ab" * 32},
+                "update": {"name": "Lia-Update-9.9.9.zip", "size": 3000000}}
+        app._update_worker(full)
+        assert [c[0] for c in calls] == ["authorize", "download", "stage_delta", "script", "popen",
+                                         "quit"], calls
+        assert calls[0][1] == "update" and calls[1][1] == "Lia-Update-9.9.9.zip"
+        # the pack does not fit this copy -> the full Portable, no error shown
+        calls.clear()
+        delta_ok[0] = False
+        app._update_worker(full)
+        assert [c[0] for c in calls] == ["authorize", "download", "stage_delta", "authorize",
+                                         "download", "stage", "script", "popen", "quit"], calls
+        assert calls[3][1] == "portable"
+        # an installed copy takes the same small update - no Setup download
+        app._update["kind"] = "installer"
+        delta_ok[0] = True
+        calls.clear()
+        app._update_worker(full)
+        assert [c[0] for c in calls] == ["authorize", "download", "stage_delta", "script", "popen",
+                                         "quit"], calls
+        # no small update: no pack, a Program Files install, a source checkout,
+        # the update_delta escape hatch
+        assert app._update_delta_root(dict(full, update=None)) is None
+        assert app._update_delta_root(full)
+        w._install_root_is_protected = lambda p=None: True
+        assert app._update_delta_root(full) is None
+        w._install_root_is_protected = lambda p=None: False
+        app.config["update_delta"] = False
+        assert app._update_delta_root(full) is None
+        app.config["update_delta"] = True
+        app._update["kind"] = "source"
+        assert app._update_delta_root(full) is None
+    finally:
+        for k, v in saved.items():
+            setattr(U, k, v)
+        for k, v in saved_w.items():
+            setattr(w, k, v)
+        _sp.Popen, w.time.sleep = saved_popen, saved_sleep
+
+    import inspect
+    src = inspect.getsource(w.LiaApp._update_watchdog)
+    assert '("portable", "installer")' in src and "note_installed_version" in src
+    here = os.path.dirname(os.path.abspath(U.__file__))
+    iss = open(os.path.join(here, "installer.iss"), encoding="utf-8").read()
+    for must in ('Type: filesandordirs; Name: "{app}\\runtime"',
+                 'Type: filesandordirs; Name: "{app}\\app"',
+                 'Type: filesandordirs; Name: "{app}\\_update"'):
+        assert must in iss, must
+    import build_runtime
+    assert "make_update_pack.py" in build_runtime.DEV_ONLY_FILES
+
+
+_test("update: the small update - only the changed files, signed, full download as fallback",
+      t_delta_update)
 
 
 def t_meeting_chunk_foreign_script_strip():
@@ -16347,7 +16966,7 @@ def t_unfinished_meeting_resume():
     old = wav("2026-08-01_10-00-00", 30); touch("2026-08-01_10-00-00_meeting_LIVE.txt")
     os.utime(old, (1, 1))                                                           # stale
     app = w.LiaApp.__new__(w.LiaApp)
-    app.config = {"meeting_resume_max_age_days": 21, "meeting_model": "local_pyannote_hebrew"}
+    app.config = {"meeting_resume_max_age_days": 21, "meeting_model": "local_diarize_hebrew"}
     app._active_meeting = None
     app._finalizing_meeting = None
     app._processing_meetings = set()
@@ -16369,7 +16988,7 @@ def t_unfinished_meeting_resume():
         w.MeetingSession._run_diarize_job = orig_job
     s = ran[0]
     assert s._wav_path == found[0]["wav"] and s._live_path == found[0]["live"]
-    assert s._diarize_backend == "local_pyannote" and s.diarize_mode and s.summarize
+    assert s._diarize_backend == "local_diarize" and s.diarize_mode and s.summarize
     assert s._diarize_enhance_model == "local_hebrew_turbo"
     assert time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(s.start_time)) == "2026-09-09_20-38-53"
     assert s._title_event.is_set()
@@ -16381,16 +17000,16 @@ def t_unfinished_meeting_resume():
         app._resume_meeting(found[0]).join(2)
     finally:
         w.MeetingSession._run_diarize_job = orig_job
-    assert ran[0]._diarize_backend == "local_pyannote"
+    assert ran[0]._diarize_backend == "local_diarize"
     # 'Don't ask again' drops only the LIVE file, never the recording
     app._dismiss_unfinished_meetings(found)
     assert not os.path.exists(found[0]["live"]) and os.path.exists(found[0]["wav"])
     assert app._find_unfinished_meetings(meetings_dir=d) == []
     # the shared plan matches what _start_meeting used inline before
     P = w.LiaApp._diarize_plan
-    assert P("local_pyannote_hebrew") == ("local_hebrew_turbo", "local_pyannote")
-    assert P("local_pyannote_parakeet") == ("local_parakeet_english", "local_pyannote")
-    assert P("local_pyannote_multilang") == ("local_multilang_turbo", "local_pyannote")
+    assert P("local_diarize_hebrew") == ("local_hebrew_turbo", "local_diarize")
+    assert P("local_diarize_parakeet") == ("local_parakeet_english", "local_diarize")
+    assert P("local_diarize_multilang") == ("local_multilang_turbo", "local_diarize")
     assert P("gemini_diarize") == (None, "gemini")
     assert P("assemblyai_universal_2") == ("openai_gpt4o", "assemblyai")
     assert P("local_hebrew_turbo") == (None, "assemblyai")
@@ -16754,7 +17373,7 @@ def t_diarize_preflight_silent_terminal_state():
 
     s = w.MeetingSession.__new__(w.MeetingSession)
     s.app = _App()
-    s._diarize_backend = "local_pyannote"
+    s._diarize_backend = "local_diarize"
     s._diarize_enhance_model = "local_hebrew_turbo"
     s.summarize = True
     s.title = "T"; s.title_guess = ""; s.transcribe_label = ""
@@ -16836,49 +17455,6 @@ _test("meeting: speaker-rename UI (turns / preview segment / wiring)",
       t_speaker_rename_ui)
 
 
-def t_speaker_profiles():
-    """Voiceprint store (speaker naming, phase 3): learn folds a running
-    centroid per name (casefold-merged), match is conservative (threshold AND
-    margin), bad input never learns, the store persists, and the lia /
-    diarize_local wiring is in place (talk-gated embeddings, learn on rename,
-    self-learn, match before writing)."""
-    import numpy as np
-    import speaker_profiles as sp
-    # isolate the store (suite APPDATA is already a temp dir; use a sub-salt)
-    rng = np.random.default_rng(3)
-    voice_a = rng.standard_normal(256)
-    voice_b = rng.standard_normal(256)
-    assert sp.learn("דנה", voice_a) == 1
-    assert sp.learn("דנה", voice_a + rng.standard_normal(256) * 0.1) == 2  # merged
-    assert sp.learn("יובל", voice_b) == 1
-    assert sp.learn("", voice_a) == 0 and sp.learn("X", [float("nan")] * 256) == 0
-    m = sp.match({"A": voice_a + rng.standard_normal(256) * 0.15,
-                  "B": rng.standard_normal(256)})
-    assert m.get("A") == "דנה" and "B" not in m, m
-    # margin guard: two near-identical profiles -> ambiguous -> no match
-    sp.learn("כמעט-דנה", voice_a + rng.standard_normal(256) * 0.05)
-    m2 = sp.match({"A": voice_a})
-    assert "A" not in m2 or m2["A"] in ("דנה", "כמעט-דנה")  # matched only if clear
-    names = [n for n, _c, _u in sp.stats()]
-    assert "דנה" in names and "יובל" in names
-    # wiring
-    import lia as w
-    assert w.DEFAULT_CONFIG.get("speaker_profiles_enabled") is True
-    src = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)),
-                            "lia.py"), encoding="utf-8").read()
-    assert '_talk_s.get(l, 0.0) >= 10.0' in src              # weak-cluster gate
-    assert "Voiceprint learned (rename)" in src              # rename-save learns
-    assert "Voiceprint learned (self)" in src                # self cluster learns
-    assert "speaker_profiles.match(cand)" in src             # auto-name matching
-    assert 'return utts, (data.get("speaker_embeddings") or {})' in src
-    dsrc = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)),
-                             "diarize_local.py"), encoding="utf-8").read()
-    assert "return_embeddings=True" in dsrc
-    assert '"speaker_embeddings": embeddings' in dsrc
-    assert "all(x == x for x in row)" in dsrc                # all-finite gate
-
-
-_test("meeting: voiceprint store (learn / match / wiring)", t_speaker_profiles)
 
 
 def t_speaker_name_pass():
