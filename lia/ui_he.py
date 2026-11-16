@@ -318,6 +318,20 @@ STRINGS = {
     "Auto-detect meetings": "זיהוי פגישות אוטומטי",
     "Auto-detect Zoom / Teams / Meet calls": "זיהוי אוטומטי של שיחות Zoom / Teams / Meet",
     "Hide meeting windows": "הסתרת חלונות הפגישה",
+    "Claude link": "קישור ל-Claude",
+    "Live draft (Hebrew)": "טיוטה חיה (עברית)",
+    "Zipformer: live text while speaking": "Zipformer: טקסט חי תוך כדי דיבור",
+    "Live text while speaking": "טקסט חי תוך כדי דיבור",
+    "On = the words are typed into the line you are writing in as you say them, and corrected in place. Off = the text appears when you stop. In hold mode the words show on a small card instead.": "דלוק = המילים מוקלדות לתוך השורה שבה אתה כותב תוך כדי דיבור, ומתוקנות במקום. כבוי = הטקסט מופיע כשמסיימים. במצב לחיצה ממושכת המילים מוצגות בחלונית קטנה.",
+    "The live transcript shows the words about 2 seconds after they are said, in grey, until the accurate text replaces them. Runs on the CPU. Downloads a 72 MB model the first time. From the next meeting.": "התמלול החי מציג את המילים כ-2 שניות אחרי שנאמרו, באפור, עד שהטקסט המדויק מחליף אותן. רץ על ה-CPU. מוריד מודל של 72MB בפעם הראשונה. מהפגישה הבאה.",
+    "Claude can start and stop a recording": "Claude יכול להתחיל ולסיים הקלטה",
+    "Only when you ask Claude to. Stopping always saves the recording.": "רק כשמבקשים מ-Claude. סיום תמיד שומר את ההקלטה.",
+    "Turn on Claude link first.": "קודם מדליקים את הקישור ל-Claude.",
+    "Lia added itself to Claude Code and to the Claude app. Restart Claude once.": "Lia הוסיפה את עצמה ל-Claude Code ולאפליקציית Claude. צריך להפעיל את Claude מחדש פעם אחת.",
+    "Lia added itself to Claude Code. Restart Claude once.": "Lia הוסיפה את עצמה ל-Claude Code. צריך להפעיל את Claude מחדש פעם אחת.",
+    "Lia added itself to the Claude app. Restart Claude once.": "Lia הוסיפה את עצמה לאפליקציית Claude. צריך להפעיל את Claude מחדש פעם אחת.",
+    "No Claude app was found on this PC.": "לא נמצאה אפליקציית Claude במחשב הזה.",
+    "Claude on this PC can read the meeting being recorded when you ask it to. Reading only. The text then goes to your own Claude account.": "Claude במחשב הזה יכול לקרוא את הפגישה שמוקלטת כשמבקשים ממנו. קריאה בלבד. הטקסט מגיע אז לחשבון ה-Claude שלך.",
     "No meeting cards, prompts or notices on screen, and the summary does not open by itself. Run meetings from the tray.": "בלי כרטיסי פגישה, שאלות או הודעות על המסך, והסיכום לא נפתח מעצמו. מנהלים את הפגישה מהאייקון במגש.",
     "Offers to record when a call starts.": "מציעה להקליט כששיחה מתחילה.",
     "Summarize when a meeting ends": "סיכום כשהפגישה מסתיימת",
@@ -374,6 +388,18 @@ STRINGS = {
     "e.g. נאור / Naor": "לדוגמה: נאור / Naor",
     "Speaker detection": "זיהוי דוברים",
     "Live speaker labels": "תוויות דוברים בזמן אמת",
+    "Remember voices": "זכירת קולות",
+    "A voice you or the Teams captions named is named again in later meetings. Voiceprints stay on this PC.":
+        "קול שקיבל שם (ממך או מכתוביות Teams) יקבל את אותו שם בפגישות הבאות. טביעות הקול נשמרות רק במחשב הזה.",
+    "Saved voices": "קולות שמורים",
+    "Forget a wrong one, and Lia stops naming it.": "שכחה של קול שגוי, ו-Lia תפסיק לתת לו שם.",
+    "Forget all voices": "שכחת כל הקולות",
+    "1 voice": "קול אחד",
+    "1 meeting": "פגישה אחת",
+    "(you)": "(הקול שלך)",
+    "All saved voices forgotten.": "כל הקולות השמורים נשכחו.",
+    "Forgotten.": "נשכח.",
+    "That voice is no longer saved.": "הקול הזה כבר לא שמור.",
     "Label who speaks in the live transcript, with the text (CPU, about half a core). Teams caption names win.":
         "מסמן מי מדבר בתמלול החי, יחד עם הטקסט (מעבד, בערך חצי ליבה). שמות מכתוביות Teams קודמים.",
     "Who spoke when, 100% local on the CPU (NVIDIA Nemotron 3). One-time download, about 650 MB.":
@@ -386,6 +412,15 @@ STRINGS = {
     "picking it downloads speaker detection once (about 650 MB)":
         "בחירה בו מורידה את זיהוי הדוברים פעם אחת (כ-650 MB)",
     "speaker detection is downloading...": "זיהוי הדוברים בהורדה...",
+    "In the call:": "בשיחה:",
+    "Me": "אני",
+    "Name this voice": "שם לקול הזה",
+    "Same person as": "אותו אדם כמו",
+    "Lia found this name": "Lia מצאה את השם הזה",
+    "Fast text (OpenAI GPT transcribe)": "טקסט מהיר (OpenAI GPT transcribe)",
+    "With the OpenAI meeting model, the live transcript shows each sentence about a second after it is said, in grey, until the accurate text replaces it. The speech is sent to OpenAI a second time: about $0.27 more per hour of speech. From the next meeting.": "עם מודל הפגישות של OpenAI, התמלול החי מציג כל משפט כשנייה אחרי שנאמר, באפור, עד שהטקסט המדויק מחליף אותו. הדיבור נשלח ל-OpenAI פעם שנייה: בערך 0.27 דולר נוספים לשעת דיבור. מהפגישה הבאה.",
+    "Click to name this speaker": "לחיצה נותנת שם לדובר הזה",
+    "Lia knows this voice from an earlier meeting": "Lia מכירה את הקול הזה מפגישה קודמת",
     "Who spoke when, 100% local on the CPU (NVIDIA Nemotron 3). Downloads by itself the first time a meeting needs it, about 650 MB once.":
         "מי דיבר מתי, מקומי לגמרי על המעבד (NVIDIA Nemotron 3). יורד לבד בפעם הראשונה שפגישה צריכה אותו, כ-650 MB פעם אחת.",
     "Speaker detection is downloading - this meeting records without speakers, the next one will have them":
@@ -437,6 +472,7 @@ STRINGS = {
     "Whisper Hebrew Local": "Whisper עברית מקומי",
     "Whisper Multi-Language Local (99 languages)": "Whisper רב-לשוני מקומי (99 שפות)",
     "Parakeet Multi-Language Local (25 languages)": "Parakeet רב-לשוני מקומי (25 שפות)",
+    "Zipformer Hebrew Local (fast on CPU)": "Zipformer עברית מקומי (מהיר על CPU)",
     "English Distil Local": "Distil אנגלית מקומי",
     "Groq Multi-Language": "Groq רב-לשוני",
     "Gemini 3.5 transcribe Multi-Language": "Gemini 3.5 transcribe רב-לשוני",
@@ -454,6 +490,8 @@ STRINGS = {
     "OpenAI ChatGPT 6.1 Sol - strongest": "OpenAI ChatGPT 6.1 Sol - החזק ביותר",
     "GPU (4 GB+) recommended · slower on CPU": "מומלץ GPU (4 GB ומעלה) · איטי יותר על CPU",
     "fast on a plain CPU · no GPU needed": "מהיר גם על CPU רגיל · בלי צורך ב-GPU",
+    "fast on a plain CPU · no GPU needed · Hebrew only":
+        "מהיר גם על CPU רגיל · בלי צורך ב-GPU · עברית בלבד",
     "works on CPU · GPU faster": "עובד על CPU · מהיר יותר עם GPU",
     "GPU (4 GB+) recommended · CPU: ready ~5 min after a 1h meeting":
         "מומלץ GPU (4 GB ומעלה) · ב-CPU: מוכן כ-5 דק׳ אחרי פגישה של שעה",
@@ -577,6 +615,9 @@ STRINGS = {
     "e.g. <b><bdi>&#1489;&#1497;&#1496;&#1493;&#1500;&#1497;&#1503;</bdi></b> &#8594; <b><bdi>&#1489;&#1497;&#1496;&#1493;&#1500;&#1497;&#1501;</bdi></b>, the fast-speech plural Whisper mishears. Only this one is fixed automatically.":
         "לדוגמה <b><bdi>&#1489;&#1497;&#1496;&#1493;&#1500;&#1497;&#1503;</bdi></b> &#8592; <b><bdi>&#1489;&#1497;&#1496;&#1493;&#1500;&#1497;&#1501;</bdi></b>, צורת הרבים שנשמעת לא נכון ב-Whisper בדיבור מהיר. רק התיקון הזה נעשה אוטומטית.",
     "Suggest other unknown Hebrew words": "הצעת מילים עבריות לא מוכרות נוספות",
+    "English terms by sound (Zipformer)": "מונחים באנגלית לפי הצליל (Zipformer)",
+    "The Hebrew-only model writes English words in Hebrew letters. A spelling that sounds like one of your approved terms becomes the term: <b><bdi>&#1505;&#1511;&#1497;&#1493;&#1512;&#1497;&#1496;&#1497;</bdi></b> &#8594; <b>Security</b>. Also in the live draft and the live dictation text.": "המודל העברי כותב מילים באנגלית באותיות עבריות. כתיב שנשמע כמו אחד המונחים המאושרים שלך הופך למונח: <b><bdi>&#1505;&#1511;&#1497;&#1493;&#1512;&#1497;&#1496;&#1497;</bdi></b> &#8592; <b>Security</b>. פועל גם בטיוטה החיה ובטקסט החי בהכתבה.",
+    "English terms by sound": "מונחים באנגלית לפי הצליל",
     "They are listed below; nothing changes until you add one.": "הן מופיעות למטה; שום דבר לא משתנה עד שמוסיפים אחת.",
     "Suggested unknown words": "מילים לא מוכרות שהוצעו",
     "Not in the dictionary, plus fixes a meeting summary proposed (pre-filled). Add = joins the corrections.":

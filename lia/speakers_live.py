@@ -13,14 +13,30 @@ reach the live transcript in the same update (Naor, 2026-11-06).
 
 The timeline here is the fed audio (sample count), not the wall clock; the
 caller converts with its own offset. Stdlib + numpy only (runs in the app).
+
+The child can never hold up the meeting (2026-11-08, after Lia Lite's stuck
+request): feed() only queues; a writer thread writes to the child. A write
+blocked for WRITE_STALL_S, or more than MAX_BACKLOG_S of audio waiting, ends
+speaker detection for this meeting (the child is killed, never restarted - a
+new session would number the voices from A again); the meeting goes on with
+the usual cut.
 """
 
 import json
 import os
+import queue
 import struct
 import subprocess
 import threading
 import time
+
+WRITE_STALL_S = 20.0
+MAX_BACKLOG_S = 60.0
+# Until the child says "ready" it is loading the model and reads nothing: a
+# cold load right after Lia starts (Whisper + Parakeet loading too) took over
+# 20 s on 2026-11-09 and the stall check ended speakers 30 s into a meeting.
+LOAD_TIMEOUT_S = 180.0
+LOAD_BACKLOG_S = 240.0
 
 FRAME_MERGE_GAP_S = 0.4
 MIN_TURN_S = 0.2
@@ -53,8 +69,13 @@ class LiveSpeakers:
         self._covered = 0.0
         self._fed = 0             # samples written
         self._ready = False
+        self._ready_at = 0.0
+        self._started = time.monotonic()
         self._done = False
         self.error = ""
+        self._q = queue.Queue()
+        self._backlog = 0.0       # seconds queued, not yet written
+        self._writing_since = None
 
     # ---- lifecycle ----
     def start(self):
@@ -63,12 +84,67 @@ class LiveSpeakers:
         for k in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP"):
             env.pop(k, None)
         # CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS
+        self._started = time.monotonic()
         self._proc = subprocess.Popen(self._args, stdin=subprocess.PIPE,
                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                       env=env, creationflags=0x08000000 | 0x00004000)
         threading.Thread(target=self._reader, daemon=True,
                          name="live-speakers").start()
+        threading.Thread(target=self._writer, daemon=True,
+                         name="live-speakers-writer").start()
         return self
+
+    def _writer(self):
+        """Write queued frames to the child, in order. None = close stdin."""
+        while True:
+            item = self._q.get()
+            p = self._proc
+            if item is None or p is None:
+                try:
+                    if p is not None:
+                        p.stdin.close()
+                except Exception:
+                    pass
+                return
+            data, dur = item
+            self._writing_since = time.monotonic()
+            try:
+                p.stdin.write(data)
+                p.stdin.flush()
+            except Exception as e:
+                self._fail("feed failed: %s" % e)
+                return
+            finally:
+                self._writing_since = None
+                with self._lock:
+                    self._backlog = max(0.0, self._backlog - dur)
+
+    def _fail(self, why):
+        """Speaker detection ends for this meeting (no restart)."""
+        with self._cond:
+            if not self.error:
+                self.error = why
+            self._cond.notify_all()
+        p = self._proc
+        try:
+            if p is not None and p.poll() is None:
+                p.kill()
+        except Exception:
+            pass
+        self._log("Live speakers: off for this meeting (%s)" % why)
+
+    def _check_stall(self):
+        t = self._writing_since
+        if t is None or self.error:
+            return
+        if not self._ready:
+            if time.monotonic() - self._started > LOAD_TIMEOUT_S:
+                self._fail("the model did not load in %.0f s" % LOAD_TIMEOUT_S)
+            return
+        # the stall clock starts no earlier than "ready" (a write queued
+        # during the load waits for the load, not for a stuck model)
+        if time.monotonic() - max(t, self._ready_at) > WRITE_STALL_S:
+            self._fail("the model stopped reading for %.0f s" % WRITE_STALL_S)
 
     @property
     def proc(self):
@@ -88,6 +164,7 @@ class LiveSpeakers:
                 with self._cond:
                     if m.get("ready"):
                         self._ready = True
+                        self._ready_at = time.monotonic()
                     if m.get("error"):
                         self.error = str(m["error"])
                     for r in m.get("runs") or ():
@@ -118,7 +195,9 @@ class LiveSpeakers:
 
     # ---- feeding ----
     def feed(self, audio):
-        """Write one drained window (float in [-1, 1] or int16), in order."""
+        """Queue one drained window (float in [-1, 1] or int16), in order.
+        Never blocks: the writer thread hands it to the child."""
+        self._check_stall()
         if audio is None or not self.alive():
             return
         try:
@@ -129,10 +208,19 @@ class LiveSpeakers:
             b = a.tobytes()
             if not b:
                 return
-            self._proc.stdin.write(struct.pack("<I", len(b)) + b)
-            self._proc.stdin.flush()
+            dur = a.shape[0] / 16000.0
             with self._lock:
-                self._fed += a.shape[0]
+                cap = MAX_BACKLOG_S if self._ready else LOAD_BACKLOG_S
+                if self._backlog + dur > cap:
+                    over = True
+                else:
+                    over = False
+                    self._backlog += dur
+                    self._fed += a.shape[0]
+            if over:
+                self._fail("more than %.0f s of audio waiting for the model" % cap)
+                return
+            self._q.put((struct.pack("<I", len(b)) + b, dur))
         except Exception as e:
             self.error = self.error or ("feed failed: %s" % e)
 
@@ -149,6 +237,7 @@ class LiveSpeakers:
     def wait_labels(self, timeout=4.0):
         """Wait until every full step of the fed audio is labelled (the last
         partial step stays open). True when it got there."""
+        self._check_stall()
         end = time.monotonic() + timeout
         with self._cond:
             while True:
@@ -163,14 +252,11 @@ class LiveSpeakers:
 
     def finish(self, timeout=10.0):
         """End of the meeting: flush the last partial step and wait for it."""
+        self._check_stall()
         if not self.alive():
             return False
-        try:
-            self._proc.stdin.write(struct.pack("<I", 0))
-            self._proc.stdin.flush()
-            self._proc.stdin.close()
-        except Exception:
-            return False
+        self._q.put((struct.pack("<I", 0), 0.0))     # after every queued frame
+        self._q.put(None)
         end = time.monotonic() + timeout
         with self._cond:
             while not self._done and not self.error:
@@ -184,12 +270,11 @@ class LiveSpeakers:
         p = self._proc
         if p is None:
             return
+        self._q.put(None)
         try:
             if p.poll() is None:
-                try:
-                    p.stdin.close()
-                except Exception:
-                    pass
+                if self._writing_since is not None:
+                    p.kill()                # a blocked write: do not wait on it
                 p.wait(timeout=3)
         except Exception:
             try:

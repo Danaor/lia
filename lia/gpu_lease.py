@@ -25,6 +25,9 @@ is one lease both apps honour, agreed between them as "contract v1":
    starts inside that window; stale 30 min after `until`.
 8. `alive-<app>.json`, refreshed every 60 s: a visibility self-check.
 9. No preemption. A holder past 2x its expect_s is reported, never killed.
+10. (2026-11-10, behaviour inside v1) A holder that only WAITS for VRAM does
+   not keep the lock: Lease.step_aside() frees it for the wait, keeps this
+   app's want file, and takes it back before the job goes on.
 
 This module is stdlib-only and knows nothing about Lia, so it can be tested on
 its own (LIA_GPU_LEASE_DIR points it at a scratch directory).
@@ -375,6 +378,9 @@ class Lease:
         self._fh = None
         self._depth = 0
         self._info = None
+        self._owners = {}         # thread ident -> its share of _depth
+        self._aside = False       # step_aside() in progress (the lock is free)
+        self._aside_said = False
         self._started = now_iso()
         self._warned = set()
         self._yield_seen = {}     # (app, since) -> when a FREE lock was first yielded
@@ -600,13 +606,25 @@ class Lease:
         when the lease directory is unavailable. wait=False: one try, None
         when the lease is not free right now (no want file is written).
         Raises LeaseTimeout after max_wait_s of waiting (None = no limit)."""
-        with self._mu:
-            if self._depth > 0:
-                self._depth += 1
-                return False
+        me = threading.get_ident()
+        while True:
+            with self._mu:
+                if self._depth <= 0:
+                    break
+                if not self._aside:
+                    self._depth += 1
+                    self._owners[me] = self._owners.get(me, 0) + 1
+                    return False
+            # Another thread of this process holds the job but stepped aside
+            # (the file lock is free, maybe held by the other app now): a nested
+            # job must not start GPU work until the lock is back.
+            if should_cancel is not None and should_cancel():
+                raise (cancel_exc or LeaseCancelled)("cancelled while waiting for the GPU lease")
+            self._sleep(min(1.0, poll_s))
         if not self.ok:
             with self._mu:
                 self._depth += 1
+                self._owners[me] = self._owners.get(me, 0) + 1
             return False
         since = now_iso()
         want = self._p("want-%s.json" % self.app)
@@ -676,6 +694,8 @@ class Lease:
                 self._warn_once("heavy.json", "GPU lease: writing heavy.json failed: %s", e)
             with self._mu:
                 self._fh, self._depth, self._info = fh, 1, info
+                self._owners = {me: 1}
+                self._aside_said = False
             if self.log is not None:
                 waited = self._clock() - t0
                 self.log.info("GPU lease: taken for %s%s", job,
@@ -686,15 +706,24 @@ class Lease:
                 _remove(want)
 
     def release(self):
+        me = threading.get_ident()
         with self._mu:
             if self._depth <= 0:
                 return
             self._depth -= 1
+            n = self._owners.get(me, 0)
+            if n > 1:
+                self._owners[me] = n - 1
+            else:
+                self._owners.pop(me, None)
             if self._depth > 0:
                 return
             fh, info = self._fh, self._info
             self._fh, self._info = None, None
+            self._owners = {}
         if fh is None:
+            # The lease folder is unavailable, or the job ended while it was
+            # stepped aside (a Discard / a timeout there): nothing is locked.
             return
         try:
             d = valid_heavy(read_json(self._p("heavy.json")))
@@ -704,6 +733,111 @@ class Lease:
             self._unlock(fh)
         if self.log is not None and info:
             self.log.info("GPU lease: released (%s)", info.get("job"))
+
+    def step_aside(self, wait_s, *, should_cancel=None, cancel_exc=None,
+                   on_wait=None, max_wait_s=None, poll_s=3.0):
+        """The holder is only WAITING (for VRAM), not working: free the file
+        lock for wait_s so another app can run its job, then take it back
+        (blocking; an older request of the other app goes first, and no retake
+        inside another app's live window). The nesting depth is kept, so the
+        caller's release() stays balanced. 2026-11-09: this app held the lease
+        13 hours while it waited for 1 MiB of VRAM, and every job of the other
+        app queued behind it.
+
+        Returns True when it stepped aside and holds the lock again; False
+        when there was nothing to free (not the holder, the lease is off) or
+        another THREAD of this process shares the hold (it may be working on
+        the GPU right now) - the caller then just sleeps. While aside, a
+        Discard raises cancel_exc and more than max_wait_s without getting the
+        lock back raises LeaseTimeout: both leave the lock NOT held, and
+        release() copes with that."""
+        me = threading.get_ident()
+        with self._mu:
+            if self._depth <= 0 or self._fh is None or self._aside:
+                return False
+            if self._owners.get(me, 0) != self._depth:
+                return False              # another thread shares this hold
+            fh, info = self._fh, dict(self._info or {})
+            self._fh = None
+            self._aside = True
+            said, self._aside_said = self._aside_said, True
+        job = info.get("job") or "job"
+        want = self._p("want-%s.json" % self.app)
+        since = now_iso()
+        t0 = self._clock()
+        end = t0 + max(0.0, float(wait_s))
+        fh2 = None
+        peer_ran = False
+        try:
+            try:
+                d = valid_heavy(read_json(self._p("heavy.json")))
+                if d and d["pid"] == os.getpid():
+                    _remove(self._p("heavy.json"))
+            finally:
+                self._unlock(fh)
+            if not said and self.log is not None:
+                self.log.info("GPU lease: %s is only waiting for memory - the lease "
+                              "is free for other apps meanwhile", job)
+            last = None
+            while True:
+                if should_cancel is not None and should_cancel():
+                    raise (cancel_exc or LeaseCancelled)(
+                        "cancelled while waiting for the GPU lease")
+                try:        # stay in the queue: a fresh want = a live waiter
+                    write_json_atomic(want, {"v": VERSION, "pid": os.getpid(),
+                                             "since": since, "job": job,
+                                             "need_mib": int(info.get("need_mib") or 0)})
+                except Exception:
+                    pass
+                if self._clock() >= end:
+                    live = self.live_window()
+                    if live:
+                        why = ("another app's meeting bot is live until %s"
+                               % _hhmm(live.get("until")))
+                    else:
+                        fh2 = self._try_lock()
+                        if fh2 is not None:
+                            w = self.older_want(since)
+                            if w is None or self._stuck_want(w):
+                                break
+                            self._unlock(fh2)
+                            fh2 = None
+                            why = "waiting for %s's earlier request (%s)" % (
+                                w.get("app", "another app").capitalize(),
+                                w.get("job") or "a job")
+                        else:
+                            peer_ran = True
+                            why = self.holder_text() or "another app holds the GPU lease"
+                    if max_wait_s is not None and self._clock() - t0 > max_wait_s:
+                        raise LeaseTimeout("the GPU has been busy for %d min (%s)" % (
+                            round((self._clock() - t0) / 60.0), why))
+                    if on_wait is not None:
+                        note = "GPU busy - %s %s" % (why, _fmt(self._clock() - t0))
+                        if note != last:
+                            last = note
+                            try:
+                                on_wait(note)
+                            except Exception:
+                                pass
+                self._sleep(min(1.0, poll_s))
+            info["since"] = now_iso()
+            try:
+                write_json_atomic(self._p("heavy.json"), info)
+            except Exception as e:
+                self._warn_once("heavy.json", "GPU lease: writing heavy.json failed: %s", e)
+            with self._mu:
+                self._fh, self._info = fh2, info
+            if peer_ran and self.log is not None:
+                self.log.info("GPU lease: taken again for %s after %s (another app "
+                              "ran meanwhile)", job, _fmt(self._clock() - t0))
+            return True
+        finally:
+            with self._mu:
+                self._aside = False
+                lost = fh2 is not None and self._fh is not fh2
+            if lost:                      # locked, then something failed
+                self._unlock(fh2)
+            _remove(want)
 
     # ---- visibility self-check (rule 8) --------------------------------------
     def heartbeat(self, version=""):
@@ -751,6 +885,9 @@ class NullLease:
     def release(self):
         with self._mu:
             self._depth = max(0, self._depth - 1)
+
+    def step_aside(self, wait_s, **k):
+        return False
 
     def held(self):
         with self._mu:

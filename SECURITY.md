@@ -106,6 +106,18 @@ Guards for the elevated mode:
   DNS-rebinding web page is refused), the `Origin`, and per-server / per-address
   connection limits. Never port-forward the server to the public internet;
   reach it over Tailscale (or a `wss://` reverse proxy).
+- **Claude link** (Settings > Meetings, off by default): when on, Lia runs a
+  small reader for the meeting being recorded so that Claude on the same PC can
+  read it when you ask. It listens on `127.0.0.1` only, on a random port, and
+  is read-only (`GET`) unless you also turn on "Claude can start and stop a
+  recording" (off by default): that adds exactly two requests, start a
+  recording and stop it. Nothing can be discarded and no setting can be
+  changed from Claude, and stopping always saves the recording. Every
+  request needs a token that is created at each start and stored DPAPI-encrypted
+  in `%APPDATA%\Lia\ears.json` (if it cannot be encrypted, the reader does not
+  start); requests from a web page (`Origin`) or with a foreign `Host` are
+  refused. The log records counts and timings, never text. What Claude reads
+  goes to your own Claude account, which is why the setting is yours to turn on.
 
 ## Content from meetings and e-mail
 

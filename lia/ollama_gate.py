@@ -48,6 +48,11 @@ LEARNED = {}                # model -> MiB a fresh load really needed
 CTX_FLOOR, CTX_BUCKET, CTX_CAP = 8192, 4096, 32768
 CHARS_PER_TOKEN = 1.9       # Hebrew (the conservative side; English ~4)
 WAIT_POLL_S = 2.0
+# 2026-11-09: a wait for VRAM held the cross-app lease 13 hours for 1 MiB. A
+# few MiB short of an estimate with a 400 MiB margin is room; a window's wait
+# does not keep the lease (Lease.step_aside) and ends after WAIT_MAX_S.
+WAIT_TOLERANCE_MB = 64
+WAIT_MAX_S = 15 * 60.0
 EXPECT_S = {"ask": 120, "chat": 180}
 
 # Set by the window process: where a wait is shown and how the user cancels it.
@@ -65,6 +70,10 @@ _log = logging.getLogger("lia.ollama_gate")
 
 class GpuWaitCancelled(Exception):
     """The user cancelled a call that was waiting for the GPU."""
+
+
+class GpuWaitTimeout(Exception):
+    """The GPU had no room for the model for WAIT_MAX_S."""
 
 
 def is_local(url):
@@ -196,8 +205,10 @@ class _Waiter:
             time.sleep(min(1.0, left))
 
 
-def _ensure(model, load_ctx, need_ctx, root, w, log=None, post=None):
-    """Under the lease: the num_ctx to send once `model` runs whole in VRAM."""
+def _ensure(model, load_ctx, need_ctx, root, w, log=None, post=None, lease=None):
+    """Under the lease: the num_ctx to send once `model` runs whole in VRAM.
+    While it only waits for room the lease is free for the other app
+    (lease.step_aside); after WAIT_MAX_S it raises GpuWaitTimeout."""
     import requests
     post = post or requests.post
     first = True
@@ -227,10 +238,27 @@ def _ensure(model, load_ctx, need_ctx, root, w, log=None, post=None):
                          "" if gone else " - still listed after 20 s")
             continue
         first = False
-        if avail < need:
+        if avail < need - WAIT_TOLERANCE_MB:
+            waited = time.monotonic() - t0
+            if waited >= WAIT_MAX_S:
+                raise GpuWaitTimeout(
+                    "the GPU did not free up in %d min: %s needs %.1f GB free, %.1f GB now"
+                    % (round(waited / 60.0), model, need / 1024.0, avail / 1024.0))
             w.note("GPU busy - waiting for %.1f GB free (%.1f GB now) %s"
-                   % (need / 1024.0, avail / 1024.0, gpu_lease._fmt(time.monotonic() - t0)))
-            w.sleep(WAIT_POLL_S)
+                   % (need / 1024.0, avail / 1024.0, gpu_lease._fmt(waited)))
+            stepped = False
+            if lease is not None:
+                try:
+                    stepped = lease.step_aside(
+                        WAIT_POLL_S, should_cancel=w.cancelled,
+                        cancel_exc=GpuWaitCancelled, on_wait=w.note,
+                        max_wait_s=max(1.0, WAIT_MAX_S - waited))
+                except gpu_lease.LeaseTimeout as e:
+                    raise GpuWaitTimeout(str(e)) from e
+            if stepped:
+                first = True        # the lock is fresh again: rule 4 applies again
+            else:
+                w.sleep(WAIT_POLL_S)
             continue
         try:
             post(root + "/api/generate", json={"model": model, "prompt": "", "stream": False,
@@ -286,7 +314,7 @@ def local_call(model, base_url, need_ctx, load_ctx=None, *, job="ask", detail=""
                       need_mib=vram_need(model, load_ctx) or 0, on_wait=w.note,
                       should_cancel=w.cancelled, cancel_exc=GpuWaitCancelled)
         try:
-            yield _ensure(model, load_ctx, int(need_ctx), root, w, log)
+            yield _ensure(model, load_ctx, int(need_ctx), root, w, log, lease=lease)
         finally:
             lease.release()
 

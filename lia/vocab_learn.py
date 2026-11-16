@@ -197,6 +197,35 @@ def apply_corrections(text, pairs):
     return text, counts
 
 
+def corrections_replacer(pairs):
+    """One compiled pass over the same pairs: -> fn(text) -> text. For text
+    that is redrawn several times a second (a live draft), where the
+    pair-by-pair loop of apply_corrections is too slow. Same word boundaries
+    and literal insertion; the longest `wrong` wins; nothing is counted."""
+    table = {}
+    for p in pairs or ():
+        try:
+            wrong = (p.get("wrong") or "").strip()
+            right = (p.get("right") or "").strip()
+        except Exception:
+            continue
+        if (not wrong or not right or _norm(wrong) == _norm(right)
+                or _CONTROL_RE.search(right)):
+            continue
+        table.setdefault(wrong.lower(), right)
+    if not table:
+        return lambda text: text
+    rx = re.compile(r"(?<![A-Za-z0-9\u0590-\u05ff])(?:"
+                    + "|".join(re.escape(w) for w in sorted(table, key=len, reverse=True))
+                    + r")(?![A-Za-z0-9\u0590-\u05ff])", re.IGNORECASE)
+
+    def fn(text):
+        if not text:
+            return text
+        return rx.sub(lambda m: table.get(m.group(0).lower(), m.group(0)), text)
+    return fn
+
+
 def count_corrections(texts, pairs):
     """Count how many times each correction's `wrong` occurs across `texts`
     (a string or list of strings), using the SAME matcher live application uses.

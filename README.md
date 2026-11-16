@@ -193,6 +193,7 @@ python lia.py
 | Purpose | Local (free, offline) | Cloud (optional) |
 |---|---|---|
 | Hebrew | ivrit.ai Whisper large-v3-turbo | Groq Whisper, OpenAI gpt-transcribe, Gemini Transcribe (free tier) |
+| Hebrew without a GPU | Zipformer2 66M (72 MB, fast on a plain CPU, Hebrew only, less accurate than Whisper) | same as above |
 | English + 24 European languages | NVIDIA Parakeet TDT 0.6B v3 (fast even on CPU) | same as above |
 | 99 languages | Whisper large-v3-turbo | same as above |
 | Speaker separation | pyannote community-1 | Gemini Transcribe diarization (beta) |
@@ -220,6 +221,7 @@ Lia's code is MIT licensed. It stands on the shoulders of excellent open models 
 
 - [ivrit.ai Whisper models](https://huggingface.co/ivrit-ai) - Hebrew fine-tunes of OpenAI Whisper
 - [NVIDIA Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) - CC-BY-4.0, via [onnx-asr](https://github.com/istupakov/onnx-asr)
+- [zipformer2-66m-streaming-he](https://huggingface.co/ivrit-ai/zipformer2-66m-streaming-he) by Yakov Kolani, mirrored by ivrit.ai - CC-BY-4.0, Hebrew on a plain CPU
 - [pyannote speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1) - CC-BY-4.0
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper) / CTranslate2 - fast local Whisper inference
 - [Gemma](https://ai.google.dev/gemma) via [Ollama](https://ollama.com) - local summaries

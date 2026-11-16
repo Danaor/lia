@@ -4542,8 +4542,9 @@ def t_live_speakers_meeting():
     s._mic_rms_1s = [0.05] * 5 + [0.001] * 7
     s._loop_rms_1s = [0.001] * 5 + [0.05] * 7
     s._live_spk_offset = 0.5
+    s._call_known = True        # a call (the fake meeting is too short to tell)
     out = s._live_labelled([dict(r) for r in recs])
-    assert out[0]["speaker"] == "Naor" and out[1]["speaker"] == "Speaker B", out
+    assert out[0]["speaker"] == "Naor" and out[1]["speaker"] == "Speaker 2", out
     named = s._live_labelled([dict(recs[1], speaker="Dana")])
     assert named[0]["speaker"] == "Dana"
     # Teams caption votes PER LABEL name a live label (a split: both labels
@@ -4555,7 +4556,8 @@ def t_live_speakers_meeting():
     assert w.MeetingSession.live_label_names(live, caps) == {"A": "Dana", "B": "Dana"}
     class _T:
         def turns(self):
-            return [{"t0": 0.0, "t1": 12.5, "speaker": "Yoni"}]
+            # the user's voice alone (one name on both voices would be a room)
+            return [{"t0": 0.0, "t1": 8.5, "speaker": "Yoni"}]
     s._teams = _T()
     keep_min = w.MeetingSession.LIVE_NAME_MIN_S
     w.MeetingSession.LIVE_NAME_MIN_S = 4.0          # the fake meeting is 12 s long
@@ -4573,7 +4575,7 @@ def t_live_speakers_meeting():
     src = inspect.getsource(w.MeetingSession._drain_audio)
     assert "sp.feed(audio)" in src
     rot = inspect.getsource(w.MeetingSession._rotation_loop)
-    assert "self._submit_by_live_speakers(audio, now_rel)" in rot
+    assert "self._submit_by_live_speakers(" in rot and "audio, now_rel," in rot
     fin = inspect.getsource(w.MeetingSession._finalise_current_chunk)
     assert "self._submit_by_live_speakers(audio, now_rel, final=True)" in fin
     assert "self._live_labelled(chunks)" in inspect.getsource(w.MeetingSession._flow_items)
@@ -4582,6 +4584,529 @@ def t_live_speakers_meeting():
     dn = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)), "diarize_nemotron.py"),
               encoding="utf-8").read()
     assert "def live_main(args)" in dn and "lia_live=(step, 0)" in dn
+
+
+def t_loopback_meeting_clock():
+    """The loopback on the meeting clock (2026-11-08, the Lia Lite bug): a WASAPI
+    loopback delivers NOTHING while nothing plays, so a stream that starts in
+    the middle of a drain window was padded at the END and its audio moved to
+    the window start. place_on_clock puts it where it arrived."""
+    import numpy as np
+    import lia as w
+    L = w.LoopbackRecorder
+    sr = 48000
+
+    def bufs(t_first_end, n):          # n buffers of 1024 frames, back to back
+        return [(t_first_end + i * 1024 / sr, 1024) for i in range(n)]
+
+    def audio_for(stamps):
+        return np.ones(int(round(sum(f for _t, f in stamps) * 16000 / sr)), dtype=np.float32)
+
+    # 40 s of nothing, then a 2 s sentence: it sits at 40 s, not at 0
+    st = bufs(40.0 + 1024 / sr, 94)
+    out = L.place_on_clock(audio_for(st), st, sr, 0.0, 42.1)
+    first = int(np.argmax(out != 0)) / 16000.0
+    assert abs(first - 40.0) < 0.05, first
+    assert len(out) / 16000.0 <= 42.1 + 1e-6
+    # continuous delivery (a call renders silence too): unchanged
+    st = bufs(1024 / sr, 470)
+    a = audio_for(st)
+    assert L.place_on_clock(a, st, sr, 0.0, 10.03) is a
+    # a 30 s gap inside the window with the call rendering: no gap -> no jump;
+    # a real 30 s hole between two sentences -> the second at its own time
+    st = bufs(1024 / sr, 47) + bufs(31.0 + 1024 / sr, 47)
+    out = L.place_on_clock(audio_for(st), st, sr, 0.0, 32.1)
+    nz = np.flatnonzero(out)
+    second = nz[np.searchsorted(nz, int(5 * 16000))] / 16000.0
+    assert abs(second - 31.0) < 0.05, second
+    # a callback stall that delivers a full window in one burst adds nothing
+    st = [(10.0, 1024)] * 470
+    a = audio_for(st)
+    assert len(L.place_on_clock(a, st, sr, 0.0, 10.03)) == len(a)
+    # the stream stopped mid-window: its audio stays at the window start
+    st = bufs(1024 / sr, 47)
+    out = L.place_on_clock(audio_for(st), st, sr, 0.0, 10.0)
+    assert out[0] != 0 and len(out) == len(audio_for(st))
+    # nothing delivered: as before (the session pads the window)
+    assert len(L.place_on_clock(np.zeros(0, np.float32), [], sr, 0.0, 10.0)) == 0
+    # drain() applies it: a fake stream that delivered 1 s at the end of a 10 s window
+    rec = L.__new__(L)
+    import threading as _th
+    rec._data_lock = _th.Lock()
+    rec._native_rate, rec._channels, rec.clock_fill = 16000, 1, True
+    rec.audio_data = [np.full(1024, 1000, np.int16).tobytes()] * 16
+    t_now = w.time.monotonic()
+    rec._stamps = [(t_now - 0.02 * (15 - i), 1024) for i in range(16)]
+    rec._win_t0 = t_now - 10.0
+    out = rec.drain()
+    assert len(out) > 9 * 16000 and out[0] == 0 and out[-1] != 0, len(out)
+    assert rec._stamps == [] and rec._win_t0 >= t_now
+
+
+def t_live_voice_naming():
+    """Naming a voice during the meeting (2026-11-08, after Lia Lite): the live
+    window's names file renames a label everywhere, "same person as" merges
+    two labels, voices read "Speaker 1, 2", self-introductions name a voice
+    (strong phrases alone, "אני X" only for a known person), being addressed
+    by name is a hint, and the voices file pairs every paragraph with its voice."""
+    import json
+    import tempfile
+    import threading as _th
+    import lia as w
+    import live_transcript_window as lw
+
+    class FakeSp:
+        proc = None
+
+        def __init__(self, tt):
+            self.tt = tt
+
+        def turns(self):
+            return list(self.tt)
+
+        def speakers(self):
+            return sorted({x["speaker"] for x in self.tt})
+
+    d = tempfile.mkdtemp()
+    live_path = os.path.join(d, "2026-11-08_10-00-00_meeting_LIVE.txt")
+    s = w.MeetingSession.__new__(w.MeetingSession)
+    s.app = type("A", (), {"_self_speaker_name": lambda self: "Naor", "config": {}})()
+    s._mic_rms_1s, s._loop_rms_1s = [], []
+    s._live_spk_offset = 0.0
+    s._teams = None
+    s.attendees = ["Dana Levi", "Yossi Cohen <yossi@example.com>", "שרה כהן"]
+    s._live_spk = FakeSp([{"t0": 0, "t1": 20, "speaker": "A"}, {"t0": 20, "t1": 40, "speaker": "B"},
+                          {"t0": 40, "t1": 55, "speaker": "C"}, {"t0": 55, "t1": 70, "speaker": "D"}])
+    s._names_path = live_path + ".names.json"
+    s._voices_path = live_path + ".voices.json"
+    ch = [{"index": 0, "timestamp_rel": 0.0, "text": "Yossi, can you start?", "status": "ok", "live_label": "A"},
+          {"index": 1, "timestamp_rel": 20.0, "text": "Sure, thanks.", "status": "ok", "live_label": "B"},
+          {"index": 2, "timestamp_rel": 40.0, "text": "שלום, קוראים לי רונית ואני מהרכש", "status": "ok", "live_label": "C"},
+          {"index": 3, "timestamp_rel": 55.0, "text": "אני חושב שזה בסדר", "status": "ok", "live_label": "D"}]
+    out = s._live_labelled([dict(c) for c in ch])
+    names = [c["speaker"] for c in out]
+    assert names == ["Speaker 1", "Speaker 2", "רונית", "Speaker 4"], names   # "אני חושב" is no name
+    assert [c["voice"] for c in out] == ["A", "B", "C", "D"]
+    st = s._live_last_state
+    assert st["found"] == {"C": "רונית"} and st["hints"] == {"B": "Yossi Cohen"}, (st["found"], st["hints"])
+    # a weak introduction counts for a known person only
+    ch2 = [dict(ch[3], text="היי, אני שרה מהצוות")]
+    assert s._live_labelled(ch2)[0]["speaker"] == "שרה כהן"
+    # the live window names a voice and merges another into it
+    api = lw.LiveApi({"live_path": live_path})
+    assert api.set_name("B", "  Yossi\x07 Cohen ")["ok"]
+    assert api.merge("D", "B")["ok"]
+    assert not api.set_name("Z", "x")["ok"] and not api.set_name("../x", "x")["ok"]
+    assert not api.merge("B", "D")["ok"]          # would loop: D is already B
+    saved = json.load(open(s._names_path, encoding="utf-8"))
+    assert saved == {"names": {"B": "Yossi Cohen"}, "merge": {"D": "B"}}, saved
+    out = s._live_labelled([dict(c) for c in ch])
+    assert [c["speaker"] for c in out] == ["Speaker 1", "Yossi Cohen", "רונית", "Yossi Cohen"]
+    assert out[3]["voice"] == "B"
+    # a Teams name on a chunk still wins over everything
+    assert s._live_labelled([dict(ch[1], speaker="Dana Levi")])[0]["speaker"] == "Dana Levi"
+    # the user's own voice: the mic-channel label gets "Your name", unless renamed
+    s._mic_rms_1s = [0.05] * 20 + [0.001] * 50
+    s._loop_rms_1s = [0.001] * 20 + [0.05] * 50
+    out = s._live_labelled([dict(c) for c in ch])
+    assert out[0]["speaker"] == "Naor", out[0]
+    # the voices file: each paragraph with its voice, the voices, suggestions
+    s._chunks_lock = _th.Lock()
+    s.chunks = [dict(c) for c in ch]
+    items = []
+    body = s._assemble_transcript_markdown(live=True, voices=items)
+    s._write_voices_file(items)
+    vf = json.load(open(s._voices_path, encoding="utf-8"))
+    assert [p["v"] for p in vf["paras"]] == ["A", "B", "C", "B"], vf["paras"]
+    assert vf["paras"][1]["name"] == "Yossi Cohen" and "Yossi Cohen: Sure" in body
+    vs = {v["v"]: v for v in vf["voices"]}
+    assert set(vs) == {"A", "B", "C"} and vs["A"]["self"] and vs["C"]["src"] == "found"
+    assert vs["B"]["src"] == "user" and vs["A"]["n"] == 1 and vs["C"]["n"] == 3
+    assert "Dana Levi" in vf["people"] and "Naor" in vf["people"]
+    assert all("<" not in p for p in vf["people"])
+    # the window reads it back with the transcript
+    assert api.get()["voices"]["paras"][0]["v"] == "A"
+    # flow without a voices list is unchanged
+    plain = w.flow_chunk_paragraphs([dict(c, speaker="X") for c in ch])
+    assert all(len(i) == 3 for i in plain)
+    # a Hebrew paragraph starts with an RLM before "<name>: " - the window
+    # must still find the name (2026-11-08: every Hebrew line lost its tag,
+    # so "Speaker 2" could not be named)
+    import re as _re
+    js = _re.search(r"function tagHtml\(para, text\)\{.*?\n\}\n",
+                    open(lw.__file__, encoding="utf-8").read(), _re.S).group(0)
+    assert "\\u200f" in js and "lead +" in js, "tagHtml must skip a leading direction mark"
+    # 2026-11-09: a window Windows marks hidden pauses animations, so lines
+    # that "rise" in stayed at opacity 0 (title + buttons, no text - measured
+    # on the real WebView2: 2 of 6 lines visible). The class is dropped after
+    # the animation's time, and a failed first read never stops the polling.
+    src = open(lw.__file__, encoding="utf-8").read()
+    assert "classList.remove('rise')" in src and "function checkVisible" in src
+    start = src[src.index("window.addEventListener('pywebviewready'"):]
+    assert start.index("setInterval(poll") < start.index("await refresh()")
+    assert api.diag("test line") is True
+    assert "test line" in open(os.path.join(d, "live_transcript.log"), encoding="utf-8").read()
+
+
+def t_voice_bank():
+    """The voice bank (2026-11-09): a live label named in one meeting (typed
+    name, Teams caption vote, the user's own voice) leaves a local voiceprint;
+    a later meeting names a matching label (source "bank", below the user's
+    name, the captions and the user's own voice, above "Speaker N"). Covers the
+    features (= WeSpeaker's Kaldi fbank), the store (one print per meeting,
+    Forget, Forget all), the match rule (threshold + margin + one label per
+    name), the save guard, the channel pick, the live tracker, and the
+    MeetingSession wiring - with a fake embedder (no model, no download)."""
+    import json
+    import tempfile
+    import numpy as np
+    import lia as w
+    import voice_bank as vb
+
+    # features: the same numbers as onnx-asr's WeSpeaker preprocessor
+    rng = np.random.default_rng(3)
+    a = (rng.standard_normal(16000 * 2) * 0.1).astype(np.float32)
+    try:
+        from onnx_asr.preprocessors.numpy_preprocessor import KaldiPreprocessorNumpy
+        p = KaldiPreprocessorNumpy("wespeaker")
+        ref, _ = p(a[None] * 32768.0, np.array([a.size]))
+        ref = ref[0] - ref[0].mean(axis=0)
+        assert np.abs(p._melscale_fbanks - vb._mel_banks()).max() < 1e-6
+        assert np.abs(ref - vb.fbank(a)).max() < 1e-3
+    except ImportError:
+        pass
+    assert vb.fbank(a[:100]) is None and vb.fbank(a).shape == (198, 80)
+    assert vb.MODEL_SHA256 and vb.MODEL_REV in vb.MODEL_URL
+
+    def vec(i, noise=0.0, seed=0):
+        v = np.zeros(256, np.float32)
+        v[i] = 1.0
+        if noise:
+            v += np.random.default_rng(seed).standard_normal(256).astype(np.float32) * noise
+        return vb.unit(v)
+
+    # the store: local JSON, one print per meeting, Forget, Forget all
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "voice_bank.json")
+    vid = vb.remember("Dana Levi", vec(1), 30, src="captions", meeting="m1", path=path)
+    assert vb.remember(" dana  levi ", vec(1, 0.05, 1), 40, src="user", meeting="m2", path=path) == vid
+    assert vb.remember("Dana Levi", vec(1, 0.05, 2), 50, src="user", meeting="m2", path=path) == vid
+    vb.remember("Yossi", vec(2), 25, meeting="m1", path=path)
+    vb.remember("Naor", vec(3), 60, meeting="m1", path=path, self_voice=True)
+    vb.remember("Naor Daniel", vec(3), 30, meeting="m2", path=path, self_voice=True)
+    rows = {r["name"]: r for r in vb.summary(path)}
+    assert rows["Dana Levi"]["meetings"] == 2 and rows["Dana Levi"]["seconds"] == 80, rows
+    assert "Naor Daniel" not in rows and rows["Naor"]["meetings"] == 2    # one voice for the user
+    assert rows["Naor"]["self"] and not rows["Yossi"]["self"]
+    raw = open(path, encoding="utf-8").read()
+    assert "Dana Levi" in raw and len(json.loads(raw)["voices"]) == 3
+    for i in range(12):
+        vb.remember("Yossi", vec(2), 25, meeting="x%d" % i, path=path)
+    assert vb.summary(path)[-1]["meetings"] == vb.MAX_PRINTS_PER_VOICE
+    assert vb.forget(rows["Yossi"]["id"], path) and not vb.forget("nope", path)
+    assert {r["name"] for r in vb.summary(path)} == {"Dana Levi", "Naor"}
+    bank = vb.bank_voices(path)
+    assert {n for n, _ in bank} == {"Dana Levi", "Naor"}
+
+    # the match rule: threshold + margin over the next name, one label per name
+    assert vb.best_match(vec(1, 0.02), bank)[0] == "Dana Levi"
+    assert vb.best_match(vec(5), bank)[0] is None                       # a stranger
+    near = vb.unit(vec(1) + vec(3) * 0.9)                               # between two voices
+    assert vb.best_match(near, bank)[0] is None
+    assert vb.best_match(vec(1), bank, exclude=["dana levi"])[0] is None
+    got = vb.assign({"A": vec(1, 0.05, 4), "B": vec(1, 0.2, 5), "C": vec(7)}, bank)
+    assert set(got) == {"A"} and got["A"][0] == "Dana Levi", got        # B lost to the closer A
+    assert vb.assign({"A": vec(1)}, bank, taken={"Dana Levi"}) == {}
+
+    # the save guard: too little speech, a voice unlike its saved one, a
+    # voice that sounds like someone else saved; the user's word wins
+    voices = vb.load(path)["voices"]
+    assert "speech" in vb.save_conflict(vec(1), "Dana Levi", 5, voices)
+    assert vb.save_conflict(vec(1, 0.05, 6), "Dana Levi", 30, voices) == ""
+    assert "unlike" in vb.save_conflict(vec(9), "Dana Levi", 30, voices)
+    assert "another" in vb.save_conflict(vec(3), "Somebody", 30, voices)
+    assert vb.save_conflict(vec(3), "Somebody", 30, voices, trusted=True) == ""
+    assert vb.save_conflict(vec(9), "New Person", 30, voices) == ""
+    assert vb.forget_all(path) and vb.summary(path) == [] and not vb.forget_all(path)
+
+    # the channel: the side that carries the voice alone
+    loud, quiet = np.full(16000, 0.1, np.float32), np.full(16000, 0.001, np.float32)
+    assert vb.pick_channel(loud, quiet, loud) is loud
+    assert vb.pick_channel(quiet, loud, loud) is loud
+    assert vb.pick_channel(loud, loud, loud) is None                    # talk-over
+    assert vb.pick_channel(quiet, quiet, quiet) is None
+    assert vb.pick_channel(None, None, loud) is loud                     # one source only
+
+    # the live tracker: closed turns are embedded from the right channel
+    class FakeEmb:
+        def __init__(self):
+            self.calls = []
+
+        def embed(self, audio):
+            side = "mic" if float(np.mean(audio)) > 0.05 else "sys"
+            self.calls.append((side, len(audio) / 16000.0))
+            return vec(1 if side == "mic" else 2)
+
+    fe = FakeEmb()
+    tr = vb.LiveTracker(fe)
+    n = 16000 * 40
+    mic = np.zeros(n, np.float32)
+    sysa = np.zeros(n, np.float32)
+    mic[: 16000 * 20] = 0.1                    # A on the mic 0-20 s
+    sysa[16000 * 20:] = 0.03                   # B on the system track 20-40 s
+    for i in range(0, n, 16000 * 10):
+        tr.feed(mic[i:i + 160000] + sysa[i:i + 160000], mic[i:i + 160000], sysa[i:i + 160000])
+    turns = [{"t0": 0.0, "t1": 20.0, "speaker": "A"}, {"t0": 20.0, "t1": 40.0, "speaker": "B"}]
+    tr.update(turns, covered=30.0)             # B still open (< 15 s closed)
+    assert tr.prints.seconds("A") == 20.0 and tr.prints.seconds("B") == 0.0
+    tr.update(turns, covered=40.0, final=True)
+    assert tr.prints.seconds("B") == 20.0 and {c[0] for c in fe.calls} == {"mic", "sys"}
+    tr.update(turns, covered=40.0, final=True)                        # nothing twice
+    assert tr.prints.seconds("A") == 20.0 and tr.prints.seconds("B") == 20.0
+    assert vb.cosine(tr.prints.print_of("A"), vec(1)) > 0.99
+
+    # the MeetingSession: bank names a label; the user / captions / own voice
+    # win; a name is never given twice; the end of the meeting saves only
+    # what a person or the captions named
+    class FakeSp:
+        proc = None
+        covered_s = 40.0
+
+        def turns(self):
+            return list(turns3)
+
+        def speakers(self):
+            return ["A", "B", "C"]
+
+    turns3 = [{"t0": 0, "t1": 20, "speaker": "A"}, {"t0": 20, "t1": 40, "speaker": "B"},
+              {"t0": 40, "t1": 60, "speaker": "C"}]
+    live_path = os.path.join(d, "2026-11-09_10-00-00_meeting_LIVE.txt")
+    s = w.MeetingSession.__new__(w.MeetingSession)
+    s.app = type("A", (), {"_self_speaker_name": lambda self: "Naor", "config": {}})()
+    s._mic_rms_1s, s._loop_rms_1s = [], []
+    s._live_spk_offset = 0.0
+    s._teams = None
+    s._cancelled = False
+    s.attendees = []
+    s._live_spk = FakeSp()
+    s._live_path = live_path
+    s._names_path = live_path + ".names.json"
+    s._voices_path = live_path + ".voices.json"
+    s._voice_tracker = vb.LiveTracker(fe)
+    for lab, i in (("A", 1), ("B", 2), ("C", 4)):
+        s._voice_tracker.prints.add(lab, vec(i, 0.03, i), 25.0)
+    s._bank_voices = [("Dana Levi", vec(1)), ("Yossi", vec(2))]
+    s._bank_self_names = set()
+    ch = [{"index": k, "timestamp_rel": 20.0 * k, "text": "t%d" % k, "status": "ok", "live_label": lab}
+          for k, lab in enumerate("ABC")]
+    out = s._live_labelled([dict(c) for c in ch])
+    assert [c["speaker"] for c in out] == ["Dana Levi", "Yossi", "Speaker 3"], out
+    assert s._voice_name("A", s._live_last_state) == ("Dana Levi", "bank")
+    # the user names B "Yossi" -> no other label may be Yossi; names C "Dana Levi"
+    # -> A loses the bank name (one name, one label)
+    json.dump({"names": {"B": "Yossi", "C": "Dana Levi"}, "merge": {}},
+              open(s._names_path, "w", encoding="utf-8"))
+    out = s._live_labelled([dict(c) for c in ch])
+    assert [c["speaker"] for c in out] == ["Speaker 1", "Yossi", "Dana Levi"], out
+    # a print that has too little speech is not matched yet
+    s._voice_tracker = vb.LiveTracker(fe)
+    s._voice_tracker.prints.add("A", vec(1), vb.MIN_MATCH_SPEECH_S - 1)
+    os.remove(s._names_path)
+    s._names_cache = None
+    assert s._live_labelled([dict(ch[0])])[0]["speaker"] == "Speaker 1"
+    # save at the end of the meeting: user + captions named labels only
+    bank_path = vb.store_path()
+    assert os.path.dirname(bank_path) == w.CONFIG_DIR           # delete-all-my-data covers it
+    assert bank_path.startswith(os.environ["APPDATA"]), "the suite must not touch the real store"
+    vb.forget_all()
+    s._voice_tracker = vb.LiveTracker(fe)
+    for lab, i in (("A", 1), ("B", 2), ("C", 4)):
+        s._voice_tracker.prints.add(lab, vec(i, 0.03, i), 30.0)
+    json.dump({"names": {"C": "Ronit"}, "merge": {}}, open(s._names_path, "w", encoding="utf-8"))
+    s._names_cache = None
+    s._live_labelled([dict(c) for c in ch])        # A, B: bank; C: the user's name
+    old_ready = vb.model_ready
+    vb.model_ready = lambda root=None: True
+    try:
+        s._voice_bank_save()
+    finally:
+        vb.model_ready = old_ready
+    saved = {r["name"]: r for r in vb.summary()}
+    assert set(saved) == {"Ronit"}, saved              # bank-named voices are not re-saved
+    assert json.load(open(bank_path, encoding="utf-8"))["voices"][0]["prints"][0]["meeting"] == \
+        "2026-11-09_10-00-00"
+    vb.forget_all()
+    # wiring: config, Settings actions + state, the live window shows the source
+    assert w.DEFAULT_CONFIG["voice_bank_enabled"] is True
+    App = w.LiaApp
+    acts = App._settings_action_map(App.__new__(App))
+    for k in ("toggle_voice_bank", "voice_bank_forget", "voice_bank_forget_all"):
+        assert k in acts, k
+    import inspect
+    assert '"voice_bank": _safe(self._voice_bank_state' in inspect.getsource(App._settings_state)
+    sw = open(os.path.join(os.path.dirname(w.__file__), "settings_window.py"), encoding="utf-8").read()
+    assert 'data-call="voice_bank_forget" data-args=\\\'' in sw and "Remember voices" in sw
+    import live_transcript_window as lw
+    assert "vo.src==='bank'" in open(lw.__file__, encoding="utf-8").read()
+    src = inspect.getsource(w.MeetingSession._drain_audio)
+    assert "vt.feed(audio, *self._last_drain_parts)" in src
+    assert "self._voice_bank_save()" in inspect.getsource(w.MeetingSession.stop)
+
+
+_test("voice bank: features, store, match rule, save guard, live tracker, meeting wiring",
+      t_voice_bank)
+
+
+def t_channel_checked_speakers():
+    """Who spoke, checked against the channels (2026-11-08): Teams caption
+    timing let the user's turn run into the next speaker's (6 paragraphs of
+    the other side carried the user's name in a real meeting). A piece where
+    only the computer sound spoke is not the user; one where only the mic
+    spoke is the user; mixed or short pieces keep their name."""
+    import lia as w
+    # seconds 0-9: the user on the mic; 10-29: the other side; 30-31: both
+    mic = [0.05] * 10 + [0.001] * 20 + [0.05] * 2
+    loop = [0.001] * 10 + [0.05] * 20 + [0.05] * 2
+    caps = [{"speaker": "Naor Daniel", "t0": 0, "t1": 14}, {"speaker": "Yossi", "t0": 14, "t1": 30}]
+    assert w.caption_self_name(caps, mic, loop) == "Naor Daniel"
+    ch = [{"index": 0, "timestamp_rel": 0.0, "dur": 9.0, "speaker": "Naor Daniel"},
+          {"index": 1, "timestamp_rel": 10.0, "dur": 6.0, "speaker": "Naor Daniel"},   # caption ran over
+          {"index": 2, "timestamp_rel": 16.0, "dur": 6.0, "speaker": "Naor Daniel / Yossi"},
+          {"index": 3, "timestamp_rel": 22.0, "dur": 6.0, "speaker": "Yossi"},
+          {"index": 4, "timestamp_rel": 2.0, "dur": 5.0, "speaker": "Yossi"},          # the user, misnamed
+          {"index": 5, "timestamp_rel": 30.0, "dur": 2.0, "speaker": "Yossi"},         # both talk: keep
+          {"index": 6, "timestamp_rel": 12.0, "dur": 1.0, "speaker": "Naor Daniel"}]   # 1 s: too short
+    out = w.channel_checked_speakers(ch, mic, loop, ["נאור"], caps,
+                                     w.caption_self_name(caps, mic, loop))
+    got = [c["speaker"] for c in out]
+    assert got == ["Naor Daniel", "Yossi", "Yossi", "Yossi", "Naor Daniel", "Yossi", "Naor Daniel"], got
+    assert out[1]["speaker_was"] == "Naor Daniel" and "speaker_was" not in out[0]
+    # no caption turns: the neighbouring non-user name; none at all: no name
+    out = w.channel_checked_speakers([dict(ch[1]), dict(ch[3])], mic, loop, ["Naor Daniel"])
+    assert out[0]["speaker"] == "Yossi", out
+    out = w.channel_checked_speakers([dict(ch[1])], mic, loop, ["Naor Daniel"])
+    assert out[0]["speaker"] is None
+    # no channel data (mic-only meeting, no system track): unchanged
+    assert w.channel_checked_speakers(ch, mic, [], ["Naor Daniel"]) is ch
+    assert w.DEFAULT_CONFIG.get("meeting_speaker_channel_check", True) is True
+    import inspect
+    assert "self._channel_checked(chunks)" in inspect.getsource(w.MeetingSession._flow_items)
+
+
+def t_live_speakers_never_block():
+    """The speaker model can never hold up the meeting (2026-11-08, after Lia
+    Lia Lite's stuck request): feed() only queues; a child that stops reading ends
+    speaker detection after WRITE_STALL_S (killed, not restarted), and so does
+    a backlog over MAX_BACKLOG_S; the caller then sees alive() False."""
+    import sys as _sys
+    import time as _t
+    import numpy as np
+    import speakers_live as sl
+    keep = (sl.WRITE_STALL_S, sl.MAX_BACKLOG_S, sl.LOAD_TIMEOUT_S)
+    try:
+        big = np.zeros(16000 * 30, dtype=np.float32)          # far over a pipe buffer
+        # still loading the model (no "ready" yet): not a stall (2026-11-09: a
+        # cold load after launch ended speakers 30 s into a meeting)
+        sl.WRITE_STALL_S, sl.MAX_BACKLOG_S, sl.LOAD_TIMEOUT_S = 0.5, 600.0, 60.0
+        sp = sl.LiveSpeakers(_sys.executable, "x", "p", "m")
+        sp._args = [_sys.executable, "-c", "import time; time.sleep(30)"]
+        sp.start()
+        sp.feed(big)
+        sp.feed(big)
+        _t.sleep(1.2)
+        sp.feed(big)
+        assert sp.alive() and not sp.error, sp.error
+        sp.stop()
+        # ...but one that never loads ends it
+        sl.LOAD_TIMEOUT_S = 0.5
+        sp = sl.LiveSpeakers(_sys.executable, "x", "p", "m")
+        sp._args = [_sys.executable, "-c", "import time; time.sleep(30)"]
+        sp.start()
+        sp.feed(big)
+        sp.feed(big)
+        _t.sleep(1.0)
+        sp.feed(big)
+        assert not sp.alive() and "did not load" in sp.error, sp.error
+        sp.stop()
+        sl.LOAD_TIMEOUT_S = 60.0
+        sl.WRITE_STALL_S, sl.MAX_BACKLOG_S = 1.0, 600.0
+        sp = sl.LiveSpeakers(_sys.executable, "x", "p", "m")
+        sp._args = [_sys.executable, "-u", "-c",
+                    "import time; print('{\"ready\": true}', flush=True); time.sleep(30)"]
+        sp.start()                                             # loaded, then never reads
+        _t.sleep(0.5)
+        t0 = _t.monotonic()
+        sp.feed(big)
+        sp.feed(big)
+        assert _t.monotonic() - t0 < 0.5, "feed blocked"
+        assert sp.alive()
+        _t.sleep(1.5)
+        assert sp.wait_labels(timeout=0.2) is False
+        assert not sp.alive() and "stopped reading" in sp.error, sp.error
+        sp.proc.wait(5)
+        assert sp.proc.poll() is not None                      # killed
+        t0 = _t.monotonic()
+        sp.stop()
+        assert _t.monotonic() - t0 < 1.0
+        # a backlog over the cap ends it too
+        sl.WRITE_STALL_S, sl.MAX_BACKLOG_S = 60.0, 40.0
+        sp = sl.LiveSpeakers(_sys.executable, "x", "p", "m")
+        sp._args = [_sys.executable, "-u", "-c",
+                    "import time; print('{\"ready\": true}', flush=True); time.sleep(30)"]
+        sp.start()
+        _t.sleep(0.5)
+        sp.feed(big)
+        sp.feed(big)
+        assert not sp.alive() and "waiting for the model" in sp.error, sp.error
+        sp.stop()
+    finally:
+        sl.WRITE_STALL_S, sl.MAX_BACKLOG_S, sl.LOAD_TIMEOUT_S = keep
+
+
+def t_room_meeting_no_self_guess():
+    """A room (everyone on the mic, the computer silent): Lia never guesses
+    which voice is the user, and the mic-only rule does not write the user's
+    name on everyone; once the computer carries speech it is a call."""
+    import lia as w
+
+    class FakeSp:
+        proc = None
+
+        def __init__(self, tt):
+            self.tt = tt
+
+        def turns(self):
+            return list(self.tt)
+
+        def speakers(self):
+            return sorted({x["speaker"] for x in self.tt})
+
+    s = w.MeetingSession.__new__(w.MeetingSession)
+    s.app = type("A", (), {"_self_speaker_name": lambda self: "Naor",
+                           "config": {}})()
+    s._teams = None
+    s._live_spk_offset = 0.0
+    s.attendees = []
+    s._live_spk = FakeSp([{"t0": 0, "t1": 30, "speaker": "A"}, {"t0": 30, "t1": 60, "speaker": "B"}])
+    s._mic_rms_1s = [0.08] * 30 + [0.03] * 30                # both voices on the mic
+    s._loop_rms_1s = [0.0005] * 60
+    ch = [{"index": 0, "timestamp_rel": 0.0, "dur": 30.0, "text": "a", "status": "ok", "live_label": "A"},
+          {"index": 1, "timestamp_rel": 30.0, "dur": 30.0, "text": "b", "status": "ok", "live_label": "B"}]
+    assert s._is_call() is False
+    out = s._channel_checked(s._live_labelled([dict(c) for c in ch]))
+    assert [c["speaker"] for c in out] == ["Speaker 1", "Speaker 2"], out
+    assert w.channel_checked_speakers(
+        [dict(ch[1], speaker="Speaker 2")], s._mic_rms_1s, s._loop_rms_1s,
+        ["Naor"], mic_is_user=False)[0]["speaker"] == "Speaker 2"
+    # the computer carries 10+ s of speech: a call from now on
+    s._mic_rms_1s += [0.001] * 12
+    s._loop_rms_1s += [0.05] * 12
+    s._live_spk.tt.append({"t0": 60, "t1": 72, "speaker": "C"})
+    assert s._is_call() is True
+    s._loop_rms_1s[60:] = [0.0005] * 12                       # decided once
+    assert s._is_call() is True
+    out = s._live_labelled([dict(c) for c in ch])
+    assert out[0]["speaker"] == "Naor", out                    # the mic voice in a call
 
 
 def t_speakers_auto_install():
@@ -4663,6 +5188,13 @@ def t_speakers_auto_install():
     assert "0x08000000 | 0x00004000" in inst
 
 
+_test("loopback on the meeting clock: silence it did not deliver stays in place",
+      t_loopback_meeting_clock)
+_test("live voices: name / merge from the window, introductions, voices file",
+      t_live_voice_naming)
+_test("speaker names checked against the mic / system channels", t_channel_checked_speakers)
+_test("live speakers: a stuck model never holds up the meeting", t_live_speakers_never_block)
+_test("room meeting: no guess of the user's voice, no mic-only renaming", t_room_meeting_no_self_guess)
 _test("speaker detection downloads itself when needed (gates, retry, Remove)",
       t_speakers_auto_install)
 _test("live speakers: tracker merges runs, arrival labels, dominant label", t_live_speakers_tracker)
@@ -5510,7 +6042,8 @@ def t_meeting_chunk_cadence():
     assert mk({"meeting_chunk_seconds": 15})._mic_silent_drains == 8
     assert mk({"meeting_chunk_seconds": 45})._mic_silent_drains == 3
     assert mk({"meeting_chunk_seconds": 120})._mic_silent_drains == 2
-    assert "timeout=self.chunk_seconds" in inspect.getsource(w.MeetingSession._rotation_loop)
+    assert "timeout=self.chunk_seconds" in inspect.getsource(w.MeetingSession._rotation_wait)
+    assert "self._rotation_wait()" in inspect.getsource(w.MeetingSession._rotation_loop)
     assert w.DEFAULT_CONFIG.get("meeting_chunk_seconds") == 15
 
     # Live-transcript auto-refresh window: module + LiveApi lifecycle (no webview
@@ -7159,6 +7692,476 @@ def t_gpu_lease_lia_side():
 _test("gpu lease: Lia's side (whole-job hold, unload only after acquiring, "
       "peer summary -> shed + cloud, no restore while held, visibility)",
       t_gpu_lease_lia_side)
+
+
+def t_gpu_lease_step_aside():
+    """2026-11-09: Lia held the lease 13 hours while it only WAITED for 1 MiB
+    of VRAM, and the other app's whole morning queued behind it. A holder that
+    only waits frees the file lock (Lease.step_aside): the other app's older
+    request runs, the nesting depth stays balanced, and a Discard / a timeout
+    while aside leaves release() safe."""
+    import json, tempfile, threading as _th, time as _t
+    import gpu_lease as gl
+    d = tempfile.mkdtemp(prefix="lease_")
+    P = lambda n: os.path.join(d, n)
+    lia = gl.Lease("lia", directory=d)
+    peer = gl.Lease("alpha", directory=d)
+    # nothing to free: not a holder / the lease is off
+    assert lia.step_aside(0.1) is False
+    assert gl.NullLease("lia").step_aside(0.1) is False
+
+    # 1. the lock is free while aside and back afterwards; depth is kept
+    assert lia.acquire("summary", need_mib=19869) is True
+    assert lia.acquire("summary") is False                  # nested: depth 2
+    seen = []
+    def probe():
+        fh = peer._try_lock()
+        seen.append((fh is not None, os.path.exists(P("heavy.json")),
+                     os.path.exists(P("want-lia.json"))))
+        if fh is not None:
+            peer._unlock(fh)
+        return False
+    assert lia.step_aside(0.3, should_cancel=probe, poll_s=0.05) is True
+    assert len(seen) >= 2 and seen[1] == (True, False, True), seen
+    assert peer._try_lock() is None, "the lock was not taken back"
+    h = json.load(open(P("heavy.json"), encoding="utf-8"))
+    assert (h["app"], h["job"], h["need_mib"]) == ("lia", "summary", 19869), h
+    assert not os.path.exists(P("want-lia.json"))
+    lia.release()
+    assert lia.held() and peer._try_lock() is None          # depth 2 -> 1: still held
+    lia.release()
+    assert not lia.held() and not os.path.exists(P("heavy.json"))
+    fh = peer._try_lock()
+    assert fh is not None
+    peer._unlock(fh)
+
+    # 2. the other app's OLDER request goes first, and Lia gets the lock back
+    #    only after that job released it
+    assert lia.acquire("summary") is True
+    ev = []
+    def peer_job():
+        peer.acquire("summary", need_mib=19832, poll_s=0.05)
+        ev.append("peer-got")
+        _t.sleep(0.5)
+        ev.append("peer-done")
+        peer.release()
+    t = _th.Thread(target=peer_job, daemon=True)
+    t.start()
+    _t.sleep(0.4)
+    assert ev == [] and os.path.exists(P("want-alpha.json"))    # it queues behind Lia
+    notes = []
+    assert lia.step_aside(0.2, on_wait=notes.append, poll_s=0.05) is True
+    ev.append("lia-back")
+    t.join(5)
+    assert ev == ["peer-got", "peer-done", "lia-back"], ev
+    assert any("Alpha is running summary" in n for n in notes), notes
+    assert json.load(open(P("heavy.json"), encoding="utf-8"))["app"] == "lia"
+    # an older want that is only a FILE (lock free) is honoured too
+    json.dump({"v": 1, "pid": os.getpid(), "since": gl.now_iso(), "job": "ab",
+               "need_mib": 0}, open(P("want-alpha.json"), "w", encoding="utf-8"))
+    _th.Timer(0.6, lambda: gl._remove(P("want-alpha.json"))).start()
+    t0 = _t.monotonic()
+    notes.clear()
+    assert lia.step_aside(0.1, on_wait=notes.append, max_wait_s=20.0, poll_s=0.05) is True
+    assert _t.monotonic() - t0 >= 0.5, "took the lock ahead of an older request"
+    assert any("Alpha's earlier request (ab)" in n for n in notes), notes
+    lia.release()
+    assert not lia.held()
+
+    # 3. a Discard while aside (the other app holds the lock now): the lock is
+    #    NOT held, release() is safe and does not touch the other app's files
+    class Disc(Exception):
+        pass
+    assert lia.acquire("summary") is True
+    st = {"n": 0}
+    def cancel_after_peer():
+        st["n"] += 1
+        if st["n"] == 1:
+            assert peer.acquire("ab", wait=False) is True
+        return st["n"] >= 4
+    try:
+        lia.step_aside(0.1, should_cancel=cancel_after_peer, cancel_exc=Disc, poll_s=0.05)
+        raise AssertionError("the Discard was ignored")
+    except Disc:
+        pass
+    assert lia.held() and lia._fh is None                   # the job is still open
+    assert not os.path.exists(P("want-lia.json"))
+    lia.release()
+    assert not lia.held()
+    assert json.load(open(P("heavy.json"), encoding="utf-8"))["app"] == "alpha"
+    assert lia._try_lock() is None, "release() freed the OTHER app's lock"
+
+    # 4. bounded: the other app keeps the lock past max_wait_s -> LeaseTimeout
+    assert peer.held()
+    peer.release()
+    assert lia.acquire("summary") is True
+    st["n"] = 0
+    def grab():
+        st["n"] += 1
+        if st["n"] == 1:
+            assert peer.acquire("summary", wait=False) is True
+        return False
+    try:
+        lia.step_aside(0.1, should_cancel=grab, max_wait_s=0.4, poll_s=0.05)
+        raise AssertionError("no LeaseTimeout")
+    except gl.LeaseTimeout as e:
+        assert "Alpha is running summary" in str(e), e
+    lia.release()
+    assert not lia.held() and peer.held()
+    peer.release()
+
+    # 5. another THREAD shares the hold (it may be working on the GPU): no
+    #    stepping aside; and a job that starts while the holder IS aside waits
+    assert lia.acquire("summary") is True
+    go, done = _th.Event(), _th.Event()
+    def other():
+        lia.acquire("pyannote")
+        go.set()
+        done.wait(5)
+        lia.release()
+    t = _th.Thread(target=other, daemon=True)
+    t.start()
+    assert go.wait(5)
+    assert lia.step_aside(0.1, poll_s=0.05) is False
+    assert peer._try_lock() is None                          # still locked
+    done.set()
+    t.join(5)
+    late = []
+    st["n"] = 0
+    def start_late():
+        st["n"] += 1
+        if st["n"] == 1:
+            def nested():
+                lia.acquire("pyannote", poll_s=0.05)
+                late.append(_t.monotonic())
+                lia.release()
+            _th.Thread(target=nested, daemon=True).start()
+        elif st["n"] > 3:
+            assert not late, "a nested job started while the lock was free"
+        return False
+    assert lia.step_aside(0.4, should_cancel=start_late, poll_s=0.05) is True
+    back = _t.monotonic()
+    for _ in range(100):
+        if late:
+            break
+        _t.sleep(0.05)
+    assert late and late[0] >= back - 0.05, (late, back)
+    for _ in range(100):
+        if lia._depth == 1:
+            break
+        _t.sleep(0.05)
+    lia.release()
+    assert not lia.held() and not os.path.exists(P("heavy.json"))
+    fh = peer._try_lock()
+    assert fh is not None
+    peer._unlock(fh)
+
+
+_test("gpu lease: a holder that only waits steps aside (lock free + retaken, "
+      "depth balanced, older request first, Discard / timeout safe, threads)",
+      t_gpu_lease_step_aside)
+
+
+def t_gpu_wait_bounded_and_lease_free():
+    """The 2026-11-09 wait: 19,868 MiB free of a 19,869 MiB need, for 13 hours,
+    with the cross-app lease held. Now a few MiB short is room, the lease is
+    free while a job waits, a wait that does not move releases the rest of
+    Lia's own models, and a bounded wait ends with GpuWaitTimeout."""
+    import tempfile, threading as _th, time as _t
+    import gpu_lease as gl
+    import lia as w
+    saved = (w._gpu_free_mb, w._GPU_SHED_HOOK[0], w._LEASE[0], w._ollama_ps,
+             w._ollama_unload)
+    saved_env = os.environ.get("LIA_TEST_NO_GPU_GATE")
+    now = [0.0]
+    clock = lambda: now[0]
+    def sleep(s):
+        now[0] += s
+    try:
+        w._LEASE[0] = gl.NullLease("lia")
+        w._GPU_SHED_HOOK[0] = None
+        # 1. the incident's numbers: room, at once
+        w._gpu_free_mb = lambda: 19868
+        assert w._wait_for_gpu(19869, "x", sleep=sleep, clock=clock) is True
+        assert now[0] == 0.0
+        assert w._gpu_room(19869 - w._GPU_WAIT_TOLERANCE_MB, 19869)
+        assert not w._gpu_room(19869 - w._GPU_WAIT_TOLERANCE_MB - 1, 19869)
+        assert w._GPU_WAIT_TOLERANCE_MB < (w._OLLAMA_VRAM_MARGIN_MB
+                                           - w._OLLAMA_PAGING_FREE_MB)
+        # 2. a bounded wait gives up with a reason (never the CPU, never forever)
+        w._gpu_free_mb = lambda: 18000
+        try:
+            w._wait_for_gpu(19869, "the local summary model (g)", max_wait_s=600.0,
+                            sleep=sleep, clock=clock)
+            raise AssertionError("the wait did not end")
+        except w.GpuWaitTimeout as e:
+            assert isinstance(e, w.GpuBusyError)
+            assert str(e) == ("the GPU did not free up in 10 min: the local summary "
+                              "model (g) needs ~19.4 GB free, 17.6 GB now"), str(e)
+            assert w._summary_error_text(e, local=True) == str(e)
+        assert 600.0 <= now[0] <= 640.0, now
+        assert w._GPU_WAIT_MAX_S == gl.DEFAULT_MAX_WAIT_S == 45 * 60
+        #    no bound given (a Whisper retry inside a meeting) = the old wait
+        seq = iter([500] * 200 + [20000])
+        w._gpu_free_mb = lambda: next(seq)
+        now[0] = 0.0
+        assert w._wait_for_gpu(12800, "x", shed_own=False, sleep=sleep, clock=clock) is True
+        assert now[0] > 3600
+        # 3. a wait that does not move: after _GPU_WAIT_STALL_S Lia releases
+        #    what it can, even though that alone cannot close the gap
+        calls, free = [], [10000]
+        def hook(short, what, force=False):
+            calls.append((short, force, now[0]))
+            if force:
+                free[0] = 12790
+                return 1330
+            return 0
+        w._GPU_SHED_HOOK[0] = hook
+        w._gpu_free_mb = lambda: free[0]
+        now[0] = 0.0
+        assert w._wait_for_gpu(12800, "x", sleep=sleep, clock=clock) is True
+        forced = [c for c in calls if c[1]]
+        assert len(forced) == 1 and forced[0][0] == 2800, calls
+        assert w._GPU_WAIT_STALL_S <= forced[0][2] <= w._GPU_WAIT_STALL_S + 30, forced
+        #    ... but not while another app is on the lease (its load, not ours)
+        d = tempfile.mkdtemp(prefix="lease_")
+        w._LEASE[0] = gl.Lease("lia", directory=d)
+        peer = gl.Lease("alpha", directory=d)
+        assert peer.acquire("summary", need_mib=19832) is True
+        calls.clear(); free[0] = 10000; now[0] = 0.0
+        try:
+            w._wait_for_gpu(12800, "x", max_wait_s=900.0, sleep=sleep, clock=clock)
+            raise AssertionError("the wait did not end")
+        except w.GpuWaitTimeout:
+            pass
+        assert not [c for c in calls if c[1]], calls
+        peer.release()
+        w._GPU_SHED_HOOK[0] = None
+
+        # 4. a job that HOLDS the lease frees it while it waits: the other app's
+        #    queued job runs inside Lia's wait, then Lia goes on under the lease
+        os.environ.pop("LIA_TEST_NO_GPU_GATE", None)
+        w._ollama_ps = lambda root=None: {}
+        w._ollama_unload = lambda names, **k: True
+        ev, retaken = [], []
+        st = {"free": 500}
+        w._gpu_free_mb = lambda: st["free"]
+        def peer_job():
+            peer.acquire("summary", need_mib=19832, poll_s=0.05)
+            ev.append("peer-got")
+            _t.sleep(0.4)
+            st["free"] = 20000            # its job ends, the card has room
+            ev.append("peer-done")
+            peer.release()
+        with w.heavy_gpu_job("summary", need_mib=19869):
+            assert peer.other_holder()["app"] == "lia"
+            t = _th.Thread(target=peer_job, daemon=True)
+            t.start()
+            _t.sleep(0.3)
+            assert ev == []                                 # it waits for Lia's lease
+            assert w._wait_for_gpu(19869, "the local summary model", poll_s=1.0,
+                                   max_wait_s=60.0,
+                                   on_retake=lambda: retaken.append(1) and False) is True
+            ev.append("lia-goes-on")
+            assert peer.other_holder()["app"] == "lia"      # under the lease again
+        t.join(5)
+        assert ev == ["peer-got", "peer-done", "lia-goes-on"], ev
+        assert retaken, "on_retake was not called after the lease came back"
+        fh = peer._try_lock()
+        assert not w._gpu_lease().held() and fh is not None
+        peer._unlock(fh)
+        #    on_retake() True = stop waiting (the caller looks again)
+        st["free"] = 500
+        with w.heavy_gpu_job("summary", need_mib=19869):
+            assert w._wait_for_gpu(19869, "x", poll_s=1.0, max_wait_s=60.0,
+                                   on_retake=lambda: True) is True
+        #    _wait_until frees the lease the same way, and is bounded
+        flag = []
+        def quick_peer():
+            peer.acquire("ab", poll_s=0.05)
+            flag.append("peer-ran")
+            peer.release()
+        with w.heavy_gpu_job("summary", need_mib=19869):
+            t = _th.Thread(target=quick_peer, daemon=True)
+            t.start()
+            _t.sleep(0.3)
+            assert not flag
+            w._wait_until(lambda: bool(flag), "y", poll_s=1.0)
+            assert peer.other_holder()["app"] == "lia"
+        t.join(5)
+        assert flag == ["peer-ran"], "the lease was held during _wait_until"
+        try:
+            w._wait_until(lambda: False, "the summary model", poll_s=5.0,
+                          max_wait_s=60.0, sleep=sleep, clock=clock)
+            raise AssertionError("_wait_until did not end")
+        except w.GpuWaitTimeout as e:
+            assert "waiting for the summary model" in str(e), e
+
+        # 5. the summary's own wait is the bounded one, and a model the other
+        #    app left resident meanwhile is reused instead of waited for
+        G = "gemma4:31b-it-qat"
+        ps = [{}]
+        seen = {}
+        w._ollama_ps = lambda root=None: dict(ps[0])
+        st["free"] = 500
+        saved_wait = w._wait_for_gpu
+        def fake_wait(need, what, **k):
+            seen.update(k)
+            ps[0] = {"other:1": (9000, 9000, 4096)}
+            unl = []
+            w._ollama_unload = lambda names, **kk: unl.append(sorted(names)) or True
+            assert k["on_retake"]() is False and unl == [["other:1"]], unl
+            ps[0] = {G: (17574, 17574, 20480)}              # the other app's run left it
+            assert k["on_retake"]() is True
+            return True
+        w._wait_for_gpu = fake_wait
+        posts = []
+        try:
+            out = w._ollama_ensure_on_gpu(G, 20480, post=lambda *a, **k: posts.append(a))
+        finally:
+            w._wait_for_gpu = saved_wait
+        assert out[1] == 20480 and posts == [], (out, posts)
+        assert seen["max_wait_s"] == w._GPU_WAIT_MAX_S, seen
+    finally:
+        (w._gpu_free_mb, w._GPU_SHED_HOOK[0], w._LEASE[0], w._ollama_ps,
+         w._ollama_unload) = saved
+        if saved_env is None:
+            os.environ.pop("LIA_TEST_NO_GPU_GATE", None)
+        else:
+            os.environ["LIA_TEST_NO_GPU_GATE"] = saved_env
+
+
+_test("gpu-busy: a wait frees the lease, tolerates a few MiB, releases Lia's "
+      "own models when stuck, and a summary's wait is bounded (11-09 13 h)",
+      t_gpu_wait_bounded_and_lease_free)
+
+
+def t_gpu_peer_job_blocks_own_load():
+    """2026-11-10 12:06: Lia started inside the other app's summary and loaded
+    its local Whisper fallback onto the card; that summary's pass timed out.
+    Lia's own Whisper loads now wait until the lease is released (capped)."""
+    import inspect, tempfile, threading as _th, time as _t
+    import gpu_lease as gl
+    import lia as w
+    saved = w._LEASE[0]
+    now = [0.0]
+    clock = lambda: now[0]
+    def sleep(s):
+        now[0] += s
+    class Fake:
+        app = "lia"
+        def __init__(self, seq):
+            self.seq = list(seq)
+        def other_holder(self):
+            return self.seq.pop(0) if len(self.seq) > 1 else self.seq[0]
+    H = lambda job: {"app": "alpha", "job": job, "pid": 1, "need_mib": 19832}
+    try:
+        # the lease is off / nobody holds it: no wait
+        w._LEASE[0] = gl.NullLease("lia")
+        assert w._wait_out_peer_gpu_job("x", sleep=sleep, clock=clock) == 0.0
+        # ends when the peer releases
+        w._LEASE[0] = Fake([H("summary")] * 3 + [None])
+        assert w._wait_out_peer_gpu_job("x", poll_s=2.0, sleep=sleep, clock=clock) == 6.0
+        # every summary-model job counts, a Whisper / pyannote job does not
+        for job in w._PEER_GEMMA_JOBS:
+            now[0] = 0.0
+            w._LEASE[0] = Fake([H(job), None])
+            assert w._wait_out_peer_gpu_job("x", sleep=sleep, clock=clock) == 2.0, job
+        now[0] = 0.0
+        w._LEASE[0] = Fake([H("pyannote")])
+        assert w._wait_out_peer_gpu_job("x", sleep=sleep, clock=clock) == 0.0
+        # capped: a holder that never releases does not block the load for good
+        w._LEASE[0] = Fake([H("summary")])
+        assert w._wait_out_peer_gpu_job("x", max_s=60.0, sleep=sleep, clock=clock) == 60.0
+        now[0] = 0.0
+        waited = w._wait_out_peer_gpu_job("x", sleep=sleep, clock=clock)
+        assert waited == w._PEER_JOB_WAIT_MAX_S == 1200.0, waited
+        # a broken lease folder never breaks startup
+        class Boom:
+            def other_holder(self):
+                raise OSError("planted")
+        w._LEASE[0] = Boom()
+        assert w._wait_out_peer_gpu_job("x", sleep=sleep, clock=clock) == 0.0
+        # with the real lease: a real hold by the other app, released mid-wait
+        d = tempfile.mkdtemp(prefix="lease_")
+        w._LEASE[0] = gl.Lease("lia", directory=d)
+        peer = gl.Lease("alpha", directory=d)
+        assert peer.acquire("summary", need_mib=19832) is True
+        rel = _th.Timer(0.5, peer.release)
+        t0 = _t.monotonic()
+        rel.start()
+        w._wait_out_peer_gpu_job("the local Whisper fallback", poll_s=0.1)
+        rel.join(5)
+        assert 0.4 <= _t.monotonic() - t0 < 4.0
+        assert w._gpu_lease().other_holder() is None
+    finally:
+        w._LEASE[0] = saved
+    # wiring: the startup fallback load, the local-primary load and the
+    # GPU-retry load all wait first (a GPU model only - Parakeet is on the CPU)
+    src = inspect.getsource(w.LiaApp._load_model)
+    bg = src[src.index("def _load_local_bg"):]
+    assert bg.index("_wait_out_peer_gpu_job(") < bg.index("load_model("), "fallback load"
+    prim = src[src.index("Local is primary"):]
+    assert prim.index("_wait_out_peer_gpu_job(") < prim.index("load_model("), "primary load"
+    assert src.count("not in CPU_FRIENDLY_MODELS:\n") >= 2
+    retry = inspect.getsource(w.LiaApp._start_local_gpu_retry)
+    assert retry.index("_wait_out_peer_gpu_job(") < retry.index("load_model(")
+
+
+_test("gpu lease: Lia's own Whisper load waits out another app's summary job "
+      "(ends on release, capped, startup + retry wired)",
+      t_gpu_peer_job_blocks_own_load)
+
+
+def t_ollama_gate_wait_frees_lease():
+    """The Ask / Chat windows gate their gemma call the same way: a few MiB
+    short is room, the wait frees the lease, and it ends after WAIT_MAX_S."""
+    import ollama_gate as og
+    saved = (og.ps, og.gpu_free_mb, og.WAIT_MAX_S, og.WAIT_POLL_S, dict(og.LEARNED))
+    G = "gemma4:31b-it-qat"
+    need = og.vram_need(G, 20480)
+    posts, steps = [], []
+    post = lambda url, json=None, timeout=None: posts.append(json)
+    class L:
+        def step_aside(self, wait_s, **k):
+            steps.append(sorted(k))
+            return True
+    try:
+        og.ps = lambda root: {}
+        og.WAIT_POLL_S = 0.01
+        w = og._Waiter(None, None)
+        # 1 MiB short (11-09): loads at once
+        og.gpu_free_mb = lambda: need - 1
+        assert og._ensure(G, 20480, 20480, "http://127.0.0.1:1", w, post=post,
+                          lease=L()) == 20480
+        assert len(posts) == 1 and not steps
+        # really short: the wait steps aside, then loads when there is room
+        seq = iter([need - 3000, need - 3000, need + 10, need + 10])
+        og.gpu_free_mb = lambda: next(seq)
+        notes = []
+        w = og._Waiter(notes.append, None)
+        assert og._ensure(G, 20480, 20480, "http://127.0.0.1:1", w, post=post,
+                          lease=L()) == 20480
+        assert len(steps) == 2 and len(posts) == 2, (steps, posts)
+        assert steps[0] == ["cancel_exc", "max_wait_s", "on_wait", "should_cancel"]
+        assert notes and notes[0].startswith("GPU busy - waiting for")
+        # bounded
+        og.WAIT_MAX_S = 0.0
+        og.gpu_free_mb = lambda: 500
+        try:
+            og._ensure(G, 20480, 20480, "http://127.0.0.1:1", og._Waiter(None, None),
+                       post=post, lease=L())
+            raise AssertionError("the window's wait did not end")
+        except og.GpuWaitTimeout as e:
+            assert "did not free up" in str(e), e
+        assert og.WAIT_TOLERANCE_MB < og.VRAM_MARGIN_MB - og.PAGING_FREE_MB
+    finally:
+        og.ps, og.gpu_free_mb, og.WAIT_MAX_S, og.WAIT_POLL_S, learned = saved
+        og.LEARNED.clear(); og.LEARNED.update(learned)
+
+
+_test("ollama gate: a window's wait for VRAM frees the lease, tolerates a few "
+      "MiB and is bounded", t_ollama_gate_wait_frees_lease)
 
 
 
@@ -11654,9 +12657,16 @@ def t_fresh_install_defaults_1_4_4():
     saved = w._has_cuda_gpu
     try:
         w._has_cuda_gpu = lambda: False
-        cfg = {"model_size": "ivrit-ai/whisper-large-v3-turbo-ct2"}
+        cfg = {"model_size": "ivrit-ai/whisper-large-v3-turbo-ct2",
+               "primary_language": "en"}
         assert w._default_dictation_model(cfg) == w.PARAKEET_MODEL
         assert cfg.get("_no_gpu_parakeet_notice") is True
+        # Hebrew without a GPU (2026-11-11): the Hebrew CPU model, not Parakeet
+        # (Parakeet has no Hebrew).
+        cfg = {"model_size": "ivrit-ai/whisper-large-v3-turbo-ct2"}
+        assert w._default_dictation_model(cfg) == w.ZIPFORMER_MODEL
+        assert cfg.get("_no_gpu_zipformer_notice") is True
+        assert "_no_gpu_parakeet_notice" not in cfg
         w._has_cuda_gpu = lambda: True
         cfg = {"model_size": "ivrit-ai/whisper-large-v3-turbo-ct2"}
         assert w._default_dictation_model(cfg) == "ivrit-ai/whisper-large-v3-turbo-ct2"
@@ -11672,8 +12682,14 @@ def t_fresh_install_defaults_1_4_4():
             w.CONFIG_DIR, w.CONFIG_FILE = od, of
         seed = w.bundled_seed_config() or {}
         if "model_size" not in seed:
-            assert fresh["model_size"] == w.PARAKEET_MODEL, fresh["model_size"]
-            assert fresh.get("_no_gpu_parakeet_notice") is True
+            if fresh.get("primary_language") == "he":
+                assert fresh["model_size"] == w.ZIPFORMER_MODEL, fresh["model_size"]
+                assert fresh.get("_no_gpu_zipformer_notice") is True
+                if "meeting_model" not in seed:
+                    assert fresh["meeting_model"] == w.ZIPFORMER_MEETING_KEY
+            else:
+                assert fresh["model_size"] == w.PARAKEET_MODEL, fresh["model_size"]
+                assert fresh.get("_no_gpu_parakeet_notice") is True
         assert fresh["recording_mode"] == "toggle" and fresh["beep_device_index"] == "off"
     finally:
         w._has_cuda_gpu = saved
@@ -11710,8 +12726,10 @@ def t_fresh_install_defaults_1_4_4():
     assert "_no_gpu_parakeet_notice" not in app.config and app._pending_notices == []
     # runtime safety net + welcome text + chained-reload flag ownership
     src = inspect.getsource(App._load_model)
-    assert "switching dictation to Parakeet Multi-Language" in src
-    assert "_queue_notice(*self._NO_GPU_PARAKEET_NOTICE)" in src
+    assert "switching dictation to %s (CPU)" in src
+    assert "ZIPFORMER_MODEL if he_cpu else PARAKEET_MODEL" in src
+    assert "self._NO_GPU_ZIPFORMER_NOTICE if he_cpu" in src
+    assert "else self._NO_GPU_PARAKEET_NOTICE" in src
     assert 'getattr(self, "_model_load_t0", None) == my_t0' in src
     ob = inspect.getsource(App._tray_first_run_onboarding)
     assert "press it again to stop" in ob
@@ -17104,6 +18122,13 @@ def t_energy_timeline_sample_exact():
     turns = [{"speaker": "A", "start": 0, "end": 60000},
              {"speaker": "B", "start": 60000, "end": 120000}]
     assert w.pick_self_speaker(turns, stub._mic_rms_1s, stub._loop_rms_1s)[0] == "B"
+    # a CHUNKED meeting keeps the timeline too: the live speaker labels and the
+    # channel check of names read it (2026-11-09: "Speaker 1" for the user on a
+    # real call - the timeline was collected in diarize mode only)
+    chunked = types.SimpleNamespace(diarize_mode=False, _mic_rms_1s=[], _loop_rms_1s=[])
+    w.MeetingSession._note_channel_energy(chunked, mic[:sr * 70], loop[:sr * 70])
+    assert len(chunked._mic_rms_1s) == 70 == len(chunked._loop_rms_1s)
+    assert chunked._mic_rms_1s[65] > 0.03 and chunked._loop_rms_1s[10] > 0.08
     # track fallback (resumed meeting: no in-memory timeline)
     d = tempfile.mkdtemp(prefix="lia_energy_")
     stem = os.path.join(d, "2026-09-22_10-32-01")
@@ -19327,6 +20352,2121 @@ def t_pause_seconds_at_cut():
 
 _test("transcript flow: pause measured at the smart cut + wired into the chunk record",
       t_pause_seconds_at_cut)
+
+
+def t_cloud_big_file_in_pieces():
+    """A file over the 25 MB upload cap is no longer refused (2026-11-10, a
+    60 MB phone recording): OpenAI and Groq decode it, cut it at pauses and
+    send the pieces through transcribe(), in order, nothing dropped."""
+    import shutil
+    import wave
+    import numpy as np
+    import lia as w
+    sr = 16000
+    secs = 16 * 60                       # 16 min of 16-bit mono = 30.7 MB
+    t = np.arange(sr * secs) / sr
+    x = 0.3 * np.sin(2 * np.pi * 220 * t)
+    for k in range(20, secs, 20):        # a 1 s pause every 20 s
+        x[k * sr:(k + 1) * sr] = 0.0
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "big.wav")
+    with wave.open(path, "wb") as f:
+        f.setnchannels(1); f.setsampwidth(2); f.setframerate(sr)
+        f.writeframes((x * 32767).astype(np.int16).tobytes())
+    assert os.path.getsize(path) > w.CLOUD_FILE_SIZE_LIMIT_BYTES
+    for cls, name in ((w.OpenAITranscriber, "OpenAI"), (w.GroqTranscriber, "Groq")):
+        o = cls(api_key="k")
+        o.model = object()
+        seen, fails = [], {"n": 0}
+
+        def fake(audio, language=None, task="transcribe", o=o, seen=seen, fails=fails, **kw):
+            n = len(audio)
+            # piece 2 fails once: it is tried again, not dropped
+            if len(seen) == 1 and fails["n"] == 0:
+                fails["n"] += 1
+                raise RuntimeError("HTTP 500")
+            seen.append(n)
+            return "piece %d" % n
+
+        o.transcribe = fake
+        o._post = lambda *a, **k: (_ for _ in ()).throw(AssertionError("whole-file upload"))
+        _sleep = w.time.sleep
+        w.time.sleep = lambda s: None
+        try:
+            if name == "OpenAI":
+                # 3 workers: order of the TEXT is the order of the audio
+                text = w.transcribe_big_file_in_pieces(o, path, name=name, workers=1)
+            else:
+                text = o.transcribe_file(path, language="he")
+        finally:
+            w.time.sleep = _sleep
+        parts = text.split(chr(10) * 2)
+        assert len(parts) == len(seen) >= 4, (len(parts), len(seen))
+        assert fails["n"] == 1
+        assert all(n <= 270 * sr for n in seen), max(seen) / sr
+        assert sum(seen) == sr * secs, (sum(seen), sr * secs)      # nothing lost, nothing twice
+        assert parts == ["piece %d" % n for n in seen]
+        # every cut sits inside a pause (second 0-1 of each 20 s)
+        pos = 0
+        for n in seen[:-1]:
+            pos += n
+            assert 0.0 <= (pos / sr) % 20 <= 1.0, pos / sr
+    # the real entry point with workers: text in audio order
+    o = w.OpenAITranscriber(api_key="k")
+    o.model = object()
+    o.transcribe = lambda audio, language=None, task="transcribe", **kw: "%d" % len(audio)
+    text = o.transcribe_file(path)
+    assert sum(int(v) for v in text.split(chr(10) * 2)) == sr * secs
+    # a piece that fails twice fails the file
+    def boom(audio, **kw):
+        raise RuntimeError("HTTP 500")
+    o.transcribe = boom
+    w.time.sleep, _sleep = (lambda s: None), w.time.sleep
+    try:
+        try:
+            o.transcribe_file(path)
+            raise AssertionError("a hole in the transcript went unreported")
+        except RuntimeError as e:
+            assert "part " in str(e)
+    finally:
+        w.time.sleep = _sleep
+    shutil.rmtree(d, ignore_errors=True)
+
+
+_test("cloud file over 25 MB: sent in pieces cut at pauses (OpenAI + Groq)",
+      t_cloud_big_file_in_pieces)
+
+
+def t_zipformer_hebrew_cpu_model():
+    """Hebrew without a GPU (2026-11-11): the Zipformer2 66M model runs on the
+    shipped onnxruntime through zipformer_he.py. Checks the features, the
+    greedy search, the transcriber contract and every place the model is
+    registered. (Accuracy was measured outside the suite: Kan 11.8% WER, the
+    same as sherpa-onnx on the same files.)"""
+    import numpy as np
+    import lia as w
+    import zipformer_he as z
+    import ui_he
+    import inspect
+
+    # --- features: Kaldi fbank, snip_edges off
+    sr = 16000
+    tone = (0.5 * np.sin(2 * np.pi * 1000.0 * np.arange(sr) / sr)).astype(np.float32)
+    f = z.fbank(tone)
+    assert f.shape == (100, 80) and f.dtype == np.float32, f.shape
+    assert z.fbank(np.zeros(0, np.float32)).shape == (0, 80)
+    assert z.fbank(np.zeros(79, np.float32)).shape == (0, 80)
+    assert z.fbank(np.zeros(80, np.float32)).shape == (1, 80)
+    mel = lambda hz: 1127.0 * np.log(1.0 + hz / 700.0)
+    lo, hi = mel(20.0), mel(7600.0)
+    want = int((mel(1000.0) - lo) / ((hi - lo) / 81.0)) - 1
+    peak = int(f[50].argmax())
+    assert abs(peak - want) <= 1, (peak, want)
+    silent = z.fbank(np.zeros(sr, np.float32))
+    assert np.allclose(silent, np.log(np.finfo(np.float32).eps)), "silence = the log floor"
+    assert np.isfinite(z.fbank(np.random.RandomState(0).randn(sr).astype(np.float32))).all()
+
+    # --- greedy search on stand-in sessions: one token per frame at most,
+    #     <unk> is skipped, the decoder sees the last two tokens
+    class _Enc:
+        def __init__(self):
+            self.calls = 0
+        def run(self, _o, feed):
+            self.calls += 1
+            assert feed["x"].shape == (1, 141, 80)
+            enc = np.zeros((1, 4, 3), np.float32)
+            enc[0, :, 0] = self.calls * 10 + np.arange(4)     # frame id
+            return [enc, feed["st"] + 1]
+    class _Dec:
+        def __init__(self):
+            self.seen = []
+        def run(self, _o, feed):
+            self.seen.append(feed["y"].tolist()[0])
+            return [np.asarray([[float(feed["y"][0, -1])]], np.float32)]
+    plan = {10: 3, 11: 0, 12: 2, 13: 4, 20: 5, 21: 5, 22: 0, 23: 6}   # frame -> token
+    class _Join:
+        def run(self, _o, feed):
+            n = len(feed["encoder_out"])
+            assert feed["decoder_out"].shape[0] == n
+            out = np.zeros((n, 8), np.float32)
+            for i in range(n):
+                out[i, plan[int(feed["encoder_out"][i, 0])]] = 1.0
+            return [out]
+    m = object.__new__(z.ZipformerHe)
+    m.encoder, m.decoder, m.joiner = _Enc(), _Dec(), _Join()
+    m.T, m.chunk, m.context, m.blank, m.unk = 141, 128, 2, 0, 2
+    m.tokens = {0: "<blk>", 2: "<unk>", 3: "\u2581שלום", 4: "\u2581עו", 5: "לם", 6: ","}
+    m._x_name = "x"
+    m._state_in = [("st", [1], np.float32)]
+    import threading
+    m._lock = threading.Lock()
+    text = m._decode_feats(np.zeros((141 + 128, 80), np.float32))
+    assert text == "שלום עולםלם,", text          # 3, (unk skipped), 4, 5, 5, 6
+    assert m.encoder.calls == 2, "two steps of 128 frames, state carried"
+    assert m.decoder.seen[0] == [-1, 0], "sherpa-onnx's start context"
+    assert m.decoder.seen[-1] == [5, 6]
+    assert m._decode_feats(np.zeros((140, 80), np.float32)) == "", "under one step = nothing"
+
+    # --- the transcriber contract
+    t = w.ZipformerTranscriber()
+    assert t.model_size == w.ZIPFORMER_MODEL and t.device == "cpu" and t.custom_vocabulary == ""
+    assert 1 <= t.threads <= 4
+    try:
+        t.transcribe(np.zeros(16000, np.float32))
+        raise AssertionError("an unloaded model must raise")
+    except RuntimeError:
+        pass
+    class _M:
+        def __init__(self):
+            self.n = []
+        def decode(self, a):
+            self.n.append(len(a))
+            return "  שלום עולם  "
+    t.model = _M()
+    assert t.transcribe(np.zeros(0, np.float32)) == ""
+    assert t.transcribe(np.zeros(16000, np.float32), language="he", beam_size=3,
+                        bias_ok=False) == "שלום עולם"
+    try:
+        t.transcribe(np.zeros(16000, np.float32), task="translate")
+        raise AssertionError("translate must raise")
+    except RuntimeError:
+        pass
+    t.load_model()          # already loaded: no download, no reload
+    assert isinstance(t.model, _M)
+
+    # --- registered everywhere a local model must be
+    Z, K = w.ZIPFORMER_MODEL, w.ZIPFORMER_MEETING_KEY
+    assert Z in w.MODELS and Z in w.CPU_FRIENDLY_MODELS and w.MODEL_LANGUAGE[Z] == "he"
+    assert len(w.MODEL_REVISIONS[Z]) == 40, "the download is pinned to a commit"
+    assert "MODEL_REVISIONS.get(ZIPFORMER_MODEL)" in inspect.getsource(
+        w.ZipformerTranscriber.load_model), "the pin is passed at load"
+    assert Z in w._LOCAL_HW_NOTES and K in w._LOCAL_HW_NOTES
+    App = w.LiaApp
+    drow = [r for r in App._MENU_MODELS_ORDERED if r[1] == Z]
+    assert len(drow) == 1 and drow[0][2] == "local" and drow[0][3] is False
+    mrow = [r for r in App._MEETING_MODELS if r[1] == K]
+    assert len(mrow) == 1 and mrow[0][2] == [] and mrow[0][0] == drow[0][0]
+    assert K in App._MEETING_TRANSCRIBE_NAMES
+    assert App._LANG_DICTATION["en"][Z] == w.PARAKEET_MODEL
+    assert App._LANG_MEETING["en"][K] == "local_parakeet_english"
+    for s_ in (drow[0][0], w._LOCAL_HW_NOTES[Z]):
+        assert s_ in ui_he.STRINGS, "Hebrew interface text for %r" % s_
+
+    # --- the dictation factory: the plain model, no he/en router
+    class _App:
+        config = {"cpu_threads": 4, "dictation_bilingual_auto": True}
+        _language_profile = lambda self: "hebrew"
+    made = App._make_local_transcriber(_App(), Z)
+    assert type(made) is w.ZipformerTranscriber
+
+    # --- the meeting / file builder reuses the loaded dictation instance
+    class _App2:
+        config = {}
+        _local_transcriber = t
+        _composed_vocabulary = lambda self: ""
+    got = App._build_meeting_transcriber(_App2(), K)
+    assert got == (t, "he", False), got
+
+    # --- first run without a GPU: Hebrew -> Zipformer, English -> Parakeet
+    old = w._has_cuda_gpu
+    try:
+        w._has_cuda_gpu = lambda: False
+        c = {"primary_language": "he", "enabled_languages": ["he", "en"]}
+        assert w._default_dictation_model(c) == Z and c.get("_no_gpu_zipformer_notice")
+        assert not c.get("_no_gpu_parakeet_notice")
+        c = {"primary_language": "en", "enabled_languages": ["he", "en"]}
+        assert w._default_dictation_model(c) == w.PARAKEET_MODEL
+        assert c.get("_no_gpu_parakeet_notice") and not c.get("_no_gpu_zipformer_notice")
+        w._has_cuda_gpu = lambda: True
+        c = {"primary_language": "he", "enabled_languages": ["he", "en"],
+             "model_size": "ivrit-ai/whisper-large-v3-turbo-ct2"}
+        assert w._default_dictation_model(c) == "ivrit-ai/whisper-large-v3-turbo-ct2"
+    finally:
+        w._has_cuda_gpu = old
+    assert "Hebrew" in App._NO_GPU_ZIPFORMER_NOTICE[1]
+
+
+_test("Hebrew without a GPU: the Zipformer model (features, search, wiring, defaults)",
+      t_zipformer_hebrew_cpu_model)
+
+
+# ============================================================
+# Claude link (2026-11-11): Claude on this PC reads the meeting
+# ============================================================
+import inspect
+import json
+import os
+import sys
+
+
+def _ear_get(ear, path, token=None, headers=None, method="GET"):
+    import http.client
+    c = http.client.HTTPConnection("127.0.0.1", ear.port, timeout=5)
+    h = {"Authorization": "Bearer " + (ear.token if token is None else token)}
+    h.update(headers or {})
+    c.request(method, path, headers=h)
+    r = c.getresponse()
+    body = r.read()
+    c.close()
+    return r.status, (json.loads(body) if body else None)
+
+
+def _ear_protect(text):
+    import base64
+    return "dpapi:" + base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def t_claude_link_ear_http():
+    """The reader (ears.py): only a request with its token, to its own host
+    name, not from a web page, and only GET, gets an answer. Its file names the
+    port and never holds the token in clear, and is removed at stop."""
+    import tempfile
+    import ears
+
+    def boom(_q):
+        raise RuntimeError("no")
+    d = tempfile.mkdtemp()
+    e = ears.Ear("lia", "9.9.9", d,
+                 {"/v1/meeting": lambda q: {"active": True, "q": q}, "/v1/boom": boom},
+                 protect=_ear_protect)
+    assert e.start()
+    try:
+        assert _ear_get(e, "/v1/meeting?after=3&fresh=1") == (
+            200, {"active": True, "q": {"after": "3", "fresh": "1"}})
+        assert _ear_get(e, "/v1/meeting", token="wrong")[0] == 401
+        assert _ear_get(e, "/v1/meeting", token="")[0] == 401
+        assert _ear_get(e, "/v1/nothing")[0] == 404
+        assert _ear_get(e, "/v1/boom")[0] == 503
+        assert _ear_get(e, "/v1/meeting", headers={"Origin": "https://example.com"})[0] == 403
+        assert _ear_get(e, "/v1/meeting", headers={"Host": "evil.example:%d" % e.port})[0] == 403
+        assert _ear_get(e, "/v1/meeting", headers={"Host": "localhost:%d" % e.port})[0] == 403
+        for m in ("POST", "OPTIONS", "PUT", "DELETE"):
+            assert _ear_get(e, "/v1/meeting", method=m)[0] == 405, m
+        p = os.path.join(d, "ears.json")
+        raw = open(p, encoding="utf-8").read()
+        rec = json.loads(raw)
+        assert rec["app"] == "lia" and rec["pid"] == os.getpid() and rec["port"] == e.port
+        assert rec["token_dpapi"].startswith("dpapi:") and e.token not in raw
+        assert e._srv.server_address[0] == "127.0.0.1"
+    finally:
+        e.stop()
+    assert not os.path.exists(os.path.join(d, "ears.json")), "removed at stop"
+    # a token that cannot be protected = no reader, and no file
+    d2 = tempfile.mkdtemp()
+    for bad in (lambda t: t, lambda t: ""):
+        e2 = ears.Ear("lia", "9.9.9", d2, {}, protect=bad)
+        assert e2.start() is False
+        assert not os.path.exists(os.path.join(d2, "ears.json"))
+    # pages: by number, time and size, always at least one line
+    L = [{"seq": i, "t": i * 10.0, "e": i * 10.0 + 9, "text": "x" * 50, "speaker": "A"}
+         for i in range(10)]
+    assert [x["seq"] for x in ears.page(L, after=6)[0]] == [7, 8, 9]
+    got, more = ears.page(L, limit=3)
+    assert [x["seq"] for x in got] == [0, 1, 2] and more is True
+    got, more = ears.page(L, max_chars=200)
+    assert len(got) == 3 and more is True
+    assert [x["seq"] for x in ears.page(L, from_s=35, to_s=55)[0]] == [3, 4, 5]
+    assert len(ears.page([dict(L[0], text="y" * 9000)], max_chars=200)[0]) == 1
+
+
+_test("Claude link: the reader answers only its token holder, on loopback, GET only",
+      t_claude_link_ear_http)
+
+
+def _ear_session(w, chunks=(), diarize=False):
+    import threading
+    import time as _t
+    s = w.MeetingSession.__new__(w.MeetingSession)
+
+    class _App:
+        config = {"meeting_speaker_channel_check": False}
+
+        def _self_speaker_name(self):
+            return "Dana Test"
+    s.app = _App()
+    s.diarize_mode = diarize
+    s.chunks, s._chunks_lock = [], threading.Lock()
+    s._live_chunks, s._live_chunks_lock = [], threading.Lock()
+    (s._live_chunks if diarize else s.chunks).extend(dict(c) for c in chunks)
+    s._teams, s._live_spk = None, None
+    s._active, s._cancelled = True, False
+    s._stop_event = threading.Event()
+    s._flush_event, s._flush_done = threading.Event(), threading.Event()
+    s._last_flush_mono = 0.0
+    s._last_rotation_mono = _t.monotonic() - 10.0
+    s.start_time = _t.time() - 100.0
+    s.chunk_seconds = 60
+    s.title, s.title_guess, s.event_subject, s.attendees = "Kickoff", None, "", []
+    return s
+
+
+def _ear_chunk(i, text, status="ok", **kw):
+    return dict({"index": i, "timestamp_rel": i * 10.0, "dur": 9.0, "text": text,
+                 "status": status, "cut": "smart", "pause_s": 0.0}, **kw)
+
+
+def t_claude_link_lines():
+    """The meeting's lines as Claude gets them: numbered by chunk (stable,
+    rising), only transcribed chunks, never past one still being transcribed,
+    with the names the live window shows; the first read is everything and
+    the next only what is new; they stay after the meeting ends."""
+    import lia as w
+    s = _ear_session(w, [
+        _ear_chunk(0, "פתחנו את הפגישה", speaker="Dana Test"),
+        _ear_chunk(1, "", status="empty"),
+        _ear_chunk(2, "מה לגבי ההרשאות?", speaker="Yossi Test"),
+        _ear_chunk(3, "", status="failed"),
+        _ear_chunk(4, "", status="pending"),
+        _ear_chunk(5, "this one came back before chunk 4"),
+    ])
+    lines, pending = s.ear_lines()
+    assert pending is True
+    assert [x["seq"] for x in lines] == [0, 2], lines
+    assert lines[0] == {"seq": 0, "t": 0.0, "e": 9.0, "who": "me",
+                        "speaker": "Dana Test", "text": "פתחנו את הפגישה"}
+    assert lines[1]["who"] == "them" and lines[1]["speaker"] == "Yossi Test"
+    s.chunks[4].update(status="ok", text="ומתי עולים?")
+    lines, pending = s.ear_lines()
+    assert pending is False and [x["seq"] for x in lines] == [0, 2, 4, 5]
+    assert lines[3]["who"] == "" and lines[3]["speaker"] == ""
+    assert s.ear_key().startswith("lia-") and s.ear_key() == s.ear_key()
+
+    # a name given to a voice shows on the next read
+    st = {"user": {}, "merge": {}, "votes": {}, "self": "B", "me": "Dana Test",
+          "found": {}, "hints": {}, "secs": {}, "bank": {}}
+    s2 = _ear_session(w, [_ear_chunk(0, "שלום", live_label="A"),
+                          _ear_chunk(1, "היי", live_label="B")])
+    s2._live_spk = object()
+    s2._live_voice_state = lambda chunks=None: st
+    got = s2.ear_lines()[0]
+    assert [(x["speaker"], x["who"]) for x in got] == [("Speaker 1", "them"),
+                                                       ("Dana Test", "me")]
+    st["user"] = {"A": "Noa Test"}
+    assert s2.ear_lines()[0][0]["speaker"] == "Noa Test"
+
+    # the diarized live view: its own chunks, no names
+    s3 = _ear_session(w, [_ear_chunk(0, "one"), _ear_chunk(1, "", status="pending")],
+                      diarize=True)
+    assert [x["text"] for x in s3.ear_lines()[0]] == ["one"] and s3.ear_pending()
+    assert '"dur": len(audio_np) / 16000.0' in inspect.getsource(
+        w.MeetingSession._submit_live_peek)
+
+    # the app's answers
+    app = w.LiaApp.__new__(w.LiaApp)
+    app.config = {}
+    app._self_speaker_name = lambda: "Dana Test"
+    app._active_meeting, app._ears_last = None, None
+    assert app._ears_meeting() == {"app": "lia", "active": False, "ended": False,
+                                   "key": "", "lines": 0}
+    assert app._ears_lines({"after": "7"})["next"] == 7
+    assert app._ears_agenda() == {"text": ""}
+    s.flush_now = lambda: False
+    app._active_meeting = app._ears_last = s
+    m = app._ears_meeting()
+    assert m["active"] and not m["ended"] and m["lines"] == 4 and m["me"] == "Dana Test"
+    assert m["title"] == "Kickoff" and m["source"] == "stream" and m["has_agenda"] is False
+    assert 99 <= m["elapsed_s"] <= 102 and m["last_line_t"] == 59.0
+    first = app._ears_lines({"fresh": "1"})
+    assert [x["seq"] for x in first["lines"]] == [0, 2, 4, 5] and first["next"] == 5
+    assert 40 <= first["age_s"] <= 43 and first["in_flight"] is False and not first["more"]
+    s.chunks.append(_ear_chunk(6, "משפט חדש"))
+    second = app._ears_lines({"after": str(first["next"]), "fresh": "1"})
+    assert [x["text"] for x in second["lines"]] == ["משפט חדש"] and second["next"] == 6
+    assert app._ears_lines({"after": "6"})["lines"] == [] and app._ears_lines({"after": "6"})["next"] == 6
+    # the calendar, when there is one
+    s.event_subject, s.attendees = "Design review", ["Noa Test <noa@example.com>", "Avi Test"]
+    ag = app._ears_agenda()
+    assert "Subject: Design review" in ag["text"] and "Invited: Noa Test, Avi Test" in ag["text"]
+    assert "example.com" not in ag["text"] and app._ears_meeting()["has_agenda"] is True
+    # after the end: still readable, marked ended, no age
+    app._active_meeting = None
+    m = app._ears_meeting()
+    assert m["active"] is False and m["ended"] is True and m["lines"] == 5 and "elapsed_s" not in m
+    r = app._ears_lines({})
+    assert len(r["lines"]) == 5 and r["age_s"] is None and r["in_flight"] is False
+    # a new meeting has a new key
+    s_new = _ear_session(w, [])
+    s_new.start_time = s.start_time + 3600
+    assert s_new.ear_key() != s.ear_key()
+    # nothing of the text is logged
+    src = inspect.getsource(w.LiaApp._ears_lines)
+    assert "Claude link read: %d of %d line(s)" in src
+
+
+_test("Claude link: numbered lines with names, first read all, then only what is new",
+      t_claude_link_lines)
+
+
+def t_claude_link_fresh_on_read():
+    """A read wakes the REAL rotation loop: the open window is cut and
+    submitted on the rotation thread and its text is in the same read. At
+    most one cut on request every 3 s, never on a window under 1.5 s, and a
+    decode that never finishes does not hold the read past its limit."""
+    import lia as w
+    import numpy as np
+    import threading
+    import time as _t
+    sr = 16000
+    rng = np.random.RandomState(3)
+    speech = (rng.randn(4 * sr) * 0.05).astype(np.float32)
+    speech[int(3.2 * sr):int(3.5 * sr)] = 0.0       # a pause 0.5-0.8 s before the end
+
+    s = _ear_session(w)
+    s.app.config = {"meeting_chunk_smart_cut": True}
+    s._carry_tail, s._chunk_lock = None, threading.RLock()
+    s._drain_lock = threading.Lock()
+    s._drain_audio_inner = lambda: speech.copy()
+    threads = []
+
+    def submit(a, **k):
+        threads.append(threading.current_thread().name)
+        with s._chunks_lock:
+            i = len(s.chunks)
+            s.chunks.append(_ear_chunk(i, "", status="pending", dur=len(a) / sr,
+                                       timestamp_rel=k.get("start_rel") or 0.0))
+
+        def done():
+            _t.sleep(0.2)
+            s.chunks[i].update(status="ok", text="chunk %d" % i)
+        threading.Thread(target=done, daemon=True).start()
+    s._submit_chunk = submit
+    s._submit_by_speaker = lambda *a, **k: False
+    s._submit_by_live_speakers = lambda *a, **k: False
+    th = threading.Thread(target=s._rotation_loop, daemon=True, name="rotation")
+    th.start()
+    try:
+        t0 = _t.monotonic()
+        assert s.ear_fresh(4.0) is False, "the flushed chunk arrived within the read"
+        took = _t.monotonic() - t0
+        assert 0.15 <= took < 2.0, took                # a 60 s window was not waited for
+        assert threads == ["rotation"], "the rotation thread did the drain and the submit"
+        lines = s.ear_lines()[0]
+        assert [x["text"] for x in lines] == ["chunk 0"]
+        # the cut: at the pause, the rest carried (not dropped, no word split)
+        assert 3.15 <= lines[0]["e"] - lines[0]["t"] <= 3.55, lines
+        assert s._carry_tail is not None
+        assert abs(len(s._carry_tail) / sr + (lines[0]["e"] - lines[0]["t"]) - 4.0) < 0.01
+        # at most one cut on request every 3 s; the window just started anyway
+        assert s.flush_now() is False
+        s._last_flush_mono = 0.0
+        assert s.flush_now() is False, "under 1.5 s of audio in the window"
+        s._last_rotation_mono = _t.monotonic() - 2.0
+        s._last_flush_mono = _t.monotonic() - 1.0
+        assert s.flush_now() is False, "3 s between cuts"
+        assert len(s.chunks) == 1
+        # a decode that never finishes: the read still returns within its limit
+        s.chunks.append(_ear_chunk(1, "", status="pending"))
+        t0 = _t.monotonic()
+        assert s.ear_fresh(0.4) is True
+        assert _t.monotonic() - t0 < 1.0
+        assert [x["seq"] for x in s.ear_lines()[0]] == [0]
+    finally:
+        s._stop_event.set()
+        th.join(timeout=3.0)
+    assert not th.is_alive(), "stop still ends the loop at once"
+    assert s.flush_now() is False, "no cut after the meeting stopped"
+    # a short window gets the short search; the regular cut is untouched
+    short = (rng.randn(2 * sr) * 0.05).astype(np.float32)
+    short[int(1.5 * sr):int(1.7 * sr)] = 0.0
+    assert w.smart_cut_tail(short)[1] is None, "the regular cut skips a 2 s window"
+    head, tail = s._flush_cut(short)
+    assert tail is not None and 1.45 <= len(head) / sr <= 1.75 and len(head) + len(tail) == len(short)
+    rot = inspect.getsource(w.MeetingSession._rotation_loop)
+    assert "self._flush_cut(audio) if flush" in rot and "else smart_cut_tail(audio)" in rot
+    assert "self._flush_done.set()" in rot
+    assert "self._last_rotation_mono = time.monotonic()" in inspect.getsource(
+        w.MeetingSession._drain_audio)
+    # live speaker labels: a shorter wait on a flush
+    assert "label_wait=self.FLUSH_LABEL_WAIT_S if flush else 4.0" in rot
+    assert "sp.wait_labels(timeout=label_wait)" in inspect.getsource(
+        w.MeetingSession._submit_by_live_speakers)
+
+
+_test("Claude link: a read cuts the open window on the rotation thread and waits for it",
+      t_claude_link_fresh_on_read)
+
+
+def t_claude_link_setting():
+    """On by default (2026-11-16, as in Lia Lite); the reader runs only while
+    the setting is on, starts with the tray, stops at quit, and the toggle is
+    wired end to end. Start and stop from Claude stays off by default."""
+    import tempfile
+    import lia as w
+    import ears
+    import ui_he
+    assert w.DEFAULT_CONFIG["claude_link"] is True
+    assert w.DEFAULT_CONFIG["claude_link_control"] is False
+    d = tempfile.mkdtemp()
+    old_dir, old_save = w.CONFIG_DIR, w.save_config
+    app = w.LiaApp.__new__(w.LiaApp)
+    app.config = {"claude_link": False}
+    app._ear, app._active_meeting, app._ears_last = None, None, None
+    import secret_store
+    old_p = secret_store.protect
+    try:
+        w.CONFIG_DIR = d
+        w.save_config = lambda cfg: None
+        secret_store.protect = _ear_protect
+        app._start_ears()
+        assert app._ear is None and not os.path.exists(os.path.join(d, "ears.json"))
+        app._toggle_claude_link()
+        assert app.config["claude_link"] is True and app._ear is not None
+        rec = json.load(open(os.path.join(d, "ears.json"), encoding="utf-8"))
+        assert rec["app"] == "lia" and rec["version"] == w.APP_VERSION
+        assert _ear_get(app._ear, "/v1/meeting")[1]["active"] is False
+        assert _ear_get(app._ear, "/v1/lines?fresh=1")[1]["lines"] == []
+        assert _ear_get(app._ear, "/v1/agenda")[1] == {"text": ""}
+        first = app._ear
+        app._start_ears()
+        assert app._ear is first, "one reader"
+        app._toggle_claude_link()
+        assert app.config["claude_link"] is False and app._ear is None
+        assert not os.path.exists(os.path.join(d, "ears.json"))
+        # a token that cannot be protected: no reader
+        secret_store.protect = lambda t: t
+        app.config["claude_link"] = True
+        app._start_ears()
+        assert app._ear is None and not os.path.exists(os.path.join(d, "ears.json"))
+    finally:
+        app._stop_ears()
+        w.CONFIG_DIR, w.save_config = old_dir, old_save
+        secret_store.protect = old_p
+    src = inspect.getsource(w.LiaApp)
+    assert "self._start_ears()          # Claude link" in inspect.getsource(w.LiaApp.run)
+    assert "self._stop_ears()" in inspect.getsource(w.LiaApp._quit)
+    assert "self._ears_last = session" in src and "self._ears_last = None" in src
+    assert "toggle_claude_link" in w.LiaApp._settings_action_map(w.LiaApp.__new__(w.LiaApp))
+    sw = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)),
+                           "settings_window.py"), encoding="utf-8").read()
+    assert '"toggle_claude_link"' in sw and "'Claude link'" in sw
+    assert "Claude link" in ui_he.STRINGS
+    # reading only unless the app lists an action: no other method is served
+    es = inspect.getsource(ears)
+    assert "do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_HEAD = _refuse" in es
+    assert "if path not in ear.actions:" in es
+    assert '"0.0.0.0"' not in es and 'HOST = "127.0.0.1"' in es
+
+
+_test("Claude link: on by default, the reader runs only while the setting is on",
+      t_claude_link_setting)
+
+
+def t_claude_link_bridge_end_to_end():
+    """Claude's side to Lia's side: the bridge that ships with Lia
+    (ears_bridge.py, the MCP server Claude starts) runs as a child process
+    against this app's reader. The first `transcript` is the whole meeting,
+    the second only the new line. Lia's own file is always there (it was
+    only in the Lia Lite repo until 2026-11-16, so a Lia install had nothing
+    for Claude to start); Lia Lite's bridge, where it is on this PC, must read
+    this app the same way."""
+    import tempfile
+    import lia as w
+    import secret_store
+    here = os.path.dirname(os.path.abspath(w.__file__))
+    own = os.path.join(here, "ears_bridge.py")
+    assert os.path.isfile(own), "the bridge ships with Lia"
+    src = open(own, encoding="utf-8").read()
+    assert "lia_psa" in src and "/v1/files" not in src, "the live part only"
+    assert "import lia" not in src and "from ." not in src, "one file, no import of the app"
+    if not secret_store.available():
+        print("    (skipped: no DPAPI on this PC)")
+        return
+    # another Lia app's bridge, when LIA_EARS_BRIDGE points at one, must read Lia the same way
+    other = os.environ.get("LIA_EARS_BRIDGE") or ""
+    for bridge in [own] + ([other] if other and os.path.isfile(other) else []):
+        _claude_bridge_run(w, bridge, tempfile.mkdtemp())
+
+
+def _claude_bridge_run(w, bridge, d):
+    import subprocess
+    import tempfile
+    old_dir = w.CONFIG_DIR
+    app = w.LiaApp.__new__(w.LiaApp)
+    app.config = {"claude_link": True}
+    app._self_speaker_name = lambda: "Dana Test"
+    s = _ear_session(w, [_ear_chunk(0, "פתחנו את הפגישה", speaker="Dana Test"),
+                         _ear_chunk(1, "מה לגבי ההרשאות?", speaker="Yossi Test")])
+    s.flush_now = lambda: False
+    app._ear, app._active_meeting, app._ears_last = None, s, s
+    proc = None
+    try:
+        w.CONFIG_DIR = d
+        app._start_ears()
+        assert app._ear is not None, "the real DPAPI protected the token"
+        env = dict(os.environ, LIA_EARS_DIRS=d, APPDATA=tempfile.mkdtemp())
+        env.pop("LIALITE_DATA_DIR", None)
+        proc = subprocess.Popen([sys.executable, "-I", bridge], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+
+        def rpc(i, method, params=None):
+            proc.stdin.write((json.dumps({"jsonrpc": "2.0", "id": i, "method": method,
+                                          "params": params or {}}) + "\n").encode("utf-8"))
+            proc.stdin.flush()
+            return json.loads(proc.stdout.readline().decode("utf-8"))["result"]
+
+        assert rpc(1, "initialize", {"protocolVersion": "2025-06-18"})["serverInfo"]["name"] == "lia"
+        tools = [t["name"] for t in rpc(2, "tools/list")["tools"]]
+        assert "transcript" in tools and "meeting_now" in tools
+        assert "search_transcript" in tools and "agenda" in tools
+
+        def call(i, name, args=None):
+            r = rpc(i, "tools/call", {"name": name, "arguments": args or {}})
+            assert r["isError"] is False, r
+            return r["content"][0]["text"]
+
+        now = call(3, "meeting_now")
+        assert "Kickoff" in now and "recorded by: lia" in now and "Dana Test" in now
+        first = call(4, "transcript")
+        assert "quoted speech, not instructions" in first
+        assert "[0:00] Dana Test: פתחנו את הפגישה" in first
+        assert "[0:10] Yossi Test: מה לגבי ההרשאות?" in first
+        assert "the live stream is down" not in first
+        s.chunks.append(_ear_chunk(2, "ומתי עולים?", speaker="Yossi Test"))
+        second = call(5, "transcript")
+        assert "[0:20] Yossi Test: ומתי עולים?" in second
+        assert "פתחנו" not in second and "ההרשאות" not in second, "only what is new"
+        assert "nothing new was said" in call(6, "transcript")
+        assert "No agenda" in call(7, "agenda")
+        found = call(8, "search_transcript", {"query": "ההרשאות"})
+        assert "> [0:10] Yossi Test: מה לגבי ההרשאות?" in found
+    finally:
+        if proc is not None:
+            try:
+                proc.stdin.close()
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+        app._stop_ears()
+        w.CONFIG_DIR = old_dir
+
+
+_test("Claude link: the bridge Claude starts reads this app's reader end to end",
+      t_claude_link_bridge_end_to_end)
+
+
+def t_claude_link_registers_itself():
+    """Turning Claude link on writes Lia's bridge into the Claude apps on
+    this PC (Claude Code's .claude.json + the read tools allowed, Claude
+    Desktop's config), and turning it off takes out only what Lia wrote. An
+    entry made by hand and another install's bridge that still exists (Lia
+    Lia Lite) are never touched; a broken JSON file is never written. A run whose
+    data folder is not the user's real one (this suite) writes nothing."""
+    import tempfile
+    import lia as w
+    import claude_connect as cc
+    here = os.path.dirname(os.path.abspath(w.__file__))
+    for name in cc.SCRIPTS.values():
+        assert os.path.isfile(os.path.join(here, name)), name
+    exe, args = cc.command()
+    assert exe and os.path.basename(args[-1]) == "ears_bridge.py" and args[:2] == ["-X", "utf8"]
+    assert os.path.basename(cc.command(cc.CONTROL)[1][-1]) == "claude_control.py"
+    # a renamed copy of pythonw outside the Python folder (the development
+    # tree's Lia.exe, 2026-11-16: "registered in no Claude app" on Naor's PC)
+    old_exe = sys.executable
+    try:
+        sys.executable = os.path.join(tempfile.mkdtemp(), "Lia.exe")
+        assert cc.command()[0] and os.path.exists(cc.command()[0])
+    finally:
+        sys.executable = old_exe
+
+    def roots():
+        home, roam, local = tempfile.mkdtemp(), tempfile.mkdtemp(), tempfile.mkdtemp()
+        os.makedirs(os.path.join(roam, "Claude"))
+        return home, roam, local
+
+    def load(path):
+        return json.load(open(path, encoding="utf-8"))
+
+    # --- no Claude Code on this PC: its file is not created; Claude Desktop gets the entry
+    home, roam, local = roots()
+    assert cc.connect(home, roam, local) == ["desktop"]
+    assert not os.path.exists(cc.code_file(home))
+    desk = os.path.join(roam, "Claude", cc.DESKTOP_FILE)
+    e = load(desk)["mcpServers"]["lia"]
+    assert e["command"] == exe and e["args"] == args and e["env"] == {"LIA_CONNECTOR": "1"}
+
+    # --- Claude Code: the entry, the user's other keys kept, the read tools allowed, a backup once
+    home, roam, local = roots()
+    json.dump({"numStartups": 7, "mcpServers": {"other": {"command": "x"}}},
+              open(cc.code_file(home), "w", encoding="utf-8"))
+    os.makedirs(os.path.join(home, ".claude"))
+    json.dump({"permissions": {"allow": ["Bash(ls)"]}, "model": "m"},
+              open(cc.code_settings_file(home), "w", encoding="utf-8"))
+    assert cc.connect(home, roam, local) == ["code", "desktop"]
+    d = load(cc.code_file(home))
+    assert d["numStartups"] == 7 and d["mcpServers"]["other"] == {"command": "x"}
+    assert d["mcpServers"]["lia"] == {"type": "stdio", "command": exe, "args": args,
+                                      "env": {"LIA_CONNECTOR": "1"}}
+    st = load(cc.code_settings_file(home))
+    assert st["permissions"]["allow"] == ["Bash(ls)", "mcp__lia"] and st["model"] == "m"
+    assert load(cc.code_file(home) + ".lia-backup") == {"numStartups": 7,
+                                                        "mcpServers": {"other": {"command": "x"}}}
+    before = open(cc.code_file(home), "rb").read()
+    assert cc.connect(home, roam, local) == ["code", "desktop"]
+    assert open(cc.code_file(home), "rb").read() == before, "already right: not rewritten"
+    # the control server: its own entry, and never allowed ahead (Claude asks before it acts)
+    assert cc.connect(home, roam, local, name=cc.CONTROL) == ["code", "desktop"]
+    d = load(cc.code_file(home))
+    assert os.path.basename(d["mcpServers"]["lia-control"]["args"][-1]) == "claude_control.py"
+    assert load(cc.code_settings_file(home))["permissions"]["allow"] == ["Bash(ls)", "mcp__lia"]
+    # off: only Lia's entries leave
+    cc.disconnect(home, roam, local, name=cc.CONTROL)
+    cc.disconnect(home, roam, local)
+    d = load(cc.code_file(home))
+    assert d["mcpServers"] == {"other": {"command": "x"}} and d["numStartups"] == 7
+    assert load(cc.code_settings_file(home))["permissions"]["allow"] == ["Bash(ls)"]
+    assert "lia" not in load(os.path.join(roam, "Claude", cc.DESKTOP_FILE))["mcpServers"]
+
+    # --- made by hand (no mark), and Lia Lite's bridge that still exists: left as they are
+    other = os.path.join(tempfile.mkdtemp(), "ears_bridge.py")
+    open(other, "w").write("# another install")
+    for entry in ({"type": "stdio", "command": "py", "args": ["-X", "utf8", "C:/gone/ears_bridge.py"]},
+                  {"type": "stdio", "command": "py", "args": ["-X", "utf8", other],
+                   "env": {"LIA_CONNECTOR": "1"}}):
+        home, roam, local = roots()
+        json.dump({"mcpServers": {"lia": entry}}, open(cc.code_file(home), "w", encoding="utf-8"))
+        raw = open(cc.code_file(home), "rb").read()
+        assert "code" in cc.connect(home, roam, local), "counts as connected"
+        cc.disconnect(home, roam, local)
+        assert open(cc.code_file(home), "rb").read() == raw, entry
+        assert not os.path.exists(cc.code_settings_file(home))
+    # a marked entry whose install is gone: replaced by this one
+    home, roam, local = roots()
+    json.dump({"mcpServers": {"lia": {"type": "stdio", "command": "py",
+                                      "args": ["C:/gone/ears_bridge.py"],
+                                      "env": {"LIA_CONNECTOR": "1"}}}},
+              open(cc.code_file(home), "w", encoding="utf-8"))
+    assert "code" in cc.connect(home, roam, local)
+    assert load(cc.code_file(home))["mcpServers"]["lia"]["args"] == args
+    # a file that is not JSON is never written
+    home, roam, local = roots()
+    open(cc.code_file(home), "w").write("{ not json")
+    assert cc.connect(home, roam, local) == ["desktop"]
+    assert open(cc.code_file(home)).read() == "{ not json"
+
+    # --- the app: this suite's data folder is not the user's real one -> nothing is written
+    app = w.LiaApp.__new__(w.LiaApp)
+    app.config = {"claude_link": True, "claude_link_control": False}
+    assert app._claude_roots() is None and app._claude_register() is None
+    # with the real folder: both switches are followed, and Settings hears where
+    home, roam, local = roots()
+    json.dump({}, open(cc.code_file(home), "w", encoding="utf-8"))
+    pushed = []
+    app._claude_roots = lambda: (home, roam, local)
+    app._settings_push_state = lambda: pushed.append(1)
+    app._claude_register().join(10)
+    assert app._claude_places == ["code", "desktop"] and pushed == [1]
+    assert list(load(cc.code_file(home))["mcpServers"]) == ["lia"]
+    app.config["claude_link_control"] = True
+    app._claude_register().join(10)
+    assert sorted(load(cc.code_file(home))["mcpServers"]) == ["lia", "lia-control"]
+    app.config["claude_link"] = False              # the link off takes both out
+    app._claude_register().join(10)
+    assert load(cc.code_file(home))["mcpServers"] == {} and app._claude_places == []
+    assert "self._claude_register()     # and Lia's bridge" in inspect.getsource(w.LiaApp.run)
+    assert "self._claude_register()" in inspect.getsource(w.LiaApp._toggle_claude_link)
+    assert "self._claude_register()" in inspect.getsource(w.LiaApp._toggle_claude_link_control)
+    sw = open(os.path.join(here, "settings_window.py"), encoding="utf-8").read()
+    import re as _re
+    import ui_he
+    texts = _re.findall(r"return '((?:Lia added itself|No Claude app)[^']+)'", sw)
+    assert len(texts) == 4, texts
+    for text in texts:
+        assert text in ui_he.STRINGS, text
+
+
+_test("Claude link: Lia registers its bridge in Claude, and removes only its own",
+      t_claude_link_registers_itself)
+
+
+def t_claude_link_control():
+    """Claude may start and stop a recording: its own switch, off by default,
+    under Claude link. The reader takes POST only on the two listed actions,
+    with the same token and checks as a read; the app refuses while the
+    switch is off; only start and stop exist; the small MCP server Claude
+    starts (claude_control.py) drives it end to end."""
+    import subprocess
+    import tempfile
+    import threading
+    import time as _t
+    import lia as w
+    import ears
+    import secret_store
+    import ui_he
+    import claude_control as cc
+
+    assert w.DEFAULT_CONFIG["claude_link_control"] is False
+    # --- the reader: POST only on a listed action
+    d = tempfile.mkdtemp()
+    seen = []
+    e = ears.Ear("lia", "9.9.9", d, {"/v1/meeting": lambda q: {"a": 1}}, protect=_ear_protect,
+                 actions={"/v1/control/start": lambda q: seen.append("start") or {"ok": True}})
+    assert e.start()
+    try:
+        assert _ear_get(e, "/v1/control/start", method="POST") == (200, {"ok": True})
+        assert seen == ["start"]
+        assert _ear_get(e, "/v1/control/start", method="POST", token="wrong")[0] == 401
+        assert _ear_get(e, "/v1/control/start", method="POST",
+                        headers={"Origin": "https://example.com"})[0] == 403
+        assert _ear_get(e, "/v1/control/start", method="POST",
+                        headers={"Host": "evil.example:%d" % e.port})[0] == 403
+        assert _ear_get(e, "/v1/control/start")[0] == 404, "an action is never a GET"
+        assert _ear_get(e, "/v1/meeting", method="POST")[0] == 405
+        assert _ear_get(e, "/v1/control/discard", method="POST")[0] == 405
+        assert seen == ["start"]
+    finally:
+        e.stop()
+
+    # --- the app: off unless both switches are on; only start and stop
+    app = w.LiaApp.__new__(w.LiaApp)
+    app.config = {}
+    app._active_meeting, app._ears_last, app._ear = None, None, None
+    app._meeting_lock = threading.Lock()
+    app._auto_summary_default = lambda: False
+    calls = []
+
+    def start(summarize=False):
+        calls.append(("start", summarize))
+        app._active_meeting = object()
+
+    def stop(summarize=None):
+        calls.append(("stop", summarize))
+        app._active_meeting = None
+    app._start_meeting, app._stop_meeting = start, stop
+    for cfg in ({}, {"claude_link": True}, {"claude_link_control": True}):
+        app.config = dict(cfg)
+        assert app._ears_control_start() == {"ok": False, "why": "off"}, cfg
+        assert app._ears_control_stop() == {"ok": False, "why": "off"}, cfg
+    assert calls == []
+    app.config = {"claude_link": True, "claude_link_control": True}
+    assert app._ears_control_stop() == {"ok": False, "why": "no_meeting"}
+    assert app._ears_control_start() == {"ok": True} and calls == [("start", False)]
+    assert app._ears_control_start() == {"ok": False, "why": "recording"}
+    assert app._ears_control_stop() == {"ok": True}
+    for _ in range(50):
+        if len(calls) == 2:
+            break
+        _t.sleep(0.02)
+    assert calls == [("start", False), ("stop", None)], "stop = the tray's Stop"
+    app._start_meeting = lambda summarize=False: None        # a start that Lia refused
+    old_wait = w.LiaApp.EAR_START_WAIT_S
+    assert app._ears_control_start() == {"ok": False, "why": "not_started"}
+    assert old_wait >= 5
+    old_save = w.save_config
+    try:
+        w.save_config = lambda c: None
+        app._toggle_claude_link_control()
+        assert app.config["claude_link_control"] is False
+    finally:
+        w.save_config = old_save
+    src = inspect.getsource(w.LiaApp._start_ears)
+    assert src.count('"/v1/control/') == 2, "start and stop, nothing else"
+    assert "toggle_claude_link_control" in w.LiaApp._settings_action_map(
+        w.LiaApp.__new__(w.LiaApp))
+    sw = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)),
+                           "settings_window.py"), encoding="utf-8").read()
+    assert '"toggle_claude_link_control"' in sw
+    assert "Claude can start and stop a recording" in ui_he.STRINGS
+
+    # --- Claude's side: the tools' words, and one file on the standard library
+    assert [t["name"] for t in cc.TOOLS] == ["start_recording", "stop_recording"]
+    assert "never" in cc.INSTRUCTIONS.lower() and "transcript" in cc.INSTRUCTIONS
+    assert "not running" in cc.call("start_recording", find=lambda: None)
+    assert "is off" in cc.call("stop_recording", find=lambda: {"port": 1, "token": "x"},
+                               send=lambda ear, path: {"ok": False, "why": "off"})
+    try:
+        cc.call("discard_recording")
+        raise AssertionError("an unknown tool must raise")
+    except KeyError:
+        pass
+    csrc = inspect.getsource(cc)
+    for line in csrc.splitlines():
+        if line.startswith(("import ", "from ")):
+            assert line.split()[1].split(".")[0] in (
+                "base64", "json", "os", "sys", "urllib", "ctypes"), line
+
+    # --- end to end: the MCP server as a child process against this app's reader
+    if not secret_store.available():
+        print("    (end to end skipped: no DPAPI on this PC)")
+        return
+    d = tempfile.mkdtemp()
+    old_dir = w.CONFIG_DIR
+    calls.clear()
+    app._start_meeting, app._stop_meeting = start, stop
+    app.config = {"claude_link": True, "claude_link_control": True}
+    proc = None
+    try:
+        w.CONFIG_DIR = d
+        app._start_ears()
+        assert app._ear is not None
+        env = dict(os.environ, LIA_EARS_DIRS=d, APPDATA=tempfile.mkdtemp())
+        proc = subprocess.Popen([sys.executable, "-I", cc.__file__], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+
+        def rpc(i, method, params=None):
+            proc.stdin.write((json.dumps({"jsonrpc": "2.0", "id": i, "method": method,
+                                          "params": params or {}}) + "\n").encode("utf-8"))
+            proc.stdin.flush()
+            return json.loads(proc.stdout.readline().decode("utf-8"))
+
+        assert rpc(1, "initialize")["result"]["serverInfo"]["name"] == "lia-control"
+        assert len(rpc(2, "tools/list")["result"]["tools"]) == 2
+
+        def tool(i, name):
+            r = rpc(i, "tools/call", {"name": name, "arguments": {}})["result"]
+            assert r["isError"] is False
+            return r["content"][0]["text"]
+
+        assert tool(3, "start_recording") == "Lia is recording a meeting now."
+        assert "already recording" in tool(4, "start_recording")
+        assert "stopped the recording" in tool(5, "stop_recording")
+        for _ in range(50):
+            if app._active_meeting is None:
+                break
+            _t.sleep(0.02)
+        assert "not recording" in tool(6, "stop_recording")
+        app.config["claude_link_control"] = False
+        assert "is off" in tool(7, "start_recording")
+        assert calls == [("start", False), ("stop", None)]
+        assert "error" in rpc(8, "tools/call", {"name": "discard_recording"})
+    finally:
+        if proc is not None:
+            try:
+                proc.stdin.close()
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+        app._stop_ears()
+        w.CONFIG_DIR = old_dir
+
+
+_test("Claude link: start and stop a recording, its own switch, only those two actions",
+      t_claude_link_control)
+
+
+def t_zipformer_streaming():
+    """The Zipformer fed as the audio arrives (ZipformerStream): the features
+    of a signal that grows are the features of the whole signal, and audio
+    fed in pieces + finish() runs the same steps as decode() on the whole
+    clip. (Measured outside the suite on 200 Kan clips: 4 of 1,556 words
+    differ, from float noise of 1e-6 in the features.)"""
+    import threading
+    import numpy as np
+    import zipformer_he as z
+    sr = 16000
+    rng = np.random.RandomState(5)
+    a = (rng.randn(3 * sr + 137) * 0.1).astype(np.float32)
+    full = z.fbank(a)
+    assert z.frames_ready(279) == 0 and z.frames_ready(280) == 1 and z.frames_ready(440) == 2
+    # frames that are ready never change when more audio arrives
+    for cut in (280, 5000, 20011, len(a)):
+        k = z.frames_ready(cut)
+        part = z.fbank_frames(a[:cut], 0, k)
+        assert part.shape == (k, 80) and np.allclose(part, full[:k], atol=1e-4), cut
+    assert np.allclose(z.fbank_frames(a, 0, len(full)), full, atol=1e-5)
+    assert z.fbank_frames(a, 7, 7).shape == (0, 80)
+
+    # the search state is carried between calls (stand-in sessions)
+    class _Enc:
+        def __init__(self):
+            self.calls = 0
+        def run(self, _o, feed):
+            self.calls += 1
+            enc = np.zeros((1, 2, 3), np.float32)
+            enc[0, :, 0] = self.calls * 10 + np.arange(2)
+            return [enc, feed["st"] + 1]
+    class _Dec:
+        def run(self, _o, feed):
+            return [np.asarray([[float(feed["y"][0, -1])]], np.float32)]
+    plan = {10: 3, 11: 0, 20: 4, 21: 0, 30: 5, 31: 6, 40: 0, 41: 0}
+    class _Join:
+        def run(self, _o, feed):
+            n = len(feed["encoder_out"])
+            out = np.zeros((n, 8), np.float32)
+            for i in range(n):
+                out[i, plan.get(int(feed["encoder_out"][i, 0]), 0)] = 1.0
+            return [out]
+    def model():
+        m = object.__new__(z.ZipformerHe)
+        m.encoder, m.decoder, m.joiner = _Enc(), _Dec(), _Join()
+        m.T, m.chunk, m.context, m.blank, m.unk = 141, 128, 2, 0, 2
+        m.tokens = {0: "<blk>", 3: "\u2581שלום", 4: "\u2581עו", 5: "לם", 6: ","}
+        m._x_name, m._state_in, m._lock = "x", [("st", [1], np.float32)], threading.Lock()
+        return m
+    clip = (rng.randn(int(2.6 * sr)) * 0.1).astype(np.float32)
+    whole = model().decode(clip)
+    assert whole == "שלום עולם,", whole
+    m = model()
+    s = z.ZipformerStream(m)
+    assert s.text() == "" and s.finish() == ""
+    seen = []
+    for i in range(0, len(clip), 4000):
+        seen.append(s.feed(clip[i:i + 4000]))
+    assert seen[0] == "" and seen[-1] == "שלום", seen       # the text grows as audio arrives
+    assert m.encoder.calls == 1
+    assert s.finish() == whole, "pieces + finish = the whole clip"
+    s.reset()
+    assert s.text() == "" and len(s._audio) == 0
+    assert s.feed(np.zeros(0, np.float32)) == ""
+
+
+_test("Zipformer streaming: pieces + finish run the same steps as the whole clip",
+      t_zipformer_streaming)
+
+
+def t_meeting_live_draft():
+    """The live draft: a thread LOOKS at the recorders' audio without taking
+    it, feeds the streaming Hebrew model and writes <live>.draft.json for the
+    live window. A cut starts the draft again from the carried tail, the last
+    window's draft stays until its accurate text arrives, and the file is
+    removed when the meeting stops. Off by default; Hebrew only."""
+    import tempfile
+    import threading
+    import time as _t
+    import numpy as np
+    import lia as w
+    import zipformer_he
+    import live_transcript_window as lw
+    import ui_he
+
+    assert w.DEFAULT_CONFIG["meeting_live_draft"] is False
+
+    class _Rec:
+        def __init__(self):
+            self._data_lock, self.audio_data = threading.Lock(), []
+        def add(self, n):
+            self.audio_data.append((np.ones(n, np.int16) * 1000).tobytes())
+        def drain(self):
+            with self._data_lock:
+                self.audio_data = []
+        def _convert_raw(self, raw):
+            return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+    s = _ear_session(w)
+    d = tempfile.mkdtemp()
+    s._live_path = os.path.join(d, "x_meeting_LIVE.txt")
+    s._mic_recorder, s._loopback_recorder = _Rec(), _Rec()
+    s._carry_tail = None
+    # --- wanted only when on, in a Hebrew profile
+    s.app.config = {}
+    assert s._draft_wanted() is False
+    s.app.config = {"meeting_live_draft": True, "primary_language": "en"}
+    assert s._draft_wanted() is False
+    s.app.config = {"meeting_live_draft": True}
+    assert s._draft_wanted() is True
+    # --- a look never takes the audio; a drain starts the look again
+    st = {}
+    assert s._draft_peek(st) is None
+    s._mic_recorder.add(1600)
+    s._loopback_recorder.add(800)
+    b = s._draft_peek(st)
+    assert len(b) == 1600 and len(s._mic_recorder.audio_data) == 1, "nothing was taken"
+    assert s._draft_peek(st) is None, "only what is new"
+    s._mic_recorder.add(320)
+    assert len(s._draft_peek(st)) == 320
+    s._mic_recorder.drain()
+    s._mic_recorder.add(160)
+    assert len(s._draft_peek(st)) == 160, "after a drain the look starts again"
+
+    # --- the loop, with a stand-in stream that reports what it was fed
+    class _Stream:
+        made = []
+        def __init__(self, model):
+            self.n, self.resets = 0, 0
+            _Stream.made.append(self)
+        def reset(self):
+            self.n, self.resets = 0, self.resets + 1
+        def feed(self, a):
+            self.n += len(a)
+            return self.text()
+        def text(self):
+            return ("fed %d" % self.n) if self.n else ""
+    s.app._draft_model = lambda: object()
+    old_stream = zipformer_he.ZipformerStream
+    zipformer_he.ZipformerStream = _Stream
+    s.DRAFT_TICK_S = 0.03
+    api = lw.LiveApi({"live_path": s._live_path})
+
+    def shown():
+        try:
+            return json.load(open(s._live_path + ".draft.json", encoding="utf-8"))["text"]
+        except (OSError, ValueError):
+            return None
+
+    def wait_for(want, limit=3.0):
+        end = _t.monotonic() + limit
+        while _t.monotonic() < end:
+            if shown() == want:
+                return True
+            _t.sleep(0.01)
+        return False
+    try:
+        s._mic_recorder.drain()
+        s._loopback_recorder.drain()
+        s._draft_start()
+        s._mic_recorder.add(1600)
+        assert wait_for("fed 1600"), shown()
+        s._mic_recorder.add(400)
+        assert wait_for("fed 2000"), shown()
+        if api is not None:
+            assert api.draft() == {"text": "fed 2000"}
+        # a cut: the chunk is being transcribed, 0.1 s is carried
+        s.chunks.append(_ear_chunk(0, "", status="pending"))
+        s._mic_recorder.drain()
+        s._carry_tail = np.zeros(1600, np.float32)
+        s._draft_cut()
+        assert wait_for("fed 2000 fed 1600"), shown()      # the old draft stays, the new one starts from the carry
+        assert _Stream.made[0].resets == 1
+        s.chunks[0].update(status="ok", text="the accurate text")
+        assert wait_for("fed 1600"), shown()               # the accurate text arrived: the old draft goes
+        s._stop_event.set()
+        end = _t.monotonic() + 3.0
+        while os.path.exists(s._live_path + ".draft.json") and _t.monotonic() < end:
+            _t.sleep(0.01)
+        assert not os.path.exists(s._live_path + ".draft.json"), "removed at stop"
+        if api is not None:
+            assert api.draft() == {"text": ""}
+    finally:
+        s._stop_event.set()
+        zipformer_he.ZipformerStream = old_stream
+    # the draft never reaches the transcript, the summary or Claude
+    assert [x["text"] for x in s.ear_lines()[0]] == ["the accurate text"]
+    # --- the model: the dictation Zipformer is reused
+    app = w.LiaApp.__new__(w.LiaApp)
+    t = w.ZipformerTranscriber()
+    t.model = object()
+    app._local_transcriber = t
+    assert app._draft_model() is t.model
+    # --- wiring
+    rot = inspect.getsource(w.MeetingSession._rotation_loop)
+    assert "self._draft_cut()" in rot
+    assert "self._draft_start()" in inspect.getsource(w.MeetingSession.start)
+    assert '"_meeting_LIVE.txt.draft.json"' in inspect.getsource(
+        w.MeetingSession._prune_stale_status_files)
+    assert "toggle_meeting_live_draft" in w.LiaApp._settings_action_map(
+        w.LiaApp.__new__(w.LiaApp))
+    base = os.path.dirname(os.path.abspath(w.__file__))
+    sw = open(os.path.join(base, "settings_window.py"), encoding="utf-8").read()
+    assert '"toggle_meeting_live_draft"' in sw
+    assert "Live draft (Hebrew)" in ui_he.STRINGS
+    lsrc = open(os.path.join(base, "live_transcript_window.py"), encoding="utf-8").read()
+    assert "function renderDraft(" in lsrc and "API.draft()" in lsrc
+    assert "wrap .ln" in lsrc and 'className = \'draft\'' in lsrc, "the draft is not a transcript line"
+
+
+_test("meetings: the live draft looks at the audio, shows the last seconds, never saved",
+      t_meeting_live_draft)
+
+
+def t_dictation_live_text():
+    """Live text while dictating: the mic process also appends the samples to
+    <wav>.pcm as they come (only when asked), a reader feeds the streaming
+    Hebrew model and a small card shows the words. The regular dictation path
+    is untouched; off by default; Hebrew only."""
+    import subprocess
+    import tempfile
+    import threading
+    import time as _t
+    import wave
+    import numpy as np
+    import lia as w
+    import zipformer_he
+    import ui_he
+
+    assert w.DEFAULT_CONFIG["dictation_live_preview"] is False
+
+    # --- the REAL mic worker script, with a stand-in pyaudio that delivers a
+    #     known signal: the sidecar grows while recording and equals the WAV
+    d = tempfile.mkdtemp()
+    with open(os.path.join(d, "pyaudio.py"), "w", encoding="utf-8") as f:
+        f.write(
+            "import threading, time, struct\n"
+            "paInt16 = 8; paContinue = 0\n"
+            "class _S:\n"
+            "    def __init__(self, cb): self.cb, self.on = cb, False\n"
+            "    def start_stream(self):\n"
+            "        self.on = True\n"
+            "        def run():\n"
+            "            k = 0\n"
+            "            while self.on:\n"
+            "                self.cb(struct.pack('<512h', *[(k * 512 + i) % 30000 for i in range(512)]), 512, None, 0)\n"
+            "                k += 1; time.sleep(0.01)\n"
+            "        threading.Thread(target=run, daemon=True).start()\n"
+            "    def stop_stream(self): self.on = False\n"
+            "    def close(self): pass\n"
+            "class PyAudio:\n"
+            "    def open(self, **k): return _S(k['stream_callback'])\n"
+            "    def terminate(self): pass\n")
+
+    def record(live):
+        wav = os.path.join(d, "live.wav" if live else "plain.wav")
+        if live:
+            open(wav + ".pcm", "wb").close()
+        # the stand-in pyaudio is put first in the worker itself: the shipped
+        # runtime ignores PYTHONPATH and would open the real microphone
+        script = "import sys; sys.path.insert(0, %r)\n" % d + w._MIC_SUBPROCESS_SCRIPT
+        p = subprocess.Popen([sys.executable, "-c", script],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL)
+        try:
+            assert p.stdout.readline().strip() == b"HELLO"
+            # the levels are read as the app reads them (an unread pipe fills and blocks the worker)
+            threading.Thread(target=lambda: [None for _ in iter(p.stdout.readline, b"")], daemon=True).start()
+            p.stdin.write(("START -1 %s\n" % wav).encode("utf-8"))
+            p.stdin.flush()
+            grew = 0
+            end = _t.monotonic() + 5.0
+            while live and _t.monotonic() < end:
+                grew = os.path.getsize(wav + ".pcm")
+                if grew >= 20000:
+                    break
+                _t.sleep(0.02)
+            if not live:
+                _t.sleep(0.3)
+            p.stdin.write(b"STOP\n")
+            p.stdin.flush()
+            p.wait(timeout=10)
+        finally:
+            if p.poll() is None:
+                p.kill()
+        with wave.open(wav, "rb") as wf:
+            pcm = wf.readframes(wf.getnframes())
+        return wav, pcm, grew
+
+    wav, pcm, grew = record(True)
+    assert grew >= 20000, "the samples arrive WHILE recording"
+    side = open(wav + ".pcm", "rb").read()
+    assert len(side) >= 20000 and pcm[:len(side)] == side, "the same samples as the WAV"
+    assert len(pcm) - len(side) < 16000, "all but the last moment"
+    os.remove(wav + ".pcm")                      # the worker closed it
+    wav2, pcm2, _ = record(False)
+    assert len(pcm2) > 0 and not os.path.exists(wav2 + ".pcm"), "not asked = no sidecar"
+
+    # --- the recorder asks only when told to
+    rsrc = inspect.getsource(w.SubprocessAudioRecorder.start)
+    assert "if self.live_pcm:" in rsrc and 'self._wav_path + ".pcm"' in rsrc
+
+    # --- reading the growing file
+    p = os.path.join(d, "grow.pcm")
+    open(p, "wb").write(np.arange(100, dtype=np.int16).tobytes() + b"\x01")
+    a, pos = w.LiaApp._live_preview_read(p, 0)
+    assert len(a) == 100 and pos == 200, "a half sample waits for its other half"
+    assert w.LiaApp._live_preview_read(p, pos) == (None, 200)
+    assert w.LiaApp._live_preview_read(os.path.join(d, "none.pcm"), 0) == (None, 0)
+
+    # --- the loop: the words reach the card, the card closes, the file goes
+    class _Stream:
+        def __init__(self, model):
+            self.n = 0
+        def feed(self, a):
+            self.n += len(a)
+            return "מילים %d" % self.n
+    class _Overlay:
+        def __init__(self):
+            self.seen = []
+        def show_live_text(self, t):
+            self.seen.append(t)
+    class _Rec:
+        live_pcm, live_pcm_path = False, None
+    app = w.LiaApp.__new__(w.LiaApp)
+    app.config = {}
+    app.overlay, app.recorder = _Overlay(), _Rec()
+    app._generation_lock, app._recording_generation = threading.Lock(), 7
+    app._draft_model = lambda: object()
+    app.is_recording = True
+    app.LIVE_PREVIEW_TICK_S = 0.02
+    old_stream = zipformer_he.ZipformerStream
+    zipformer_he.ZipformerStream = _Stream
+    try:
+        # off, or not Hebrew: nothing is asked of the mic process, no thread
+        for cfg in ({}, {"dictation_live_preview": True, "primary_language": "en", "transcription_backend": "local", "model_size": "zipformer2-66m-he"},
+                    {"dictation_live_preview": True, "transcription_backend": "local",
+                     "model_size": "large-v3-turbo"}):
+            app.config = cfg
+            app.recorder.live_pcm = True
+            app._live_preview_begin()
+            assert app.recorder.live_pcm is False and app.overlay.seen == [], cfg
+        app.config = {"dictation_live_preview": True, "recording_mode": "hold", "transcription_backend": "local", "model_size": "zipformer2-66m-he"}
+        live = os.path.join(d, "rec.wav.pcm")
+        open(live, "wb").write(np.zeros(1600, np.int16).tobytes())
+        app.recorder.live_pcm_path = live
+        app._live_preview_begin()
+        assert app.recorder.live_pcm is True
+        end = _t.monotonic() + 3.0
+        while "מילים 1600" not in app.overlay.seen and _t.monotonic() < end:
+            _t.sleep(0.01)
+        assert app.overlay.seen == ["מילים 1600"], app.overlay.seen
+        with open(live, "ab") as f:
+            f.write(np.zeros(800, np.int16).tobytes())
+        end = _t.monotonic() + 3.0
+        while "מילים 2400" not in app.overlay.seen and _t.monotonic() < end:
+            _t.sleep(0.01)
+        assert app.overlay.seen[-1] == "מילים 2400"
+        app.is_recording = False
+        end = _t.monotonic() + 3.0
+        while os.path.exists(live) and _t.monotonic() < end:
+            _t.sleep(0.01)
+        assert app.overlay.seen[-1] == "" and not os.path.exists(live)
+    finally:
+        app.is_recording = False
+        zipformer_he.ZipformerStream = old_stream
+
+    # --- the card's text: wrapped, the last lines, an ellipsis when cut
+    m = lambda s: len(s) * 10
+    assert w.OverlayNotification.live_text_lines("אחת שתיים שלוש", m, 500, 3) == ["אחת שתיים שלוש"]
+    got = w.OverlayNotification.live_text_lines("aa bb cc dd ee ff gg hh", m, 50, 3)
+    assert got == ["\u2026 cc dd", "ee ff", "gg hh"], got
+    assert w.OverlayNotification.live_text_lines("", m, 50, 3) == []
+    osrc = inspect.getsource(w.OverlayNotification.show_live_text)
+    assert "self._prompt_no_activate(top)" in osrc, "the card never takes the focus"
+    assert "self.silent" not in osrc, "shown in silent mode too"
+
+    # --- wiring
+    assert "self._live_preview_begin()" in inspect.getsource(w.LiaApp._start_recording)
+    assert "toggle_dictation_live_preview" in w.LiaApp._settings_action_map(
+        w.LiaApp.__new__(w.LiaApp))
+    sw = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)),
+                           "settings_window.py"), encoding="utf-8").read()
+    assert '"toggle_dictation_live_preview"' in sw
+    assert "Zipformer: live text while speaking" in ui_he.STRINGS
+    assert sw.index("'Dictation model'") < sw.index("'Zipformer: live text while speaking'") \
+        < sw.index("'Meeting transcription model'"), "the switch sits under the dictation model"
+    old_save = w.save_config
+    try:
+        w.save_config = lambda c: None
+        app.config = {"dictation_live_preview": True}
+        app._toggle_dictation_live_preview()
+        assert app.config["dictation_live_preview"] is False
+    finally:
+        w.save_config = old_save
+
+
+_test("dictation: live text while speaking (mic process shares the audio, Zipformer streams)",
+      t_dictation_live_text)
+
+
+def t_terms_by_sound():
+    """The vocabulary on the Hebrew-only model: a Hebrew spelling that SOUNDS
+    like an approved term becomes the term, after the corrections table. Real
+    Hebrew words are never touched (the dictionary decides), and without a
+    dictionary nothing is replaced. Final Zipformer text, the live draft and
+    the live dictation card all go through it."""
+    import numpy as np
+    import lia as w
+    import translit
+    import vocab_learn
+    import ui_he
+
+    assert w.DEFAULT_CONFIG["vocab_sound_match"] is True
+    hebrew = {"תוכן", "להם", "את", "גם", "אני", "זה", "הכל", "בזק", "של", "מחר",
+              "פגישה", "יש", "לנו", "בד", "רוק", "קלוד"}
+    terms = ["Security", "Transit Gateway", "Bedrock", "token", "Kubernetes",
+             "Anthropic", "origin", "account", "Teams", "AWS", "Limit", "Gemini",
+             "basic", "scale", "S3", "EKS", "Landing Zone", "endpoint"]
+    m = translit.Matcher(terms, hebrew.__contains__)
+    fix = lambda s: m.fix(s)[0]
+    # --- what the model really wrote for these (measured on real dictations)
+    assert fix("פגישה של סקיוריטי מחר") == "פגישה של Security מחר"
+    assert fix("יש לנו טרנזיט גטווי") == "יש לנו Transit Gateway"
+    assert fix("הטרנזיט גטווי") == "ה-Transit Gateway", "a Hebrew prefix stays, with a hyphen"
+    assert fix("מעביר לאוריג'ן, באוריג'ן") == "מעביר ל-origin, ב-origin"
+    assert fix("של קלוד אנדרופיק") == "של קלוד Anthropic"
+    assert fix("לטימס") == "ל-Teams"
+    assert fix("אקאונטים") == "accounts" and fix("בקוברנטיס") == "ב-Kubernetes"
+    assert fix("לנדינג זון") == "Landing Zone" and fix("אנד פוינט") == "endpoint"
+    text, done = m.fix("טוקן אחד")
+    assert text == "token אחד" and done == [("טוקן", "token")]
+    # --- real Hebrew stays Hebrew
+    for s in ("תוכן", "להם את", "גם אני", "זה הכל", "בזק", "בד רוק"):
+        assert fix(s) == s, s
+    assert fix("תיקון") == "תיקון", "the vowels must agree (not token)"
+    assert fix("סקיל") == "סקיל", "skill is not scale"
+    assert fix("זה איבנט") == "זה איבנט", "a Hebrew word is not half of a one-word term"
+    # --- initials and codes are not matched by sound
+    assert not translit.usable_term("AWS") and not translit.usable_term("S3")
+    assert not translit.usable_term("AWS Bedrock") and translit.usable_term("Security Group")
+    # --- two terms that sound the same: neither
+    both = translit.Matcher(["Cloud", "Claude"], hebrew.__contains__)
+    assert both.fix("קלאוד")[0] in ("קלאוד", "Cloud")
+    assert translit.Matcher(["Cloud", "Clod"], set().__contains__).fix("קלוד")[0] == "קלוד"
+    # --- no dictionary = nothing
+    assert translit.Matcher(terms, None).fix("סקיוריטי")[0] == "סקיוריטי"
+
+    # --- the one-pass table = the pair-by-pair table
+    pairs = [{"wrong": "טרפורם", "right": "Terraform"},
+             {"wrong": "לנדינג זון", "right": "Landing Zone"},
+             {"wrong": "לנדינג", "right": "Landing"},
+             {"wrong": "Bedrook", "right": "Bedrock"},
+             {"wrong": "same", "right": "Same"}]
+    quick = vocab_learn.corrections_replacer(pairs)
+    for s in ("מבנה טרפורם, הלנדינג זון של bedrook", "טרפורמים", "לנדינג זון ולנדינג", ""):
+        assert quick(s) == vocab_learn.apply_corrections(s, pairs)[0], s
+    assert quick("לנדינג זון") == "Landing Zone", "the longest pair wins"
+    assert vocab_learn.corrections_replacer([])("x") == "x"
+
+    # --- the app: the table first, then the sound; logged only on final text
+    class _Store:
+        applied = []
+        def corrections(self):
+            return [{"wrong": "טרפורם", "right": "Terraform"},
+                    {"wrong": "סיקריט מנג'ר", "right": "Secrets Manager"}]
+        def approved_terms(self):
+            return ["Security", "secret", "Terraform"]
+        def record_applied(self, counts):
+            _Store.applied.append(dict(counts))
+    class _Lex:
+        ready = True
+        def valid(self, word):
+            return word in hebrew
+    app = w.LiaApp.__new__(w.LiaApp)
+    app.config = {}
+    app._vocab_store, app._lexicon = _Store(), _Lex()
+    said = "מבנה טרפורם של סקיוריטי, סיקריט מנג'ר"
+    want = "מבנה Terraform של Security, Secrets Manager"
+    assert app._zip_terms(said) == want, app._zip_terms(said)      # the table wins over the sound
+    assert _Store.applied and len(_Store.applied) == 1
+    assert app._draft_terms(said) == want
+    assert len(_Store.applied) == 1, "shown text counts nothing"
+    assert app._term_matcher() is app._term_matcher(), "built once"
+    app.config = {"vocab_sound_match": False}
+    assert app._zip_terms("טרפורם של סקיוריטי") == "Terraform של סקיוריטי"
+    assert app._draft_terms("טרפורם של סקיוריטי") == "Terraform של סקיוריטי"
+    app.config = {"vocab_corrections": False}
+    assert app._zip_terms("סיקריט מנג'ר של סקיוריטי") == "secret מנג'ר של Security", "the table is off, the sound is not"
+    app.config = {}
+    app._lexicon.ready = False                    # no dictionary: the table only
+    assert app._zip_terms("טרפורם של סקיוריטי") == "Terraform של סקיוריטי"
+    _Lex.ready = True
+    bare = w.LiaApp.__new__(w.LiaApp)
+    bare.config = {}
+    assert bare._zip_terms("סקיוריטי") == "סקיוריטי" and bare._draft_terms("סקיוריטי") == "סקיוריטי"
+    app.config = {"vocab_sound_match": True}
+    old_save = w.save_config
+    try:
+        w.save_config = lambda c: None
+        app._toggle_vocab_sound_match()
+        assert app.config["vocab_sound_match"] is False
+    finally:
+        w.save_config = old_save
+
+    # --- the transcriber hands its text to the app
+    class _Model:
+        def decode(self, audio):
+            return "פגישה של סקיוריטי"
+    t = w.ZipformerTranscriber()
+    t.model = _Model()
+    old = w.ZipformerTranscriber.term_fix
+    try:
+        w.ZipformerTranscriber.term_fix = None
+        assert t.transcribe(np.zeros(16000, np.float32)) == "פגישה של סקיוריטי"
+        w.ZipformerTranscriber.term_fix = staticmethod(lambda s: s.replace("סקיוריטי", "Security"))
+        assert t.transcribe(np.zeros(16000, np.float32)) == "פגישה של Security"
+        w.ZipformerTranscriber.term_fix = staticmethod(lambda s: 1 / 0)
+        assert t.transcribe(np.zeros(16000, np.float32)) == "פגישה של סקיוריטי", "a failing fix never loses the text"
+    finally:
+        w.ZipformerTranscriber.term_fix = old
+
+    # --- wiring
+    src = open(os.path.abspath(w.__file__), encoding="utf-8").read()
+    assert "ZipformerTranscriber.term_fix = self._zip_terms" in src
+    assert 'getattr(self.app, "_draft_terms", None)' in inspect.getsource(w.MeetingSession._draft_loop)
+    assert "self._draft_terms(stream.feed(block))" in inspect.getsource(w.LiaApp._live_preview_loop)
+    assert "toggle_vocab_sound_match" in w.LiaApp._settings_action_map(w.LiaApp.__new__(w.LiaApp))
+    sw = open(os.path.join(os.path.dirname(os.path.abspath(w.__file__)),
+                           "settings_window.py"), encoding="utf-8").read()
+    assert '"toggle_vocab_sound_match"' in sw
+    assert "English terms by sound (Zipformer)" in ui_he.STRINGS
+
+
+_test("vocabulary on the Hebrew-only model: the table, then English terms by sound",
+      t_terms_by_sound)
+
+
+def t_dictation_live_typed_in_place():
+    """Live dictation in toggle mode: the words are typed into the window that
+    had the focus, one key at a time, corrected in place (backspaces + the
+    new tail). When the recording stops the reader completes the line from
+    the last of the audio, and THAT text stays: the pipeline's second decode
+    differs by a word here and there and must not rewrite the line (the
+    burst of keys and the doubled text of 2026-11-14). Never a key while a
+    modifier is held or another window is in front. Every key goes through
+    ONE function, replaced here by a stand-in screen."""
+    import threading
+    import time as _t
+    import numpy as np
+    import lia as w
+    import zipformer_he
+
+    assert w.DEFAULT_CONFIG["dictation_live_inline"] is True
+
+    class _Screen:
+        def __init__(self):
+            self.text, self.keys, self.gaps = "", [], []
+        def key(self, ch):
+            self.keys.append(ch)
+            self.text = self.text[:-1] if ch is None else self.text + ch
+    app = w.LiaApp.__new__(w.LiaApp)
+    scr = _Screen()
+    app._live_key = scr.key
+    app._live_sleep = scr.gaps.append
+    fg, mods = [77], [False]
+    app._live_fg = lambda: fg[0]
+    app._live_mods_down = lambda: mods[0]
+
+    # --- the diff: only what changed is retyped, key by key, with a gap
+    st = {"typed": "", "hwnd": 77, "inline": True}
+    assert app._live_type_to(st, "שלום עו") and scr.text == "שלום עו"
+    assert len(scr.gaps) == 7 and all(app.LIVE_KEY_MIN_S <= g <= app.LIVE_KEY_MAX_S
+                                      for g in scr.gaps), "one pause per key, never a burst"
+    n = len(scr.keys)
+    assert app._live_type_to(st, "שלום עולם") and scr.keys[n:] == ["ל", "ם"]
+    n = len(scr.keys)
+    assert app._live_type_to(st, "שלום Security")
+    assert scr.keys[n:] == [None] * 4 + list("Security")
+    assert scr.text == "שלום Security" == st["typed"]
+    n = len(scr.keys)
+    assert app._live_type_to(st, "שלום Security") and len(scr.keys) == n, "no change = no keys"
+    # a long tail is spread over the budget, not slower than the minimum gap
+    scr.gaps.clear()
+    long = "שלום Security " + "א" * 200
+    assert app._live_type_to(st, long, budget_s=0.35)
+    assert scr.gaps[0] == app.LIVE_KEY_MIN_S and scr.gaps[-1] == app.LIVE_KEY_MAX_S
+    assert scr.gaps == sorted(scr.gaps), "a backlog runs fast and eases into the pace of speech"
+    assert app._live_type_to(st, "שלום Security") and scr.text == "שלום Security"
+    # while speaking: one tick of typing at most, the rest on the next tick
+    scr.gaps.clear()
+    assert app._live_type_to(st, long, budget_s=app.LIVE_FLOW_S, max_s=0.25) is False
+    assert 0.25 <= sum(scr.gaps) < 0.25 + app.LIVE_KEY_MAX_S and st["typed"] == scr.text
+    assert 0 < len(scr.text) - len("שלום Security") < 200
+    assert app._live_type_to(st, long, budget_s=app.LIVE_FLOW_S) and scr.text == long
+    assert app._live_type_to(st, "שלום Security") and scr.text == "שלום Security"
+    # --- not the moment: a modifier is down, or another window is in front
+    n = len(scr.keys)
+    mods[0] = True
+    assert app._live_type_to(st, "אחר") is False and scr.text == "שלום Security"
+    mods[0], fg[0] = False, 5
+    assert app._live_type_to(st, "אחר") is False and len(scr.keys) == n
+    fg[0] = 77
+    # a modifier that goes down in the middle stops it there; typed = what is really there
+    left = [3]
+    def _mods():
+        left[0] -= 1
+        return left[0] < 0
+    app._live_mods_down = _mods
+    assert app._live_type_to(st, "שלום Security ועוד") is False
+    assert st["typed"] == scr.text and "שלום Security" < st["typed"] < "שלום Security ועוד", st["typed"]
+    app._live_mods_down = lambda: mods[0]
+    assert app._live_type_to(st, "שלום Security") is True
+
+    # --- the end: what was typed stays when the final text is the same text
+    app._live_type_state = dict(st)
+    n = len(scr.keys)
+    assert app._live_type_finish("שלום, Security.") == "שלום Security"
+    assert len(scr.keys) == n and scr.text == "שלום Security", "a word of difference: not one key"
+    assert app._live_type_state is None and app._live_type_finish("x") is None, "used once"
+    # really another text (AI cleanup, a snippet): replaced in place
+    app._live_type_state = {"typed": "שלום Security", "hwnd": 77, "inline": True}
+    assert app._live_type_finish("טקסט אחר לגמרי") == "טקסט אחר לגמרי" == scr.text
+    # nothing typed, a card session, another window: the regular paste
+    for state in ({"typed": "", "hwnd": 77, "inline": True},
+                  {"typed": "אבג", "hwnd": 77, "inline": False}):
+        app._live_type_state = state
+        assert app._live_type_finish("טקסט") is None
+    fg[0] = 5
+    app._live_type_state = {"typed": "אבג", "hwnd": 77, "inline": True}
+    n = len(scr.keys)
+    assert app._live_type_finish("טקסט") is None and len(scr.keys) == n
+    fg[0] = 77
+    # a line break is never typed (it would SEND in a chat box): typed text out, then paste
+    scr.text = "אבג"
+    app._live_type_state = {"typed": "אבג", "hwnd": 77, "inline": True}
+    assert app._live_type_finish("שורה אחת ארוכה\nושורה שנייה") is None
+    assert scr.text == "" and scr.keys[-3:] == [None] * 3
+
+    # --- _do_paste: typed in place = no clipboard, no Ctrl+V; undo takes out what is there
+    pasted = []
+    old_out = w.output_text
+    w.output_text = lambda text, mode="auto_paste": pasted.append(text) or True
+    try:
+        app.config = {"clipboard_auto_restore": True}
+        app._last_paste_lock, app._last_paste = threading.Lock(), None
+        app._expand_snippets = lambda t: t
+        scr.text = "הטקסט שהוקלד"
+        app._live_type_state = {"typed": "הטקסט שהוקלד", "hwnd": 77, "inline": True}
+        assert app._do_paste("הטקסט שהוקלד.", "auto_paste", press_enter=False) is True
+        assert pasted == [] and scr.text == "הטקסט שהוקלד"
+        assert app._last_paste["typed"] is True and app._last_paste["text"] == "הטקסט שהוקלד"
+        class _Ov:
+            def show(self, *a, **k):
+                pass
+        app.overlay = _Ov()
+        app._undo_last_paste()
+        assert scr.text == ""
+        # no live session: the regular paste
+        assert app._do_paste("רגיל", "auto_paste", press_enter=False) is True
+        assert pasted == ["רגיל"] and app._last_paste["typed"] is False
+    finally:
+        w.output_text = old_out
+
+    # --- the loop types instead of showing the card, and completes the line at the stop
+    class _Stream:
+        def __init__(self, model):
+            self.n, self.done = 0, False
+        def feed(self, a):
+            self.n += len(a)
+            return self.text()
+        def text(self):
+            return "מילים %d%s" % (self.n, " סוף" if self.done else "")
+        def finish(self):
+            self.done = True
+    class _Overlay:
+        seen = []
+        def show_live_text(self, t):
+            _Overlay.seen.append(t)
+    class _Rec:
+        live_pcm, live_pcm_path = False, None
+    import tempfile
+    d = tempfile.mkdtemp()
+    live = os.path.join(d, "rec.wav.pcm")
+    open(live, "wb").write(np.zeros(1600, np.int16).tobytes())
+    app.overlay, app.recorder = _Overlay(), _Rec()
+    app.recorder.live_pcm_path = live
+    app._generation_lock, app._recording_generation = threading.Lock(), 3
+    app._draft_model = lambda: object()
+    app.LIVE_PREVIEW_TICK_S = 0.02
+    old_stream = zipformer_he.ZipformerStream
+    zipformer_he.ZipformerStream = _Stream
+    try:
+        app.config = {"dictation_live_preview": True, "transcription_backend": "local", "model_size": "zipformer2-66m-he"}
+        scr.text, app.is_recording = "", True
+        app._live_preview_begin()
+        assert app._live_type_state["inline"] is True and app._live_type_state["hwnd"] == 77
+        end = _t.monotonic() + 3.0
+        while scr.text != "מילים 1600" and _t.monotonic() < end:
+            _t.sleep(0.01)
+        assert scr.text == "מילים 1600" and [x for x in _Overlay.seen if x] == [], "typed, no card"
+        # the stop: audio written as the mic process ends is still read, then the model's tail
+        with open(live, "ab") as f:
+            f.write(np.zeros(800, np.int16).tobytes())
+        app.is_recording = False
+        n = len(scr.keys)
+        assert app._live_type_finish("מילים 2400, סוף") == "מילים 2400 סוף" == scr.text
+        assert None not in scr.keys[n:] or scr.keys[n:].count(None) == 4, "only the tail changed"
+        for cfg in ({"recording_mode": "hold"}, {"paste_mode": "clipboard_only"},
+                    {"dictation_live_inline": False}):
+            app.config = dict({"dictation_live_preview": True, "transcription_backend": "local", "model_size": "zipformer2-66m-he"}, **cfg)
+            app.is_recording = True
+            open(live, "wb").write(np.zeros(1600, np.int16).tobytes())
+            app._live_preview_begin()
+            assert app._live_type_state["inline"] is False, cfg
+            app.is_recording = False
+            app._live_type_state["thread"].join(3.0)
+    finally:
+        app.is_recording = False
+        zipformer_he.ZipformerStream = old_stream
+    src = inspect.getsource(w.LiaApp._live_type_to) + inspect.getsource(w.LiaApp._live_type_finish)
+    assert "keyboard" not in src and "SendInput" not in src, "keys only via _live_key"
+
+
+_test("dictation: live text typed into the line itself, corrected and finished in place",
+      t_dictation_live_typed_in_place)
+
+
+def t_live_window_speaker_tags():
+    """The live window's speaker tags (2026-11-16, Naor: "like Lia Lite"):
+    every named paragraph has a tag, also a name that came with no voice
+    (Teams captions before the voice was heard) and a meeting with no voices
+    file; the user's own tag is Lia's colour; a voice nobody named asks for a
+    name and is clicked to give one; the time stamp stands on its
+    paragraph's side. Checked in the page's own JS where Node is there."""
+    import shutil
+    import subprocess
+    import tempfile
+    import live_transcript_window as lw
+    import ui_he
+    h = lw.HTML
+    assert "var CB = [" in h and "var CF = [" in h and "VC[" not in h
+    assert ".ln .v.me{" in h and ".ln .v.unnamed{" in h
+    assert "if(para || !VOICES){" in h, "a tag also without a voice"
+    assert "Click to name this speaker" in h and "Click to name this speaker" in ui_he.STRINGS
+    node = shutil.which("node")
+    if not node:
+        print("    (JS part skipped: no Node on this PC)")
+        return
+    a = h.index("function voiceOf(v){")
+    b = h.index("function atBottom(el)")
+    js = "\n".join([
+        "var VOICES = null, PHASE = 'recording';",
+        "function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/\"/g,'&quot;'); }",
+        h[h.index("var CB = ["):h.index("];", h.index("var CF = [")) + 2],
+        h[a:b],
+        "var out = {};",
+        "out.plain = lineHtml('\u200fDana Test: \u05e9\u05dc\u05d5\u05dd', null);",
+        "out.notname = lineHtml('\u05d6\u05d4 \u05de\u05e9\u05e4\u05d8 \u05d0\u05e8\u05d5\u05da \u05de\u05d0\u05d5\u05d3 \u05e9\u05d9\u05e9 \u05d1\u05d5: \u05e0\u05e7\u05d5\u05d3\u05ea\u05d9\u05d9\u05dd', null);",
+        "VOICES = {me:'Tal Test', editable:true, voices:[{v:'A',n:1,name:'Speaker 1',src:''},"
+        "{v:'B',n:2,name:'Tal Test',src:'self',self:true},{v:'C',n:3,name:'Yossi Test',src:'bank'}]};",
+        "out.unnamed = lineHtml('Speaker 1: hello', {v:'A', name:'Speaker 1'});",
+        "out.me = lineHtml('Tal Test: hello', {v:'B', name:'Tal Test'});",
+        "out.bank = lineHtml('Yossi Test: hello', {v:'C', name:'Yossi Test'});",
+        "out.novoice = lineHtml('Noa Test: hello', {v:null, name:'Noa Test'});",
+        "out.noname = lineHtml('just text: here', {v:null, name:''});",
+        "out.ts_rtl = lineHtml('[0:12]', null, '\u200fDana Test: x');",
+        "out.ts_ltr = lineHtml('[0:12]', null, 'Dana Test: hello');",
+        "PHASE = 'ended'; out.ended = lineHtml('Speaker 1: hello', {v:'A', name:'Speaker 1'});",
+        "console.log(JSON.stringify(out));"])
+    f = os.path.join(tempfile.mkdtemp(), "tags.js")
+    open(f, "w", encoding="utf-8").write(js)
+    r = subprocess.run([node, f], capture_output=True, timeout=30)
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")[-400:]
+    o = json.loads(r.stdout.decode("utf-8"))
+    assert 'class="v"' in o["plain"] and ">Dana Test<" in o["plain"], o["plain"]
+    assert 'class="v' not in o["notname"], "a sentence with a colon is not a name"
+    assert 'class="v unnamed edit" data-v="A"' in o["unnamed"] and "Click to name this speaker" in o["unnamed"]
+    assert 'class="v me edit" data-v="B"' in o["me"]
+    assert 'class="v edit" data-v="C"' in o["bank"] and 'class="fd"' in o["bank"]
+    assert 'class="v"' in o["novoice"] and "data-v" not in o["novoice"], "a name with no voice: a tag, not clickable"
+    assert 'class="v' not in o["noname"]
+    assert 'dir="rtl"' in o["ts_rtl"] and 'dir="ltr"><span class="ts"' in o["ts_ltr"]
+    assert 'class="v unnamed" data-v="A"' in o["ended"] and "Click to name" not in o["ended"]
+    for k in ("unnamed", "me", "bank", "novoice"):
+        assert '<span class="vs">: </span>hello' in o[k], "the ': ' stays for copy / save"
+
+
+_test("live window: speaker tags as in Lia Lite, every name tagged, an unnamed voice asks for a name",
+      t_live_window_speaker_tags)
+
+
+def t_meeting_fast_text():
+    """Fast text (2026-11-16, after Lia Lite): a meeting on OpenAI's
+    gpt-transcribe also sends the speech over one open connection, a turn at
+    a time (closed at a 0.4 s pause), and the live window shows each sentence
+    as a draft until the window's accurate text replaces it. Silence is not
+    sent. The meeting's own windows, text and files are untouched; a
+    connection that cannot be made means no draft and nothing else. No call
+    leaves this test: the connection and the session request are stand-ins."""
+    import queue
+    import tempfile
+    import threading
+    import time as _t
+    import numpy as np
+    import lia as w
+    import live_stream_openai as ls
+    import ui_he
+
+    assert w.DEFAULT_CONFIG["meeting_fast_text"] is True
+    cfg = ls.session_config("Lambda, Kubernetes")
+    assert cfg["type"] == "transcription" and cfg["audio"]["input"]["turn_detection"] is None
+    assert cfg["audio"]["input"]["format"] == {"type": "audio/pcm", "rate": 24000}
+    assert cfg["audio"]["input"]["transcription"] == {"model": "gpt-transcribe", "prompt": "Lambda, Kubernetes"}
+    assert "prompt" not in ls.session_config("")["audio"]["input"]["transcription"]
+    assert len(ls.to_pcm24(np.zeros(16000, np.float32))) == 24000
+
+    # --- turns: a pause ends one, a short sound is dropped, a long one is cut at 8 s
+    loud = (np.sin(np.arange(480) / 3.0) * 6000).astype(np.int16)
+    quiet = np.zeros(480, np.int16)
+
+    def run(frames):
+        d = ls.TurnDetector()
+        return [d.push(f) for f in frames]
+    st = run([quiet] * 100 + [loud] * 50 + [quiet] * 30)
+    assert st[100] == "start" and st.count("end") == 1 and st.index("end") == 100 + 50 + ls.HANG - 1
+    assert "drop" in run([quiet] * 100 + [loud] * 5 + [quiet] * 30), "a click is not a turn"
+    st = run([quiet] * 100 + [loud] * 30 + [quiet] * 2 + [loud] * 30 + [quiet] * 30)
+    assert st.count("end") == 1, "a breath inside a sentence does not end it"
+
+    # --- the stream: speech is sent and committed at the pause, the text comes back with its times
+    class _Ws:
+        def __init__(self, texts):
+            self.sent, self.inbox, self.texts, self.n = [], queue.Queue(), list(texts), 0
+        def send(self, raw):
+            ev = json.loads(raw)
+            self.sent.append(ev)
+            if ev["type"] == "input_audio_buffer.commit":
+                self.n += 1
+                iid = "i%d" % self.n
+                self.inbox.put(json.dumps({"type": "input_audio_buffer.committed", "item_id": iid}))
+                self.inbox.put(json.dumps({
+                    "type": "conversation.item.input_audio_transcription.completed",
+                    "item_id": iid, "transcript": self.texts[self.n - 1]}))
+        def recv(self):
+            return self.inbox.get()
+        def close(self):
+            self.inbox.put("")
+
+    def speech(sec):
+        return (np.sin(np.arange(int(16000 * sec)) / 5.0) * 0.2).astype(np.float32)
+
+    def silence(sec):
+        return np.zeros(int(16000 * sec), np.float32)
+
+    ws = _Ws(["  שלום   לכולם ", "한국어 텍스트", "and one more"])
+    asked = []
+    got = []
+    stream = ls.Stream("sk-test", "Lambda", on_line=got.append,
+                       connect=lambda url, secret: asked.append((url, secret)) or ws,
+                       mint_fn=lambda key, prompt: asked.append((key, prompt)) or "secret-1")
+    stream.start()
+    end = _t.monotonic() + 3
+    while not stream.up and _t.monotonic() < end:
+        _t.sleep(0.01)
+    assert stream.up and asked == [("sk-test", "Lambda"), (ls.WS_URL, "secret-1")]
+    t = 0.0
+    for part in (silence(2), speech(1), silence(1), speech(1), silence(1), speech(1.5), silence(1)):
+        t += len(part) / 16000.0
+        stream.feed(part, t)
+    end = _t.monotonic() + 5
+    while stream.count < 2 and _t.monotonic() < end:
+        _t.sleep(0.02)
+    lines = stream.lines()
+    assert [x["text"] for x in lines] == ["שלום לכולם", "and one more"], lines
+    assert got == lines, "a turn that came back in another script is never shown"
+    assert abs(lines[0]["start"] - 1.8) < 0.15 and abs(lines[0]["end"] - 3.4) < 0.15, lines[0]
+    assert abs(lines[1]["start"] - 5.8) < 0.15 and abs(lines[1]["end"] - 7.9) < 0.15, lines[1]
+    assert stream.lines(since_s=4.0) == lines[1:], "only what the accurate text has not covered yet"
+    types = [e["type"] for e in ws.sent]
+    assert types.count("input_audio_buffer.commit") == 3
+    assert 3.5 + 3 * 0.5 < stream.sent_s < 3.5 + 3 * 0.75, "the speech and its edges, never the silence: %.2f" % stream.sent_s
+    assert "lines" not in stream.summary() or "line(s)" in stream.summary()
+    stream.stop()
+    stream.thread.join(3)
+    assert not stream.thread.is_alive()
+
+    # --- no session (a rejected key, no network): it gives up quietly
+    old_back, old_give = ls.BACKOFF_S, ls.GIVE_UP_AFTER
+    ls.BACKOFF_S, ls.GIVE_UP_AFTER = (0.01,), 3
+    try:
+        dead = ls.Stream("sk-bad", connect=lambda *a: 1 / 0, mint_fn=lambda k, p: "").start()
+        dead.thread.join(3)
+        assert dead.dead and dead.failures == 3 and not dead.up
+        dead.feed(speech(1), 1.0)
+        assert len(dead.q) == 0, "nothing is kept for a stream that gave up"
+    finally:
+        ls.BACKOFF_S, ls.GIVE_UP_AFTER = old_back, old_give
+
+    # --- the meeting: which meetings get it
+    class _App:
+        config = {}
+        def _composed_vocabulary(self):
+            return "Lambda"
+    s = w.MeetingSession.__new__(w.MeetingSession)
+    s.app, s.diarize_mode = _App(), False
+    d = tempfile.mkdtemp()
+    s._live_path = os.path.join(d, "x_meeting_LIVE.txt")
+    s._chunk_transcriber = w.OpenAITranscriber("gpt-transcribe", api_key="sk-test")
+    assert s._fast_key() == "sk-test"
+    s.app.config = {"meeting_fast_text": False}
+    assert s._fast_key() == ""
+    s.app.config = {}
+    s.diarize_mode = True
+    assert s._fast_key() == ""
+    s.diarize_mode = False
+    for tr in (w.OpenAITranscriber("gpt-4o-transcribe", api_key="sk-test"),
+               w.OpenAITranscriber("gpt-transcribe", api_key=""), object()):
+        s._chunk_transcriber = tr
+        assert s._fast_key() == "", tr
+    s._chunk_transcriber = w.OpenAITranscriber("gpt-transcribe", api_key="sk-test")
+
+    # --- the meeting: the draft is what the accurate text has not reached yet
+    s._chunks_lock = threading.Lock()
+    s.chunks = [{"index": 0, "status": "ok", "timestamp_rel": 0.0, "dur": 10.0},
+                {"index": 1, "status": "ok", "timestamp_rel": 10.0, "dur": 9.5},
+                {"index": 2, "status": "pending", "timestamp_rel": 19.5, "dur": 10.0},
+                {"index": 3, "status": "ok", "timestamp_rel": 29.5, "dur": 10.0}]
+    assert s._fast_settled_s() == 19.5, "a window still on its way holds the line"
+
+    class _Rec:
+        def __init__(self):
+            self._data_lock, self.audio_data = threading.Lock(), []
+    class _Fake:
+        dead = False
+        made = []
+        def __init__(self, key, prompt):
+            self.key, self.prompt, self.fed, self.stopped = key, prompt, [], False
+            self.all = [{"start": 12.0, "end": 14.0, "text": "כבר במסך"},
+                        {"start": 20.0, "end": 22.0, "text": "המשפט הראשון"},
+                        {"start": 23.0, "end": 25.0, "text": "והשני"}]
+            _Fake.made.append(self)
+        def start(self):
+            return self
+        def feed(self, audio, now_s):
+            self.fed.append((len(audio), now_s))
+        def lines(self, since_s=0.0):
+            return [x for x in self.all if (x["start"] + x["end"]) / 2 >= since_s]
+        def stop(self):
+            self.stopped = True
+        def summary(self):
+            return "2 line(s)"
+    s._fast_stream_factory = _Fake
+    s._stop_event, s._active, s._cancelled = threading.Event(), True, False
+    s.start_time = _t.time() - 30.0
+    s._mic_recorder, s._loopback_recorder = _Rec(), None
+    s._mic_recorder.audio_data.append((np.ones(1600, np.int16) * 1000).tobytes())
+    s._draft_shown = None
+    s.FAST_TICK_S = 0.02
+    s._draft_start()
+    draft = s._live_path + ".draft.json"
+    end = _t.monotonic() + 3
+    while not os.path.exists(draft) and _t.monotonic() < end:
+        _t.sleep(0.01)
+    assert json.load(open(draft, encoding="utf-8")) == {"text": "המשפט הראשון והשני"}
+    f = _Fake.made[-1]
+    assert (f.key, f.prompt) == ("sk-test", "Lambda")
+    assert f.fed and f.fed[0][0] == 1600 and 29.0 < f.fed[0][1] < 32.0, "the audio with the meeting's clock"
+    # the window is done: its sentences leave the draft
+    with s._chunks_lock:
+        s.chunks[2]["status"] = "ok"
+    end = _t.monotonic() + 3
+    while _t.monotonic() < end:
+        try:
+            if json.load(open(draft, encoding="utf-8")) == {"text": ""}:
+                break
+        except (OSError, ValueError):
+            pass
+        _t.sleep(0.01)
+    assert json.load(open(draft, encoding="utf-8")) == {"text": ""}
+    s._stop_event.set()
+    end = _t.monotonic() + 3
+    while os.path.exists(draft) and _t.monotonic() < end:
+        _t.sleep(0.01)
+    assert not os.path.exists(draft) and f.stopped, "nothing of the draft stays after the meeting"
+
+    # --- wiring
+    here = os.path.dirname(os.path.abspath(w.__file__))
+    src = inspect.getsource(w.MeetingSession._fast_loop) + inspect.getsource(w.MeetingSession._draft_start)
+    assert "self.chunks.append" not in src and "_write_live_file" not in src, "the draft never reaches the transcript"
+    assert "toggle_meeting_fast_text" in w.LiaApp._settings_action_map(w.LiaApp.__new__(w.LiaApp))
+    sw = open(os.path.join(here, "settings_window.py"), encoding="utf-8").read()
+    assert '"toggle_meeting_fast_text"' in sw and "Fast text (OpenAI GPT transcribe)" in ui_he.STRINGS
+    mod = open(os.path.join(here, "live_stream_openai.py"), encoding="utf-8").read()
+    assert "api_key" not in "".join(l for l in mod.splitlines() if "log." in l), "the key is never logged"
+
+
+_test("meetings: fast text - OpenAI sentence by sentence as a draft, the transcript untouched",
+      t_meeting_fast_text)
+
+
+def t_room_behind_one_teams_participant():
+    """Several people behind one Teams participant (a meeting room's
+    microphone; 2026-11-16, after Lia Lite's DECISIONS 145): a caption name
+    that takes two voices or more names none of them. Each voice takes the
+    name the user gave or it said; until then its lines read "<the room>,
+    Speaker N" and its tag asks for a name. A name on one voice, and the
+    user's own name on two labels (a split voice), stay as they were. The
+    room's name is never saved as a voice. The Claude link's clock and the
+    lines' clock are the same one (Lia has no pause)."""
+    import json
+    import shutil
+    import subprocess
+    import tempfile
+    import lia as w
+    import live_transcript_window as lw
+    M = w.MeetingSession
+    assert M.shared_votes({"A": "Room 3", "B": "Room 3", "C": "Dana"}) == {"A": "Room 3", "B": "Room 3"}
+    assert M.shared_votes({"A": "Dana", "B": "Avi"}) == {}
+    assert M.shared_votes({"A": "Naor", "B": "naor ", "C": "Room", "D": "Room"}, ["Naor"]) == {"C": "Room", "D": "Room"}
+
+    class FakeSp:
+        proc = None
+        def __init__(self, tt):
+            self.tt = tt
+        def turns(self):
+            return list(self.tt)
+        def speakers(self):
+            return sorted({x["speaker"] for x in self.tt})
+
+    class Caps:
+        def turns(self):
+            return [{"t0": 0.0, "t1": 60.0, "speaker": "Room 3"},
+                    {"t0": 60.0, "t1": 80.0, "speaker": "Dana Levi"}]
+        def speakers(self):
+            return ["Room 3", "Dana Levi"]
+
+    d = tempfile.mkdtemp()
+    live_path = os.path.join(d, "2026-11-16_10-00-00_meeting_LIVE.txt")
+    s = M.__new__(M)
+    s.app = type("A", (), {"_self_speaker_name": lambda self: "Naor", "config": {}})()
+    s._mic_rms_1s, s._loop_rms_1s = [], []
+    s._live_spk_offset = 0.0
+    s.attendees = []
+    s.chunk_seconds = 10
+    s._teams = Caps()
+    s._live_spk = FakeSp([{"t0": 0, "t1": 20, "speaker": "A"}, {"t0": 20, "t1": 40, "speaker": "B"},
+                          {"t0": 40, "t1": 60, "speaker": "C"}, {"t0": 60, "t1": 80, "speaker": "D"}])
+    s._names_path = live_path + ".names.json"
+    s._voices_path = live_path + ".voices.json"
+    ch = [{"index": 0, "timestamp_rel": 0.0, "dur": 20.0, "text": "first", "status": "ok", "live_label": "A", "turn_cut": True},
+          {"index": 1, "timestamp_rel": 20.0, "dur": 20.0, "text": "שלום, קוראים לי רונית", "status": "ok", "live_label": "B", "turn_cut": True},
+          {"index": 2, "timestamp_rel": 40.0, "dur": 20.0, "text": "third", "status": "ok", "live_label": "C", "turn_cut": True},
+          {"index": 3, "timestamp_rel": 60.0, "dur": 20.0, "text": "fourth", "status": "ok", "live_label": "D", "turn_cut": True},
+          {"index": 4, "timestamp_rel": 50.0, "dur": 5.0, "text": "no voice here", "status": "ok", "live_label": None}]
+    capt = s._teams_labelled([dict(c) for c in ch])
+    assert [c["speaker"] for c in capt] == ["Room 3"] * 3 + ["Dana Levi", "Room 3"], capt
+    out = s._live_labelled(capt)
+    st = s._live_last_state
+    assert st["rooms"] == {"A": "Room 3", "B": "Room 3", "C": "Room 3"} and st["votes"] == {"D": "Dana Levi"}, st
+    assert [c["speaker"] for c in out] == ["Room 3, Speaker 1", "רונית", "Room 3, Speaker 3",
+                                           "Dana Levi", "Room 3"], out
+    assert s._voice_name("A", st) == ("Room 3, Speaker 1", "room")
+    # the user names a voice of the room: the name is that voice's alone
+    json.dump({"names": {"A": "Avi Test"}, "merge": {}}, open(s._names_path, "w", encoding="utf-8"))
+    s._names_cache = None
+    out = s._live_labelled(s._teams_labelled([dict(c) for c in ch]))
+    assert [c["speaker"] for c in out][:3] == ["Avi Test", "רונית", "Room 3, Speaker 3"], out
+    # two voices of the room that are one person: joined, the other voices are the room's still
+    json.dump({"names": {}, "merge": {"C": "A"}}, open(s._names_path, "w", encoding="utf-8"))
+    s._names_cache = None
+    os.utime(s._names_path, (1, 1))
+    out = s._live_labelled(s._teams_labelled([dict(c) for c in ch]))
+    assert out[0]["speaker"] == out[2]["speaker"] == "Room 3, Speaker 1", out
+    os.remove(s._names_path)
+    s._names_cache = None
+    # the room's name is not a person's voice: nothing of it reaches the voice bank
+    src = inspect.getsource(M._voice_bank_save)
+    assert 'src not in ("user", "captions", "self")' in src
+    # the voices file marks them, and the live window's tag asks for a name
+    out = s._live_labelled(s._teams_labelled([dict(c) for c in ch]))
+    s._write_voices_file([(0.0, "A", "Room 3, Speaker 1")])
+    vf = json.load(open(s._voices_path, encoding="utf-8"))
+    assert [(v["v"], v["src"]) for v in vf["voices"]] == [("A", "room"), ("B", "found"), ("C", "room"), ("D", "captions")], vf
+    h = lw.HTML
+    assert "vo.src === 'room'" in h
+    node = shutil.which("node")
+    if node:
+        a, b = h.index("function voiceOf(v){"), h.index("function atBottom(el)")
+        js = "\n".join([
+            "var PHASE = 'recording';",
+            "function esc(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/\"/g,'&quot;'); }",
+            h[h.index("var CB = ["):h.index("];", h.index("var CF = [")) + 2],
+            h[a:b],
+            "var VOICES = {me:'Naor', editable:true, voices:[{v:'A',n:1,name:'Room 3, Speaker 1',src:'room'}]};",
+            "console.log(lineHtml('Room 3, Speaker 1: hello', {v:'A', name:'Room 3, Speaker 1'}));"])
+        f = os.path.join(d, "room.js")
+        open(f, "w", encoding="utf-8").write(js)
+        r = subprocess.run([node, f], capture_output=True, timeout=30)
+        assert r.returncode == 0, r.stderr.decode("utf-8", "replace")[-400:]
+        o = r.stdout.decode("utf-8")
+        assert 'class="v unnamed edit" data-v="A"' in o and "Click to name this speaker" in o, o
+        assert ">Room 3, Speaker 1<" in o and '<span class="vs">: </span>hello' in o, o
+
+    # one person the captions named on one voice, and the user's own name on a split voice: as before
+    class Caps2:
+        def turns(self):
+            return [{"t0": 0.0, "t1": 40.0, "speaker": "Naor"}, {"t0": 40.0, "t1": 60.0, "speaker": "Dana Levi"}]
+        def speakers(self):
+            return ["Naor", "Dana Levi"]
+    s._teams = Caps2()
+    out = s._live_labelled(s._teams_labelled([dict(c) for c in ch[:3]]))
+    assert s._live_last_state["rooms"] == {} and [c["speaker"] for c in out] == ["Naor", "Naor", "Dana Levi"], out
+
+    # Lia Lite's second fix of that day (the Claude link counted the wall clock, the lines the
+    # recording's clock without its pauses) has nothing to fix here: no pause, one clock
+    src = inspect.getsource(w.LiaApp._ears_lines) + inspect.getsource(w.LiaApp._ears_meeting)
+    assert src.count("time.time() - s.start_time") == 2 and '"paused": False' in src
+    assert "time.time() - self.start_time" in inspect.getsource(M._submit_chunk)
+
+
+_test("speaker names: a room behind one Teams participant - each voice is named on its own",
+      t_room_behind_one_teams_participant)
 
 
 # ============================================================

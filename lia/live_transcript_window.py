@@ -44,6 +44,11 @@ class LiveApi:
         self._live_path = self._payload.get("live_path") or ""
         self._status_path = (self._payload.get("status_path")
                              or ((self._live_path + ".status.json") if self._live_path else ""))
+        # live speaker labels (2026-11-08): the meeting writes <live>.voices.json
+        # (which voice each paragraph is), this window writes <live>.names.json
+        # (the names the user gives and "same person as" merges)
+        self._voices_path = (self._live_path + ".voices.json") if self._live_path else ""
+        self._names_path = (self._live_path + ".names.json") if self._live_path else ""
         self._seen_live = False
 
     def meta(self):
@@ -65,9 +70,77 @@ class LiveApi:
     def version(self):
         lm, ls = self._stat(self._live_path)
         sm, ss = self._stat(self._status_path)
+        vm, vs = self._stat(self._voices_path) if self._voices_path else (0.0, 0)
         if lm:
             self._seen_live = True
-        return "%.3f:%d:%.3f:%d:%d" % (lm, ls, sm, ss, 1 if self._seen_live else 0)
+        return "%.3f:%d:%.3f:%d:%d:%.3f:%d" % (lm, ls, sm, ss, 1 if self._seen_live else 0,
+                                              vm, vs)
+
+    def _read_voices(self):
+        if not self._voices_path:
+            return None
+        try:
+            with open(self._voices_path, encoding="utf-8") as f:
+                v = json.load(f)
+            return v if isinstance(v, dict) else None
+        except (OSError, ValueError):
+            return None
+
+    _LABEL = __import__("re").compile(r"^[A-H]$")
+
+    def _names(self):
+        try:
+            with open(self._names_path, encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                return {"names": dict(d.get("names") or {}), "merge": dict(d.get("merge") or {})}
+        except (OSError, ValueError):
+            pass
+        return {"names": {}, "merge": {}}
+
+    def _save_names(self, d):
+        tmp = self._names_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, self._names_path)
+
+    def set_name(self, v, name):
+        """Name a voice (label A-H); "" clears the name. The meeting picks it up
+        within a second and writes it on every paragraph of that voice."""
+        import re
+        if not self._names_path or not self._LABEL.match(str(v or "")):
+            return {"ok": False}
+        name = re.sub(r"[\x00-\x1f\x7f]", "", str(name or "")).strip()[:40]
+        try:
+            d = self._names()
+            if name:
+                d["names"][v] = name
+            else:
+                d["names"].pop(v, None)
+            self._save_names(d)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200]}
+
+    def merge(self, v, into):
+        """"Same person as": voice `v` is shown as voice `into` from now on."""
+        if not self._names_path or not (self._LABEL.match(str(v or ""))
+                                        and self._LABEL.match(str(into or ""))) or v == into:
+            return {"ok": False}
+        try:
+            d = self._names()
+            root, seen = into, set()
+            while root in d["merge"] and root not in seen:
+                seen.add(root)
+                root = d["merge"][root]
+            if root == v:
+                return {"ok": False}
+            d["merge"][v] = root
+            d["names"].pop(v, None)
+            self._save_names(d)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:200]}
 
     def _read_status(self):
         if not self._status_path:
@@ -77,6 +150,18 @@ class LiveApi:
                 return json.load(f)
         except (OSError, ValueError):
             return None
+
+    def draft(self):
+        """The live draft (<live>.draft.json): the words of the last seconds,
+        before the meeting model's text. '' when there is none."""
+        if not self._live_path:
+            return {"text": ""}
+        try:
+            with open(self._live_path + ".draft.json", encoding="utf-8") as f:
+                d = json.load(f)
+            return {"text": str((d or {}).get("text") or "")[:4000]}
+        except (OSError, ValueError):
+            return {"text": ""}
 
     def _read_live(self):
         if not self._live_path:
@@ -98,6 +183,7 @@ class LiveApi:
             return {
                 "status": "ok",
                 "phase": status.get("phase") or "recording",
+                "voices": self._read_voices(),
                 "text": text or "",
                 "have_live": text is not None,
                 "transcript_ready": bool(tr.get("ready")),
@@ -109,10 +195,11 @@ class LiveApi:
             }
         # No status file (older meeting / very early): legacy inference.
         if text is not None:
-            return {"status": "ok", "phase": "recording", "text": text, "have_live": True}
+            return {"status": "ok", "phase": "recording", "text": text, "have_live": True,
+                    "voices": self._read_voices()}
         return {"status": "ok",
                 "phase": "ended" if self._seen_live else "waiting",
-                "text": "", "have_live": False}
+                "text": "", "have_live": False, "voices": self._read_voices()}
 
     def open_artifact(self, which):
         """Open the saved transcript ('transcript') or summary ('summary'). Only
@@ -137,6 +224,33 @@ class LiveApi:
             return {"ok": True}
         except Exception:
             return {"ok": False}
+
+    DIAG_MAX = 256 * 1024
+
+    def diag(self, msg):
+        """One line in <meetings>/live_transcript.log (2026-11-09: a window
+        showed its title and buttons but no text, and nothing recorded why).
+        The page reports its first render, any script error, and a render
+        whose lines are not visible. Never raises; no transcript text."""
+        try:
+            import time
+            d = os.path.dirname(self._live_path or "")
+            if not d:
+                return False
+            p = os.path.join(d, "live_transcript.log")
+            try:
+                if os.path.getsize(p) > self.DIAG_MAX:
+                    os.replace(p, p + ".1")
+            except OSError:
+                pass
+            line = "%s pid=%d %s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), os.getpid(),
+                                         os.path.basename(self._live_path)[:19],
+                                         str(msg).replace("\n", " ")[:400])
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(line)
+            return True
+        except Exception:
+            return False
 
     def copy_text(self, text):
         """'Copy all' - put the transcript on the clipboard. From Python, not
@@ -245,9 +359,38 @@ HTML = r"""<!DOCTYPE html>
   /* one centred reading column: English starts and Hebrew ends on its edges
      (a left-anchored column left right-aligned Hebrew floating mid-window) */
   .ln.rise{ animation:rise .5s var(--ease) both; }
+  /* the live draft: the last seconds, before the accurate text (never copied or saved) */
+  .draft{ line-height:1.7; margin:0 auto 10px; max-width:820px; word-break:break-word;
+          color:var(--muted); font-style:italic; user-select:none; -webkit-user-select:none; }
   .ln .ts{ color:var(--accent); font-variant-numeric:tabular-nums; font-size:11.5px; font-weight:600;
            opacity:.75; font-family:"Cascadia Code","Cascadia Mono",Consolas,monospace; }
   .ln .tsg{ display:inline-block; width:10px; }
+  /* a speaker's tag, as in Lia Lite (2026-11-16): a soft pill in the speaker's own colour, the user's in
+     Lia's colour; every named paragraph has one, a voice's tag is clicked to name it */
+  .ln .v{ display:inline-block; font-size:.78em; font-weight:700; line-height:1.55; padding:1px 10px; margin-inline-end:8px;
+          border-radius:999px; vertical-align:.08em; max-width:15em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+          background:var(--cb, #F1ECE4); color:var(--cf, #6B5537); }
+  .ln .v.me{ background:#ECEAFB; color:#3B2FA8; }
+  .ln .v.edit{ cursor:pointer; }
+  .ln .v.edit:hover{ filter:brightness(.95); }
+  /* a voice nobody named yet: an outline that asks for a name */
+  .ln .v.unnamed{ background:transparent; border:1px dashed var(--cf, #6B5537); padding:0 9px; }
+  .ln .v.unnamed.edit::after{ content:"+"; margin-inline-start:5px; font-weight:700; opacity:.7; }
+  .ln .v .fd{ display:inline-block; width:5px; height:5px; border-radius:50%; background:var(--accent); margin-inline-start:5px; vertical-align:2px; }
+  .ln .vs{ font-size:0; }
+  header .incall{ color:var(--muted); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  header .incall[hidden]{ display:none; }
+  .pop{ position:fixed; z-index:10; background:var(--panel); border:1px solid var(--line-2); border-radius:12px;
+        box-shadow:0 8px 28px rgba(23,23,40,.14); padding:10px; width:260px; font-size:13px; }
+  .pop .row{ display:flex; flex-wrap:wrap; gap:6px; margin-bottom:8px; }
+  .pop .h{ color:var(--muted); font-size:11.5px; margin:2px 0 6px; }
+  .pop button{ appearance:none; border:1px solid var(--line-2); background:var(--panel); color:var(--fg); cursor:pointer;
+               font:inherit; font-size:12.5px; padding:3px 10px; border-radius:999px; }
+  .pop button.hint{ border-color:var(--accent); color:var(--accent); }
+  .pop button.me{ font-weight:700; }
+  .pop button.pri{ background:var(--accent); border-color:var(--accent); color:#fff; }
+  .pop input{ width:100%; font:inherit; font-size:13px; padding:6px 9px; border:1px solid var(--line-2); border-radius:8px; margin-bottom:8px; }
+  .pop .acts{ display:flex; gap:6px; justify-content:flex-end; }
   .banner{ color:var(--muted); text-align:center; margin-top:12vh; font-size:14px; line-height:1.7; padding:0 20px; }
   .banner .orb{ width:56px; height:56px; display:block; margin:0 auto 14px; }
   .banner.ended{ color:var(--fg); }
@@ -272,6 +415,7 @@ HTML = r"""<!DOCTYPE html>
     <div class="ttl">
       <div class="ttl-r"><span class="dot" id="dot"></span><h1 id="title" dir="auto">Live transcript</h1></div>
       <span class="sub" id="sub"></span>
+      <span class="incall" id="incall" hidden></span>
     </div>
     <span class="clock" id="clock" hidden></span>
   </header>
@@ -289,6 +433,12 @@ var META = {chunk_seconds:15, started:'', title:'Live transcript'};
 var ORB = '__LIA_ORB__';
 var SHOWN = -1;           // lines already on screen: newer ones rise in once
 var CLOCK = null;         // the stage clock's timer while recording
+var VOICES = null;        // <live>.voices.json: paras [{ts,v,name}], voices, people
+var PHASE = '';
+var POP = null;           // the open naming popup
+// the speakers' colours, the same eight as Lia Lite's transcript: background + text
+var CB = ['#FDECE7','#E3F2F1','#EEF0FB','#FFF4DE','#F6E8F4','#E8F2E3','#E7EEF7','#F1ECE4'];
+var CF = ['#9A4A2E','#2F6F6A','#4A4FA0','#8A5A12','#8B3A7E','#3F6B2E','#355C86','#6B5537'];
 
 function esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
   .replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
@@ -297,9 +447,64 @@ function stripHead(text){
   var i = text.indexOf('\n\n');
   return i >= 0 ? text.slice(i + 2) : text;
 }
-function lineHtml(raw){
+function voiceOf(v){
+  var vs = (VOICES && VOICES.voices) || [];
+  for(var i = 0; i < vs.length; i++) if(vs[i].v === v) return vs[i];
+  return null;
+}
+function editable(){ return PHASE === 'recording' && VOICES && VOICES.editable !== false; }
+function hue(s){ var h = 0; s = String(s); for(var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return Math.abs(h) % CB.length; }
+// with no voices file (speaker detection is not running) the name is read from
+// the paragraph itself: a short "<name>: " at its start, as the meeting writes it
+var NAME_RX = /^([^\s:.,!?\d][^:.,!?\n]{0,38}): /;
+function tagHtml(para, text){
+  // the paragraph starts with "<name>: " (written by the meeting): show the
+  // name as a tag; the ": " stays in the text (copy / save keep it). A
+  // paragraph of a VOICE has a tag that is clicked to name it; a name that
+  // came with no voice (Teams captions before the voice was heard) has a
+  // tag too, in the colour of the name.
+  para = para || {};
+  var vo = para.v ? (voiceOf(para.v) || {v:para.v, n:0, name:para.name, src:''}) : null;
+  // a Hebrew paragraph starts with a direction mark (RLM) before the name:
+  // keep it in front (it sets the line's direction), match after it
+  var lead = (text.match(/^[\u200e\u200f\u202a-\u202e\u2066-\u2069]*/) || [''])[0];
+  text = text.slice(lead.length);
+  var pre = para.name || (vo && vo.name) || '';
+  if(!pre && !VOICES){
+    var m = text.match(NAME_RX);
+    if(m && m[1].trim().split(/\s+/).length <= 4) pre = m[1];
+  }
+  var shown = para.shown || pre;
+  if(pre && text.indexOf(pre + ': ') === 0) text = text.slice(pre.length + 2);
+  else return null;
+  var me = (VOICES && VOICES.me) || '';
+  var mine = (vo && vo.self) || (me && shown === me);
+  // a voice of a room ("<the room>, Speaker 2") asks for a name too
+  var unnamed = !!vo && ((!vo.src && /^Speaker \d+$/.test(shown)) || vo.src === 'room');
+  var i = vo ? ((vo.n || 1) - 1) % CB.length : hue(shown);
+  var edit = !!vo && editable();
+  var title = vo && vo.src==='found' ? 'Lia found this name' :
+              vo && vo.src==='bank' ? 'Lia knows this voice from an earlier meeting' :
+              (edit && unnamed) ? 'Click to name this speaker' : '';
+  return lead + '<span class="v'+(mine?' me':'')+(unnamed?' unnamed':'')+(edit?' edit':'')+'"'+
+         (vo ? ' data-v="'+esc(para.v)+'"' : '')+' style="--cb:'+CB[i]+';--cf:'+CF[i]+'"'+
+         (title ? ' title="'+title+'"' : '')+'>'+esc(shown)+
+         ((vo && (vo.src==='found' || vo.src==='bank')) ? '<span class="fd"></span>' : '')+'</span><span class="vs">: </span>'+esc(text);
+}
+// the side a paragraph reads from: its direction mark, else its first letter
+function rtlText(s){
+  s = String(s || '');
+  if(/^[\u200f\u202b\u2067]/.test(s)) return true;
+  if(/^[\u200e\u202a\u2066]/.test(s)) return false;
+  var c = s.match(/[A-Za-z\u0590-\u08ff]/);
+  return !!c && c[0] >= '\u0590';
+}
+function lineHtml(raw, para, next){
   var m = raw.match(/^\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*([\s\S]*)$/);
-  if(m){ return '<div class="ln" dir="auto"><span class="ts" dir="ltr">'+esc(m[1])+'</span><span class="tsg"></span>'+esc(m[2])+'</div>'; }
+  // a time stamp alone on its line stands on the side its paragraph starts from (as in Lia Lite)
+  if(m){ return '<div class="ln"'+(m[2] ? ' dir="auto"' : (next && rtlText(next) ? ' dir="rtl"' : ' dir="ltr"'))+
+                '><span class="ts" dir="ltr">'+esc(m[1])+'</span><span class="tsg"></span>'+esc(m[2])+'</div>'; }
+  if(para || !VOICES){ var h = tagHtml(para, raw); if(h) return '<div class="ln" dir="auto">'+h+'</div>'; }
   return '<div class="ln" dir="auto">'+esc(raw)+'</div>';
 }
 function atBottom(el){ return el.scrollHeight - el.scrollTop - el.clientHeight < 40; }
@@ -312,9 +517,26 @@ function selectingInWrap(){
   return wrap.contains(sel.getRangeAt(0).commonAncestorContainer);
 }
 var pendingBody = null;   // a redraw held back while the user has text selected
+var DRAFT = '';           // the live draft text (grey, after the last line)
+function renderDraft(text){
+  if(text !== undefined) DRAFT = text || '';
+  var wrap = document.getElementById('wrap');
+  if(selectingInWrap() || POP) return;
+  var el = wrap.querySelector('.draft');
+  var show = DRAFT && PHASE === 'recording';
+  if(!show){ if(el) el.remove(); return; }
+  if(!el){
+    el = document.createElement('div'); el.className = 'draft'; el.setAttribute('dir', 'auto');
+    wrap.appendChild(el);
+  }
+  if(el.textContent !== DRAFT){
+    el.textContent = DRAFT;
+    if(follow) wrap.scrollTop = wrap.scrollHeight;
+  }
+}
 function renderTranscript(body){
   var wrap = document.getElementById('wrap');
-  if(selectingInWrap()){ pendingBody = body; return; }
+  if(selectingInWrap() || POP){ pendingBody = body; return; }
   pendingBody = null;
   body = (body||'').replace(/\s+$/,'');
   if(!body){
@@ -323,13 +545,52 @@ function renderTranscript(body){
   }
   var lines = body.split('\n').filter(function(l){ return l.trim().length; });
   var first = SHOWN < 0;
+  // pair each paragraph with its voice: the k-th "[m:ss]" line <-> paras[k]
+  var paras = (VOICES && VOICES.paras) || [], k = -1, para = null;
   wrap.innerHTML = lines.map(function(l, i){
-    var h = lineHtml(l);
+    var tm = l.match(/^\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*$/);
+    if(tm){ k++; para = (paras[k] && paras[k].ts === tm[1]) ? paras[k] : null; }
+    var h = lineHtml(l, tm ? null : para, tm ? lines[i + 1] : null);
     return (!first && i >= SHOWN) ? h.replace('<div class="ln"', '<div class="ln rise"') : h;
   }).join('');
   SHOWN = lines.length;
   if(follow) wrap.scrollTop = wrap.scrollHeight;
+  // A "rise" line starts at opacity 0. While Windows reports the window as
+  // hidden (behind another window, minimised) animations pause, and a line
+  // could stay invisible: drop the class once the animation had its time.
+  clearTimeout(window._riseT);
+  window._riseT = setTimeout(function(){
+    wrap.querySelectorAll('.ln.rise').forEach(function(e){ e.classList.remove('rise'); });
+    checkVisible(lines.length);
+  }, 900);
 }
+var DIAGGED = {};
+function diag(key, msg){
+  // once per key per window - a small log, never the transcript text
+  if(DIAGGED[key] || !API || !API.diag) return;
+  DIAGGED[key] = 1;
+  try{ API.diag(msg); }catch(e){}
+}
+function checkVisible(n){
+  var w = document.getElementById('wrap');
+  var lns = w.querySelectorAll('.ln'), vis = 0;
+  lns.forEach(function(e){
+    var cs = getComputedStyle(e);
+    if(parseFloat(cs.opacity) > 0.5 && cs.visibility !== 'hidden' && e.offsetHeight > 0) vis++;
+  });
+  if(n > 0 && vis === 0){
+    diag('invisible', 'lines not visible: lines=' + n + ' ln=' + lns.length + ' hidden=' + document.hidden +
+         ' wrapH=' + w.clientHeight + ' scroll=' + w.scrollTop + '/' + w.scrollHeight);
+    lns.forEach(function(e){ e.classList.remove('rise'); e.style.opacity = '1'; });
+  }
+}
+window.addEventListener('error', function(e){
+  diag('err:' + (e && e.message), 'js error: ' + (e && e.message) + ' @' + (e && e.lineno));
+});
+window.addEventListener('unhandledrejection', function(e){
+  var m = e && e.reason ? String(e.reason.message || e.reason) : '?';
+  diag('rej:' + m, 'js rejection: ' + m);
+});
 
 function setDot(kind){ // 'live' | 'idle' | 'ok'
   var d = document.getElementById('dot');
@@ -404,7 +665,93 @@ function renderFoot(r){
   foot.innerHTML = html;
 }
 
+function renderInCall(){
+  var el = document.getElementById('incall');
+  var vs = ((VOICES && VOICES.voices) || []).filter(function(x){ return !x.self && x.s >= 10; });
+  if(!vs.length){ el.hidden = true; return; }
+  el.innerHTML = '<span>In the call:</span> <span dir="auto">' +
+    vs.map(function(x){ return esc(x.name); }).join(' &middot; ') + '</span>';
+  el.hidden = false;
+}
+function closePop(){
+  if(POP){ POP.remove(); POP = null; }
+  if(pendingBody !== null && !selectingInWrap()){ var b = pendingBody; renderTranscript(b); }
+}
+function openPop(tag){
+  closePop();
+  var v = tag.getAttribute('data-v'), vo = voiceOf(v) || {v:v, name:tag.textContent, src:''};
+  var cur = (vo.src === 'user' || vo.src === 'captions' || vo.src === 'found' || vo.src === 'self' || vo.src === 'bank') ? vo.name : '';
+  var sug = [], seen = {};
+  function add(n, cls){ if(n && !seen[n.toLowerCase()]){ seen[n.toLowerCase()] = 1; sug.push([n, cls]); } }
+  var me = (VOICES && VOICES.me) || '';
+  if(me) seen[me.toLowerCase()] = 1;      // offered as the "Me" button
+  add(vo.hint, 'hint');
+  ((VOICES && VOICES.people) || []).forEach(function(n){ add(n, ''); });
+  var others = ((VOICES && VOICES.voices) || []).filter(function(x){ return x.v !== v; });
+  var p = document.createElement('div');
+  p.className = 'pop';
+  p.innerHTML =
+    ((sug.length || me) ? '<div class="row">' +
+        (me ? '<button data-name="'+esc(me)+'" class="me" title="'+esc(me)+'">Me</button>' : '') +
+        sug.slice(0, 8).map(function(s){
+        return '<button data-name="'+esc(s[0])+'" class="'+s[1]+'" dir="auto">'+esc(s[0])+'</button>'; }).join('') + '</div>' : '') +
+    '<input id="vname" dir="auto" maxlength="40" placeholder="Name this voice" value="'+esc(cur)+'">' +
+    (others.length ? '<div class="h">Same person as</div><div class="row">' + others.map(function(x){
+        return '<button data-into="'+esc(x.v)+'" dir="auto">'+esc(x.name)+'</button>'; }).join('') + '</div>' : '') +
+    '<div class="acts"><button data-act="clear">Clear</button><button data-act="save" class="pri">Save</button></div>';
+  document.body.appendChild(p);
+  var r = tag.getBoundingClientRect(), w = 260, h = p.offsetHeight;
+  var x = Math.min(Math.max(8, r.left), window.innerWidth - w - 8);
+  var y = r.bottom + 6; if(y + h > window.innerHeight - 8) y = Math.max(8, r.top - h - 6);
+  p.style.left = x + 'px'; p.style.top = y + 'px';
+  POP = p;
+  var inp = p.querySelector('#vname');
+  inp.focus(); inp.select();
+  async function save(name){
+    if(!API) return;
+    try{ await API.set_name(v, name); }catch(e){}
+    if(VOICES){
+      var old = vo.name, now = name || ('Speaker ' + (vo.n || 0));
+      (VOICES.voices || []).forEach(function(x){
+        if(x.v === v){ x.name = now; x.src = name ? 'user' : ''; } });
+      // until the meeting rewrites the transcript (within a second)
+      (VOICES.paras || []).forEach(function(q){
+        if(q.v === v && (q.name === old || q.shown)) q.shown = now; });
+    }
+    closePop(); renderInCall(); renderTranscript(lastText);
+  }
+  inp.addEventListener('keydown', function(ev){
+    if(ev.key === 'Enter'){ ev.preventDefault(); save(inp.value.trim()); }
+    else if(ev.key === 'Escape'){ ev.preventDefault(); closePop(); }
+  });
+  p.addEventListener('click', async function(ev){
+    var b = ev.target.closest('button'); if(!b) return;
+    if(b.hasAttribute('data-name')){ save(b.getAttribute('data-name')); return; }
+    if(b.hasAttribute('data-into')){
+      try{ if(API) await API.merge(v, b.getAttribute('data-into')); }catch(e){}
+      closePop(); return;
+    }
+    var a = b.getAttribute('data-act');
+    if(a === 'save') save(inp.value.trim());
+    else if(a === 'clear') save('');
+  });
+}
+document.addEventListener('mousedown', function(ev){
+  if(POP && !POP.contains(ev.target) && !ev.target.closest('.v.edit')) closePop();
+});
+document.addEventListener('keydown', function(ev){ if(ev.key === 'Escape' && POP) closePop(); });
+document.getElementById('wrap').addEventListener('click', function(ev){
+  var t = ev.target.closest('.v.edit');
+  if(t && editable()){ ev.preventDefault(); openPop(t); }
+});
+
 function render(r){
+  PHASE = r.phase || '';
+  diag('first', 'first render: phase=' + PHASE + ' text=' + ((r.text || '').length) +
+       ' voices=' + (r.voices ? 'yes' : 'no') + ' hidden=' + document.hidden);
+  if(r.voices !== undefined) VOICES = r.voices;
+  if(PHASE !== 'recording' && POP) closePop();
+  renderInCall();
   if(r.phase==='cancelled'){
     document.getElementById('wrap').innerHTML =
       '<div class="banner ended">The meeting was discarded.<br>No transcript was saved.</div>';
@@ -416,6 +763,7 @@ function render(r){
     if(body.replace(/\s+/g,'')) lastText = body;
     renderTranscript(lastText);
   }
+  renderDraft();
   renderFoot(r);
 }
 
@@ -433,7 +781,9 @@ async function poll(){
     if(!API || stopped) return;
     var v = await API.version();
     if(v !== lastVer){ lastVer = v; await refresh(); }
-  }catch(e){}
+    if(PHASE === 'recording' && API.draft){ var d = await API.draft(); renderDraft((d && d.text) || ''); }
+    else if(DRAFT) renderDraft('');
+  }catch(e){ lastVer = ''; diag('poll', 'refresh failed: ' + (e && e.message ? e.message : e)); }
 }
 
 function setFollow(on){
@@ -494,9 +844,16 @@ window.addEventListener('pywebviewready', async function(){
     document.getElementById('title').textContent = META.title || T('Live transcript');
     document.getElementById('sub').textContent = META.started ? ('Started ' + META.started) : '';
   }catch(e){}
-  lastVer = await API.version();
-  await refresh();
-  window._pollTimer = setInterval(poll, 1000);
+  // the poll starts whatever happens below: a first read that fails must not
+  // leave the window frozen (it re-reads on the next change)
+  window._pollTimer = setInterval(poll, 500);     // the draft moves within a second of the speech
+  try{
+    lastVer = await API.version();
+    await refresh();
+  }catch(e){
+    lastVer = '';
+    diag('start', 'first read failed: ' + (e && e.message ? e.message : e));
+  }
 });
 </script>
 </body></html>"""

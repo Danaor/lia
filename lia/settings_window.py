@@ -282,8 +282,8 @@ def _demo_state():
                         {"key": "local_diarize_parakeet", "label": "Parakeet Multi-Language Local + Nemotron Speakers", "checked": False, "enabled": True, "where": "local", "wnote": "GPU (4 GB+) recommended · speakers on the CPU, ~30 s per meeting hour", "note": ""},
                         {"key": "local_multilang_turbo", "label": "Whisper Multi-Language Local (99 languages)", "checked": False, "enabled": True, "where": "local", "wnote": "GPU (4 GB+) recommended · CPU: ready ~5 min after a 1h meeting", "note": ""},
                         {"key": "local_diarize_multilang", "label": "Whisper Multi-Language Local + Nemotron Speakers", "checked": False, "enabled": True, "where": "local", "wnote": "GPU (4 GB+) recommended · speakers on the CPU, ~30 s per meeting hour", "note": ""},
-                        {"key": "gemini_transcribe", "label": "Gemini 3.5 transcribe Multi-Language", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · Free Tier Available", "note": "needs gemini_api_key"},
-                        {"key": "openai_gpt_transcribe", "label": "OpenAI GPT transcribe", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · ~$0.27 per meeting hour", "note": "needs openai_api_key"}],
+                        {"key": "openai_gpt_transcribe", "label": "OpenAI GPT transcribe", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · ~$0.27 per meeting hour", "note": "needs openai_api_key"},
+                        {"key": "gemini_transcribe", "label": "Gemini 3.5 transcribe Multi-Language", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · Free Tier Available", "note": "needs gemini_api_key"}],
             "file": [{"key": "", "label": "Same as meeting model", "checked": True, "enabled": True, "note": ""}],
             "summary": [{"model": "off", "label": "Off - transcript only (no AI summary)", "checked": True, "enabled": True, "note": ""},
                         {"model": "gpt-6.1-sol", "label": "OpenAI ChatGPT 6.1 Sol", "checked": False, "enabled": False, "where": "cloud", "wnote": "Requires API key · ~$0.05 per meeting summary", "note": ""},
@@ -810,6 +810,14 @@ APP_JS = r"""
         (opts.action?'<span class="grp-act">'+opts.action+'</span>':'')+'</div>'+
       '<div class="grp'+(opts.tone?' '+opts.tone:'')+'"'+(opts.id?' id="'+opts.id+'"':'')+'>'+rows+'</div>';
   }
+  function claudePlaces(){
+    var p = ((S && S.claude) || {}).places || [];
+    var code = p.indexOf("code") >= 0, desk = p.indexOf("desktop") >= 0;
+    if (code && desk) return 'Lia added itself to Claude Code and to the Claude app. Restart Claude once.';
+    if (code) return 'Lia added itself to Claude Code. Restart Claude once.';
+    if (desk) return 'Lia added itself to the Claude app. Restart Claude once.';
+    return 'No Claude app was found on this PC.';
+  }
   function srow(title, desc, control, cls){
     return '<div class="srow'+(cls?' '+cls:'')+'"><div class="srow-l"><div class="srow-t">'+title+'</div>'+
       (desc?'<div class="srow-d">'+desc+'</div>':'')+'</div>'+
@@ -1237,6 +1245,10 @@ APP_JS = r"""
     return '<div class="content-head"><h1>Models</h1></div>'+
       grp('Engines',
         pick('m_dict', 'Dictation model', 'Press-to-talk dictation.', t.dictation, "set_dictation_model", "idx", "int")+
+        // a mode of the Zipformer only: the other models cannot write while you speak
+        ((cfg("transcription_backend","")==="local" && cfg("model_size","")==="zipformer2-66m-he") ?
+          srow('Zipformer: live text while speaking', 'On = the words are typed into the line you are writing in as you say them, and corrected in place. Off = the text appears when you stop. In hold mode the words show on a small card instead.',
+            swb(!!cfg("dictation_live_preview", false), "toggle_dictation_live_preview")) : '')+
         pick('m_meet', 'Meeting transcription model', 'Live meetings.', t.meeting, "set_meeting_model", "key", "str")+
         pick('m_sum', 'Meeting summary model', 'Writes the summary after a meeting.', t.summary, "set_summary_model", "model", "str")+
         pick('m_file', 'Transcribe-file model', 'Tray > Transcribe a file.', t.file, "set_file_model", "key", "str")
@@ -1484,6 +1496,8 @@ APP_JS = r"""
       }));
     var slangCur = slangRows.filter(function(r){ return r[0]===slang; })[0];
     var spk = ((S.home||{}).speakers)||{};
+    var vb = ((S.home||{}).voice_bank)||{};
+    var vbVoices = vb.voices||[];
     var spkStatus = spk.installed ? 'Installed - meeting models "+ Nemotron Speakers" can be picked in Models.'
       : spk.busy ? (spk.step==="model" ? 'Downloading the model... '+(spk.pct||0)+'%' : 'Installing packages... (a few minutes)')
       : spk.error ? ('Install failed: '+spk.error)
@@ -1500,6 +1514,18 @@ APP_JS = r"""
           swb(!!cfg("auto_detect_meetings",false), "toggle_auto_detect_meetings"))+
         srow('Hide meeting windows', 'No meeting cards, prompts or notices on screen, and the summary does not open by itself. Run meetings from the tray.',
           swb(!!cfg("meeting_windows_hidden",false), "toggle_meeting_windows_hidden"))+
+        srow('Live draft (Hebrew)', 'The live transcript shows the words about 2 seconds after they are said, in grey, until the accurate text replaces them. Runs on the CPU. Downloads a 72 MB model the first time. From the next meeting.',
+          swb(!!cfg("meeting_live_draft",false), "toggle_meeting_live_draft"))+
+        srow('Fast text (OpenAI GPT transcribe)', 'With the OpenAI meeting model, the live transcript shows each sentence about a second after it is said, in grey, until the accurate text replaces it. The speech is sent to OpenAI a second time: about $0.27 more per hour of speech. From the next meeting.',
+          swb(!!cfg("meeting_fast_text",true), "toggle_meeting_fast_text"))+
+        srow('Claude link', 'Claude on this PC can read the meeting being recorded when you ask it to. Reading only. The text then goes to your own Claude account.'+
+            (cfg("claude_link",false) ? '<br><span class="i18n">'+claudePlaces()+'</span>' : ''),
+          swb(!!cfg("claude_link",false), "toggle_claude_link"))+
+        (cfg("claude_link",false)
+          ? srow('Claude can start and stop a recording', 'Only when you ask Claude to. Stopping always saves the recording.',
+              swb(!!cfg("claude_link_control",false), "toggle_claude_link_control"))
+          : srow('Claude can start and stop a recording', 'Turn on Claude link first.',
+              swb(false, "toggle_claude_link_control", true), 'disabledrow'))+
         (cfg("summary_model","off")==="off"
           ? srow('Summarize when a meeting ends', 'Choose a summary model on the Models page first.',
               swb(false, "toggle_meeting_auto_summary", true), 'disabledrow')
@@ -1542,7 +1568,20 @@ APP_JS = r"""
           '<button class="btn primary" data-save-selfname="1">Save</button>')+
         srow('Speaker detection', spkStatus, spkCtl)+
         (spk.installed ? srow('Live speaker labels', 'Label who speaks in the live transcript, with the text (CPU, about half a core). Teams caption names win.',
-          swb(cfg("meeting_live_speakers",true)!==false, "toggle_meeting_live_speakers")) : '')
+          swb(cfg("meeting_live_speakers",true)!==false, "toggle_meeting_live_speakers")) : '')+
+        (spk.installed ? srow('Remember voices', 'A voice you or the Teams captions named is named again in later meetings. Voiceprints stay on this PC.',
+          swb(vb.enabled!==false, "toggle_voice_bank")) : '')+
+        (spk.installed && vbVoices.length ?
+          more('voices', 'Saved voices', 'Forget a wrong one, and Lia stops naming it.',
+            '<span class="cur">'+vbVoices.length+' voice'+(vbVoices.length===1?'':'s')+'</span>',
+            vbVoices.map(function(v){
+              return '<div class="row" style="display:flex;align-items:center;gap:10px;padding:6px 0">'+
+                '<span dir="auto" style="flex:1">'+esc(v.name)+(v.self?' <span class="hint" style="margin:0">(you)</span>':'')+'</span>'+
+                '<span class="hint" style="margin:0"><span>'+esc(String(v.meetings))+' meeting'+(v.meetings===1?'':'s')+'</span>'+(v.updated?' · '+esc(v.updated):'')+'</span>'+
+                '<button class="btn" data-call="voice_bank_forget" data-args=\''+esc(JSON.stringify([v.id]))+'\'>Forget</button>'+
+              '</div>';
+            }).join('')+
+            '<div class="row" style="padding:6px 0"><button class="btn" data-call="voice_bank_forget_all" data-args="[]">Forget all voices</button></div>') : '')
       )+
       // Tools stay on this page as a compact grid (Naor 2026-10-05).
       '<div class="grp-h">Tools</div><div class="grp agrid">'+
@@ -1641,7 +1680,9 @@ APP_JS = r"""
           T('e.g. <b><bdi>&#1489;&#1497;&#1496;&#1493;&#1500;&#1497;&#1503;</bdi></b> &#8594; <b><bdi>&#1489;&#1497;&#1496;&#1493;&#1500;&#1497;&#1501;</bdi></b>, the fast-speech plural Whisper mishears. Only this one is fixed automatically.'),
           swb(!!lx.enabled, "toggle_lexicon_fix"))+
         srow('Suggest other unknown Hebrew words', 'They are listed below; nothing changes until you add one.',
-          swb(lx.suggest!==false, "toggle_lexicon_suggest"));
+          swb(lx.suggest!==false, "toggle_lexicon_suggest"))+
+        srow('English terms by sound (Zipformer)', T('The Hebrew-only model writes English words in Hebrew letters. A spelling that sounds like one of your approved terms becomes the term: <b><bdi>&#1505;&#1511;&#1497;&#1493;&#1512;&#1497;&#1496;&#1497;</bdi></b> &#8594; <b>Security</b>. Also in the live draft and the live dictation text.'),
+          swb(lx.sound!==false, "toggle_vocab_sound_match"));
     }
     rows += more('v_oov', 'Suggested unknown words',
       'Not in the dictionary, plus fixes a meeting summary proposed (pre-filled). Add = joins the corrections.',
@@ -1935,6 +1976,7 @@ APP_JS = r"""
     {t:"System audio", k:"system audio loopback שמע מערכת", p:"audio", f:"System audio device"},
     {t:"Beep / sounds", k:"beep sound chime צליל ביפ", p:"audio", f:"Done beep"},
     {t:"Dictation model", k:"dictation model engine הכתבה מודל מנוע", p:"models", f:"Dictation model"},
+    {t:"Live text while speaking", k:"live text streaming zipformer realtime טקסט חי זורם בזמן אמת הכתבה", p:"models", f:"Zipformer: live text while speaking"},
     {t:"Meeting model", k:"meeting model engine פגישות מודל", p:"models", f:"Meeting transcription model"},
     {t:"Summary model", k:"summary model סיכום מודל", p:"models", f:"Meeting summary model"},
     {t:"Restore clipboard after paste", k:"clipboard restore paste שחזור לוח הדבקה", p:"general", f:"Restore clipboard"},
@@ -1960,6 +2002,7 @@ APP_JS = r"""
     {t:"Corrections", k:"corrections fix replace תיקונים", p:"vocab", f:"Corrections"},
     {t:"Vocabulary suggestions", k:"suggestions learn terms הצעות מונחים", p:"vocab", f:"Suggestions"},
     {t:"Learned terms", k:"learned terms hints נלמדו מונחים", p:"vocab", f:"Learned terms"},
+    {t:"English terms by sound", k:"english terms sound transliteration zipformer תעתיק אנגלית מונחים", p:"vocab", f:"English terms by sound (Zipformer)"},
     {t:"Hebrew spelling guard", k:"hebrew spelling lexicon hspell plural איות עברית רבים", p:"vocab", f:"Hebrew dictionary"},
     {t:"Snippets", k:"snippets expansion abbreviation קיצורים הרחבה", p:"snippets", f:""},
     {t:"Groq key", k:"groq key api מפתח", p:"keys", f:"Groq"},
@@ -1972,6 +2015,9 @@ APP_JS = r"""
     {t:"Backup mic / auto-switch mic", k:"backup mic fallback switch מיקרופון גיבוי", p:"meetings", f:"Backup mic"},
     {t:"Your name (speaker)", k:"name speaker self שם דובר", p:"meetings", f:"Your name"},
     {t:"Live speaker labels", k:"live speaker labels realtime דוברים בזמן אמת", p:"meetings", f:"Live speaker labels"},
+    {t:"Live draft (Hebrew)", k:"live draft realtime streaming zipformer טיוטה חיה בזמן אמת", p:"meetings", f:"Live draft (Hebrew)"},
+    {t:"Claude link", k:"claude link mcp transcript קישור קלוד", p:"meetings", f:"Claude link"},
+    {t:"Remember voices (voice bank)", k:"voice bank remember voices voiceprint forget saved voices קולות שמורים זכור קולות", p:"meetings", f:"Remember voices"},
     {t:"Speaker detection (who spoke when)", k:"speaker detection diarization nemotron speakers install זיהוי דוברים", p:"meetings", f:"Speaker detection"},
     {t:"Voice ask answer output", k:"voice ask answer paste card שאלה קולית תשובה", p:"meetings", f:"Voice ask answer"},
     {t:"Meeting tools (action items, rename, transcribe)", k:"tools action items rename speakers folder כלים משימות", p:"meetings", f:"Action items"},

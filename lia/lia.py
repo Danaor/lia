@@ -290,6 +290,12 @@ try:
 except Exception:
     lexicon_mod = None
 
+# Hebrew transliteration -> the user's English term, by sound (translit.py).
+try:
+    import translit as translit_mod
+except Exception:
+    translit_mod = None
+
 LOG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Lia")
 # One-time rebrand migrations (WhisperType -> Recap -> Lia): if the app was
 # previously installed under an older name, move the whole data folder to
@@ -380,7 +386,7 @@ if sys.platform == "win32":
     ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
 
 # --- Configuration ---
-APP_VERSION = "1.6.19"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
+APP_VERSION = "1.6.21"  # shown in Settings > Advanced; keep in sync with build.py / installer.iss / the exe stamps
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Lia")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 
@@ -790,6 +796,11 @@ DEFAULT_CONFIG = {
     # curated seed + what the summary model spots while it summarises anyway
     # (===CORRECTIONS=== tail). False disables all applications.
     "vocab_corrections": True,
+    # The Hebrew-only model (Zipformer) writes English words in Hebrew letters.
+    # True = a Hebrew spelling that SOUNDS like an approved vocabulary term is
+    # replaced by the term ("סקיוריטי" -> Security). Works only while the
+    # Hebrew dictionary is installed (Settings > Vocabulary).
+    "vocab_sound_match": True,
     # Hebrew lexicon post-pass (S44, 2026-09-05): auto-fix the -ין/-ים plural
     # confusion Whisper makes on fast Hebrew ("ביטולין" -> "ביטולים"). Needs the
     # hspell-derived word list (AGPL) downloaded on first enable (Settings >
@@ -1002,6 +1013,12 @@ DEFAULT_CONFIG = {
     # its text. Needs speaker detection installed; Teams caption names win.
     "meeting_live_speakers": True,
     "meeting_live_speakers_step_frames": 38,
+    # Voice bank (2026-11-09, Naor): a live label named in one meeting (typed
+    # in the live window, a Teams caption vote, the user's own voice) leaves a
+    # local voiceprint in %APPDATA%\Lia\voice_bank.json; later meetings name a
+    # matching label automatically. See voice_bank.py and
+    # plans/VOICE_BANK_PLAN_2026-11-09.md. Settings > Meetings > Speakers.
+    "voice_bank_enabled": True,
     # Speaker detection downloads itself in the background the first time it
     # is needed (Naor 2026-11-06: no Install click). Remove turns this off.
     "speakers_auto_install": True,
@@ -1030,6 +1047,40 @@ DEFAULT_CONFIG = {
     # automatic start/stop prompts, no meeting notices or balloons, and the
     # summary does not open by itself; the tray runs the meeting.
     "meeting_windows_hidden": False,
+    # Claude link (2026-11-11, Naor: he pasted the live transcript into Claude
+    # 10-15 times a meeting). True = Claude on this PC can READ the meeting
+    # being recorded when the user asks it to (ears.py: 127.0.0.1 only, a
+    # token, GET only). On by default since 2026-11-16 (Naor, as in Lia Lite):
+    # Lia adds its bridge to the Claude apps on this PC by itself. Nothing is
+    # sent anywhere until the user asks their own Claude about the meeting.
+    "claude_link": True,
+    # Live draft (2026-11-14, Naor): in a Hebrew meeting the live window shows
+    # the words about 2 s after they are said, from the streaming Zipformer on
+    # the CPU, in grey, until the meeting model's text replaces them. The draft
+    # is never saved, summarized or served. Off by default (a 72 MB download
+    # the first time, and a text that changes).
+    "meeting_live_draft": False,
+    # Fast text (2026-11-16, Naor: "Lia Lite transcribes faster, not every 10
+    # seconds"): a meeting transcribed by OpenAI's gpt-transcribe also sends
+    # the speech over one open connection, sentence by sentence, and the live
+    # window shows each sentence about a second after it ends, in grey, until
+    # the window's own accurate text replaces it (live_stream_openai.py). The
+    # speech is sent a second time: about $0.27 more per hour of speech. The
+    # draft is never saved, summarized or served.
+    "meeting_fast_text": True,
+    # Live dictation text (2026-11-14, Naor): while dictating in Hebrew, a
+    # small card shows the words as they are said (the streaming Zipformer on
+    # the CPU). The pasted text still comes from the dictation model at the
+    # end. Off = the regular way: nothing until the recording stops.
+    "dictation_live_preview": False,
+    # True = in toggle mode the live words are typed into the window you are
+    # writing in (and corrected in place); False = shown on a small card.
+    # Hold mode always uses the card.
+    "dictation_live_inline": True,
+    # Claude may also START and STOP a recording (Naor, 2026-11-11). Its own
+    # switch, off by default, and it needs claude_link. Nothing else can be
+    # changed from Claude: no discard, no settings; Stop always saves.
+    "claude_link_control": False,
     # Summarize when a meeting ends (2026-10-28, Naor). Decides every end
     # that does not choose itself (the Stop pill, the call-ended card, the
     # silence stop); "End & summarize" / "End" still choose explicitly.
@@ -1230,6 +1281,59 @@ def mix_audio(audio1, audio2):
 # Both Groq and OpenAI's /audio/transcriptions enforce a 25 MB request
 # body cap. We round down a hair to leave room for multipart overhead.
 CLOUD_FILE_SIZE_LIMIT_BYTES = 24 * 1024 * 1024  # 24 MB
+
+
+class _CloudFileSplit:
+    """Piece sizes for a file over the cloud upload cap (see
+    transcribe_big_file_in_pieces): about 4 minutes, cut at a pause."""
+    CHUNK_TARGET_S = 210.0
+    CHUNK_MAX_S = 270.0
+    CHUNK_OVERLAP_S = 1.0
+
+
+def transcribe_big_file_in_pieces(transcriber, file_path, language=None,
+                                  task="transcribe", name="Cloud", workers=1):
+    """A file over the 25 MB upload cap of Groq / OpenAI (2026-11-10: a 60 MB
+    phone recording was refused with "compress the file"). Decode it, cut it
+    at pauses into pieces of about 4 minutes and send each piece through the
+    transcriber's own transcribe(); the text comes back in order, one
+    paragraph per piece. A piece that fails is tried once more; a second
+    failure fails the file (never a transcript with a silent hole)."""
+    try:
+        from faster_whisper.audio import decode_audio
+        audio = np.asarray(decode_audio(file_path, sampling_rate=16000),
+                           dtype=np.float32)
+    except Exception as e:
+        raise RuntimeError("Could not read the audio file: %s" % e)
+    if len(audio) == 0:
+        return ""
+    pieces = RemoteTranscriber._split_at_silence.__func__(_CloudFileSplit, audio)
+    log.info("%s file: %.1f min, over the upload cap - %d piece(s)",
+             name, len(audio) / 16000.0 / 60.0, len(pieces))
+
+    def _one(i):
+        pc = pieces[i]
+        for attempt in (1, 2):
+            try:
+                t = transcriber.transcribe(pc, language=language, task=task) or ""
+                log.info("%s file: piece %d/%d (%.0f s) -> %d chars", name,
+                         i + 1, len(pieces), len(pc) / 16000.0, len(t))
+                return t.strip()
+            except Exception as e:
+                if attempt == 2:
+                    raise RuntimeError("%s failed on part %d of %d: %s"
+                                       % (name, i + 1, len(pieces), e))
+                log.warning("%s file: piece %d/%d failed (%s) - once more",
+                            name, i + 1, len(pieces), e)
+                time.sleep(2.0)
+
+    if workers > 1 and len(pieces) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=int(workers)) as ex:
+            texts = list(ex.map(_one, range(len(pieces))))
+    else:
+        texts = [_one(i) for i in range(len(pieces))]
+    return (chr(10) * 2).join(t for t in texts if t)
 
 
 # Mapping from file extension to MIME for cloud audio uploads.
@@ -1490,7 +1594,103 @@ def soften_chunk_boundary(prev_text, next_text, cut="drain", pause_s=0.0,
     return prev, "break"
 
 
-def flow_chunk_paragraphs(chunks, para_seconds=60.0, enabled=True, live=False):
+def _channel_seconds(mic_rms, loop_rms, a, b, floor=0.01, ratio=2.0):
+    """(mic-only seconds, system-only seconds) in meeting seconds [a, b], from
+    the per-second channel energies (mic = the user, system = the call)."""
+    m = s_ = 0
+    for i in range(max(0, int(a)), min(len(mic_rms), len(loop_rms), int(-(-b // 1)))):
+        mr, lr = mic_rms[i], loop_rms[i]
+        if max(mr, lr) < floor:
+            continue
+        if mr > ratio * lr:
+            m += 1
+        elif lr > ratio * mr:
+            s_ += 1
+    return m, s_
+
+
+def caption_self_name(caption_turns, mic_rms, loop_rms, min_s=5):
+    """The user's own name in the Teams captions: the caption speaker whose
+    captioned time is mostly mic-only (>= 60%). "" when none is clear."""
+    acc = {}
+    for t in caption_turns or []:
+        m, s_ = _channel_seconds(mic_rms, loop_rms, t["t0"], t["t1"])
+        a = acc.setdefault(t.get("speaker") or "", [0, 0])
+        a[0] += m
+        a[1] += s_
+    best, share = "", 0.0
+    for name, (m, s_) in acc.items():
+        if name and m >= min_s and m / max(1, m + s_) >= 0.6 and m / max(1, m + s_) > share:
+            best, share = name, m / max(1, m + s_)
+    return best
+
+
+def channel_checked_speakers(chunks, mic_rms, loop_rms, self_names, caption_turns=(),
+                             self_caption="", mic_is_user=True):
+    """The last word on "who spoke" in an online meeting (2026-11-08): the user
+    is on the mic, the other side comes through the computer sound. Teams
+    caption timing is loose (a line keeps changing for seconds after its
+    speaker stopped, so the user's turn ran into the next speaker's: 6
+    paragraphs of the other side carried the user's name in a real meeting),
+    so a named piece is checked against the two channels:
+      - the computer sound spoke (>= 2 s, mic at most a quarter of that): not the user ->
+        the other name of an "A / B" pair, else the non-user caption speaker
+        around it, else the neighbouring non-user paragraph's name, else no name;
+      - the mic spoke (>= 2 s, system at most a quarter of that): the user -
+        only when mic_is_user (a call). In a room everyone is on the mic.
+    Chunks need "timestamp_rel" + "dur" (meeting seconds). Pure."""
+    if not mic_rms or not loop_rms:
+        return chunks
+    selfs = {n.strip().lower() for n in self_names if n and n.strip()}
+    if self_caption:
+        selfs.add(self_caption.lower())
+    if not selfs:
+        return chunks
+    me = self_caption or next((n for n in self_names if n and n.strip()), "")
+
+    def is_self(name):
+        return (name or "").strip().lower() in selfs
+
+    def others_near(a, b):
+        talk = {}
+        for t in caption_turns or ():
+            ov = min(b + 10, t["t1"]) - max(a - 10, t["t0"])
+            if ov > 0 and t.get("speaker") and not is_self(t["speaker"]):
+                talk[t["speaker"]] = talk.get(t["speaker"], 0.0) + ov
+        return max(talk, key=talk.get) if talk else ""
+
+    order = sorted(range(len(chunks)), key=lambda i: chunks[i].get("index", i))
+    out = list(chunks)
+    for pos, i in enumerate(order):
+        c = chunks[i]
+        name = c.get("speaker")
+        a = float(c.get("timestamp_rel", 0) or 0)
+        b = a + float(c.get("dur") or 0)
+        if not name or b <= a:
+            continue
+        m, s_ = _channel_seconds(mic_rms, loop_rms, a, b)
+        pair = [p.strip() for p in name.split(" / ")] if " / " in name else [name]
+        new = name
+        if s_ >= 2 and m * 4 <= s_ and any(is_self(p) for p in pair):
+            rest = [p for p in pair if not is_self(p)]
+            new = rest[0] if rest else others_near(a, b)
+            if not new:
+                for j in (order[pos - 1] if pos else None,
+                          order[pos + 1] if pos + 1 < len(order) else None):
+                    nb = chunks[j].get("speaker") if j is not None else ""
+                    if nb and " / " not in nb and not is_self(nb):
+                        new = nb
+                        break
+            new = new or None
+        elif mic_is_user and m >= 2 and s_ * 4 <= m and not is_self(name) and me:
+            new = next((p for p in pair if is_self(p)), me)
+        if new != name:
+            out[i] = dict(c, speaker=new, speaker_was=name)
+    return out
+
+
+def flow_chunk_paragraphs(chunks, para_seconds=60.0, enabled=True, live=False,
+                          voices=None):
     """Turn the meeting's chunk records into transcript paragraphs.
     Returns a list of items: ("text", ts_rel, text) | ("failed", ts_rel) |
     ("pending", ts_rel). Consecutive 'ok' chunks are joined via
@@ -1508,8 +1708,11 @@ def flow_chunk_paragraphs(chunks, para_seconds=60.0, enabled=True, live=False):
     marker. Pure (works on plain dicts) so it is testable without a session.
     A chunk may carry "speaker" (a name from the Teams captions, or None): a
     change of speaker starts a new paragraph, and a named paragraph reads
-    "<name>: <text>". Chunks without the key are laid out exactly as before."""
-    items, cur = [], {"ts": None, "parts": [], "spk": None}
+    "<name>: <text>". Chunks without the key are laid out exactly as before.
+    voices: a list that receives, per item, (timestamp, "voice", speaker) -
+    the live label a text paragraph belongs to (None for markers); the live
+    transcript window uses it to put a nameable tag on each paragraph."""
+    items, cur = [], {"ts": None, "parts": [], "spk": None, "voice": None}
 
     def close():
         if cur["parts"]:
@@ -1517,7 +1720,9 @@ def flow_chunk_paragraphs(chunks, para_seconds=60.0, enabled=True, live=False):
             if cur["spk"]:
                 text = "%s: %s" % (cur["spk"], text)
             items.append(("text", cur["ts"], text))
-        cur["ts"], cur["parts"], cur["spk"] = None, [], None
+            if voices is not None:
+                voices.append((cur["ts"], cur["voice"], cur["spk"]))
+        cur["ts"], cur["parts"], cur["spk"], cur["voice"] = None, [], None, None
 
     prev = None
     for c in sorted(chunks, key=lambda c: c["index"]):
@@ -1535,6 +1740,8 @@ def flow_chunk_paragraphs(chunks, para_seconds=60.0, enabled=True, live=False):
         if st in ("failed", "pending"):
             close(); prev = None
             items.append((st, ts))
+            if voices is not None:
+                voices.append((ts, None, None))
             continue
         clean = (c.get("text") or "").replace('‏', '').replace('‎', '').strip()
         clean = collapse_repetition_hallucinations(clean)
@@ -1544,6 +1751,7 @@ def flow_chunk_paragraphs(chunks, para_seconds=60.0, enabled=True, live=False):
             close()
             cur["ts"], cur["parts"] = ts, [clean]
             cur["spk"] = c.get("speaker") or None
+            cur["voice"] = c.get("voice")
         else:
             adj, _kind = soften_chunk_boundary(
                 cur["parts"][-1], clean, prev.get("cut", "drain"),
@@ -1553,6 +1761,7 @@ def flow_chunk_paragraphs(chunks, para_seconds=60.0, enabled=True, live=False):
                 close()
                 cur["ts"], cur["parts"] = ts, [clean]
                 cur["spk"] = c.get("speaker") or None
+                cur["voice"] = c.get("voice")
             else:
                 cur["parts"].append(clean)
         prev = c
@@ -2647,6 +2856,8 @@ MODELS = {
     # Hebrew-optimized (ivrit.ai) - recommended
     "ivrit-ai/whisper-large-v3-turbo-ct2": "Whisper Hebrew",
     "ivrit-ai/whisper-large-v3-ct2": "Hebrew Large (best Hebrew)",
+    # Hebrew on a plain CPU (66 M-parameter streaming Zipformer2, 72 MB int8)
+    "zipformer2-66m-he": "Zipformer Hebrew (fast on CPU)",
     # English-optimized
     "parakeet-tdt-0.6b-v3": "Parakeet Multi-Language (25 languages)",
     "distil-large-v3": "English Distil (fast + accurate)",
@@ -2660,12 +2871,13 @@ MODELS = {
 # GPU-less machine, but must NOT skip these - a user who picks Parakeet on a
 # laptop wants exactly that (2026-09-05: it was skipped, tray green, Settings
 # stuck on "Loading model", no dictation).
-CPU_FRIENDLY_MODELS = {"parakeet-tdt-0.6b-v3"}
+CPU_FRIENDLY_MODELS = {"parakeet-tdt-0.6b-v3", "zipformer2-66m-he"}
 
 # Auto-detect language from model
 MODEL_LANGUAGE = {
     "ivrit-ai/whisper-large-v3-turbo-ct2": "he",
     "ivrit-ai/whisper-large-v3-ct2": "he",
+    "zipformer2-66m-he": "he",
     "parakeet-tdt-0.6b-v3": "auto",   # v3: multilingual (25 European languages)
     "distil-large-v3": "en",
     "large-v3-turbo": "auto",
@@ -2681,6 +2893,8 @@ _LOCAL_HW_NOTES = {
     "ivrit-ai/whisper-large-v3-turbo-ct2":
         "GPU (4 GB+) recommended · slower on CPU",
     "parakeet-tdt-0.6b-v3": "fast on a plain CPU · no GPU needed",
+    "zipformer2-66m-he": "fast on a plain CPU · no GPU needed · Hebrew only",
+    "local_zipformer_hebrew": "fast on a plain CPU · no GPU needed · Hebrew only",
     "distil-large-v3": "works on CPU · GPU faster",
     "large-v3-turbo": "GPU (4 GB+) recommended · slower on CPU",
     # Meeting keys. Chunked mode transcribes DURING the meeting (45s
@@ -2709,6 +2923,8 @@ _LOCAL_HW_NOTES = {
 # folder - onnx-asr's own download has no revision parameter.
 MODEL_REVISIONS = {
     "istupakov/parakeet-tdt-0.6b-v3-onnx": "8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce",
+    # ivrit-ai/zipformer2-66m-streaming-he (zipformer_he.REPO), keyed by model id
+    "zipformer2-66m-he": "ee769a2a13b887f91572eec349458bfb0fe79e7a",
     "ivrit-ai/whisper-large-v3-turbo-ct2": "72ad623a37947395efcc3933132353790e5a12f5",
     "ivrit-ai/whisper-large-v3-ct2": "e9ed4a4a98d761b0f617d668303de2c514236c66",
     "distil-large-v3": "c3058b475261292e64a0412df1d2681c06260fab",
@@ -2757,6 +2973,11 @@ def _has_cuda_gpu():
 
 
 PARAKEET_MODEL = "parakeet-tdt-0.6b-v3"
+# Hebrew on a plain CPU (see zipformer_he.py). Measured 2026-11-11: Kan 11.8%
+# WER vs ivrit turbo 8.5%, at about 50x real time on a desktop CPU, where ivrit
+# turbo on the CPU is slower than real time (1.18 s per second of audio).
+ZIPFORMER_MODEL = "zipformer2-66m-he"
+ZIPFORMER_MEETING_KEY = "local_zipformer_hebrew"
 
 
 def _default_dictation_model(cfg):
@@ -2780,6 +3001,10 @@ def _default_dictation_model(cfg):
             cfg["_no_gpu_multilingual_notice"] = True
         return "large-v3-turbo"
     if not _has_cuda_gpu():
+        if cfg.get("primary_language", "he") == "he":
+            # Hebrew without a GPU: the Hebrew CPU model (Parakeet has no Hebrew).
+            cfg["_no_gpu_zipformer_notice"] = True
+            return ZIPFORMER_MODEL
         cfg["_no_gpu_parakeet_notice"] = True
         return PARAKEET_MODEL
     return cfg.get("model_size", DEFAULT_CONFIG["model_size"])
@@ -3194,6 +3419,12 @@ def load_config():
         if cfg.get("_no_gpu_parakeet_notice"):
             log.info("First run without a compatible GPU: dictation model -> "
                      "Parakeet Multi-Language (CPU)")
+        if cfg.get("_no_gpu_zipformer_notice"):
+            log.info("First run without a compatible GPU: dictation + meeting "
+                     "model -> Zipformer Hebrew (CPU)")
+            if ("meeting_model" not in seed
+                    and cfg.get("meeting_model") == "local_hebrew_turbo"):
+                cfg["meeting_model"] = ZIPFORMER_MEETING_KEY
     # A seed config may carry pre-protected secrets; decrypt like a real load.
     return _unprotect_config_secrets(_normalize_language_config(cfg))
 
@@ -4550,16 +4781,28 @@ WAVEFORM_NUM_BARS = 28
 #     "DONE\n"                     WAV written, ready for next recording
 #     "<f1> <f2> ... <fN>\n"       per-bar RMS levels (~20Hz, N = NB)
 _MIC_SUBPROCESS_SCRIPT = (
-    "import sys, wave, threading, time, math, struct, pyaudio\n"
+    "import os, sys, wave, threading, time, math, struct, pyaudio\n"
     f"NB = {WAVEFORM_NUM_BARS}\n"
     "def handle_one(pa, dev_arg, out_path):\n"
     "    frames = []; lock = threading.Lock(); running = [True]\n"
+    # Live dictation text: when the parent made <wav>.pcm, the samples are
+    # also appended there as they come (the parent reads the growing file).
+    "    live = None; sent = [0]\n"
+    "    try:\n"
+    "        if os.path.exists(out_path + '.pcm'): live = open(out_path + '.pcm', 'ab')\n"
+    "    except Exception: live = None\n"
     "    def cb(data, fc, ti, st):\n"
     "        with lock: frames.append(data)\n"
     "        return (None, pyaudio.paContinue)\n"
     "    def streamer():\n"
     "        while running[0]:\n"
     "            time.sleep(0.025)\n"
+    "            if live is not None:\n"
+    "                with lock:\n"
+    "                    new = frames[sent[0]:]; sent[0] = len(frames)\n"
+    "                if new:\n"
+    "                    try: live.write(b''.join(new)); live.flush()\n"
+    "                    except Exception: pass\n"
     "            with lock:\n"
     "                if not frames: continue\n"
     "                recent = b''.join(frames[-1:])\n"
@@ -4601,6 +4844,9 @@ _MIC_SUBPROCESS_SCRIPT = (
     "            if s == 'QUIT':\n"
     "                got_quit = True; break\n"
     "        running[0] = False\n"
+    "        try:\n"
+    "            if live is not None: live.close()\n"
+    "        except Exception: pass\n"
     "        try: stream.stop_stream()\n"
     "        except Exception: pass\n"
     "        try: stream.close()\n"
@@ -4803,6 +5049,10 @@ class SubprocessAudioRecorder:
         self.input_device_index = input_device_index
         self.is_recording = False
         self.audio_data = []   # compat stub — always empty for subprocess
+        # Live dictation text: True = the worker also appends the samples to
+        # <wav>.pcm as they come; live_pcm_path names that file while recording.
+        self.live_pcm = False
+        self.live_pcm_path = None
         self.latest_levels = [0.0] * WAVEFORM_NUM_BARS
 
         # Active worker — bound at start() from the warm pool. Between
@@ -4982,6 +5232,13 @@ class SubprocessAudioRecorder:
 
         fd, self._wav_path = tempfile.mkstemp(suffix=".wav", prefix="wt_mic_")
         os.close(fd)
+        self.live_pcm_path = None
+        if self.live_pcm:
+            try:
+                open(self._wav_path + ".pcm", "wb").close()
+                self.live_pcm_path = self._wav_path + ".pcm"
+            except OSError:
+                pass
 
         dev = self.input_device_index if self.input_device_index is not None else -1
         cmd = f"START {dev} {self._wav_path}\n".encode("utf-8")
@@ -5192,6 +5449,15 @@ class LoopbackRecorder:
         # See AudioRecorder._data_lock — same race protection between
         # callback appends and drain swaps during continuous recording.
         self._data_lock = threading.Lock()
+        # Meeting clock (2026-11-08): (arrival time, frames) per callback
+        # buffer + the start of the current drain window, so drain() can put
+        # the audio where it was played. A WASAPI loopback delivers NOTHING
+        # while nothing plays (not zeros): without this a stream that starts
+        # mid-window was padded at the END and its audio moved to the window
+        # start (measured: 0.75 s placed ~9 s early on a real meeting).
+        self._stamps = []
+        self._win_t0 = None
+        self.clock_fill = True
 
     @staticmethod
     def is_available():
@@ -5311,6 +5577,9 @@ class LoopbackRecorder:
             frames_per_buffer=1024,
             stream_callback=self._callback,
         )
+        with self._data_lock:
+            self._stamps = []
+            self._win_t0 = time.monotonic()
         self._stream.start_stream()
 
     def _callback(self, in_data, frame_count, time_info, status):
@@ -5318,7 +5587,51 @@ class LoopbackRecorder:
         if self.is_recording:
             with self._data_lock:
                 self.audio_data.append(in_data)
+                self._stamps.append((time.monotonic(), int(frame_count)))
         return (None, pyaudio.paContinue)
+
+    # A stretch with no buffers longer than this is silence the device did not
+    # deliver; shorter ones are callback jitter.
+    CLOCK_GAP_S = 0.5
+
+    @classmethod
+    def place_on_clock(cls, audio, stamps, rate, t0, now, out_rate=16000):
+        """Put one drain's audio on the meeting clock: zeros for every stretch
+        > CLOCK_GAP_S before the first buffer and between buffers (silence the
+        loopback did not deliver). `stamps` = (arrival time, native frames)
+        per buffer, `t0` / `now` = the drain window on the same clock. The
+        zeros never make the window longer than it lasted (a stalled callback
+        that delivers in a burst adds nothing), and audio is never moved
+        earlier than it arrived. The caller pads the tail as before."""
+        if audio is None or not len(audio) or not stamps or not rate or t0 is None:
+            return audio
+        budget = (now - t0) - len(audio) / float(out_rate)
+        if budget <= cls.CLOCK_GAP_S:
+            return audio
+        inserts = []                    # (sample index in audio, zeros)
+        cursor = 0.0                    # seconds of output so far
+        done = 0                        # native frames consumed
+        for t_arr, nf in stamps:
+            d = nf / float(rate)
+            gap = (t_arr - t0 - d) - cursor
+            if gap > cls.CLOCK_GAP_S and budget > cls.CLOCK_GAP_S:
+                g = min(gap, budget)
+                inserts.append((int(round(done * out_rate / float(rate))),
+                                int(round(g * out_rate))))
+                budget -= g
+                cursor += g
+            cursor += d
+            done += nf
+        if not inserts:
+            return audio
+        parts, at = [], 0
+        for idx, nz in inserts:
+            idx = min(max(idx, at), len(audio))
+            parts.append(audio[at:idx])
+            parts.append(np.zeros(nz, dtype=audio.dtype))
+            at = idx
+        parts.append(audio[at:])
+        return np.concatenate(parts)
 
     def _convert_raw(self, raw):
         """Bytes → mono float32 @ 16kHz (target rate)."""
@@ -5340,9 +5653,20 @@ class LoopbackRecorder:
         with self._data_lock:
             frames = self.audio_data
             self.audio_data = []
+            stamps = getattr(self, "_stamps", [])
+            self._stamps = []
+            t0 = getattr(self, "_win_t0", None)
+            now = time.monotonic()
+            self._win_t0 = now
         if not frames:
             return np.array([], dtype=np.float32)
-        return self._convert_raw(b"".join(frames))
+        audio = self._convert_raw(b"".join(frames))
+        if getattr(self, "clock_fill", False):
+            try:
+                audio = self.place_on_clock(audio, stamps, self._native_rate, t0, now)
+            except Exception as e:
+                log.debug("Loopback clock placement skipped: %s", e)
+        return audio
 
     def stop(self) -> np.ndarray:
         self.is_recording = False
@@ -6878,6 +7202,104 @@ class ParakeetTranscriber(BaseTranscriber):
 
 
 # ============================================================
+# Zipformer Hebrew (CPU)
+# ============================================================
+class ZipformerTranscriber(BaseTranscriber):
+    """Hebrew on a plain CPU: ivrit-ai/zipformer2-66m-streaming-he through
+    zipformer_he.py (numpy + the onnxruntime Lia already ships). 72 MB,
+    about 50x real time on a desktop CPU. CC-BY-4.0 (credit in the README).
+
+    What call sites should know:
+    - HEBREW ONLY. English words come out weak (spelled out or in capitals);
+      a user who mixes English terms is better served by a cloud model.
+    - custom_vocabulary is accepted for contract parity but does nothing (no
+      prompt biasing). Term fixing = term_fix (set by the app: the corrections
+      table, then the vocabulary terms by sound) + AI cleanup.
+    - task="translate" is unsupported (raises)."""
+
+    FILE_CHUNK_S = 55.0
+    term_fix = None         # the app's LiaApp._zip_terms; None = text as decoded
+
+    def __init__(self, model_size=ZIPFORMER_MODEL, threads=None):
+        super().__init__(model_size=model_size, cpu_threads=0)
+        self.device = "cpu"
+        self.custom_vocabulary = ""
+        # Measured on the 265K: 4 threads = the model card's setting, 50x real time.
+        self.threads = int(threads) if threads else min(4, PARAKEET_INTRA_OP_THREADS)
+
+    def load_model(self, callback=None):
+        if self.model is not None:
+            return
+        self._loading = True
+        try:
+            if callback:
+                callback("Loading Zipformer Hebrew...")
+            import zipformer_he
+            t0 = time.time()
+            path = zipformer_he.download(
+                revision=MODEL_REVISIONS.get(ZIPFORMER_MODEL))
+            self.model = zipformer_he.ZipformerHe(path, threads=self.threads)
+            log.info("Zipformer Hebrew loaded in %.1fs (%d threads)",
+                     time.time() - t0, self.threads)
+            if callback:
+                callback("Zipformer Hebrew ready")
+        except Exception:
+            self.model = None
+            raise
+        finally:
+            self._loading = False
+
+    def _recognize(self, audio_np):
+        audio = np.asarray(audio_np, dtype=np.float32)
+        t0 = time.time()
+        text = self.model.decode(audio) or ""
+        dt = time.time() - t0
+        secs = len(audio) / 16000.0
+        log.info("zipformer: %.1fs audio in %.2fs (%.0fx realtime, %s threads)",
+                 secs, dt, (secs / dt) if dt > 0 else 0.0, self.threads)
+        text = strip_hallucinated_tail(text.strip())
+        text = collapse_repetition_hallucinations(text).strip()
+        fix = self.term_fix
+        if fix is not None and text:
+            try:
+                text = fix(text) or text
+            except Exception:
+                pass
+        return text
+
+    def transcribe(self, audio_np, language=None, beam_size=3, task="transcribe", bias_ok=True):
+        if task == "translate":
+            raise RuntimeError("Zipformer Hebrew cannot translate - use a Whisper model")
+        if self.model is None:
+            raise RuntimeError("Zipformer Hebrew model not loaded")
+        if len(audio_np) == 0:
+            return ""
+        return self._recognize(audio_np)
+
+    def transcribe_file(self, file_path, language=None, task="transcribe"):
+        if task == "translate":
+            raise RuntimeError("Zipformer Hebrew cannot translate - use a Whisper model")
+        if self.model is None:
+            raise RuntimeError("Zipformer Hebrew model not loaded")
+        from faster_whisper.audio import decode_audio
+        audio = decode_audio(file_path, sampling_rate=16000)
+        n_chunk = int(self.FILE_CHUNK_S * 16000)
+        if len(audio) <= n_chunk:
+            return self._recognize(audio)
+        # Same cut as Parakeet's file path: ~55 s windows, each ending at the
+        # quietest 250 ms of its last 5 s. One piece at a time (the decoder
+        # holds one lock, and a file runs at ~50x real time anyway).
+        pieces = ParakeetTranscriber._split_file_audio(audio, n_chunk)
+        t0 = time.time()
+        parts = [self._recognize(p) for p in pieces]
+        dt = time.time() - t0
+        secs = len(audio) / 16000.0
+        log.info("zipformer file: %.1f min in %d pieces, %.1fs (%.0fx realtime)",
+                 secs / 60, len(pieces), dt, (secs / dt) if dt > 0 else 0.0)
+        return " ".join(p for p in parts if p).strip()
+
+
+# ============================================================
 # OpenVINO Transcriber (Intel GPU/NPU acceleration)
 # ============================================================
 OPENVINO_MODELS = {
@@ -7337,12 +7759,10 @@ class GroqTranscriber(BaseTranscriber):
         except OSError:
             size = -1
         if size > CLOUD_FILE_SIZE_LIMIT_BYTES:
-            mb = size / (1024 * 1024)
-            raise RuntimeError(
-                f"File is {mb:.1f} MB — Groq's transcription API limits "
-                f"requests to 25 MB. Compress the file or switch to the "
-                f"Local backend (faster-whisper handles any size)."
-            )
+            # over the 25 MB upload cap: in pieces, cut at pauses
+            return transcribe_big_file_in_pieces(
+                self, file_path, language=language, task=task,
+                name="Groq", workers=1)
 
         mime = guess_audio_mime(file_path)
         log.info("Groq transcribe_file: %s mime=%s size=%dKB",
@@ -8560,12 +8980,10 @@ class OpenAITranscriber(BaseTranscriber):
         except OSError:
             size = -1
         if size > CLOUD_FILE_SIZE_LIMIT_BYTES:
-            mb = size / (1024 * 1024)
-            raise RuntimeError(
-                f"File is {mb:.1f} MB — OpenAI's transcription API limits "
-                f"requests to 25 MB. Compress the file or switch to the "
-                f"Local backend (faster-whisper handles any size)."
-            )
+            # over the 25 MB upload cap: in pieces, cut at pauses
+            return transcribe_big_file_in_pieces(
+                self, file_path, language=language, task=task,
+                name="OpenAI", workers=3)
 
         mime = guess_audio_mime(file_path)
         log.info("OpenAI transcribe_file: %s mime=%s size=%dKB model=%s",
@@ -12155,6 +12573,8 @@ def _summary_error_text(e, local=False):
                     if local else "could not reach the summary service")
     except Exception:
         pass
+    if isinstance(e, (GpuWaitTimeout, gpu_lease.LeaseTimeout)):
+        return str(e)[:200]
     return ("%s: %s" % (type(e).__name__, e))[:160]
 
 
@@ -12292,16 +12712,34 @@ def _ollama_ensure_on_gpu(model, num_ctx, root=None, post=None):
                 waited += _wait_until(
                     lambda: _ollama_split(model, root) is not True,
                     "the summary model (%s, loaded partly on the CPU by "
-                    "another app)" % model)
+                    "another app)" % model, max_wait_s=_GPU_WAIT_MAX_S)
                 continue
         free0 = _gpu_free_mb()
         if free0 is None:
             return waited, num_ctx
         need = _ollama_vram_need(model, num_ctx)
         if need:
+            def _resident_ok():
+                cur = (_ollama_ps(root) or {}).get(model)
+                return bool(cur and cur[1] >= cur[0]
+                            and (not cur[2] or cur[2] >= num_ctx))
+
+            def _retaken():
+                # The lease was free while this job waited: the other app may
+                # have run and left a model resident. The very model this job
+                # needs, whole = use it. Anything else is idle right after the
+                # retake (contract rule 4) and may be unloaded for the need.
+                if _resident_ok():
+                    return True
+                _lease_unload_idle(need, model, "summary")
+                return False
+
             t = time.monotonic()
-            _wait_for_gpu(need, "the local summary model (%s)" % model)
+            _wait_for_gpu(need, "the local summary model (%s)" % model,
+                          max_wait_s=_GPU_WAIT_MAX_S, on_retake=_retaken)
             waited += time.monotonic() - t
+            if _resident_ok():
+                continue               # loaded meanwhile: reuse it (top of the loop)
             free0 = _gpu_free_mb() or free0
         try:
             post(root + "/api/generate", json={
@@ -12359,6 +12797,18 @@ def _ollama_fast_root(root):
 # meeting chunks slowed from ~0.5 s to 10-17 s each, a 12.6 s dictation queued
 # behind them for 116 s, and pyannote silently diarized on CPU.
 _GPU_WAIT_POLL_S = 30.0          # re-check cadence while a job waits for VRAM
+# 2026-11-09: a local summary waited 13 hours for 19,869 MiB with 19,868 free -
+# nothing on the card was going to change, and the cross-app lease was held the
+# whole time. Since then: (1) a job that only waits does not keep the lease
+# (gpu_lease.Lease.step_aside), (2) a need is an estimate with a 400 MiB margin,
+# so a few MiB short is room, (3) a wait that does not move releases the rest
+# of Lia's own models, and (4) a summary's wait ends after _GPU_WAIT_MAX_S with
+# a reason on its card (the same bound as waiting for the lease itself).
+_GPU_WAIT_TOLERANCE_MB = 64      # free >= need - this = room (margin 400, paging floor 256)
+_GPU_WAIT_STALL_S = 120.0        # still short after this: release ALL of Lia's own models
+_GPU_WAIT_MAX_S = float(gpu_lease.DEFAULT_MAX_WAIT_S)   # 45 min, then GpuWaitTimeout
+_GPU_WAIT_LOG_EVERY_S = 600.0    # one "still waiting" line per 10 min in lia.log
+_PEER_JOB_WAIT_MAX_S = 20 * 60.0  # Lia's own model load waits this long for a peer's job
 _WHISPER_RETRY_FREE_MB = 1024    # headroom before a failed Whisper call retries
 _WHISPER_LOAD_NEED_MB = 2000     # measured: ivrit turbo int8_float16 = 1.33 GB
 _GPU_BUSY_EXTERNAL_SM = 50       # other processes' SM % = "busy" for dictation
@@ -12371,6 +12821,11 @@ class GpuBusyError(RuntimeError):
     """A GPU call failed because the card is busy or out of memory. Answered by
     the cloud (dictation) or by waiting for the GPU (long jobs) - never by a CPU
     rebuild of the model."""
+
+
+class GpuWaitTimeout(GpuBusyError):
+    """A job waited for room on the GPU longer than its bound (_GPU_WAIT_MAX_S).
+    The job fails with this text on its card; it is never moved to the CPU."""
 
 
 class _SummaryGpuDivert(BaseException):
@@ -12644,11 +13099,15 @@ def _gpu_own_idle_s(clock=time.monotonic):
         return clock() - _GPU_OWN["last"]
 
 
-def _gpu_shed_own(short_mb, what):
+def _gpu_shed_own(short_mb, what, force=False):
+    """force: release what Lia can even when that does not close the whole gap
+    (a wait that has not moved for _GPU_WAIT_STALL_S)."""
     hook = _GPU_SHED_HOOK[0]
     if hook is None or short_mb <= 0:
         return 0
     try:
+        if force:
+            return int(hook(short_mb, what, force=True) or 0)
         return int(hook(short_mb, what) or 0)
     except Exception as e:
         log.warning("GPU: releasing Lia's own models failed: %s", e)
@@ -12758,30 +13217,124 @@ def _ollama_gate_in_process(model, root, load_ctx, need_ctx, job, detail, on_wai
 ollama_gate.IN_PROCESS_GATE[0] = _ollama_gate_in_process
 
 
-def _wait_until(ready, what, *, poll_s=5.0, sleep=time.sleep, clock=time.monotonic):
+def _gpu_room(free, need_mb):
+    """Is `free` MiB room for a `need_mb` load? Unknown VRAM = yes (never block
+    blind); a few MiB short = yes (the need is an estimate with a margin, and
+    the 11-09 wait hung on 1 MiB)."""
+    return free is None or free >= need_mb - _GPU_WAIT_TOLERANCE_MB
+
+
+def _gpu_lease_step_aside(wait_s, should_cancel=None, cancel_exc=None, on_wait=None,
+                          max_wait_s=None):
+    """Free the cross-app lease for wait_s when THIS thread's job holds it and
+    only waits (gpu_lease.Lease.step_aside). True = it stepped aside and holds
+    the lease again; False = nothing to free (not held, the lease is off, or
+    it failed) and the caller sleeps instead. A Discard and LeaseTimeout pass."""
+    try:
+        fn = getattr(_gpu_lease(), "step_aside", None)
+    except Exception:
+        fn = None
+    if fn is None:
+        return False
+    try:
+        return bool(fn(wait_s, should_cancel=should_cancel, cancel_exc=cancel_exc,
+                       on_wait=on_wait, max_wait_s=max_wait_s))
+    except (GpuBusyError, gpu_lease.LeaseCancelled, gpu_lease.LeaseTimeout):
+        raise
+    except Exception as e:
+        if cancel_exc is not None and isinstance(e, cancel_exc):
+            raise
+        if should_cancel is not None:
+            should_cancel()        # a Discard that raises its own exception: again
+        log.warning("GPU lease: stepping aside failed (%s: %s)", type(e).__name__, e)
+        return False
+
+
+def _gpu_wait_step(step_s, should_cancel, cancel_exc, on_wait, left_s, what,
+                   sleep, clock):
+    """One poll interval of a GPU wait. A job that holds the cross-app lease
+    does not keep it while it only waits: the other app runs meanwhile (11-09:
+    13 hours held for 1 MiB). Otherwise sleep in 1 s steps so a Discard lands
+    within a second. left_s = what is left of the wait's bound (None = none).
+    Returns True when the lease was freed and taken back."""
+    cexc = cancel_exc or GpuBusyError
+    try:
+        if _gpu_lease_step_aside(step_s, should_cancel, cexc, on_wait, left_s):
+            return True
+    except gpu_lease.LeaseTimeout as e:
+        raise GpuWaitTimeout("%s - %s did not get the GPU" % (e, what)) from e
+    end = clock() + step_s
+    while clock() < end:
+        if should_cancel is not None and should_cancel():
+            raise cexc("cancelled while waiting for the GPU")
+        sleep(1.0)
+    return False
+
+
+def _wait_out_peer_gpu_job(what, *, max_s=None, poll_s=2.0, sleep=time.sleep,
+                           clock=time.monotonic):
+    """Do not load one of Lia's own models onto the card while another process
+    holds the lease for a summary-model job: wait until it releases (at most
+    max_s, then load anyway - dictation must not stay without its model for
+    good). 11-10 12:06: Lia started inside the other app's summary and loaded
+    its local Whisper; that summary's pass timed out. Returns the seconds
+    waited. Never raises."""
+    max_s = _PEER_JOB_WAIT_MAX_S if max_s is None else max_s
+    t0 = clock()
+    said = None
+    try:
+        while True:
+            h = _gpu_lease().other_holder()
+            if not h or h.get("job") not in _PEER_GEMMA_JOBS:
+                break
+            who = "%s holds the lease for its %s" % (
+                str(h.get("app") or "another app").capitalize(), h.get("job"))
+            if clock() - t0 >= max_s:
+                log.warning("GPU: %s for %s now - %s loads anyway", who,
+                            _fmt_wait(clock() - t0), what)
+                break
+            if said is None:
+                said = who
+                log.info("GPU: %s - %s loads after it releases", who, what)
+            sleep(poll_s)
+        if said is not None and clock() - t0 < max_s:
+            log.info("GPU: the lease is free after %s - loading %s",
+                     _fmt_wait(clock() - t0), what)
+    except Exception as e:
+        log.debug("GPU peer-job wait failed: %s", e)
+    return clock() - t0
+
+
+def _wait_until(ready, what, *, poll_s=5.0, max_wait_s=None, sleep=time.sleep,
+                clock=time.monotonic):
     """Block until ready() is true, with the job's card note ("GPU busy -
-    waiting for <what> m:ss") and Discard (gpu_wait_context). Returns seconds."""
+    waiting for <what> m:ss") and Discard (gpu_wait_context). The cross-app
+    lease is free meanwhile (_gpu_wait_step). Returns seconds; raises
+    GpuWaitTimeout after max_wait_s (None = no bound)."""
     on_wait, should_cancel, cancel_exc = _gpu_wait_var.get() or (None, None, None)
     t0 = clock()
     last = None
     while not ready():
+        waited = clock() - t0
+        if max_wait_s is not None and waited >= max_wait_s:
+            raise GpuWaitTimeout("the GPU did not free up in %d min (waiting for %s)"
+                                 % (round(waited / 60.0), what))
         if on_wait is not None:
-            txt = "GPU busy - waiting for %s %s" % (what, _fmt_wait(clock() - t0))
+            txt = "GPU busy - waiting for %s %s" % (what, _fmt_wait(waited))
             if txt != last:
                 last = txt
                 try:
                     on_wait(txt)
                 except Exception:
                     pass
-        end = clock() + poll_s
-        while clock() < end:
-            if should_cancel is not None and should_cancel():
-                raise (cancel_exc or GpuBusyError)("cancelled while waiting for the GPU")
-            sleep(1.0)
+        _gpu_wait_step(poll_s, should_cancel, cancel_exc, on_wait,
+                       None if max_wait_s is None else max(1.0, max_wait_s - waited),
+                       what, sleep, clock)
     return clock() - t0
 
 
 def _wait_for_gpu(need_mb, what, *, shed_own=True, min_wait_s=0.0, poll_s=None,
+                  max_wait_s=None, on_retake=None,
                   sleep=time.sleep, clock=time.monotonic):
     """Block until GPU 0 has `need_mb` MiB free (the GPU-busy policy: wait,
     never fall back to the CPU). It NEVER unloads an Ollama model: Ollama is
@@ -12791,7 +13344,14 @@ def _wait_for_gpu(need_mb, what, *, shed_own=True, min_wait_s=0.0, poll_s=None,
     OWN resident models if that alone closes the gap (_GPU_SHED_HOOK). The job
     in this context (gpu_wait_context) sees "GPU busy - waiting ..." on its card
     and can cancel with a Discard. Returns True when there is room (or free
-    VRAM is unknown: never block blind)."""
+    VRAM is unknown: never block blind).
+
+    Since 2026-11-10 (the 13-hour wait): room = need minus a small tolerance
+    (_gpu_room); the cross-app lease is NOT kept while waiting (_gpu_wait_step;
+    on_retake() runs each time it is taken back, True = stop waiting, the
+    caller re-checks); a wait still short after _GPU_WAIT_STALL_S with no other
+    app on the lease releases the rest of Lia's own models; and after
+    max_wait_s (None = no bound) it raises GpuWaitTimeout."""
     poll_s = _GPU_WAIT_POLL_S if poll_s is None else poll_s
     on_wait, should_cancel, cancel_exc = _gpu_wait_var.get() or (None, None, None)
 
@@ -12802,14 +13362,14 @@ def _wait_for_gpu(need_mb, what, *, shed_own=True, min_wait_s=0.0, poll_s=None,
     with gpu_own_work():
         t0 = clock()
         free = _gpu_free_mb()
-        if min_wait_s <= 0 and (free is None or free >= need_mb):
+        if min_wait_s <= 0 and _gpu_room(free, need_mb):
             return True
         shed_tried = False
         if shed_own and free is not None and free < need_mb:
             shed_tried = True
             if _gpu_shed_own(need_mb - free, what):
                 free = _gpu_free_mb()
-                if min_wait_s <= 0 and (free is None or free >= need_mb):
+                if min_wait_s <= 0 and _gpu_room(free, need_mb):
                     return True
                 shed_tried = True
             else:
@@ -12819,6 +13379,8 @@ def _wait_for_gpu(need_mb, what, *, shed_own=True, min_wait_s=0.0, poll_s=None,
                     "holds it).", what, need_mb,
                     "?" if free is None else "%d MiB" % free)
         last_note = None
+        forced = False
+        next_log = t0 + _GPU_WAIT_LOG_EVERY_S
         while True:
             waited = clock() - t0
             if on_wait is not None:
@@ -12832,21 +13394,62 @@ def _wait_for_gpu(need_mb, what, *, shed_own=True, min_wait_s=0.0, poll_s=None,
                         on_wait(note)
                     except Exception:
                         pass
-            # Sleep in 1 s steps so a Discard lands within a second.
-            end = clock() + max(1.0, min(poll_s, 5.0) if on_wait else poll_s)
-            while clock() < end:
-                _cancelled()
-                sleep(1.0)
+            step = max(1.0, min(poll_s, 5.0) if on_wait else poll_s)
+            stepped = _gpu_wait_step(
+                step, should_cancel, cancel_exc, on_wait,
+                None if max_wait_s is None else max(1.0, max_wait_s - waited),
+                what, sleep, clock)
             _cancelled()
+            if stepped and on_retake is not None:
+                # The lease was free meanwhile: another app may have run and
+                # left the card in a new state the caller must look at.
+                try:
+                    if on_retake():
+                        return True
+                except Exception as e:
+                    log.warning("GPU: the check after retaking the lease failed: %s", e)
             free = _gpu_free_mb()
             if (shed_own and not shed_tried and free is not None
                     and free < need_mb and _gpu_shed_own(need_mb - free, what)):
                 shed_tried = True          # the other tenant shrank: now it helps
                 free = _gpu_free_mb()
-            if (clock() - t0) >= min_wait_s and (free is None or free >= need_mb):
+            waited = clock() - t0
+            if waited >= min_wait_s and _gpu_room(free, need_mb):
                 log.info("GPU free again for %s after %s (%s MiB free)", what,
-                         _fmt_wait(clock() - t0), "?" if free is None else free)
+                         _fmt_wait(waited), "?" if free is None else free)
                 return True
+            if (shed_own and not forced and free is not None
+                    and waited >= _GPU_WAIT_STALL_S and _gpu_no_peer_holder()):
+                # The wait does not move and no other app is on the lease: the
+                # gap is Lia's own residents (or the desktop). Release all Lia
+                # can, even if that alone does not close it.
+                forced = True
+                if _gpu_shed_own(need_mb - free, what, force=True):
+                    free = _gpu_free_mb()
+                    if waited >= min_wait_s and _gpu_room(free, need_mb):
+                        log.info("GPU free for %s after releasing Lia's own models "
+                                 "(%s MiB free)", what, "?" if free is None else free)
+                        return True
+            if max_wait_s is not None and waited >= max_wait_s:
+                msg = ("the GPU did not free up in %d min: %s needs ~%.1f GB free, "
+                       "%s now" % (round(waited / 60.0), what, need_mb / 1024.0,
+                                   "?" if free is None else "%.1f GB" % (free / 1024.0)))
+                log.warning("GPU busy: giving up - %s (never the CPU). Task Manager / "
+                            "nvidia-smi shows who holds the memory.", msg)
+                raise GpuWaitTimeout(msg)
+            if clock() >= next_log:
+                next_log = clock() + _GPU_WAIT_LOG_EVERY_S
+                log.info("GPU busy: %s still waiting after %s (needs ~%d MiB free, "
+                         "%s now)", what, _fmt_wait(waited), need_mb,
+                         "?" if free is None else "%d MiB" % free)
+
+
+def _gpu_no_peer_holder():
+    """True when no OTHER process holds the cross-app lease right now."""
+    try:
+        return _gpu_lease().other_holder() is None
+    except Exception:
+        return True
 
 
 def _task_done_runaway(n_votes, n_tasks):
@@ -13245,6 +13848,12 @@ class MeetingSession:
         # drained 45s window after its quietest point is HELD BACK and prepended
         # to the next chunk, so the rotation never cuts a word mid-syllable.
         self._carry_tail = None
+        # Claude link: a read wakes the rotation loop to cut the open window
+        # now (flush_now); the loop reports back through _flush_done.
+        self._flush_event = threading.Event()
+        self._flush_done = threading.Event()
+        self._last_flush_mono = 0.0
+        self._last_rotation_mono = time.monotonic()
         # Speaker naming (2026-08-27): calendar attendee names of the meeting
         # overlapping NOW - candidates for the summary metadata, the transcript
         # header, and the rename-speakers dialog. Filled async after start().
@@ -13395,14 +14004,139 @@ class MeetingSession:
                 children.add(self._live_spk.proc)
             log.info("Live speakers: on (step %.2f s, %d threads)",
                      self._live_spk.step_s, threads)
+            if self._live_path:
+                self._names_path = self._live_path + ".names.json"
+                self._voices_path = self._live_path + ".voices.json"
+                threading.Thread(target=self._watch_live_names, daemon=True,
+                                 name="live-names").start()
+            self._start_voice_bank()
         except Exception as e:
             log.info("Live speakers unavailable: %s", e)
             self._live_spk = None
+
+    # ---- the voice bank (2026-11-09): voices named once, named again ----
+    def _start_voice_bank(self):
+        """With live labels on: collect each label's voiceprint during the
+        meeting (voice_bank.LiveTracker) and load the saved voices to match.
+        Best-effort; the model (26.5 MB) downloads itself the first time."""
+        self._voice_tracker = None
+        self._bank_voices, self._bank_self_names = [], set()
+        try:
+            if not bool(self.app.config.get("voice_bank_enabled", True)):
+                return
+            import voice_bank
+            if not voice_bank.model_ready():
+                self.app._voice_bank_download()
+            for v in voice_bank.load()["voices"]:
+                pr = voice_bank.voice_print(v)
+                if pr is not None:
+                    self._bank_voices.append((v.get("name") or "", pr))
+                    if v.get("self"):
+                        self._bank_self_names.add(v.get("name") or "")
+            self._voice_tracker = voice_bank.LiveTracker(voice_bank.Embedder(threads=2))
+            self._bank_logged = {}
+            threading.Thread(target=self._voice_bank_loop, daemon=True,
+                             name="voice-bank").start()
+            log.info("Voice bank: on (%d saved voice(s))", len(self._bank_voices))
+        except Exception as e:
+            log.info("Voice bank unavailable: %s", e)
+            self._voice_tracker = None
+
+    def _voice_bank_loop(self):
+        """Every few seconds: embed the label turns that closed since the last
+        pass. Waits while the model is still downloading (the tracker keeps
+        the last 3 minutes of audio)."""
+        import voice_bank
+        while (getattr(self, "_voice_tracker", None) is not None and not self._cancelled
+               and not getattr(self, "_stopping_live", False)):
+            time.sleep(3.0)
+            sp, vt = getattr(self, "_live_spk", None), self._voice_tracker
+            if sp is None or vt is None or not voice_bank.model_ready():
+                continue
+            try:
+                vt.update(sp.turns(), sp.covered_s)
+            except Exception as e:
+                log.debug("Voice bank update failed: %s", e)
+
+    def _voice_bank_matches(self, live_secs, user, votes, self_lab, me, merge):
+        """{label: name} for still-unnamed labels whose voice matches a saved
+        voice. A name the user, the captions or the user's own voice already
+        gave a label is never given to another label."""
+        vt = getattr(self, "_voice_tracker", None)
+        if vt is None or not getattr(self, "_bank_voices", None):
+            return {}
+        import voice_bank
+        named = set(user) | set(votes) | ({self_lab} if self_lab and me else set())
+        taken = set(user.values()) | set(votes.values()) | ({me} if self_lab and me else set())
+        if self_lab:      # the user's own voice is already found: not another label
+            taken |= set(getattr(self, "_bank_self_names", ()) or ())
+        folded = voice_bank.fold_prints(vt.prints, merge, self.voice_root)
+        cands = {lab: voice_bank.unit(v) for lab, (v, s) in folded.items()
+                 if s >= voice_bank.MIN_MATCH_SPEECH_S and lab not in named}
+        if not cands:
+            return {}
+        got = voice_bank.assign(cands, self._bank_voices, taken=taken)
+        logged = getattr(self, "_bank_logged", {})
+        for lab, (name, c) in got.items():
+            if logged.get(lab) != name:
+                logged[lab] = name
+                log.info("Voice bank: voice %s matches a saved voice (cos %.2f, %.0f s)",
+                         lab, c, folded[lab][1])
+        return {lab: name for lab, (name, c) in got.items()}
+
+    def _voice_bank_save(self):
+        """End of a chunked meeting: save the print of every label the user,
+        the Teams captions or the user's own voice named (not one named by the
+        bank itself or a self-introduction). Skips a print that contradicts
+        the saved voices unless the user typed that name."""
+        vt = getattr(self, "_voice_tracker", None)
+        sp = getattr(self, "_live_spk", None)
+        st = getattr(self, "_live_last_state", None)
+        if vt is None or st is None or self._cancelled:
+            return
+        try:
+            import voice_bank
+            if not voice_bank.model_ready():
+                return
+            if sp is not None:
+                vt.update(sp.turns(), sp.covered_s, final=True)
+            folded = voice_bank.fold_prints(vt.prints, st["merge"], self.voice_root)
+            groups = {}
+            for lab, (v, s) in folded.items():
+                name, src = self._voice_name(lab, st)
+                if src not in ("user", "captions", "self"):
+                    continue
+                g = groups.setdefault(name, {"v": 0, "s": 0.0, "src": src, "self": False})
+                g["v"] = g["v"] + v
+                g["s"] += s
+                if src == "user":
+                    g["src"] = "user"
+                g["self"] = g["self"] or lab == st.get("self")
+            stamp = os.path.basename(self._live_path or "")[:19]
+            saved, skipped = [], []
+            voices = voice_bank.load()["voices"]
+            for name, g in groups.items():
+                pr = voice_bank.unit(g["v"])
+                why = voice_bank.save_conflict(pr, name, g["s"], voices,
+                                               trusted=g["src"] == "user")
+                if why:
+                    skipped.append("%s (%s)" % (g["src"], why))
+                    continue
+                voice_bank.remember(name, pr, g["s"], src=g["src"], meeting=stamp,
+                                    self_voice=g["self"])
+                saved.append("%s %.0f s" % (g["src"], g["s"]))
+            log.info("Voice bank: saved %d voice(s) [%s]%s; embedded %.0f s of speech "
+                     "in %.1f s CPU", len(saved), ", ".join(saved),
+                     (" skipped " + ", ".join(skipped)) if skipped else "",
+                     vt.embedded_s, vt.wall_s)
+        except Exception as e:
+            log.warning("Voice bank save failed: %s", e)
 
     def _stop_live_speakers(self):
         sp = getattr(self, "_live_spk", None)
         if sp is None:
             return
+        self._stopping_live = True      # the live window stops offering names
         try:
             sp.stop()
             children = getattr(self.app, "_child_procs", None)
@@ -13422,7 +14156,7 @@ class MeetingSession:
         off = float(getattr(self, "_live_spk_offset", 0.0) or 0.0)
         return [dict(t, t0=t["t0"] + off, t1=t["t1"] + off) for t in sp.turns()]
 
-    def _submit_by_live_speakers(self, audio, now_rel, final=False):
+    def _submit_by_live_speakers(self, audio, now_rel, final=False, label_wait=4.0):
         """Live speaker labels on (no Teams caption turn in this window): cut
         the window at the label changes, label each piece BEFORE it is
         transcribed (text and speaker arrive together), and carry the part
@@ -13436,7 +14170,7 @@ class MeetingSession:
             if final:
                 sp.finish(timeout=10.0)
             else:
-                sp.wait_labels(timeout=4.0)
+                sp.wait_labels(timeout=label_wait)
             if not sp.alive() and not final:
                 return False
             fed = sp.fed_s
@@ -13497,41 +14231,298 @@ class MeetingSession:
                 out[lab] = name
         return out
 
-    def _live_labelled(self, chunks):
-        """Chunk records -> "speaker" from the live label, unless the Teams
-        captions already named that chunk: the Teams name the label's own time
-        voted for (live_label_names), else the user's name for the label that
-        tracks the MIC channel (pick_self_speaker), else "Speaker A"."""
-        if not any(c.get("live_label") for c in chunks):
-            return chunks
-        live = self._live_turns_meeting_time()
-        names = {}
+    @staticmethod
+    def shared_votes(votes, not_rooms=()):
+        """{label: caption name} for a caption name that took two voices or
+        more: several people behind one Teams participant (a meeting room's
+        microphone). The name is the room's, not any one voice's (2026-11-16,
+        after Lia Lite's DECISIONS 145). `not_rooms`: names that are one person
+        for sure (the user's own), whose second label is a split voice."""
+        skip = {str(n).strip().lower() for n in not_rooms if n and str(n).strip()}
+        count = {}
+        for n in votes.values():
+            count[n] = count.get(n, 0) + 1
+        return {lab: n for lab, n in votes.items()
+                if count[n] >= 2 and n.strip().lower() not in skip}
+
+    @staticmethod
+    def voice_number(lab):
+        """Live label 'A', 'B', ... -> 1, 2, ... ("Speaker 1", as in Lia Lite)."""
+        try:
+            return ord(str(lab)[0].upper()) - 64
+        except Exception:
+            return 0
+
+    @staticmethod
+    def voice_root(lab, merge):
+        """A label after "same person as" merges (chains followed, no loops)."""
+        seen = set()
+        while lab in merge and lab not in seen:
+            seen.add(lab)
+            lab = merge[lab]
+        return lab
+
+    def _live_voice_state(self, chunks=None):
+        """Everything the live labels render from: the user's names + merges
+        (the live window's names file), caption votes, the mic-channel label,
+        self-introductions. Returns a dict; never raises."""
+        user = self._live_user_names()
+        merge = user.get("merge", {})
+        live = [dict(t, speaker=self.voice_root(t["speaker"], merge))
+                for t in self._live_turns_meeting_time()]
+        votes, rooms = {}, {}
         try:
             t = getattr(self, "_teams", None)
             caps = t.turns() if t is not None else []
             if caps and live:
-                names = self.live_label_names(live, caps)
+                votes = self.live_label_names(live, caps)
+                # one Teams participant, two voices or more = a room: its
+                # name names none of them
+                mine = []
+                try:
+                    mine.append(self.app._self_speaker_name())
+                    mine.append(caption_self_name(caps, self._mic_rms_1s, self._loop_rms_1s))
+                except Exception:
+                    pass
+                rooms = self.shared_votes(votes, mine)
+                votes = {lab: n for lab, n in votes.items() if lab not in rooms}
+                if rooms and sorted(rooms) != getattr(self, "_rooms_logged", None):
+                    self._rooms_logged = sorted(rooms)
+                    log.info("Speaker names: %d voice(s) behind one Teams participant "
+                             "(a room): each is named on its own", len(rooms))
         except Exception as e:
             log.debug("Live label names from captions failed: %s", e)
+        self_lab, me = None, ""
         try:
             utts = [{"speaker": t["speaker"], "start": t["t0"] * 1000.0,
                      "end": t["t1"] * 1000.0} for t in live]
-            self_lab = None
-            if utts and self._mic_rms_1s and self._loop_rms_1s:
+            if utts and self._mic_rms_1s and self._loop_rms_1s and self._is_call():
                 self_lab, _gap = pick_self_speaker(utts, self._mic_rms_1s, self._loop_rms_1s)
             me = self.app._self_speaker_name() if self_lab else ""
         except Exception as e:
             log.debug("Live self speaker failed: %s", e)
             self_lab, me = None, ""
+        found, hints = {}, {}
+        if chunks is not None:
+            try:
+                found, hints = self._live_introductions(chunks, merge, me)
+            except Exception as e:
+                log.debug("Live introductions failed: %s", e)
+        secs = {}
+        for t in live:
+            secs[t["speaker"]] = secs.get(t["speaker"], 0.0) + max(0.0, t["t1"] - t["t0"])
+        bank = {}
+        try:
+            bank = self._voice_bank_matches(secs, user.get("names", {}), votes,
+                                            self_lab, me, merge)
+        except Exception as e:
+            log.debug("Voice bank match failed: %s", e)
+        return {"user": user.get("names", {}), "merge": merge, "votes": votes,
+                "rooms": rooms,
+                "self": self_lab, "me": me, "found": found, "hints": hints, "secs": secs,
+                "bank": bank}
+
+    def _voice_name(self, lab, st):
+        """(display name, source) of a merged label: the user's name, the Teams
+        caption vote, the user's own voice, a saved voice it matches (the
+        voice bank), a self-introduction, else "Speaker N"."""
+        if st["user"].get(lab):
+            return st["user"][lab], "user"
+        if st["votes"].get(lab):
+            return st["votes"][lab], "captions"
+        if lab == st["self"] and st["me"]:
+            return st["me"], "self"
+        if (st.get("bank") or {}).get(lab):
+            return st["bank"][lab], "bank"
+        if st["found"].get(lab):
+            return st["found"][lab], "found"
+        if (st.get("rooms") or {}).get(lab):
+            # a voice of a room that has no name of its own yet
+            return "%s, Speaker %d" % (st["rooms"][lab], self.voice_number(lab)), "room"
+        return "Speaker %d" % self.voice_number(lab), ""
+
+    def _live_labelled(self, chunks):
+        """Chunk records -> "speaker" + "voice" from the live label, unless the
+        Teams captions already named that chunk. A label reads (first that
+        applies): the name the user gave it in the live window, the Teams name
+        its own time voted for (live_label_names), the user's name for the
+        label that tracks the MIC channel (pick_self_speaker), a name its
+        speaker introduced themself with, else "Speaker 1"."""
+        if not any(c.get("live_label") for c in chunks):
+            return chunks
+        st = self._live_voice_state(chunks)
+        self._live_last_state = st
+        shared = set((st.get("rooms") or {}).values())
         out = []
         for c in chunks:
             lab = c.get("live_label")
-            if lab and not c.get("speaker"):
-                nm = names.get(lab) or (me if lab == self_lab and me else "") \
-                    or "Speaker %s" % lab
-                c = dict(c, speaker=nm)
+            if lab:
+                root = self.voice_root(lab, st["merge"])
+                c = dict(c, voice=root)
+                # a room's caption name gives way to the voice's own name
+                if not c.get("speaker") or c["speaker"] in shared:
+                    c["speaker"] = self._voice_name(root, st)[0]
             out.append(c)
         return out
+
+    # ---- naming voices from the live window (2026-11-08, after Lia Lite) ----
+    _NAME_MAX = 40
+
+    def _live_user_names(self):
+        """The live window's names file (<live>.names.json): {"names": {label:
+        name}, "merge": {label: into}}, checked; cached on its mtime."""
+        p = getattr(self, "_names_path", None)
+        empty = {"names": {}, "merge": {}}
+        if not p:
+            return empty
+        try:
+            mt = os.path.getmtime(p)
+        except OSError:
+            return empty
+        cache = getattr(self, "_names_cache", None)
+        if cache and cache[0] == mt:
+            return cache[1]
+        try:
+            with open(p, encoding="utf-8") as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            return empty
+        out = {"names": {}, "merge": {}}
+        ok_lab = re.compile(r"^[A-H]$")
+        for k, v in ((raw or {}).get("names") or {}).items():
+            if ok_lab.match(str(k)) and isinstance(v, str):
+                v = re.sub(r"[\x00-\x1f\x7f]", "", v).strip()[:self._NAME_MAX]
+                if v:
+                    out["names"][k] = v
+        for k, v in ((raw or {}).get("merge") or {}).items():
+            if ok_lab.match(str(k)) and isinstance(v, str) and ok_lab.match(v) and k != v:
+                out["merge"][k] = v
+        self._names_cache = (mt, out)
+        return out
+
+    # Self-introductions. STRONG: said outright, accepted alone. WEAK: "אני X",
+    # "I'm X" - accepted only when X is a known person (an invitee, a Teams
+    # caption name), since "אני חושב" is not a name.
+    _INTRO_STRONG = (re.compile(r"(?:קוראים לי|שמי)\s+([א-ת][א-ת'\"]{1,})"),
+                     re.compile(r"\bmy name is\s+([A-Za-z][a-z]{1,})", re.I))
+    _INTRO_WEAK = (re.compile(r"(?:^|[\s,.:;])(?:אני|כאן|זה|זאת|מדבר|מדברת)\s+([א-ת]{2,})"),
+                   re.compile(r"\b(?:I'm|I am|this is|it's)\s+([A-Z][a-z]{1,})"))
+
+    def _live_people(self):
+        """Known names for this meeting: invitees + Teams caption names."""
+        out, seen = [], set()
+        cands = list(getattr(self, "attendees", None) or [])
+        try:
+            t = getattr(self, "_teams", None)
+            if t is not None:
+                cands += list(t.speakers() or [])
+        except Exception:
+            pass
+        for n in cands:
+            n = re.sub(r"\s*<[^>]*>", "", str(n or "")).strip()
+            if n and n.lower() not in seen:
+                seen.add(n.lower())
+                out.append(n)
+        return out[:24]
+
+    @staticmethod
+    def _person_for(word, people):
+        """The known person whose first name is `word` (case-insensitive), or "" ."""
+        w = (word or "").strip().lower()
+        if len(w) < 2:
+            return ""
+        for p in people:
+            parts = p.split()
+            if parts and (parts[0].lower() == w or p.lower() == w):
+                return p
+        return ""
+
+    def _live_introductions(self, chunks, merge, me):
+        """({label: name} from self-introductions, {label: name} hints from
+        being addressed by name) over the labelled chunks."""
+        people = self._live_people()
+        mine = (me or "").split()[0].lower() if me else ""
+        found, hints = {}, {}
+        seq = [(self.voice_root(c["live_label"], merge), (c.get("text") or "").strip())
+               for c in sorted(chunks, key=lambda c: c.get("index", 0))
+               if c.get("live_label") and (c.get("text") or "").strip()]
+        for i, (lab, text) in enumerate(seq):
+            if lab not in found:
+                name = ""
+                for rx in self._INTRO_STRONG:
+                    m = rx.search(text)
+                    if m:
+                        name = self._person_for(m.group(1), people) or m.group(1).strip("'\"")
+                        if name[:1].islower():
+                            name = name[:1].upper() + name[1:]
+                        break
+                if not name:
+                    for rx in self._INTRO_WEAK:
+                        m = rx.search(text)
+                        if m:
+                            name = self._person_for(m.group(1), people)
+                            if name:
+                                break
+                if name and name.split()[0].lower() != mine:
+                    found[lab] = name
+            # "Dana, what do you think?" -> the NEXT other voice may be Dana
+            head = re.split(r"[,?!:]", text, maxsplit=1)
+            if len(head) > 1 and len(head[0].split()) <= 2:
+                who = self._person_for(head[0].split()[-1] if head[0].split() else "", people)
+                if who:
+                    for lab2, _t in seq[i + 1:i + 3]:
+                        if lab2 != lab:
+                            hints.setdefault(lab2, who)
+                            break
+        return found, hints
+
+    def _write_voices_file(self, items):
+        """<live>.voices.json for the live window: per transcript item its
+        voice + shown name, the voices in the call, and name suggestions."""
+        p = getattr(self, "_voices_path", None)
+        st = getattr(self, "_live_last_state", None)
+        if not p or st is None:
+            return
+        try:
+            voices = []
+            for lab in sorted(set(st["secs"]) | set(st["user"]) | set(st["found"])):
+                if lab in st["merge"]:
+                    continue
+                name, src = self._voice_name(lab, st)
+                voices.append({"v": lab, "n": self.voice_number(lab), "name": name,
+                               "src": src, "s": round(st["secs"].get(lab, 0.0), 1),
+                               "self": lab == st["self"], "hint": st["hints"].get(lab, "")})
+            people = self._live_people()
+            me = st["me"] or (self.app._self_speaker_name() if self.app else "")
+            if me and me.lower() not in {x.lower() for x in people}:
+                people.append(me)
+            data = {"paras": [{"ts": _fmt_relative_ts(ts), "v": v, "name": nm or ""}
+                              for ts, v, nm in items],
+                    "voices": voices, "people": people[:24], "me": me or "",
+                    "merge": st["merge"], "editable": not getattr(self, "_stopping_live", False)}
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, p)
+        except Exception as e:
+            log.debug("Voices file write failed: %s", e)
+
+    def _watch_live_names(self):
+        """While live labels run: a name typed in the live window shows on the
+        transcript within a second (rewrite the LIVE file on a names change)."""
+        last = None
+        while (getattr(self, "_live_spk", None) is not None and not self._cancelled
+               and not getattr(self, "_stopping_live", False)):
+            p = getattr(self, "_names_path", None)
+            try:
+                mt = os.path.getmtime(p) if p else None
+            except OSError:
+                mt = None
+            if mt != last:
+                if last is not None or mt is not None:
+                    self._write_live_file()
+                last = mt
+            time.sleep(1.0)
 
     # The model has 8 speaker slots: once they are all in use a new voice
     # lands on an existing label (measured on a 16-voice meeting).
@@ -13595,6 +14586,56 @@ class MeetingSession:
         if len(pieces) > 1:
             log.debug("Meeting window cut at %d speaker change(s)", len(pieces) - 1)
         return True
+
+    # A call: the computer sound carried speech (>= this many seconds where it
+    # dominated) or Teams captions named someone. Until then - and for good in
+    # a room, where everyone is on the mic - Lia never guesses which voice is
+    # the user (Lia Lite, 2026-11-08: it could be wrong; the "Me" button names it).
+    CALL_SYSTEM_S = 10
+
+    def _is_call(self):
+        if getattr(self, "_call_known", False):
+            return True
+        try:
+            loop = getattr(self, "_loop_rms_1s", None) or []
+            mic = getattr(self, "_mic_rms_1s", None) or []
+            n = sum(1 for i in range(min(len(loop), len(mic)))
+                    if loop[i] >= 0.01 and loop[i] > 2 * mic[i])
+            t = getattr(self, "_teams", None)
+            if n >= self.CALL_SYSTEM_S or (t is not None and t.turns()):
+                self._call_known = True
+        except Exception:
+            pass
+        return getattr(self, "_call_known", False)
+
+    def _channel_checked(self, chunks):
+        """channel_checked_speakers with this meeting's channel energies, the
+        user's names and the Teams caption turns. Never raises."""
+        try:
+            mic = getattr(self, "_mic_rms_1s", None) or []
+            loop = getattr(self, "_loop_rms_1s", None) or []
+            if not mic or not loop or not any(c.get("speaker") for c in chunks):
+                return chunks
+            t = getattr(self, "_teams", None)
+            caps = t.turns() if t is not None else []
+            names = []
+            app = getattr(self, "app", None)
+            if app is not None:
+                try:
+                    names.append(app._self_speaker_name())
+                except Exception:
+                    pass
+            selfcap = caption_self_name(caps, mic, loop) if caps else ""
+            out = channel_checked_speakers(chunks, mic, loop, names, caps, selfcap,
+                                           mic_is_user=self._is_call())
+            moved = sum(1 for c in out if "speaker_was" in c)
+            if moved and moved != getattr(self, "_chan_moved_logged", 0):
+                self._chan_moved_logged = moved
+                log.info("Speaker names: %d piece(s) renamed by the mic/system channels", moved)
+            return out
+        except Exception as e:
+            log.debug("Channel speaker check failed: %s", e)
+            return chunks
 
     def _teams_labelled(self, chunks):
         """Chunk records with "speaker" set from the Teams caption turns (the
@@ -13782,6 +14823,7 @@ class MeetingSession:
                 target=self._rotation_loop, daemon=True
             )
             self._rotation_thread.start()
+            self._draft_start()         # the live draft, when the setting is on
         except Exception:
             # Anything failing AFTER the recorders opened (disk full, bad
             # path) used to leak LIVE recorders forever: the caller dropped
@@ -13854,7 +14896,9 @@ class MeetingSession:
         self._wait_for_pending_jobs(timeout=60.0)
 
         if save:
-            return self._write_output_file(duration_sec)
+            path = self._write_output_file(duration_sec)
+            self._voice_bank_save()
+            return path
         return None
 
     # A chunk with sound but an empty result counts as LOST ("[transcription
@@ -14050,8 +15094,13 @@ class MeetingSession:
             for _line in (_tl, _ll):
                 if _line:
                     head = head.rstrip("\n") + "\n" + _line + "\n\n"
+            vitems = [] if getattr(self, "_live_spk", None) is not None else None
             body = (self._assemble_live_markdown() if self.diarize_mode
+                    else self._assemble_transcript_markdown(live=True, voices=vitems)
+                    if vitems is not None
                     else self._assemble_transcript_markdown(live=True))
+            if vitems is not None:
+                self._write_voices_file(vitems)
             with self._live_lock:
                 # Re-check INSIDE the lock: _delete_live_file (same lock) may
                 # have run since the check above - writing now would resurrect
@@ -14089,6 +15138,7 @@ class MeetingSession:
             if start_rel is not None:
                 rel_ts = max(0.0, float(start_rel))
             self._live_chunks.append({"index": idx, "timestamp_rel": rel_ts,
+                                      "dur": len(audio_np) / 16000.0,
                                       "text": "", "status": "pending",
                                       "cut": cut, "pause_s": float(pause_s or 0.0)})
 
@@ -14180,7 +15230,10 @@ class MeetingSession:
         try:
             now = time.time()
             for fn in os.listdir(MEETINGS_DIR):
-                if fn.endswith("_meeting_LIVE.txt.status.json"):
+                if fn.endswith(("_meeting_LIVE.txt.status.json",
+                                "_meeting_LIVE.txt.names.json",
+                                "_meeting_LIVE.txt.voices.json",
+                                "_meeting_LIVE.txt.draft.json")):
                     p = os.path.join(MEETINGS_DIR, fn)
                     if p == self._status_path:
                         continue
@@ -14427,10 +15480,18 @@ class MeetingSession:
         from another thread, and two concurrent drains would interleave
         reads from the same recorder buffers."""
         with self._drain_lock:
+            self._last_drain_parts = (None, None)
+            self._last_rotation_mono = time.monotonic()   # the open window starts now
             audio = self._drain_audio_inner()
             sp = getattr(self, "_live_spk", None)
             if sp is not None and audio is not None and len(audio):
                 sp.feed(audio)
+                vt = getattr(self, "_voice_tracker", None)
+                if vt is not None:
+                    try:      # the same samples, on the same fed timeline
+                        vt.feed(audio, *self._last_drain_parts)
+                    except Exception as e:
+                        log.debug("Voice bank feed failed: %s", e)
             return audio
 
     def _drain_audio_inner(self):
@@ -14482,6 +15543,10 @@ class MeetingSession:
         self._check_mic_channel_silent(mic_audio, loop_audio, backup_audio)
 
         self._note_channel_energy(mic_audio, loop_audio)
+        # the voice bank takes a voiceprint from the side that carries the
+        # voice alone (see voice_bank.pick_channel)
+        self._last_drain_parts = (mic_audio if self._mic_recorder is not None else None,
+                                  loop_audio if self._loopback_recorder is not None else None)
         if mic_audio is not None and loop_audio is not None and len(loop_audio) > 0:
             return mix_audio(mic_audio, loop_audio)
         if mic_audio is not None and len(mic_audio) > 0:
@@ -14813,9 +15878,15 @@ class MeetingSession:
         partial one counting as a full second: +8.2 s drift on a 4-min meeting,
         ~2 min per hour, and pick_self_speaker found nobody on a real call it
         gets right on the true timeline.) final=True flushes the last partial
-        second."""
-        if not self.diarize_mode:
-            return
+        second.
+
+        Every meeting, not only diarize mode (2026-11-09): the live speaker
+        labels (the user's own voice = the label that tracks the mic) and the
+        mic/system check of speaker names read this timeline in a CHUNKED
+        meeting too. With the old diarize-only gate they found nothing there:
+        a real call showed the user as "Speaker 1" for the whole meeting while
+        the tracks put him on the mic by a margin of 5.4 (threshold 0.5).
+        Two floats a second."""
         try:
             m = np.zeros(0, np.float32) if mic_audio is None else np.asarray(mic_audio, np.float32)
             l = np.zeros(0, np.float32) if loop_audio is None else np.asarray(loop_audio, np.float32)
@@ -14882,13 +15953,359 @@ class MeetingSession:
         return None
 
     # ---- main rotation loop ----
+    # ---- Live draft (2026-11-14): the words within ~2 s, from the Zipformer ----
+    # A thread of its own LOOKS at the audio the recorders hold (it never
+    # takes it: the rotation loop's drain, cut and transcription are exactly
+    # as before) and feeds the streaming Hebrew model on the CPU. The text is
+    # a draft for the live window only: it is never saved, summarized or
+    # served, and the meeting model's text replaces it when the chunk is done.
+    DRAFT_TICK_S = 1.0
+    DRAFT_KEEP_S = 8.0           # the last window's draft stays this long at most
+
+    def _draft_wanted(self):
+        try:
+            cfg = self.app.config
+            return (bool(cfg.get("meeting_live_draft", False))
+                    and cfg.get("primary_language", "he") == "he"
+                    and bool(self._live_path))
+        except Exception:
+            return False
+
+    # ---- Fast text (2026-11-16): a sentence about a second after it ends ----
+    FAST_TICK_S = 0.1
+
+    def _fast_key(self):
+        """The OpenAI key when this meeting may show the fast text: the
+        setting is on and its windows are transcribed by gpt-transcribe."""
+        try:
+            cfg = self.app.config
+            tr = self._chunk_transcriber
+            if (not bool(cfg.get("meeting_fast_text", True)) or self.diarize_mode
+                    or not self._live_path or not isinstance(tr, OpenAITranscriber)
+                    or getattr(tr, "model_size", "") != "gpt-transcribe"):
+                return ""
+            import secret_store
+            return secret_store.unprotect(tr.api_key or "") or ""
+        except Exception:
+            return ""
+
+    def _fast_settled_s(self):
+        """Meeting seconds up to which the accurate text is on screen: the end
+        of the last window done before the first one still on its way."""
+        with self._chunks_lock:
+            rows = sorted((c.get("index", 0), c.get("status"),
+                           float(c.get("timestamp_rel") or 0.0) + float(c.get("dur") or 0.0))
+                          for c in self.chunks)
+        t = 0.0
+        for _i, status, end in rows:
+            if status == "pending":
+                break
+            t = max(t, end)
+        return t
+
+    def _fast_loop(self, key):
+        stream = None
+        try:
+            import live_stream_openai as ls
+            prompt = ""
+            try:
+                prompt = self.app._composed_vocabulary() or ""
+            except Exception:
+                pass
+            make = getattr(self, "_fast_stream_factory", None) or ls.Stream
+            stream = self._fast_stream = make(key, prompt).start()
+            log.info("Fast meeting text: on")
+            fix = getattr(self.app, "_draft_terms", None)
+            st = {}
+            while not self._stop_event.wait(self.FAST_TICK_S):
+                if not self._active or self._cancelled or stream.dead:
+                    break
+                block = self._draft_peek(st)
+                if block is not None and len(block):
+                    stream.feed(block, time.time() - self.start_time)
+                text = " ".join(x["text"] for x in stream.lines(self._fast_settled_s()))
+                self._draft_publish(fix(text) if (fix is not None and text) else text)
+        except Exception as e:
+            log.warning("Fast meeting text failed: %s", type(e).__name__)
+        finally:
+            try:
+                if stream is not None:
+                    stream.stop()
+                    log.info("Fast meeting text: %s", stream.summary())
+                self._draft_shown = None
+                if getattr(self, "_draft_path", None) and os.path.exists(self._draft_path):
+                    os.remove(self._draft_path)
+            except Exception:
+                pass
+
+    def _draft_start(self):
+        key = self._fast_key()
+        if key:
+            # OpenAI's own text, sentence by sentence, takes the draft's place
+            # (any language; the Zipformer draft is Hebrew only)
+            self._draft_path = self._live_path + ".draft.json"
+            threading.Thread(target=self._fast_loop, args=(key,), daemon=True,
+                             name="meeting-fast-text").start()
+            return
+        if not self._draft_wanted():
+            return
+        self._draft_path = self._live_path + ".draft.json"
+        self._draft_lock = threading.Lock()
+        self._draft_reset = None
+        threading.Thread(target=self._draft_loop, daemon=True,
+                         name="meeting-draft").start()
+
+    def _draft_cut(self):
+        """The rotation loop cut a window: the draft starts again from the
+        tail carried into the next chunk (rotation thread; never raises)."""
+        lk = getattr(self, "_draft_lock", None)
+        if lk is None:
+            return
+        try:
+            carry = self._carry_tail
+            with lk:
+                self._draft_reset = (np.array(carry, dtype=np.float32)
+                                     if carry is not None and len(carry)
+                                     else np.zeros(0, dtype=np.float32))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _draft_new_frames(rec, st):
+        """The frames `rec` captured since the last look, without taking
+        them. A drain swaps the recorder's list: a new list = start again."""
+        with rec._data_lock:
+            frames = rec.audio_data
+            if st.get("list") is not frames:
+                st["list"], st["n"] = frames, 0
+            new = frames[st["n"]:]
+            st["n"] = len(frames)
+        return b"".join(new)
+
+    def _draft_peek(self, st):
+        """Mic + computer sound that arrived since the last look, mixed."""
+        mic = loop = None
+        rec = self._mic_recorder
+        if rec is not None:
+            raw = self._draft_new_frames(rec, st.setdefault("mic", {}))
+            if raw:
+                mic = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        rec = self._loopback_recorder
+        if rec is not None:
+            raw = self._draft_new_frames(rec, st.setdefault("loop", {}))
+            if raw:
+                loop = rec._convert_raw(raw)
+        if mic is not None and loop is not None and len(loop):
+            return mix_audio(mic, loop)
+        return mic if mic is not None else loop
+
+    def _draft_publish(self, text):
+        """Write the draft for the live window (atomic), only when it changed."""
+        if text == getattr(self, "_draft_shown", None):
+            return
+        self._draft_shown = text
+        p = self._draft_path
+        try:
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"text": text}, f, ensure_ascii=False)
+            os.replace(tmp, p)
+        except Exception as e:
+            log.debug("Live draft write failed: %s", type(e).__name__)
+
+    def _draft_loop(self):
+        try:
+            t0 = time.monotonic()
+            model = self.app._draft_model()
+            if model is None:
+                return
+            import zipformer_he
+            stream = zipformer_he.ZipformerStream(model)
+            log.info("Live draft: on (model ready in %.1f s)", time.monotonic() - t0)
+            st, prev, prev_at, fails = {}, "", 0.0, 0
+            while not self._stop_event.wait(self.DRAFT_TICK_S):
+                if not self._active or self._cancelled:
+                    break
+                try:
+                    with self._draft_lock:
+                        carry, self._draft_reset = self._draft_reset, None
+                    if carry is not None:
+                        prev, prev_at = stream.text(), time.monotonic()
+                        stream.reset()
+                        if len(carry):
+                            stream.feed(carry)
+                    block = self._draft_peek(st)
+                    text = (stream.feed(block) if block is not None and len(block)
+                            else stream.text())
+                    # the window just cut keeps its draft until its accurate
+                    # text arrives (or DRAFT_KEEP_S passes)
+                    if prev and (time.monotonic() - prev_at > self.DRAFT_KEEP_S
+                                 or not self.ear_pending()):
+                        prev = ""
+                    shown = " ".join(x for x in (prev, text) if x)
+                    fix = getattr(self.app, "_draft_terms", None)
+                    self._draft_publish(fix(shown) if fix is not None else shown)
+                    fails = 0
+                except Exception as e:
+                    fails += 1
+                    if fails == 1:
+                        log.warning("Live draft step failed: %s", type(e).__name__)
+                    if fails >= 20:
+                        log.warning("Live draft stopped after repeated failures")
+                        break
+        except Exception as e:
+            log.warning("Live draft not started: %s", type(e).__name__)
+        finally:
+            try:
+                self._draft_shown = None
+                if getattr(self, "_draft_path", None) and os.path.exists(self._draft_path):
+                    os.remove(self._draft_path)
+            except Exception:
+                pass
+
+    # ---- Claude link (2026-11-11): Claude on this PC reads the meeting ----
+    # A read first asks for the words said in the last seconds: the rotation
+    # loop is woken to cut the open window now (the same drain, cut and submit
+    # as every window, on the rotation thread), and the read waits a bounded
+    # time for that text.
+    FLUSH_MIN_WINDOW_S = 1.5     # less audio than this is not worth a cut
+    FLUSH_EVERY_S = 3.0          # at most one cut on request per this long
+    FLUSH_CUT_WINDOW_S = 1.2     # the quiet moment is searched this close to the end
+    FLUSH_LABEL_WAIT_S = 1.5     # live speaker labels: wait this long on a flush
+
+    def flush_now(self):
+        """Ask the rotation loop to cut the open window now. Only sets an
+        event: the caller's thread never touches the recorders. False = not
+        asked (no recording, too little audio in the window, or a flush less
+        than FLUSH_EVERY_S ago)."""
+        fe = getattr(self, "_flush_event", None)
+        if (fe is None or not self._active or self._cancelled
+                or self._stop_event.is_set()):
+            return False
+        now = time.monotonic()
+        if now - self._last_flush_mono < self.FLUSH_EVERY_S:
+            return False
+        if now - self._last_rotation_mono < self.FLUSH_MIN_WINDOW_S:
+            return False
+        self._last_flush_mono = now
+        self._flush_done.clear()
+        fe.set()
+        return True
+
+    def _flush_cut(self, audio):
+        """The smart cut of a window cut on request: the quietest moment in
+        its last FLUSH_CUT_WINDOW_S seconds (a shorter search than the regular
+        2.5 s, so less is held back for the next chunk), also on a window too
+        short for the regular cut. A word is never split: what follows the
+        quiet moment is carried into the next chunk, as always."""
+        w = min(self.FLUSH_CUT_WINDOW_S, len(audio) / 16000.0 / 2.0)
+        return smart_cut_tail(audio, window_s=w)
+
+    def _rotation_wait(self):
+        """Sleep one window. True = the meeting stopped. A flush request
+        (flush_now) ends the sleep early."""
+        fe = getattr(self, "_flush_event", None)
+        if fe is None:
+            return self._stop_event.wait(timeout=self.chunk_seconds)
+        end = time.monotonic() + self.chunk_seconds
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                return self._stop_event.is_set()
+            if self._stop_event.wait(timeout=min(left, 0.1)):
+                return True
+            if fe.is_set():
+                return False
+
+    def ear_pending(self):
+        """True while a chunk's text is still on its way."""
+        if self.diarize_mode:
+            with self._live_chunks_lock:
+                return any(c.get("status") == "pending" for c in self._live_chunks)
+        with self._chunks_lock:
+            return any(c.get("status") == "pending" for c in self.chunks)
+
+    def ear_fresh(self, wait_s=4.0):
+        """Before a read: cut the open window now and wait, at most `wait_s`,
+        for its text. True = text is still on its way."""
+        end = time.monotonic() + wait_s
+        if self.flush_now():
+            self._flush_done.wait(timeout=wait_s)
+        while self.ear_pending() and time.monotonic() < end:
+            time.sleep(0.05)
+        return self.ear_pending()
+
+    def ear_key(self):
+        """One stable id per meeting."""
+        try:
+            return "lia-" + time.strftime("%Y-%m-%d_%H-%M-%S",
+                                          time.localtime(self.start_time))
+        except Exception:
+            return "lia-%d" % id(self)
+
+    def ear_lines(self):
+        """-> (lines, pending): one line per transcribed chunk, in order,
+        [{seq, t, e, who, speaker, text}], with the names the live window
+        shows. `seq` is the chunk's index: it never changes or repeats. Only
+        the chunks BEFORE the first one still being transcribed are returned,
+        so a reader that asks "after seq N" never skips a late one."""
+        if self.diarize_mode:
+            with self._live_chunks_lock:
+                chunks = [dict(c) for c in self._live_chunks]
+        else:
+            with self._chunks_lock:
+                chunks = [dict(c) for c in self.chunks]
+        chunks.sort(key=lambda c: c.get("index", 0))
+        waiting = [c["index"] for c in chunks if c.get("status") == "pending"]
+        if waiting:
+            chunks = [c for c in chunks if c["index"] < waiting[0]]
+        me = ""
+        self_lab = None
+        if not self.diarize_mode:
+            # the same naming steps as the live window (_flow_items)
+            try:
+                cfg = getattr(getattr(self, "app", None), "config", None) or {}
+                if getattr(self, "_teams", None) is not None:
+                    chunks = self._teams_labelled(chunks)
+                if getattr(self, "_live_spk", None) is not None:
+                    chunks = self._live_labelled(chunks)
+                    self_lab = (getattr(self, "_live_last_state", None) or {}).get("self")
+                if cfg.get("meeting_speaker_channel_check", True):
+                    chunks = self._channel_checked(chunks)
+            except Exception as e:
+                log.debug("Claude link: speaker names failed: %s", type(e).__name__)
+            try:
+                me = self.app._self_speaker_name() or ""
+            except Exception:
+                me = ""
+        lines = []
+        for c in chunks:
+            text = (c.get("text") or "").strip()
+            if c.get("status") != "ok" or not text:
+                continue
+            t = float(c.get("timestamp_rel") or 0.0)
+            spk = str(c.get("speaker") or "")
+            who = ""
+            if spk:
+                mine = (me and spk == me) or (self_lab and c.get("voice") == self_lab)
+                who = "me" if mine else "them"
+            lines.append({"seq": int(c["index"]), "t": round(t, 2),
+                          "e": round(t + float(c.get("dur") or 0.0), 2),
+                          "who": who, "speaker": spk, "text": text})
+        return lines, bool(waiting)
+
     def _rotation_loop(self):
         """Every self.chunk_seconds: DRAIN current audio from the continuously-
         running recorders and submit it as a chunk. No close+reopen, so
         no audio is lost between chunks. Exits when stop_event is set."""
-        while not self._stop_event.wait(timeout=self.chunk_seconds):
+        while not self._rotation_wait():
             if not self._active:
                 break
+            # Claude link: a read asked for the open window now (flush_now).
+            fe = getattr(self, "_flush_event", None)
+            flush = fe is not None and fe.is_set()
+            if flush:
+                fe.clear()
             try:
                 self._chunk_lock_acquire()
                 audio = self._drain_audio()
@@ -14916,7 +16333,9 @@ class MeetingSession:
                     # Speaker names from Teams: cut this window at the speaker
                     # changes so every chunk is one speaker's turn.
                     if (self._submit_by_speaker(audio, now_rel)
-                            or self._submit_by_live_speakers(audio, now_rel)):
+                            or self._submit_by_live_speakers(
+                                audio, now_rel,
+                                label_wait=self.FLUSH_LABEL_WAIT_S if flush else 4.0)):
                         continue
                     # Smart boundary: cut at the quietest point near the end and
                     # carry the tail into the next chunk, so the 45s rotation
@@ -14929,7 +16348,8 @@ class MeetingSession:
                     start_rel = max(0.0, now_rel - len(audio) / 16000.0)
                     if bool(self.app.config.get("meeting_chunk_smart_cut", True)):
                         try:
-                            head, tail = smart_cut_tail(audio)
+                            head, tail = (self._flush_cut(audio) if flush
+                                          else smart_cut_tail(audio))
                             if tail is not None and len(head) >= 8000:
                                 # The pause length at the cut tells the flow
                                 # pass whether the chunk's closing period is real.
@@ -14944,6 +16364,9 @@ class MeetingSession:
                 log.error("Meeting rotation loop error: %s", e)
             finally:
                 self._chunk_lock_release()
+                self._draft_cut()
+                if flush:
+                    self._flush_done.set()
 
     def _chunk_lock_acquire(self):
         lk = getattr(self, "_chunk_lock", None)
@@ -15002,7 +16425,7 @@ class MeetingSession:
 
     def _short_piece_language(self, audio_np):
         """The language for one chunk. A piece under SHORT_PIECE_S seconds
-        (the speaker cuts make many: "Ronen.", "yes, yes") gives an
+        (the speaker cuts make many: "Yossi.", "yes, yes") gives an
         auto-detecting model too little to go on - in the 2026-10-28 meeting
         three Hebrew one-liners came back as invented English ("I can't",
         "Yo, hombre"). So a short piece gets the meeting's language: the
@@ -16240,7 +17663,7 @@ class MeetingSession:
             alive = still
 
     # ---- output ----
-    def _assemble_transcript_markdown(self, max_index=None, live=False):
+    def _assemble_transcript_markdown(self, max_index=None, live=False, voices=None):
         """Return the chunk-by-chunk transcript as a plain-text block
         with timestamps. Method name kept for caller stability \u2014 the
         format is now plain `.txt` with bracket timestamps, not
@@ -16253,7 +17676,7 @@ class MeetingSession:
         if max_index is not None:
             chunks = [c for c in chunks if c["index"] < max_index]
         lines = []
-        for kind, ts, *rest in self._flow_items(chunks, live=live):
+        for kind, ts, *rest in self._flow_items(chunks, live=live, voices=voices):
             lines.append(f"[{_fmt_relative_ts(ts)}]")
             if kind == "failed":
                 lines.append("[transcription failed]")
@@ -16269,7 +17692,7 @@ class MeetingSession:
             lines.append("")
         return "\n".join(lines).strip()
 
-    def _flow_items(self, chunks, live=False):
+    def _flow_items(self, chunks, live=False, voices=None):
         """Chunk records -> transcript paragraphs (see flow_chunk_paragraphs),
         honouring config `meeting_transcript_flow` / `_paragraph_seconds`.
         Tolerates a session built without an app (tests)."""
@@ -16283,8 +17706,10 @@ class MeetingSession:
             chunks = self._teams_labelled(chunks)
         if getattr(self, "_live_spk", None) is not None:
             chunks = self._live_labelled(chunks)
+        if cfg.get("meeting_speaker_channel_check", True):
+            chunks = self._channel_checked(chunks)
         return flow_chunk_paragraphs(chunks, para_seconds=para_s,
-                                     enabled=enabled, live=live)
+                                     enabled=enabled, live=live, voices=voices)
 
     def _gate_calendar_meta(self):
         """Drop the calendar attendees + subject when they belong to an
@@ -18606,18 +20031,18 @@ def _stamp_lia_launcher(exe_path):
         return False
     try:
         vi = VSVersionInfo(
-            ffi=FixedFileInfo(filevers=(1, 6, 19, 0), prodvers=(1, 6, 19, 0),
+            ffi=FixedFileInfo(filevers=(1, 6, 21, 0), prodvers=(1, 6, 21, 0),
                               mask=0x3f, flags=0x0, OS=0x40004,
                               fileType=0x1, subtype=0x0),
             kids=[
                 StringFileInfo([StringTable('040904B0', [
                     StringStruct('CompanyName', 'Naor Daniel'),
                     StringStruct('FileDescription', 'Lia'),
-                    StringStruct('FileVersion', '1.6.19.0'),
+                    StringStruct('FileVersion', '1.6.21.0'),
                     StringStruct('InternalName', 'Lia'),
                     StringStruct('OriginalFilename', 'Lia.exe'),
                     StringStruct('ProductName', 'Lia'),
-                    StringStruct('ProductVersion', '1.6.19.0'),
+                    StringStruct('ProductVersion', '1.6.21.0'),
                 ])]),
                 VarFileInfo([VarStruct('Translation', [0x0409, 1200])]),
             ],
@@ -21068,6 +22493,79 @@ class OverlayNotification:
                 self._canvas.delete("bars")
         self._tk_queue.put(_do)
 
+    # ---- Live dictation text (2026-11-14): the words while they are said ----
+    LIVE_LINES = 3
+
+    def show_live_text(self, text):
+        """The live dictation card: the last lines of `text`, bottom centre.
+        Its own small window that never takes the focus (the paste target
+        keeps it). Shown in silent mode too: it is the feature, not a notice.
+        '' hides it."""
+        def _do():
+            if not self._root:
+                return
+            import tkinter as tk
+            import tkinter.font as tkfont
+            import notification_style as _ns
+            top = getattr(self, "_live_top", None)
+            if not text:
+                if top is not None:
+                    try:
+                        top.withdraw()
+                    except Exception:
+                        pass
+                return
+            try:
+                if top is None:
+                    top = tk.Toplevel(self._root)
+                    top.withdraw()
+                    top.overrideredirect(True)
+                    top.attributes("-topmost", True)
+                    top.configure(bg="#FFFFFF", highlightthickness=1,
+                                  highlightbackground="#DADAD3")
+                    self._live_font = tkfont.Font(family="Segoe UI", size=12)
+                    self._live_lbl = tk.Label(top, text="", bg="#FFFFFF", fg="#17171E",
+                                              font=self._live_font, padx=18, pady=12)
+                    self._live_lbl.pack(fill="both", expand=True)
+                    top.update_idletasks()
+                    self._prompt_no_activate(top)
+                    self._live_top = top
+                sw, sh = self._root.winfo_screenwidth(), self._root.winfo_screenheight()
+                width = max(320, min(int(sw * 0.5), 760))
+                lines = self.live_text_lines(text, self._live_font.measure, width - 40,
+                                             self.LIVE_LINES)
+                rtl = _ns.has_rtl(text)
+                self._live_lbl.configure(text=_ns.rtl_text("\n".join(lines)),
+                                         justify="right" if rtl else "left",
+                                         anchor="e" if rtl else "w")
+                top.update_idletasks()
+                h = self._live_lbl.winfo_reqheight() + 2
+                top.geometry("%dx%d+%d+%d" % (width, h, (sw - width) // 2,
+                                             sh - h - int(sh * 0.12)))
+                top.deiconify()
+            except Exception as e:
+                log.debug("Live dictation card failed: %s", type(e).__name__)
+        self._tk_queue.put(_do)
+
+    @staticmethod
+    def live_text_lines(text, measure, width_px, keep):
+        """`text` wrapped to `width_px` (measure(s) = pixel width), the last
+        `keep` lines; an ellipsis leads when earlier lines were dropped."""
+        lines, line = [], ""
+        for w in " ".join((text or "").split()).split(" "):
+            cand = (line + " " + w) if line else w
+            if line and measure(cand) > width_px:
+                lines.append(line)
+                line = w
+            else:
+                line = cand
+        if line:
+            lines.append(line)
+        if len(lines) > keep:
+            lines = lines[-keep:]
+            lines[0] = "\u2026 " + lines[0]
+        return lines
+
     def show_recording(self):
         self.show_waveform()
 
@@ -23426,7 +24924,9 @@ class LiaApp:
             try:
                 dic = os.path.join(CONFIG_DIR, "lexicon", "he_IL.dic")
                 self._lexicon = lexicon_mod.Lexicon(dic)
-                if self.config.get("lexicon_fix_enabled") and os.path.exists(dic):
+                if ((self.config.get("lexicon_fix_enabled")
+                     or self.config.get("vocab_sound_match", True))
+                        and os.path.exists(dic)):
                     def _load_lex():
                         try:
                             self._lexicon.load()
@@ -23437,6 +24937,8 @@ class LiaApp:
             except Exception as e:
                 log.warning("Lexicon init failed (no-op): %s", e)
                 self._lexicon = None
+
+        ZipformerTranscriber.term_fix = self._zip_terms
 
         # One-time: tighten the forgotten-meeting nets. The old default first
         # reminder (60 min) let sub-hour meetings slip through with no nudge; a
@@ -23704,6 +25206,8 @@ class LiaApp:
         # None, the main press-to-dictate hotkey is blocked (you can't
         # run two recorders at once on most Windows audio stacks).
         self._active_meeting = None
+        self._ear = None                # Claude link: the reader (ears.py), when on
+        self._ears_last = None          # the last meeting, readable after it ends
         # The session currently being FINALIZED (post-Stop): _active_meeting is
         # nulled the instant Stop is clicked, but a chunked transcript is still
         # only in memory until session.stop() finishes writing it (~up to 60s
@@ -24228,6 +25732,10 @@ class LiaApp:
                 self._refresh_tray(update_menu=True)
             threading.Thread(target=self._tray_first_run_onboarding,
                              args=(icon,), daemon=True).start()
+            self._start_ears()          # Claude link, when the setting is on
+            self._claude_register()     # and Lia's bridge in the Claude apps
+            if self._live_preview_on():  # live dictation: the model ready before the first press
+                threading.Thread(target=self._draft_model, daemon=True).start()
 
         try:
             self.tray_icon.run(setup=on_tray_ready)
@@ -24464,6 +25972,11 @@ class LiaApp:
                 device=self.config.get("whisper_device", "auto"),
                 compute_type=self.config.get("cuda_compute_type"),
             )
+        if model_size == ZIPFORMER_MODEL:
+            # Hebrew on a plain CPU: its own small runtime, no he/en router
+            # (the router's detector and English child are Whisper models).
+            return ZipformerTranscriber(
+                threads=self.config.get("parakeet_threads") or None)
         if model_size.startswith("parakeet"):
             # Parakeet (multi-language, v3): its own runtime (onnx-asr), no router —
             # the model is English-only by contract (MODEL_LANGUAGE = "en").
@@ -24556,6 +26069,8 @@ class LiaApp:
 
                 def _load_local_bg():
                     try:
+                        if self.config.get("model_size") not in CPU_FRIENDLY_MODELS:
+                            _wait_out_peer_gpu_job("the local Whisper fallback")
                         self._local_transcriber.load_model(callback=lambda msg: log.info(msg))
                         log.info("Local fallback loaded.")
                     except Exception as bg_e:
@@ -24608,17 +26123,21 @@ class LiaApp:
                 # installed, switch to it and reload instead of a dead red X -
                 # an existing config that still names a heavy Whisper model on
                 # a GPU-less machine gets the same treatment as a fresh install.
-                if (self._parakeet_available()
+                he_cpu = (self.config.get("primary_language", "he") == "he"
+                          and self._language_profile() == "hebrew")
+                if ((he_cpu or self._parakeet_available())
                         and self.config.get("model_size") not in CPU_FRIENDLY_MODELS):
+                    cpu_model = ZIPFORMER_MODEL if he_cpu else PARAKEET_MODEL
                     log.warning("No dedicated GPU and no server/cloud configured - "
-                                "switching dictation to Parakeet Multi-Language (CPU).")
-                    self.config["model_size"] = PARAKEET_MODEL
+                                "switching dictation to %s (CPU).", MODELS[cpu_model])
+                    self.config["model_size"] = cpu_model
                     save_config(self.config)
-                    self._local_transcriber = self._make_local_transcriber(PARAKEET_MODEL)
+                    self._local_transcriber = self._make_local_transcriber(cpu_model)
                     if self.config.get("transcription_backend", "local") == "local":
                         self.transcriber = self._local_transcriber
                     self._local_load_event.clear()
-                    self._queue_notice(*self._NO_GPU_PARAKEET_NOTICE)
+                    self._queue_notice(*(self._NO_GPU_ZIPFORMER_NOTICE if he_cpu
+                                         else self._NO_GPU_PARAKEET_NOTICE))
                     threading.Thread(target=self._load_model, daemon=True).start()
                     return
                 # Nothing to fall back to - stay responsive, prompt for setup.
@@ -24643,7 +26162,10 @@ class LiaApp:
                 return
 
             # Local is primary: load it synchronously. Also validate any
-            # cloud key so the cleanup LLM / cloud-on-toggle is ready.
+            # cloud key so the cleanup LLM / cloud-on-toggle is ready. Not into
+            # another app's running summary (the tray says "loading" meanwhile).
+            if self.config.get("model_size") not in CPU_FRIENDLY_MODELS:
+                _wait_out_peer_gpu_job("the local Whisper model")
             self._local_transcriber.load_model(callback=lambda msg: log.info(msg))
             self._local_load_event.set()
             if self._groq_transcriber is not None:
@@ -24746,6 +26268,11 @@ class LiaApp:
         "No NVIDIA GPU found, so dictation uses Parakeet Multi-Language (25 European languages) on the CPU. "
         "For Hebrew, add a free Groq key or a Transcription server in Settings.")
 
+    _NO_GPU_ZIPFORMER_NOTICE = (
+        "No compatible GPU",
+        "No NVIDIA GPU found, so dictation uses the Hebrew Zipformer model on the CPU (Hebrew only). "
+        "For English words or better accuracy, add a free Groq key or a Transcription server in Settings.")
+
     def _queue_notice(self, title, msg):
         """Show a tray balloon (+ overlay) now, or queue it until the tray icon
         exists (the model loader often finishes before the icon is registered).
@@ -24766,13 +26293,14 @@ class LiaApp:
     def _flush_notices(self, icon):
         """Called from on_tray_ready: deliver queued balloons + the first-run
         no-GPU notice load_config left in the config (shown once, then cleared)."""
-        if self.config.pop("_no_gpu_parakeet_notice", None):
-            self._pending_notices = getattr(self, "_pending_notices", []) + [
-                self._NO_GPU_PARAKEET_NOTICE]
-            try:
-                save_config(self.config)
-            except Exception:
-                pass
+        for flag, notice in (("_no_gpu_parakeet_notice", self._NO_GPU_PARAKEET_NOTICE),
+                             ("_no_gpu_zipformer_notice", self._NO_GPU_ZIPFORMER_NOTICE)):
+            if self.config.pop(flag, None):
+                self._pending_notices = getattr(self, "_pending_notices", []) + [notice]
+                try:
+                    save_config(self.config)
+                except Exception:
+                    pass
         pending, self._pending_notices = getattr(self, "_pending_notices", []), []
         for title, msg in pending:
             try:
@@ -24901,6 +26429,7 @@ class LiaApp:
                     _wait_for_gpu(_WHISPER_LOAD_NEED_MB + 500, "the local Whisper "
                                   "model", shed_own=False,
                                   min_wait_s=_GPU_WAIT_POLL_S)
+                    _wait_out_peer_gpu_job("the local Whisper model")
                     try:
                         self._local_transcriber.load_model(
                             callback=lambda m: log.info(m))
@@ -25767,6 +27296,7 @@ class LiaApp:
         source_label = {"microphone": "Mic", "stereo_mix": "System Audio", "both": "Mic + System"}.get(source, "Mic")
         log.info("Recording (%s)...", source_label)
         self.overlay.show_recording()
+        self._live_preview_begin()      # the words while they are said, when on
         if self.tray_icon:
             self.tray_icon.icon = self._create_icon("recording")
             self._set_title("Lia - Recording...")
@@ -28934,7 +30464,16 @@ class LiaApp:
                 and (time.time() - prev.get("timestamp", 0)) < 5.0):
             old_clipboard = prev.get("old_clipboard", "")
 
-        ok = output_text(text, mode=mode)
+        # A dictation that was typed in place is finished in place (no
+        # clipboard); anything else is pasted as always.
+        live = False
+        try:
+            in_place = self._live_type_finish(text) if mode == "auto_paste" else None
+            if in_place:
+                live, text = True, in_place      # undo removes what is really there
+        except Exception as e:
+            log.warning("Live dictation finish failed: %s", type(e).__name__)
+        ok = True if live else output_text(text, mode=mode)
         if not ok:
             return False
 
@@ -28966,7 +30505,10 @@ class LiaApp:
                 "text": text,
                 "old_clipboard": old_clipboard,
                 "timestamp": time.time(),
+                "typed": live,
             }
+        if live:
+            return True
 
         # Auto-restore the clipboard after a short delay so the user's
         # previous 'copy' isn't silently lost. Only for auto_paste mode —
@@ -29009,6 +30551,25 @@ class LiaApp:
             log.info("Undo: last paste was %.0fs ago — too stale to safely undo", age)
             self.overlay.show("  ↩  Last paste too old to undo  ",
                               bg_color="#6c7086", duration=1500)
+            return
+
+        if last.get("typed"):
+            # typed in place: there is no single paste for Ctrl+Z to undo, and
+            # the clipboard was never touched - take the characters back out
+            try:
+                import keyboard as kb
+                deadline = time.time() + 1.0
+                while time.time() < deadline and self._live_mods_down():
+                    time.sleep(0.02)
+                for _ in range(len(last["text"])):
+                    self._live_key(None)
+                    self._live_sleep(self.LIVE_KEY_MIN_S)
+            except Exception as e:
+                log.warning("Undo: removing the typed text failed: %s", e)
+            log.info("Undo: removed the typed dictation (%d chars, %.1fs old)",
+                     len(last["text"]), age)
+            self.overlay.show(f"  ↩  Undone ({len(last['text'])} chars)  ",
+                              bg_color="#4c6085", duration=1500)
             return
 
         # 1. Restore the previous clipboard content immediately (overrides
@@ -29071,7 +30632,8 @@ class LiaApp:
     # `requires_one_of_keys` is a list of config-key names that must be
     # non-empty for the row to be selectable; empty = always available.
     # LOCAL first (2026-08-29, Naor's ordering): plain local, then local
-    # diarized (speaker names), then cloud, remote last.
+    # diarized (speaker names), then cloud (OpenAI before Gemini - Naor,
+    # 2026-11-09), remote last.
     # Model display names are kept IDENTICAL to the dictation picker
     # (_MENU_MODELS_ORDERED) so the same model reads the same everywhere, with no
     # ⭐ markers (Naor's ask 2026-09-16). Rows that run on the SAME underlying
@@ -29081,17 +30643,18 @@ class LiaApp:
     _MEETING_MODELS = [
         ("Whisper Hebrew Local", "local_hebrew_turbo", []),
         ("Whisper Hebrew Local + Nemotron Speakers", "local_diarize_hebrew", []),
+        ("Zipformer Hebrew Local (fast on CPU)", "local_zipformer_hebrew", []),
         ("Parakeet Multi-Language Local (25 languages)", "local_parakeet_english", []),
         ("Parakeet Multi-Language Local + Nemotron Speakers", "local_diarize_parakeet", []),
         ("Whisper Multi-Language Local (99 languages)", "local_multilang_turbo", []),
         ("Whisper Multi-Language Local + Nemotron Speakers", "local_diarize_multilang", []),
+        ("OpenAI GPT transcribe", "openai_gpt_transcribe", ["openai_api_key"]),
+        ("OpenAI GPT-4o transcribe", "openai_gpt4o", ["openai_api_key"]),
         ("Gemini 3.5 transcribe Multi-Language", "gemini_transcribe", ["gemini_api_key"]),
         ("Gemini 3.5 transcribe Multi-Language · speakers", "gemini_diarize", ["gemini_api_key"]),
         ("AssemblyAI + Whisper Hebrew Local", "assemblyai_local_hebrew", ["assemblyai_api_key"]),
         ("AssemblyAI + OpenAI GPT-4o", "assemblyai_universal_2", ["assemblyai_api_key"]),
         ("AssemblyAI", "assemblyai_diarize_only", ["assemblyai_api_key"]),
-        ("OpenAI GPT transcribe", "openai_gpt_transcribe", ["openai_api_key"]),
-        ("OpenAI GPT-4o transcribe", "openai_gpt4o", ["openai_api_key"]),
         ("Remote Transcription server", "remote_hebrew_turbo", ["remote_server_url"]),
     ]
     # Which OpenAI transcription model a meeting row bills as (price hint only).
@@ -29145,6 +30708,7 @@ class LiaApp:
         "remote_hebrew_turbo": "Remote Transcription server",
         "local_english_distil": "English Distil (local)",
         "local_parakeet_english": "Parakeet Multi-Language (local)",
+        "local_zipformer_hebrew": "Zipformer Hebrew (local)",
         "local_multilang_turbo": "Whisper Multi-Language (local)",
         "local_diarize_hebrew": "Whisper Hebrew (local) · Nemotron speakers",
         "local_diarize_parakeet": "Parakeet Multi-Language (local) · Nemotron speakers",
@@ -29308,6 +30872,57 @@ class LiaApp:
             self.config["speakers_auto_install"] = False
             save_config(self.config)
         return (ok, msg)
+
+    # --- the voice bank (2026-11-09): voices named once, named again ---
+    _VOICE_BANK_RETRY_S = 1800
+
+    def _voice_bank_download(self):
+        """The voiceprint model (26.5 MB, sha256-checked) in the background,
+        one try per 30 min. A meeting that starts before it is ready keeps the
+        last 3 minutes of audio and catches up."""
+        import voice_bank
+        if voice_bank.model_ready() or getattr(self, "_voice_bank_dl", False):
+            return
+        last = getattr(self, "_voice_bank_dl_last", 0.0)
+        if last and time.time() - last < self._VOICE_BANK_RETRY_S:
+            return
+        self._voice_bank_dl_last = time.time()
+        self._voice_bank_dl = True
+
+        def work():
+            try:
+                log.info("Voice bank: downloading the voiceprint model")
+                voice_bank.download_model(log=log.info)
+            finally:
+                self._voice_bank_dl = False
+        threading.Thread(target=work, daemon=True, name="voice-bank-dl").start()
+
+    def _voice_bank_state(self):
+        """Settings > Meetings > Speakers: the saved voices (names only)."""
+        import voice_bank
+        return {"enabled": bool(self.config.get("voice_bank_enabled", True)),
+                "model": voice_bank.model_ready(),
+                "voices": voice_bank.summary()}
+
+    def _toggle_voice_bank(self):
+        """Settings: remember voices across meetings. Off keeps the saved
+        voices (Forget deletes them) and stops saving and matching."""
+        self.config["voice_bank_enabled"] = not bool(
+            self.config.get("voice_bank_enabled", True))
+        save_config(self.config)
+        log.info("Voice bank: %s", "on" if self.config["voice_bank_enabled"] else "off")
+
+    def _voice_bank_forget(self, voice_id):
+        import voice_bank
+        ok = voice_bank.forget(str(voice_id or ""))
+        log.info("Voice bank: forgot a voice (%s)", "ok" if ok else "not found")
+        return (ok, "Forgotten." if ok else "That voice is no longer saved.")
+
+    def _voice_bank_forget_all(self):
+        import voice_bank
+        voice_bank.forget_all()
+        log.info("Voice bank: forgot all voices")
+        return (True, "All saved voices forgotten.")
 
     # --- Turn-merge tuning for LOCAL speaker detection ---
     # Measured on real meetings (2026-08-12, a 2-spk and a 4-spk 5-min slice):
@@ -29629,6 +31244,21 @@ class LiaApp:
                 log.error("Meeting model groq_turbo load failed: %s", e)
                 return (None, None, False)
             return (t, None, False)
+
+        if key == ZIPFORMER_MEETING_KEY:
+            # Hebrew on a plain CPU (chunked meetings + files). Reuse the
+            # dictation-side instance when it is the same model and loaded.
+            main = self._local_transcriber
+            if isinstance(main, ZipformerTranscriber) and main.model is not None:
+                return (main, "he", False)
+            t = ZipformerTranscriber(
+                threads=self.config.get("parakeet_threads") or None)
+            try:
+                t.load_model(callback=cb)
+            except Exception as e:
+                log.error("Meeting model %s load failed: %s", key, e)
+                return (None, None, False)
+            return (t, "he", False)
 
         if key in ("local_parakeet_english", "local_diarize_parakeet"):
             # Parakeet (multi-language, v3). local_diarize_parakeet = the SAME model,
@@ -30038,6 +31668,352 @@ class LiaApp:
         log.info("Live speaker labels: %s",
                  "on" if self.config["meeting_live_speakers"] else "off")
 
+    def _toggle_meeting_fast_text(self):
+        self.config["meeting_fast_text"] = not bool(
+            self.config.get("meeting_fast_text", True))
+        save_config(self.config)
+        log.info("Fast meeting text: %s", "on" if self.config["meeting_fast_text"] else "off")
+
+    def _toggle_meeting_live_draft(self):
+        """Settings > Meetings: the live draft (Hebrew, Zipformer on the CPU).
+        Applies from the NEXT meeting."""
+        self.config["meeting_live_draft"] = not bool(
+            self.config.get("meeting_live_draft", False))
+        save_config(self.config)
+        log.info("Live draft: %s", "on" if self.config["meeting_live_draft"] else "off")
+
+    def _draft_model(self):
+        """The loaded Hebrew Zipformer for the live draft: the dictation
+        model's when that is the Zipformer, else one of its own (2 threads;
+        72 MB downloaded the first time). None when it cannot be loaded."""
+        try:
+            t = getattr(self, "_local_transcriber", None)
+            if isinstance(t, ZipformerTranscriber) and getattr(t, "model", None) is not None:
+                return t.model
+            m = getattr(self, "_draft_zip", None)
+            if m is None:
+                import zipformer_he
+                path = zipformer_he.download(revision=MODEL_REVISIONS.get(ZIPFORMER_MODEL))
+                m = self._draft_zip = zipformer_he.ZipformerHe(path, threads=2)
+            return m
+        except Exception as e:
+            log.warning("Live draft: the model could not be loaded (%s)", type(e).__name__)
+            return None
+
+    # ---- Live dictation (2026-11-14, Naor): the words while they are said ----
+    # Hebrew, the streaming Zipformer on the CPU. The regular dictation path
+    # is untouched: the text pasted at the end comes from the dictation model
+    # as always (with the Zipformer as that model it is the same text).
+    LIVE_PREVIEW_TICK_S = 0.25
+
+    def _live_preview_on(self):
+        try:
+            # a mode of the Zipformer as the dictation model (Naor): the text
+            # on the card is then the text that is pasted
+            return (bool(self.config.get("dictation_live_preview", False))
+                    and self.config.get("primary_language", "he") == "he"
+                    and self.config.get("transcription_backend") == "local"
+                    and self.config.get("model_size") == ZIPFORMER_MODEL)
+        except Exception:
+            return False
+
+    def _toggle_dictation_live_preview(self):
+        self.config["dictation_live_preview"] = not bool(
+            self.config.get("dictation_live_preview", False))
+        save_config(self.config)
+        on = self.config["dictation_live_preview"]
+        log.info("Live dictation text: %s", "on" if on else "off")
+        if on:      # load (or download) the model now, not on the first dictation
+            threading.Thread(target=self._draft_model, daemon=True).start()
+
+    # ---- Live dictation, typed in place (2026-11-14, Naor) -----------------
+    # "I want to see the text run in the line itself": in toggle mode with
+    # auto-paste the words are TYPED into the window that had the focus when
+    # the recording started, and corrected in place (backspaces + the new
+    # tail) when the model or the vocabulary changes them. At the end the
+    # final text replaces what was typed the same way: no clipboard, no
+    # Ctrl+V. Hold mode keeps the card (the hotkey's Ctrl is down the whole
+    # time, and Ctrl + a typed letter is a shortcut).
+    @staticmethod
+    def _live_fg():
+        try:
+            import ctypes
+            return int(ctypes.windll.user32.GetForegroundWindow() or 0)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _live_mods_down():
+        """Ctrl / Alt / Win held right now (a typed letter would be a shortcut)."""
+        try:
+            import ctypes
+            gk = ctypes.windll.user32.GetAsyncKeyState
+            return any(gk(vk) & 0x8000 for vk in (0x11, 0x12, 0x5B, 0x5C))
+        except Exception:
+            return True
+
+    @staticmethod
+    def _live_key(ch):
+        """The only place that presses a key: one character as Unicode input
+        (independent of the keyboard layout), or a backspace (ch None)."""
+        import ctypes
+        from ctypes import wintypes
+
+        class _KI(ctypes.Structure):
+            _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                        ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                        ("dwExtraInfo", ctypes.c_void_p)]
+
+        class _MI(ctypes.Structure):
+            _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                        ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                        ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_void_p)]
+
+        class _U(ctypes.Union):
+            _fields_ = [("ki", _KI), ("mi", _MI)]
+
+        class _IN(ctypes.Structure):
+            _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+
+        def one(vk, scan, flags):
+            i = _IN(1, _U(ki=_KI(vk, scan, flags, 0, None)))
+            ctypes.windll.user32.SendInput(1, ctypes.byref(i), ctypes.sizeof(_IN))
+
+        if ch is None:
+            one(0x08, 0, 0)
+            one(0x08, 0, 2)
+            return
+        data = ch.encode("utf-16-le")
+        for j in range(0, len(data), 2):
+            unit = data[j] | (data[j + 1] << 8)
+            one(0, unit, 4)             # KEYEVENTF_UNICODE, down
+            one(0, unit, 4 | 2)         # up
+
+    _live_sleep = staticmethod(time.sleep)
+    LIVE_KEY_MIN_S = 0.008      # a text box needs a moment per key (some repeat or drop on a burst)
+    LIVE_KEY_MAX_S = 0.045      # the pace of speech (about 14 letters a second); slower reads as lag
+    # While speaking the typing runs about this far behind the model: the gap
+    # is recomputed on every key from what is still waiting (FLOW / waiting),
+    # so a long backlog runs fast and the last letters of a group slow down to
+    # the pace of speech - one stream instead of a block and a pause (Naor).
+    LIVE_FLOW_S = 0.45
+
+    def _live_type_to(self, st, target, budget_s=0.35, max_s=None):
+        """Make the window hold `target` instead of st['typed'], one key at a
+        time, spread over about `budget_s` so the letters run instead of
+        landing in a block. Stops at once when another window comes to the
+        front or Ctrl / Alt / Win goes down; st['typed'] always says what is
+        really in the window. `max_s` = stop after that much typing (the
+        caller comes back with a newer text). True = the window holds
+        `target`."""
+        typed = st["typed"]
+        if target == typed:
+            return True
+        k = 0
+        for a, b in zip(typed, target):
+            if a != b:
+                break
+            k += 1
+        back, tail = len(typed) - k, target[k:]
+        spent = 0.0
+        for _ in range(back):
+            if self._live_fg() != st["hwnd"] or self._live_mods_down():
+                return False
+            self._live_key(None)
+            st["typed"] = st["typed"][:-1]
+            self._live_sleep(self.LIVE_KEY_MIN_S)
+            spent += self.LIVE_KEY_MIN_S
+        for i, ch in enumerate(tail):
+            if max_s is not None and spent >= max_s:
+                return False
+            if self._live_fg() != st["hwnd"] or self._live_mods_down():
+                return False
+            self._live_key(ch)
+            st["typed"] += ch
+            gap = min(self.LIVE_KEY_MAX_S,
+                      max(self.LIVE_KEY_MIN_S, budget_s / (len(tail) - i)))
+            self._live_sleep(gap)
+            spent += gap
+        return True
+
+    LIVE_KEEP_RATIO = 0.85
+
+    def _live_type_finish(self, text):
+        """End of a dictation that was typed in place. -> the text the window
+        now holds (the caller must not paste), or None (nothing was typed in
+        place, or it cannot be finished here: the caller pastes as always).
+
+        What was typed stays: the reader thread has already completed it from
+        the last of the audio. The regular pipeline decodes the recording
+        again (gained, mixed) and its text differs by a word here and there;
+        rewriting the line for that is the burst of keys Naor saw, and a
+        rewrite whose backspaces are not all taken leaves the text twice. The
+        line is rewritten only when the final text is really another text
+        (AI cleanup, a snippet)."""
+        with self._live_type_lock():
+            st, self._live_type_state = getattr(self, "_live_type_state", None), None
+        if not st or not st.get("inline"):
+            return None
+        th = st.get("thread")
+        if th is not None and th is not threading.current_thread():
+            th.join(5.0)
+        typed = st["typed"]
+        if not typed:
+            return None
+        final = _sanitize_for_paste(text)
+        if self._live_fg() != st["hwnd"]:
+            log.info("Live dictation: another window is in front - pasting the full text there")
+            return None
+        try:
+            import difflib
+            same = (final == typed or difflib.SequenceMatcher(
+                None, typed, final, autojunk=False).ratio() >= self.LIVE_KEEP_RATIO)
+            if same:
+                log.info("Live dictation: typed in place (%d chars, kept as typed)", len(typed))
+                return typed
+            deadline = time.time() + 1.0
+            while time.time() < deadline and self._live_mods_down():
+                time.sleep(0.02)
+            if any(c in final for c in "\n\r\t"):
+                # a typed line break would SEND in a chat box: take the typed
+                # text out and let the regular paste put the final text in
+                self._live_type_to(st, "", budget_s=0.5)
+                return None
+            if not self._live_type_to(st, final, budget_s=1.0):
+                log.info("Live dictation: the final text could not replace the typed one "
+                         "(%d of %d chars)", len(st["typed"]), len(final))
+                return st["typed"]
+        except Exception as e:
+            log.warning("Live dictation: finishing in place failed (%s)", type(e).__name__)
+            return st["typed"] or None
+        log.info("Live dictation: typed in place (%d chars, replaced by the final text)", len(final))
+        return final
+
+    def _live_type_lock(self):
+        lk = getattr(self, "_live_type_lk", None)
+        if lk is None:
+            lk = self._live_type_lk = threading.Lock()
+        return lk
+
+    def _live_preview_begin(self):
+        """Called as a recording starts (before the recorder starts): ask the
+        mic process to share the audio as it comes, and start the reader."""
+        on = self._live_preview_on()
+        rec = getattr(self, "recorder", None)
+        if rec is not None and hasattr(rec, "live_pcm"):
+            rec.live_pcm = on
+        with self._live_type_lock():
+            self._live_type_state = None
+        if not on:
+            return
+        with self._generation_lock:
+            gen = self._recording_generation
+        inline = (self.config.get("recording_mode", "toggle") == "toggle"
+                  and self.config.get("paste_mode", "auto_paste") == "auto_paste"
+                  and bool(self.config.get("dictation_live_inline", True)))
+        st = {"gen": gen, "inline": inline, "typed": "", "hwnd": self._live_fg() if inline else 0}
+        th = threading.Thread(target=self._live_preview_loop, args=(gen, st), daemon=True,
+                              name="live-dictation")
+        st["thread"] = th
+        with self._live_type_lock():
+            self._live_type_state = st
+        th.start()
+
+    @staticmethod
+    def _live_preview_read(path, pos):
+        """New 16-bit samples of the growing file from byte `pos`."""
+        try:
+            with open(path, "rb") as f:
+                f.seek(pos)
+                raw = f.read()
+        except OSError:
+            return None, pos
+        raw = raw[:len(raw) - (len(raw) % 2)]
+        if not raw:
+            return None, pos
+        return (np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0,
+                pos + len(raw))
+
+    LIVE_TAIL_WAIT_S = 1.2
+
+    def _live_preview_loop(self, gen, st_type=None):
+        path = None
+        inline = bool(st_type and st_type.get("inline"))
+        try:
+            model = self._draft_model()
+            if model is None:
+                return
+            import zipformer_he
+            stream = zipformer_he.ZipformerStream(model)
+            pos, st, shown = 0, {}, None
+
+            def step():
+                nonlocal pos, path
+                rec = self.recorder
+                path = getattr(rec, "live_pcm_path", None) or path
+                block = None
+                if path:
+                    block, pos = self._live_preview_read(path, pos)
+                elif hasattr(rec, "_data_lock"):        # the in-process recorder
+                    raw = MeetingSession._draft_new_frames(rec, st)
+                    if raw:
+                        block = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                if block is not None and len(block):
+                    return self._draft_terms(stream.feed(block))
+                return None
+
+            while self.is_recording and gen == self._recording_generation:
+                text = step()
+                if text is not None:
+                    if inline:
+                        shown = text
+                    elif text != shown:
+                        shown = text
+                        self.overlay.show_live_text(text)
+                t0 = time.monotonic()
+                if inline and shown is not None:
+                    # types for one tick at most, then reads the audio again:
+                    # the letters keep running while the next words arrive
+                    self._live_type_to(st_type, shown, budget_s=self.LIVE_FLOW_S,
+                                       max_s=self.LIVE_PREVIEW_TICK_S)
+                rest = self.LIVE_PREVIEW_TICK_S - (time.monotonic() - t0)
+                if rest > 0:
+                    time.sleep(rest)
+            if inline:
+                # The recording stopped: the last of the audio (the mic process
+                # writes it as it ends), the model's tail, and the line is
+                # complete - this is the text that stays.
+                quiet, end = 0, time.monotonic() + self.LIVE_TAIL_WAIT_S
+                while quiet < 2 and time.monotonic() < end:
+                    quiet = 0 if step() is not None else quiet + 1
+                    time.sleep(0.05)
+                try:
+                    stream.finish()
+                except Exception:
+                    pass
+                shown = self._draft_terms(stream.text())
+                end = time.monotonic() + 2.0
+                while (gen == self._recording_generation
+                       and not self._live_type_to(st_type, shown, budget_s=0.25)
+                       and time.monotonic() < end):
+                    time.sleep(0.03)        # Ctrl of the stop hotkey is still down
+        except Exception as e:
+            log.warning("Live dictation text failed: %s", type(e).__name__)
+        finally:
+            try:
+                self.overlay.show_live_text("")
+            except Exception:
+                pass
+            if path:                    # the mic process closes it as it ends
+                for _ in range(20):
+                    try:
+                        os.remove(path)
+                        break
+                    except FileNotFoundError:
+                        break
+                    except OSError:
+                        time.sleep(0.25)
+
     def _toggle_keep_meeting_tracks(self):
         """Settings: keep the raw per-source meeting tracks (mic / system /
         backup) next to the mixdown. Applies from the NEXT meeting."""
@@ -30080,6 +32056,240 @@ class LiaApp:
             self.tray_icon.update_menu()
         except Exception:
             pass
+
+    # ---- Claude link (2026-11-11): Claude on this PC reads the meeting ----
+    # On by default (2026-11-16). On = a small reader on 127.0.0.1 (ears.py) that serves
+    # the meeting being recorded to the user's own Claude, on request, through
+    # the bridge Claude starts. Reading only; no AI call from Lia.
+    EAR_WAIT_S = 4.0
+
+    def _claude_link_on(self):
+        try:
+            return bool(self.config.get("claude_link", False))
+        except Exception:
+            return False
+
+    def _toggle_claude_link(self):
+        self.config["claude_link"] = not self._claude_link_on()
+        save_config(self.config)
+        log.info("Claude link: %s", "on" if self.config["claude_link"] else "off")
+        if self.config["claude_link"]:
+            self._start_ears()
+        else:
+            self._stop_ears()
+        self._claude_register()
+
+    # ---- Claude link: Lia registers itself in Claude (2026-11-16) ----
+    # The switch alone was not enough: the user also had to add the bridge to
+    # Claude by hand, and the bridge file was not part of Lia. Now the two
+    # files ship with Lia (ears_bridge.py, claude_control.py) and each switch
+    # writes its server into the Claude apps found on this PC, and takes it
+    # out when turned off (claude_connect.py).
+    def _claude_roots(self):
+        """(home, roaming, local) of the user, or None when this run's data
+        folder is not the user's real one (a test, a script with its own
+        APPDATA): such a run never writes into the user's Claude."""
+        try:
+            import ctypes
+
+            def known(csidl):
+                buf = ctypes.create_unicode_buffer(260)
+                if ctypes.windll.shell32.SHGetFolderPathW(None, csidl, None, 0, buf) != 0:
+                    return ""
+                return buf.value
+            roaming, local = known(0x1A), known(0x1C)
+            real = os.path.normcase(os.path.abspath(os.path.join(roaming, "Lia")))
+            if not roaming or os.path.normcase(os.path.abspath(CONFIG_DIR)) != real:
+                return None
+            return os.path.expanduser("~"), roaming, local
+        except Exception:
+            return None
+
+    def _claude_register(self):
+        """Make the Claude apps on this PC match the two switches, off the
+        calling thread. -> the thread, or None when nothing is written."""
+        roots = self._claude_roots()
+        if roots is None:
+            return None
+        link, control = self._claude_link_on(), self._claude_control_on()
+
+        def work():
+            try:
+                import claude_connect as cc
+                places = []
+                if link:
+                    places = cc.connect(*roots)
+                else:
+                    cc.disconnect(*roots)
+                if control:
+                    cc.connect(*roots, name=cc.CONTROL)
+                else:
+                    cc.disconnect(*roots, name=cc.CONTROL)
+                self._claude_places = list(places)
+                if link:
+                    log.info("Claude link: registered in %s",
+                             ", ".join(places) or "no Claude app (none found)")
+                self._settings_push_state()
+            except Exception as e:
+                log.warning("Claude link: registering failed (%s)", type(e).__name__)
+        t = threading.Thread(target=work, daemon=True, name="lia-claude")
+        t.start()
+        return t
+
+    def _start_ears(self):
+        """Start the reader when the setting is on. Never raises."""
+        if not self._claude_link_on() or getattr(self, "_ear", None) is not None:
+            return
+        try:
+            import ears
+            ear = ears.Ear("lia", APP_VERSION, CONFIG_DIR,
+                           {"/v1/meeting": self._ears_meeting,
+                            "/v1/lines": self._ears_lines,
+                            "/v1/agenda": self._ears_agenda},
+                           actions={"/v1/control/start": self._ears_control_start,
+                                    "/v1/control/stop": self._ears_control_stop})
+            if ear.start():
+                self._ear = ear
+        except Exception as e:
+            log.warning("Claude link not started: %s", type(e).__name__)
+
+    def _stop_ears(self):
+        ear, self._ear = getattr(self, "_ear", None), None
+        if ear is not None:
+            try:
+                ear.stop()
+            except Exception:
+                pass
+
+    # ---- Claude link: start / stop a recording (2026-11-11, Naor) ----
+    # A second switch, off by default, under "Claude link". Only start and
+    # stop: no discard, no settings. Stop always saves the recording.
+    def _claude_control_on(self):
+        try:
+            return self._claude_link_on() and bool(
+                self.config.get("claude_link_control", False))
+        except Exception:
+            return False
+
+    def _toggle_claude_link_control(self):
+        self.config["claude_link_control"] = not bool(
+            self.config.get("claude_link_control", False))
+        save_config(self.config)
+        log.info("Claude link, start and stop: %s",
+                 "on" if self.config["claude_link_control"] else "off")
+        self._claude_register()
+
+    EAR_START_WAIT_S = 8.0
+
+    def _ears_control_start(self, _q=None):
+        if not self._claude_control_on():
+            return {"ok": False, "why": "off"}
+        if self._is_meeting_active():
+            return {"ok": False, "why": "recording"}
+        log.info("Claude link: start of a recording asked")
+        t = threading.Thread(
+            target=lambda: self._start_meeting(summarize=self._auto_summary_default()),
+            daemon=True)
+        t.start()
+        t.join(timeout=self.EAR_START_WAIT_S)
+        if self._is_meeting_active():
+            return {"ok": True}
+        return {"ok": False, "why": "not_started"}
+
+    def _ears_control_stop(self, _q=None):
+        if not self._claude_control_on():
+            return {"ok": False, "why": "off"}
+        if not self._is_meeting_active():
+            return {"ok": False, "why": "no_meeting"}
+        log.info("Claude link: end of the recording asked")
+        # the same as the tray's Stop: the summary setting decides; the work
+        # after Stop takes minutes, so it runs on its own thread
+        threading.Thread(target=self._stop_meeting, daemon=True).start()
+        return {"ok": True}
+
+    def _ears_now(self):
+        """(the meeting to read, is it recording now). The last meeting stays
+        readable after it ends, until the next one starts."""
+        s = self._active_meeting
+        if s is not None and getattr(s, "start_time", None):
+            return s, True
+        return getattr(self, "_ears_last", None), False
+
+    def _ears_meeting(self, _q=None):
+        s, active = self._ears_now()
+        if s is None:
+            return {"app": "lia", "active": False, "ended": False, "key": "", "lines": 0}
+        lines, _pending = s.ear_lines()
+        try:
+            me = self._self_speaker_name() or ""
+        except Exception:
+            me = ""
+        out = {"app": "lia", "active": active, "ended": not active,
+               "key": s.ear_key(), "lines": len(lines),
+               "last_line_t": lines[-1]["e"] if lines else None,
+               "source": "stream", "me": me}
+        if active:
+            out.update({
+                "title": str(s.title or s.title_guess or s.event_subject or ""),
+                "started_at": time.strftime("%Y-%m-%dT%H:%M:%S",
+                                            time.localtime(s.start_time)),
+                "elapsed_s": round(time.time() - s.start_time, 1),
+                "paused": False,
+                "has_agenda": bool(self._ears_agenda().get("text")),
+            })
+        return out
+
+    def _ears_lines(self, q=None):
+        import ears
+        q = q or {}
+        after = ears.q_int(q, "after", -1)
+        s, active = self._ears_now()
+        if s is None:
+            return {"key": "", "lines": [], "next": after, "more": False,
+                    "age_s": None, "in_flight": False, "source": "stream"}
+        t0 = time.monotonic()
+        if active and str(q.get("fresh") or "") == "1":
+            s.ear_fresh(self.EAR_WAIT_S)
+        lines, pending = s.ear_lines()
+        got, more = ears.page(lines, after=after,
+                              from_s=ears.q_float(q, "from_s"),
+                              to_s=ears.q_float(q, "to_s"),
+                              limit=ears.q_int(q, "limit", 2000),
+                              max_chars=ears.q_int(q, "max_chars", 12000))
+        age = None
+        if active and lines:
+            age = round(max(0.0, (time.time() - s.start_time) - lines[-1]["e"]), 1)
+        if active:
+            # numbers only: the latency of every read is measured, not guessed
+            log.info("Claude link read: %d of %d line(s), newest %s s old, "
+                     "waited %.1f s%s", len(got), len(lines),
+                     "-" if age is None else age, time.monotonic() - t0,
+                     ", more on its way" if pending else "")
+        return {"key": s.ear_key(), "lines": got,
+                "next": got[-1]["seq"] if got else after, "more": more,
+                "age_s": age, "in_flight": bool(active and pending),
+                "source": "stream"}
+
+    def _ears_agenda(self, _q=None):
+        """Lia has no agenda feature: the calendar subject and invitees, when
+        the meeting has them."""
+        s, _active = self._ears_now()
+        if s is None:
+            return {"text": ""}
+        subj = str(getattr(s, "event_subject", "") or "").strip()
+        people = []
+        for n in list(getattr(s, "attendees", None) or [])[:40]:
+            n = re.sub(r"\s*<[^>]*>", "", str(n or "")).strip()
+            if n and n not in people:
+                people.append(n)
+        if not subj and not people:
+            return {"text": ""}
+        text = ["No agenda was prepared in Lia. From the calendar:"]
+        if subj:
+            text.append("Subject: " + subj)
+        if people:
+            text.append("Invited: " + ", ".join(people))
+        return {"text": "\n".join(text), "title": subj, "at": ""}
 
     def _auto_summary_default(self):
         """Whether a meeting that ends without an explicit choice gets a
@@ -30270,13 +32480,15 @@ class LiaApp:
     # are language-capable and left alone). remote is a Hebrew-only server.
     _LANG_DICTATION = {
         "en": {"ivrit-ai/whisper-large-v3-turbo-ct2": "parakeet-tdt-0.6b-v3",
-               "ivrit-ai/whisper-large-v3-ct2": "parakeet-tdt-0.6b-v3"},
+               "ivrit-ai/whisper-large-v3-ct2": "parakeet-tdt-0.6b-v3",
+               "zipformer2-66m-he": "parakeet-tdt-0.6b-v3"},
         "he": {"parakeet-tdt-0.6b-v3": "ivrit-ai/whisper-large-v3-turbo-ct2",
                "distil-large-v3": "ivrit-ai/whisper-large-v3-turbo-ct2"},
     }
     _LANG_MEETING = {
         "en": {"local_hebrew_turbo": "local_parakeet_english",
                "local_diarize_hebrew": "local_diarize_parakeet",
+               "local_zipformer_hebrew": "local_parakeet_english",
                "remote_hebrew_turbo": "local_parakeet_english"},
         "he": {"local_parakeet_english": "local_hebrew_turbo",
                "local_diarize_parakeet": "local_diarize_hebrew"},
@@ -30360,6 +32572,7 @@ class LiaApp:
         # only swap AWAY from a language-specific LOCAL/remote key, never a cloud choice.
         if (self.config.get("gemini_api_key") and self.config.get("meeting_model") in (
                 "local_hebrew_turbo", "local_diarize_hebrew",
+                "local_zipformer_hebrew",
                 "local_parakeet_english", "local_diarize_parakeet",
                 "remote_hebrew_turbo")):
             self.config["meeting_model"] = "gemini_transcribe"
@@ -30504,6 +32717,7 @@ class LiaApp:
     # product's identity and the app default; cloud follows, remote last.
     _MENU_MODELS_ORDERED = [
         ("Whisper Hebrew Local", "ivrit-ai/whisper-large-v3-turbo-ct2", "local", False, ""),
+        ("Zipformer Hebrew Local (fast on CPU)", "zipformer2-66m-he", "local", False, ""),
         ("Parakeet Multi-Language Local (25 languages)", "parakeet-tdt-0.6b-v3", "local", False, ""),
         ("English Distil Local", "distil-large-v3", "local", False, ""),
         ("Whisper Multi-Language Local (99 languages)", "large-v3-turbo", "local", False, ""),
@@ -32042,6 +34256,7 @@ class LiaApp:
                 )
                 session.start()
                 self._active_meeting = session
+                self._ears_last = session      # Claude link: readable after it ends too
                 # Speaker naming, phase 1a: fetch the calendar attendees of the
                 # meeting overlapping NOW (async, de-elevated COM helper).
                 try:
@@ -32415,6 +34630,7 @@ class LiaApp:
                 if session is None:
                     return
                 self._active_meeting = None
+                self._ears_last = None         # a discarded meeting is not readable
             # Reset the auto-detect state machine (same as a normal stop) so the
             # next call/meeting starts clean.
             with self._meeting_detect_lock:
@@ -34081,6 +36297,104 @@ class LiaApp:
                 log.warning("Lexicon fix failed (%s): %s", label, e)
         return fixed
 
+    # ---- The vocabulary on the Hebrew-only model (2026-11-14, Naor) --------
+    # The Zipformer writes an English word the way it sounds ("סקיוריטי").
+    # Two steps put the user's own spelling back: the corrections table (the
+    # explicit pairs), then a match BY SOUND against the approved vocabulary
+    # terms (translit.py). The sound match needs the Hebrew dictionary: it is
+    # what keeps real Hebrew words untouched.
+    def _term_matcher(self):
+        """The sound matcher over the approved terms, or None (switched off,
+        no dictionary loaded, no vocabulary). Rebuilt when the terms change."""
+        try:
+            if translit_mod is None or not self.config.get("vocab_sound_match", True):
+                return None
+            lex = getattr(self, "_lexicon", None)
+            store = getattr(self, "_vocab_store", None)
+            if lex is None or not lex.ready or store is None:
+                return None
+            terms = tuple(store.approved_terms())
+            cached = getattr(self, "_term_matcher_cache", None)
+            if cached is None or cached[0] != terms:
+                cached = (terms, translit_mod.Matcher(terms, lex.valid))
+                self._term_matcher_cache = cached
+            return cached[1]
+        except Exception as e:
+            log.debug("Term matcher unavailable: %s", type(e).__name__)
+            return None
+
+    def _zip_terms(self, text):
+        """The Zipformer's final text: the corrections table, then the terms
+        by sound. Every change is logged. Never raises."""
+        if not text:
+            return text
+        try:
+            if self._language_profile() != "hebrew":
+                return text
+        except Exception:
+            pass
+        fixed = text
+        store = getattr(self, "_vocab_store", None)
+        try:
+            if (store is not None and vocab_learn is not None
+                    and self.config.get("vocab_corrections", True)):
+                fixed, counts = vocab_learn.apply_corrections(fixed, store.corrections())
+                if counts:
+                    store.record_applied(counts)
+                    log.info("Vocab corrections applied (zipformer): %s",
+                             _fmt_user_text(self.config,
+                                            ", ".join("%s×%d" % kv for kv in counts.items())))
+            m = self._term_matcher()
+            if m is not None:
+                fixed, done = m.fix(fixed)
+                if done:
+                    log.info("Terms by sound (zipformer): %d - %s", len(done),
+                             _fmt_user_text(self.config,
+                                            "; ".join("%s→%s" % p for p in done)))
+        except Exception as e:
+            log.warning("Zipformer term fix failed: %s", type(e).__name__)
+            return text
+        return fixed
+
+    def _draft_terms(self, text):
+        """The same two steps for text that is only SHOWN (the live draft in a
+        meeting, the live card in dictation): quiet (no log, no counters) and
+        cheap enough to run on every refresh."""
+        if not text:
+            return text
+        try:
+            store = getattr(self, "_vocab_store", None)
+            if (store is not None and vocab_learn is not None
+                    and self.config.get("vocab_corrections", True)):
+                pairs = store.corrections()
+                sig = hash(tuple((c.get("wrong"), c.get("right")) for c in pairs))
+                cached = getattr(self, "_draft_table_cache", None)
+                if cached is None or cached[0] != sig:
+                    cached = (sig, vocab_learn.corrections_replacer(pairs))
+                    self._draft_table_cache = cached
+                text = cached[1](text)
+            m = self._term_matcher()
+            if m is not None:
+                text = m.fix(text)[0]
+        except Exception as e:
+            log.debug("Draft term fix failed: %s", type(e).__name__)
+        return text
+
+    def _toggle_vocab_sound_match(self):
+        new_val = not bool(self.config.get("vocab_sound_match", True))
+        self.config["vocab_sound_match"] = new_val
+        save_config(self.config)
+        log.info("Terms by sound: %s", "ON" if new_val else "OFF")
+        lex = getattr(self, "_lexicon", None)
+        if new_val and lex is not None and not lex.ready \
+                and os.path.exists(self._lexicon_dic_path()):
+            def _load():
+                try:
+                    lex.load()
+                except Exception as e:
+                    log.warning("Lexicon load failed (no-op): %s", e)
+            threading.Thread(target=_load, daemon=True).start()
+
     def _lexicon_protected(self):
         """Words the lexicon fix must never rewrite: the user's approved
         vocabulary terms + the RIGHT sides of the corrections table (things the
@@ -34120,6 +36434,7 @@ class LiaApp:
             "loaded": bool(lex is not None and lex.ready),
             "enabled": bool(self.config.get("lexicon_fix_enabled")),
             "suggest": bool(self.config.get("lexicon_suggest_enabled", True)),
+            "sound": bool(self.config.get("vocab_sound_match", True)),
             "size_mb": size_mb,
             "words": lex.word_count() if (lex is not None and lex.ready) else 0,
         }
@@ -36304,6 +38619,11 @@ class LiaApp:
         add("toggle_meeting_backup_mic", self._toggle_meeting_backup_mic)
         add("toggle_meeting_mic_auto_fallback", self._toggle_meeting_mic_auto_fallback)
         add("toggle_meeting_windows_hidden", self._toggle_meeting_windows_hidden)
+        add("toggle_claude_link", self._toggle_claude_link)
+        add("toggle_meeting_live_draft", self._toggle_meeting_live_draft)
+        add("toggle_meeting_fast_text", self._toggle_meeting_fast_text)
+        add("toggle_dictation_live_preview", self._toggle_dictation_live_preview)
+        add("toggle_claude_link_control", self._toggle_claude_link_control)
         add("toggle_meeting_auto_summary", self._toggle_meeting_auto_summary)
         add("summarize_meeting_for", self._summarize_meeting_path)
         add("toggle_teams_speaker_names", self._toggle_teams_speaker_names)
@@ -36342,6 +38662,7 @@ class LiaApp:
         add("lexicon_download", self._lexicon_download, True)
         add("toggle_lexicon_fix", self._toggle_lexicon_fix)
         add("toggle_lexicon_suggest", self._toggle_lexicon_suggest)
+        add("toggle_vocab_sound_match", self._toggle_vocab_sound_match)
         add("lexicon_oov_list", self._lexicon_oov_list)
         add("lexicon_oov_dismiss", self._lexicon_oov_dismiss)
         add("vocab_accept_suggestions", self._vocab_accept_suggestions)
@@ -36374,6 +38695,9 @@ class LiaApp:
         add("rename_meeting_for", self._rename_meeting_for)
         add("speakers_install", self._speakers_install, True)
         add("speakers_remove", self._speakers_remove)
+        add("toggle_voice_bank", self._toggle_voice_bank)
+        add("voice_bank_forget", self._voice_bank_forget)
+        add("voice_bank_forget_all", self._voice_bank_forget_all)
         add("copy_meeting_summary", self._copy_meeting_summary)
         return A
 
@@ -36739,6 +39063,8 @@ class LiaApp:
                 "select": self.__dict__.pop("_settings_home_select", None),
                 # Local speaker detection (Nemotron 3): installed / progress.
                 "speakers": _safe(self._speakers_status, {}),
+                # The voice bank: saved voices (names, counts - never the prints).
+                "voice_bank": _safe(self._voice_bank_state, {}),
                 "action_items_open": _safe(self._home_action_items_open_count, None),
                 "recording_source": c.get("recording_source", "microphone"),
                 "mic_name": (c.get("input_device_name")
@@ -36760,6 +39086,7 @@ class LiaApp:
                       "log": os.path.join(CONFIG_DIR, "lia.log"),
                       "meetings": MEETINGS_DIR},
             "version": APP_VERSION,
+            "claude": {"places": list(getattr(self, "_claude_places", None) or [])},
             "tables": _safe(lambda: self._settings_tables(ollama=ollama), {}),
             "serve": _safe(self._settings_serve_status, {}),
             "lexicon": _safe(self._lexicon_status, {}),
@@ -36810,6 +39137,7 @@ class LiaApp:
                       "log": os.path.join(CONFIG_DIR, "lia.log"),
                       "meetings": MEETINGS_DIR},
             "version": APP_VERSION,
+            "claude": {"places": []},
             "tables": {}, "serve": {}, "lexicon": {},
             "mics": [], "loopbacks": [], "outputs": [],
         }
@@ -37329,6 +39657,7 @@ class LiaApp:
 
     def _quit(self):
         log.info("Quitting Lia...")
+        self._stop_ears()               # Claude link: close the reader, remove its file
         # Mark shutdown BEFORE closing Settings so the reader's finally block
         # doesn't re-arm the pre-warm (which would spawn a child during quit).
         self._shutting_down = True
